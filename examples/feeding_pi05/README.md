@@ -65,6 +65,7 @@ lerobot-train \
     --dataset.root="$RAW_ROOT/lerobot" \
     --policy.type=pi05 \
     --policy.pretrained_path=lerobot/pi05_base \
+    --policy.push_to_hub=false \
     --policy.train_expert_only=true \
     --policy.gradient_checkpointing=true \
     --policy.dtype=bfloat16 \
@@ -85,6 +86,7 @@ accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 \
   $(which lerobot-train) \
   --dataset.repo_id=rice/feeding_pi05 --dataset.root="$RAW_ROOT/lerobot" \
   --policy.type=pi05 --policy.pretrained_path=lerobot/pi05_base \
+  --policy.push_to_hub=false \
   --policy.train_expert_only=true --policy.gradient_checkpointing=true \
   --policy.dtype=bfloat16 --batch_size=16 --steps=30000 \
   --output_dir="$RAW_ROOT/outputs/pi05_feeding"
