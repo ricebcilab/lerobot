@@ -29,7 +29,7 @@ import re
 import shutil
 import sys
 
-import cv2
+import av
 import numpy as np
 
 # Camera obs key (in the mp4 filename) -> short feature name used in the dataset.
@@ -75,17 +75,19 @@ def seed_index_of(path):
 
 
 def grab(video_path, idxs):
-    """Return RGB frames at the given indices (idxs are valid: sidecar len == frame count)."""
-    cap = cv2.VideoCapture(video_path)
-    want, store, i, mx = set(idxs), {}, 0, max(idxs)
-    while i <= mx:
-        ok, fr = cap.read()
-        if not ok:
-            break
-        if i in want:
-            store[i] = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-        i += 1
-    cap.release()
+    """Return RGB frames at the given indices (idxs are valid: sidecar len == frame count).
+
+    Uses PyAV rather than OpenCV: the opencv-python wheel's bundled FFmpeg only
+    attempts hardware AV1 decode and silently yields zero frames on machines
+    without it, whereas PyAV decodes AV1 in software.
+    """
+    want, store, mx = set(idxs), {}, max(idxs)
+    with av.open(video_path) as container:
+        for i, frame in enumerate(container.decode(video=0)):
+            if i in want:
+                store[i] = frame.to_ndarray(format="rgb24")
+            if i >= mx:
+                break
     return [store[i] for i in idxs]
 
 
@@ -134,8 +136,9 @@ def main(argv=None):
     vids = {seed_index_of(d): d for d in glob.glob(os.path.join(args.raw_root, "videos", "*seed*"))}
     want_seeds = resolve_seeds(args.seeds)
 
-    c = cv2.VideoCapture(glob.glob(os.path.join(next(iter(vids.values())), "demo_0_*overhead*.mp4"))[0])
-    H, W = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(c.get(cv2.CAP_PROP_FRAME_WIDTH)); c.release()
+    sample = glob.glob(os.path.join(next(iter(vids.values())), "demo_0_*overhead*.mp4"))[0]
+    with av.open(sample) as c:
+        H, W = c.streams.video[0].height, c.streams.video[0].width
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     features = {
