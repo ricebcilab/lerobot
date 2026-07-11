@@ -177,7 +177,7 @@ def main(argv=None):
     ds = LeRobotDataset.create(repo_id=args.repo_id, fps=args.fps, features=features,
                                root=output_root, robot_type="kinova_gen3", use_videos=True)
 
-    kept = dropped = crops = drink_skipped = 0
+    kept = dropped = crops = drink_skipped = no_close_skipped = 0
     for nwb_path in nwbs:
         seed = seed_index_of(nwb_path)
         if (want_seeds is not None and seed not in want_seeds) or seed not in vids:
@@ -203,6 +203,12 @@ def main(argv=None):
                     and int(row["trial_info_tgt_id"]) in DRINK_IDS
                     and np.random.default_rng([1, seed, demo]).random() >= args.old_drink_keep):
                 drink_skipped += 1; continue
+            t_close = first_close_time(fa, fa_ts, go, stop)
+
+            # A real feeding success must close the gripper
+            if t_close is None and bool(row["trial_result_result"]):
+                print(f"[seed {seed}] demo {demo}: success without gripper close (sim glitch), dropping")
+                no_close_skipped += 1; continue
             try:
                 ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps)
             except (av.FFmpegError, LookupError) as e:
@@ -215,7 +221,6 @@ def main(argv=None):
             kept += 1; s_kept += 1
 
             if args.mid_approach_crops:
-                t_close = first_close_time(fa, fa_ts, go, stop)
                 if t_close is not None:
                     crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
                     if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
@@ -231,8 +236,9 @@ def main(argv=None):
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
 
     ds.finalize()
-    print(f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, "
-          f"{dropped} dropped, {drink_skipped} old-drink trials subsampled out. Dataset at {output_root}")
+    print(f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, {dropped} dropped, "
+          f"{drink_skipped} old-drink trials subsampled out, {no_close_skipped} no-close sim glitches. "
+          f"Dataset at {output_root}")
     print("finalize() computed q01/q99 stats -> pi05 QUANTILE normalization is data-driven.")
 
 
