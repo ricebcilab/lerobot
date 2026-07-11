@@ -97,6 +97,8 @@ def grab(video_path, idxs):
                 store[i] = frame.to_ndarray(format="rgb24")
             if i >= mx:
                 break
+    if want - store.keys():
+        raise LookupError(f"{video_path}: decoded {len(store)} of {len(want)} wanted frames (truncated?)")
     return [store[i] for i in idxs]
 
 
@@ -201,7 +203,11 @@ def main(argv=None):
                     and int(row["trial_info_tgt_id"]) in DRINK_IDS
                     and np.random.default_rng([1, seed, demo]).random() >= args.old_drink_keep):
                 drink_skipped += 1; continue
-            ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps)
+            try:
+                ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps)
+            except (av.FFmpegError, LookupError) as e:
+                print(f"[seed {seed}] demo {demo}: undecodable video, dropping demo ({e})")
+                dropped += 1; continue
             if ep is None:
                 dropped += 1; continue
             task = args.task_prompt.format(food=str(row["trial_info_text_cue"]))
@@ -214,7 +220,11 @@ def main(argv=None):
                     # Only a true mid-approach start counts (crop_go > go, else it would
                     # duplicate the base episode) and it must clear the min-length filter.
                     if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
-                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
+                        try:
+                            ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
+                        except (av.FFmpegError, LookupError) as e:
+                            print(f"[seed {seed}] demo {demo}: undecodable video, dropping crop ({e})")
+                            ep2 = None
                         if ep2 is not None:
                             save_episode(ds, ep2, task)
                             crops += 1
