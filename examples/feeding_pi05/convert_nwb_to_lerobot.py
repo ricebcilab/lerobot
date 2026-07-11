@@ -39,6 +39,9 @@ CAMS = {
     "wrist": "kinova_kinova_gen3_bracelet_link_Camera_0_rgb",
 }
 GRIP = 6  # action dims [0:6] are pose deltas (summed); dim 6 is the gripper (last).
+CLOSE_THRESH = -0.02  # gripper action below this counts as "closing"
+DRINK_IDS = {7, 8, 16}  # bottle_of_coke, bottle_of_water, soda_cup
+OLD_SEED_MAX = 39  # seeds 0-39 are the v1 constant-speed collection (drinks 4x oversampled)
 
 
 def parse_args(argv=None):
@@ -56,6 +59,12 @@ def parse_args(argv=None):
                    help="Keep only successful trials (use --no-success-only to include failures).")
     p.add_argument("--seeds", default=None, help="Comma/range of seed indices, e.g. '0,1,2' or '0-9'.")
     p.add_argument("--max-demos-per-seed", type=int, default=None, help="Cap demos per seed (smoke test).")
+    p.add_argument("--mid-approach-crops", action=argparse.BooleanOptionalAction, default=False,
+                   help="For each kept demo, ALSO emit a cropped episode starting 0.3-1.0 s (uniform) "
+                        "before the first gripper close (decorrelates grasp timing from episode time).")
+    p.add_argument("--old-drink-keep", type=float, default=1.0,
+                   help="Keep fraction for old-seed (0-39) drink trials (tgt ids 7/8/16), e.g. 0.25 to "
+                        "undo the v1 4x drink oversampling. Deterministic per (seed, demo).")
     p.add_argument("--overwrite", action="store_true", help="Remove an existing output dataset first.")
     return p.parse_args(argv)
 
@@ -119,6 +128,20 @@ def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps):
     return frames, np.stack(actions), np.stack(states)
 
 
+def first_close_time(fa, fa_ts, go, stop):
+    """Timestamp of the first gripper-close command in the go-period, or None."""
+    js = np.nonzero((fa_ts >= go) & (fa_ts < stop) & (fa[:, GRIP] < CLOSE_THRESH))[0]
+    return float(fa_ts[js[0]]) if len(js) else None
+
+
+def save_episode(ds, ep, task):
+    frames, actions, states = ep
+    for i in range(len(actions)):
+        ds.add_frame({"observation.state": states[i], "action": actions[i], "task": task,
+                      **{f"observation.images.{n}": frames[n][i] for n in CAMS}})
+    ds.save_episode(parallel_encoding=False)
+
+
 def main(argv=None):
     args = parse_args(argv)
     from pynwb import NWBHDF5IO
@@ -152,7 +175,7 @@ def main(argv=None):
     ds = LeRobotDataset.create(repo_id=args.repo_id, fps=args.fps, features=features,
                                root=output_root, robot_type="kinova_gen3", use_videos=True)
 
-    kept = dropped = 0
+    kept = dropped = crops = drink_skipped = 0
     for nwb_path in nwbs:
         seed = seed_index_of(nwb_path)
         if (want_seeds is not None and seed not in want_seeds) or seed not in vids:
@@ -171,20 +194,35 @@ def main(argv=None):
             go, stop = float(row["go_cue_time"]), float(row["stop_time"])
             if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
                 dropped += 1; continue
+            # Undo the v1 4x drink oversampling: keep only a fraction of old-seed drink
+            # trials. RNG is keyed by (seed, demo) so the choice is identical no matter
+            # how seeds are sharded across parallel workers.
+            if (args.old_drink_keep < 1.0 and seed <= OLD_SEED_MAX
+                    and int(row["trial_info_tgt_id"]) in DRINK_IDS
+                    and np.random.default_rng([1, seed, demo]).random() >= args.old_drink_keep):
+                drink_skipped += 1; continue
             ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps)
             if ep is None:
                 dropped += 1; continue
-            frames, actions, states = ep
             task = args.task_prompt.format(food=str(row["trial_info_text_cue"]))
-            for i in range(len(actions)):
-                ds.add_frame({"observation.state": states[i], "action": actions[i], "task": task,
-                              **{f"observation.images.{n}": frames[n][i] for n in CAMS}})
-            ds.save_episode(parallel_encoding=False)
+            save_episode(ds, ep, task)
             kept += 1; s_kept += 1
+            if args.mid_approach_crops:
+                t_close = first_close_time(fa, fa_ts, go, stop)
+                if t_close is not None:
+                    crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
+                    # Only a true mid-approach start counts (crop_go > go, else it would
+                    # duplicate the base episode) and it must clear the min-length filter.
+                    if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
+                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
+                        if ep2 is not None:
+                            save_episode(ds, ep2, task)
+                            crops += 1
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
 
     ds.finalize()
-    print(f"\nDONE: {kept} episodes kept, {dropped} dropped. Dataset at {output_root}")
+    print(f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, "
+          f"{dropped} dropped, {drink_skipped} old-drink trials subsampled out. Dataset at {output_root}")
     print("finalize() computed q01/q99 stats -> pi05 QUANTILE normalization is data-driven.")
 
 
