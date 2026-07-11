@@ -192,13 +192,13 @@ def main(argv=None):
         n_demos = len(df) if args.max_demos_per_seed is None else min(args.max_demos_per_seed, len(df))
         s_kept = 0
         for demo in range(n_demos):
+
             row = df.iloc[demo]
             go, stop = float(row["go_cue_time"]), float(row["stop_time"])
             if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
                 dropped += 1; continue
-            # Undo the v1 4x drink oversampling: keep only a fraction of old-seed drink
-            # trials. RNG is keyed by (seed, demo) so the choice is identical no matter
-            # how seeds are sharded across parallel workers.
+            
+            # Undo the v1 4x drink oversampling
             if (args.old_drink_keep < 1.0 and seed <= OLD_SEED_MAX
                     and int(row["trial_info_tgt_id"]) in DRINK_IDS
                     and np.random.default_rng([1, seed, demo]).random() >= args.old_drink_keep):
@@ -213,12 +213,11 @@ def main(argv=None):
             task = args.task_prompt.format(food=str(row["trial_info_text_cue"]))
             save_episode(ds, ep, task)
             kept += 1; s_kept += 1
+
             if args.mid_approach_crops:
                 t_close = first_close_time(fa, fa_ts, go, stop)
                 if t_close is not None:
                     crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
-                    # Only a true mid-approach start counts (crop_go > go, else it would
-                    # duplicate the base episode) and it must clear the min-length filter.
                     if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
                         try:
                             ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
@@ -228,6 +227,7 @@ def main(argv=None):
                         if ep2 is not None:
                             save_episode(ds, ep2, task)
                             crops += 1
+                            
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
 
     ds.finalize()
