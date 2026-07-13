@@ -46,16 +46,21 @@ Then log in (token from https://huggingface.co/settings/tokens, read scope):
 hf auth login
 ```
 
-### 4. Build the dataset
+### 4. Build the dataset (object-balanced, pixels-only)
 ```bash
 export RAW_ROOT=/path/to/pi-finetune          # folder with NWB/ and videos/
-python examples/feeding_pi05/convert_nwb_to_lerobot.py \
-    --raw-root "$RAW_ROOT" \
-    --fps 30
-# -> writes "$RAW_ROOT/lerobot" (a subfolder; never overwrites your raw NWB/videos)
+python examples/feeding_pi05/build_dataset_parallel.py \
+    --raw-root "$RAW_ROOT" --fps 30 --workers 12 \
+    --output-root "$RAW_ROOT/lerobot_v0" --repo-id rice/feeding_pi05_v0 \
+    --balance-objects --mid-approach-crops
+# -> writes "$RAW_ROOT/lerobot_v0" (a subfolder; never overwrites your raw NWB/videos)
 ```
+`--balance-objects` equalizes episodes per food category (global, deterministic across
+shards; downsample the common, oversample the rare toward the per-category median) so the
+policy can't lean on an object-size close cue. `--mid-approach-crops` adds grasp-timing
+decorrelation. Single-process build: `convert_nwb_to_lerobot.py` with the same flags.
 Smoke-test first with `--seeds 0 --max-demos-per-seed 4 --overwrite`. Other flags:
-`--task-prompt`, `--min-go-seconds`, `--no-success-only`, `--seeds 0-9`, `--overwrite`.
+`--task-prompt`, `--min-go-seconds`, `--no-success-only`, `--balance-target {median,min,N}`.
 
 ### 5. Finetune (action expert only)
 **Single GPU** (expert-only is ~18 GB, fits one RTX 6000 comfortably):

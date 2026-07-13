@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Finetune pi-0.5 (action expert only) on the OmniGibson feeding dataset.
 # Run inside the `lerobot-pi05` conda env after building the dataset with
-# convert_nwb_to_lerobot.py. Tuned for a single 16 GB GPU (RTX 5080).
+# convert_nwb_to_lerobot.py (build it object-BALANCED and pixels-only:
+# `--balance-objects --mid-approach-crops`). Fresh finetune from lerobot/pi05_base.
 #
 # Prereqs:
 #   1. CUDA torch (already installed: torch 2.11.0+cu128).
 #   2. `hf auth login` with a token that has accepted the gated licenses for
 #      google/paligemma-3b-pt-224 AND lerobot/pi05_base.
+# Checkpoint SELECTION is by rollout metrics, not loss (save_freq is small so the
+# rollout peak is resolvable); see scripts/select_checkpoint.py in the pi-finetune repo.
 set -euo pipefail
 
 DATASET_ROOT="${DATASET_ROOT:-D:/Robotics/results/pi-finetune/lerobot}"
@@ -27,7 +30,7 @@ lerobot-train \
     --policy.compile_model=false \
     --batch_size=16 \
     --steps=30000 \
-    --save_freq=5000 \
+    --save_freq=2500 \
     --job_name=pi05_feeding \
     --output_dir="${OUTPUT_DIR}" \
     --wandb.enable=false
