@@ -40,8 +40,6 @@ CAMS = {
 }
 GRIP = 6  # action dims [0:6] are pose deltas (summed); dim 6 is the gripper (last).
 CLOSE_THRESH = -0.02  # gripper action below this counts as "closing"
-DRINK_IDS = {7, 8, 16}  # bottle_of_coke, bottle_of_water, soda_cup
-OLD_SEED_MAX = 39  # seeds 0-39 are the v1 constant-speed collection (drinks 4x oversampled)
 
 
 def parse_args(argv=None):
@@ -62,9 +60,16 @@ def parse_args(argv=None):
     p.add_argument("--mid-approach-crops", action=argparse.BooleanOptionalAction, default=False,
                    help="For each kept demo, ALSO emit a cropped episode starting 0.3-1.0 s (uniform) "
                         "before the first gripper close (decorrelates grasp timing from episode time).")
-    p.add_argument("--old-drink-keep", type=float, default=1.0,
-                   help="Keep fraction for old-seed (0-39) drink trials (tgt ids 7/8/16), e.g. 0.25 to "
-                        "undo the v1 4x drink oversampling. Deterministic per (seed, demo).")
+    p.add_argument("--balance-objects", action=argparse.BooleanOptionalAction, default=False,
+                   help="Balance the dataset across food categories (the trial text cue): downsample "
+                        "over-represented foods and oversample (duplicate) under-represented ones toward "
+                        "a per-category target. The plan is GLOBAL over all seeds in --raw-root and "
+                        "deterministic per (seed, demo), so parallel shards stay consistent.")
+    p.add_argument("--balance-target", default="median",
+                   help="Per-category episode target when --balance-objects: 'median' (default), 'min', "
+                        "or an integer count.")
+    p.add_argument("--balance-max-oversample", type=int, default=4,
+                   help="Cap the duplication factor for rare categories (safety against tiny categories).")
     p.add_argument("--overwrite", action="store_true", help="Remove an existing output dataset first.")
     return p.parse_args(argv)
 
@@ -136,6 +141,64 @@ def first_close_time(fa, fa_ts, go, stop):
     return float(fa_ts[js[0]]) if len(js) else None
 
 
+def _rank_key(seed, demo):
+    """Stable pseudo-random sort key per (seed, demo), identical across processes."""
+    return float(np.random.default_rng([9, int(seed), int(demo)]).random())
+
+
+def build_balance_plan(nwbs, vids, args):
+    """Map (seed, demo) -> how many times to emit that demo, to balance food categories.
+
+    Built from a GLOBAL scan of every seed's trials table (success + min-go eligibility
+    only -- no video/action read), so every parallel shard worker computes the identical
+    plan regardless of its --seeds subset. Over-represented categories are downsampled to
+    the target (keep the lowest-ranked `target` demos); under-represented categories are
+    oversampled by duplicating demos up to the target (capped by --balance-max-oversample).
+    """
+    from pynwb import NWBHDF5IO
+    by_cat = {}  # category -> list of (rank_key, seed, demo)
+    for nwb_path in nwbs:
+        seed = seed_index_of(nwb_path)
+        if seed not in vids:
+            continue
+        with NWBHDF5IO(nwb_path, "r") as io:
+            df = io.read().intervals["trials"].to_dataframe()
+        n_demos = len(df) if args.max_demos_per_seed is None else min(args.max_demos_per_seed, len(df))
+        for demo in range(n_demos):
+            row = df.iloc[demo]
+            go, stop = float(row["go_cue_time"]), float(row["stop_time"])
+            if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
+                continue
+            cat = str(row["trial_info_text_cue"])
+            by_cat.setdefault(cat, []).append((_rank_key(seed, demo), seed, demo))
+
+    counts = {c: len(v) for c, v in by_cat.items()}
+    sizes = sorted(counts.values())
+    if args.balance_target == "median":
+        target = int(sizes[len(sizes) // 2])
+    elif args.balance_target == "min":
+        target = int(sizes[0])
+    else:
+        target = int(args.balance_target)
+
+    plan, summary = {}, {}
+    for cat, demos in by_cat.items():
+        demos = sorted(demos)  # by rank_key
+        n = len(demos)
+        if n >= target:  # downsample: keep the first `target` by rank
+            for _, seed, demo in demos[:target]:
+                plan[(seed, demo)] = 1
+            planned = target
+        else:  # oversample: base copies for all, +1 for the lowest-ranked remainder
+            base = min(target // n, args.balance_max_oversample)
+            rem = min(target - base * n, n) if base < args.balance_max_oversample else 0
+            for i, (_, seed, demo) in enumerate(demos):
+                plan[(seed, demo)] = base + (1 if i < rem else 0)
+            planned = base * n + rem
+        summary[cat] = (n, planned)
+    return plan, target, summary
+
+
 def save_episode(ds, ep, task):
     frames, actions, states = ep
     for i in range(len(actions)):
@@ -161,6 +224,14 @@ def main(argv=None):
     vids = {seed_index_of(d): d for d in glob.glob(os.path.join(args.raw_root, "videos", "*seed*"))}
     want_seeds = resolve_seeds(args.seeds)
 
+    balance_plan = None
+    if args.balance_objects:
+        balance_plan, balance_target, balance_summary = build_balance_plan(nwbs, vids, args)
+        print(f"balance plan: per-category target={balance_target} (over {len(balance_summary)} foods)")
+        for cat in sorted(balance_summary, key=lambda c: -balance_summary[c][0]):
+            have, planned = balance_summary[cat]
+            print(f"  {cat:16s} eligible={have:4d} -> emit={planned:4d}")
+
     sample = glob.glob(os.path.join(next(iter(vids.values())), "demo_0_*overhead*.mp4"))[0]
     with av.open(sample) as c:
         H, W = c.streams.video[0].height, c.streams.video[0].width
@@ -177,7 +248,7 @@ def main(argv=None):
     ds = LeRobotDataset.create(repo_id=args.repo_id, fps=args.fps, features=features,
                                root=output_root, robot_type="kinova_gen3", use_videos=True)
 
-    kept = dropped = crops = drink_skipped = no_close_skipped = 0
+    kept = dropped = crops = balance_skipped = no_close_skipped = 0
     for nwb_path in nwbs:
         seed = seed_index_of(nwb_path)
         if (want_seeds is not None and seed not in want_seeds) or seed not in vids:
@@ -197,12 +268,11 @@ def main(argv=None):
             go, stop = float(row["go_cue_time"]), float(row["stop_time"])
             if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
                 dropped += 1; continue
-            
-            # Undo the v1 4x drink oversampling
-            if (args.old_drink_keep < 1.0 and seed <= OLD_SEED_MAX
-                    and int(row["trial_info_tgt_id"]) in DRINK_IDS
-                    and np.random.default_rng([1, seed, demo]).random() >= args.old_drink_keep):
-                drink_skipped += 1; continue
+
+            # Object balancing: emit this demo `n_emit` times (0 = drop, >1 = oversample).
+            n_emit = balance_plan.get((seed, demo), 0) if balance_plan is not None else 1
+            if n_emit == 0:
+                balance_skipped += 1; continue
             t_close = first_close_time(fa, fa_ts, go, stop)
 
             # A real feeding success must close the gripper
@@ -217,27 +287,30 @@ def main(argv=None):
             if ep is None:
                 dropped += 1; continue
             task = args.task_prompt.format(food=str(row["trial_info_text_cue"]))
-            save_episode(ds, ep, task)
-            kept += 1; s_kept += 1
 
-            if args.mid_approach_crops:
-                if t_close is not None:
-                    crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
-                    if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
-                        try:
-                            ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
-                        except (av.FFmpegError, LookupError) as e:
-                            print(f"[seed {seed}] demo {demo}: undecodable video, dropping crop ({e})")
-                            ep2 = None
-                        if ep2 is not None:
-                            save_episode(ds, ep2, task)
-                            crops += 1
-                            
+            ep2 = None
+            if args.mid_approach_crops and t_close is not None:
+                crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
+                if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
+                    try:
+                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
+                    except (av.FFmpegError, LookupError) as e:
+                        print(f"[seed {seed}] demo {demo}: undecodable video, dropping crop ({e})")
+                        ep2 = None
+
+            # Emit the (already-decoded) base episode and its crop n_emit times each.
+            for _ in range(n_emit):
+                save_episode(ds, ep, task)
+                kept += 1; s_kept += 1
+                if ep2 is not None:
+                    save_episode(ds, ep2, task)
+                    crops += 1
+
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
 
     ds.finalize()
     print(f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, {dropped} dropped, "
-          f"{drink_skipped} old-drink trials subsampled out, {no_close_skipped} no-close sim glitches. "
+          f"{balance_skipped} balance-subsampled out, {no_close_skipped} no-close sim glitches. "
           f"Dataset at {output_root}")
     print("finalize() computed q01/q99 stats -> pi05 QUANTILE normalization is data-driven.")
 
