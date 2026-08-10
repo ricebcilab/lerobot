@@ -70,6 +70,25 @@ def parse_args(argv=None):
                         "or an integer count.")
     p.add_argument("--balance-max-oversample", type=int, default=4,
                    help="Cap the duplication factor for rare categories (safety against tiny categories).")
+    p.add_argument("--depth", action=argparse.BooleanOptionalAction, default=False,
+                   help="Emit metric depth as EXTRA camera views (observation.images.<cam>_depth), read "
+                        "from the per-demo <demo>_depth.npz written by the depth collection graph. pi05 "
+                        "has no native depth channel, so depth is clipped+normalized to a 3-channel image "
+                        "and consumed as additional cameras (see --depth-max/--depth-min).")
+    p.add_argument("--depth-max", type=float, default=1.5,
+                   help="Clip depth to this many meters before normalizing (tabletop ~1.0-1.5).")
+    p.add_argument("--depth-min", type=float, default=0.0,
+                   help="Lower clip (meters) for depth normalization.")
+    p.add_argument("--binarize-gripper", action=argparse.BooleanOptionalAction, default=False,
+                   help="Emit the gripper action as an absolute binary STATE (0=open, 1=closed) instead of "
+                        "the raw +-0.1 velocity-style command. The command stream is latched (close cmd -> 1, "
+                        "open cmd -> 0, hold keeps state) and runs shorter than --gripper-min-dwell native "
+                        "frames are merged away, killing the 1-2-frame close blips that resampling leaves. "
+                        "Matches the openpi convention (gripper absolute in [0,1]); deployment must map the "
+                        "predicted state back to open/close commands (threshold with hysteresis).")
+    p.add_argument("--gripper-min-dwell", type=int, default=5,
+                   help="With --binarize-gripper: minimum run length (native ~38 Hz frames, default 5 "
+                        "~= 130 ms) for a gripper state segment; shorter runs merge into the prior state.")
     p.add_argument("--overwrite", action="store_true", help="Remove an existing output dataset first.")
     return p.parse_args(argv)
 
@@ -107,14 +126,63 @@ def grab(video_path, idxs):
     return [store[i] for i in idxs]
 
 
-def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps):
+def depth_to_img(d, d_min, d_max):
+    """Metric depth (H, W) in meters -> 3-channel uint8 image, clipped+normalized to
+    [d_min, d_max]. inf/nan (rays that hit nothing) map to d_max (far). Replicated to 3
+    channels so pi05's pretrained RGB (SigLIP) encoder consumes it as an extra camera view.
+    """
+    d = np.nan_to_num(np.asarray(d, np.float32), nan=d_max, posinf=d_max, neginf=d_max)
+    u = np.clip((d - d_min) / (d_max - d_min), 0.0, 1.0)
+    img = (u * 255.0).astype(np.uint8)
+    return np.repeat(img[..., None], 3, axis=2)
+
+
+def binarize_gripper(fa, min_dwell):
+    """Native gripper command stream -> latched absolute binary state {0, 1}.
+
+    Latch semantics: a close command (< CLOSE_THRESH) sets the state to 1, an open
+    command (> -CLOSE_THRESH) sets it to 0, hold (~0) keeps the current state; the
+    arm starts open. Runs shorter than ``min_dwell`` native frames are merged into
+    the preceding state, removing the 1-2-frame blips that command jitter and
+    window resampling produce (dataset close-run dwell p50 was 2 frames).
+    """
+    g = fa[:, GRIP]
+    cmd = np.where(g < CLOSE_THRESH, 1.0, np.where(g > -CLOSE_THRESH, 0.0, -1.0))
+    idx = np.where(cmd >= 0, np.arange(len(cmd)), 0)
+    np.maximum.accumulate(idx, out=idx)
+    state = np.where(cmd[idx] >= 0, cmd[idx], 0.0).astype(np.float32)
+    if min_dwell > 1 and len(state):
+        runs = []  # [start, end_exclusive, value]
+        s = 0
+        for i in range(1, len(state) + 1):
+            if i == len(state) or state[i] != state[s]:
+                runs.append([s, i, state[s]])
+                s = i
+        merged = [runs[0]]
+        for r in runs[1:]:
+            if (r[1] - r[0]) < min_dwell or merged[-1][2] == r[2]:
+                merged[-1][1] = r[1]
+            else:
+                merged.append(r)
+        for s0, e0, v in merged:
+            state[s0:e0] = v
+    return state
+
+
+def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps, depth=None, grip_dwell=None):
     """(frames_per_cam, actions, states) for one demo's go-period, or None if empty.
 
     Timestamp-binned at 1/fps: pose deltas summed per bin, gripper = last in bin,
-    image+state sampled at each bin start (frame chosen by the sidecar clock).
+    image+state sampled at each bin start (frame chosen by the sidecar clock). When
+    ``depth`` is a (d_min, d_max) tuple, also emits ``<cam>_depth`` views from the
+    per-demo depth npz, sampled at the SAME frame indices as the RGB views. When
+    ``grip_dwell`` is set, the gripper dim is the latched binary state from
+    ``binarize_gripper`` (sampled last-in-bin like the raw command); crop/close
+    timing everywhere else stays based on the raw command stream.
     """
     side = np.load(os.path.join(seed_dir, f"demo_{demo}_timestamps.npy")).astype(np.float64) / 1e9
     period = 1.0 / fps
+    gbin = binarize_gripper(fa, grip_dwell) if grip_dwell is not None else None
     actions, states, idxs = [], [], []
     for t0 in np.arange(go, stop, period):
         js = np.nonzero((fa_ts >= t0) & (fa_ts < t0 + period))[0]
@@ -126,12 +194,20 @@ def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps):
         else:                                        # fps above native: nearest single delta
             j0 = int(np.argmin(np.abs(fa_ts - t0)))
             act = fa[j0].astype(np.float32)
+        if gbin is not None:
+            act[GRIP] = gbin[js[-1] if len(js) else j0]
         actions.append(act)
         states.append(proprio[j0])
         idxs.append(int(np.argmin(np.abs(side - t0))))
     if not actions:
         return None
     frames = {n: grab(os.path.join(seed_dir, f"demo_{demo}_{c}.mp4"), idxs) for n, c in CAMS.items()}
+    if depth is not None:
+        dz = np.load(os.path.join(seed_dir, f"demo_{demo}_depth.npz"))
+        for n, c in CAMS.items():
+            dstack = dz[c.replace("_rgb", "_depth_linear")]
+            last = len(dstack) - 1
+            frames[f"{n}_depth"] = [depth_to_img(dstack[min(i, last)], depth[0], depth[1]) for i in idxs]
     return frames, np.stack(actions), np.stack(states)
 
 
@@ -203,7 +279,7 @@ def save_episode(ds, ep, task):
     frames, actions, states = ep
     for i in range(len(actions)):
         ds.add_frame({"observation.state": states[i], "action": actions[i], "task": task,
-                      **{f"observation.images.{n}": frames[n][i] for n in CAMS}})
+                      **{f"observation.images.{n}": frames[n][i] for n in frames}})
     ds.save_episode(parallel_encoding=False)
 
 
@@ -236,15 +312,24 @@ def main(argv=None):
     with av.open(sample) as c:
         H, W = c.streams.video[0].height, c.streams.video[0].width
 
+    depth_cfg = (args.depth_min, args.depth_max) if args.depth else None
+    grip_dwell = args.gripper_min_dwell if args.binarize_gripper else None
+    if args.depth and not glob.glob(os.path.join(next(iter(vids.values())), "demo_*_depth.npz")):
+        sys.exit("--depth set but no <demo>_depth.npz found in the video dirs. This raw data was "
+                 "collected without depth; recollect with the depth graph or drop --depth.")
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     features = {
         "observation.state": {"dtype": "float32", "shape": (24,),
                               "names": {"axes": [f"proprio_{i}" for i in range(24)]}},
-        "action": {"dtype": "float32", "shape": (7,),
+            "action": {"dtype": "float32", "shape": (7,),
                    "names": {"axes": ["dx", "dy", "dz", "drx", "dry", "drz", "gripper"]}},
         **{f"observation.images.{n}": {"dtype": "video", "shape": (H, W, 3),
                                        "names": ["height", "width", "channels"]} for n in CAMS},
     }
+    if args.depth:
+        features.update({f"observation.images.{n}_depth": {"dtype": "video", "shape": (H, W, 3),
+                         "names": ["height", "width", "channels"]} for n in CAMS})
     ds = LeRobotDataset.create(repo_id=args.repo_id, fps=args.fps, features=features,
                                root=output_root, robot_type="kinova_gen3", use_videos=True)
 
@@ -280,9 +365,10 @@ def main(argv=None):
                 print(f"[seed {seed}] demo {demo}: success without gripper close (sim glitch), dropping")
                 no_close_skipped += 1; continue
             try:
-                ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps)
-            except (av.FFmpegError, LookupError) as e:
-                print(f"[seed {seed}] demo {demo}: undecodable video, dropping demo ({e})")
+                ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps, depth_cfg,
+                                   grip_dwell)
+            except (av.FFmpegError, LookupError, FileNotFoundError, KeyError) as e:
+                print(f"[seed {seed}] demo {demo}: undecodable video/depth, dropping demo ({e})")
                 dropped += 1; continue
             if ep is None:
                 dropped += 1; continue
@@ -293,9 +379,10 @@ def main(argv=None):
                 crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
                 if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
                     try:
-                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps)
-                    except (av.FFmpegError, LookupError) as e:
-                        print(f"[seed {seed}] demo {demo}: undecodable video, dropping crop ({e})")
+                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps,
+                                            depth_cfg, grip_dwell)
+                    except (av.FFmpegError, LookupError, FileNotFoundError, KeyError) as e:
+                        print(f"[seed {seed}] demo {demo}: undecodable video/depth, dropping crop ({e})")
                         ep2 = None
 
             # Emit the (already-decoded) base episode and its crop n_emit times each.
