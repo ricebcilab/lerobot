@@ -121,7 +121,9 @@ Then drop `--dataset.root` from the train command; it downloads to `HF_LEROBOT_H
 - Alignment is by the **timestamp sidecar** (~4 ms to the NWB action clock); no
   reset/terminal frame-offset to manage.
 - Below native fps (~38) the six pose-delta dims are **summed** per output window
-  (preserves motion speed); gripper takes the window's last value. Train and deploy
+  (preserves motion speed); the gripper is emitted as a latched BINARY state
+  (0=open, 1=closed, blips under `--gripper-min-dwell` merged away), sampled as
+  the window's last value. Train and deploy
   at the **same** `--fps`.
 - pi05 QUANTILE normalization is data-driven: `finalize()` writes `q01/q99` stats.
 

@@ -12,10 +12,12 @@ Input layout (per seed), produced by the patched ``MP4CollectionWrapper``::
 Alignment is timestamp-based via the per-frame sidecar (same ``monotonic_ns`` clock
 as the NWB action stream, ~4 ms). Per demo we keep only the GO PERIOD
 (``go_cue_time -> stop_time``), drop unsuccessful/degenerate trials, and resample
-to a fixed control rate. Actions are per-step EEF pose deltas
-``[dx,dy,dz,drx,dry,drz, gripper]``; below the native rate (~38 Hz) the six pose
-dims are SUMMED per output window (preserves motion speed) and the gripper takes
-the window's last value -- so train and deploy at the same ``--fps``.
+to a fixed control rate. Actions are per-step EEF pose deltas plus a BINARIZED
+gripper state ``[dx,dy,dz,drx,dry,drz, gripper]``: below the native rate (~38 Hz)
+the six pose dims are SUMMED per output window (preserves motion speed), and the
+gripper is the latched binary state (0=open, 1=closed; see ``binarize_gripper``)
+sampled last-in-window -- so train and deploy at the same ``--fps``. Deployment
+maps the predicted state back to open/close commands (Pi05Agent hysteresis).
 
 Output goes to ``<raw_root>/lerobot`` by default (a subfolder; the converter
 refuses to write over your raw NWB/ or videos/).
@@ -79,16 +81,13 @@ def parse_args(argv=None):
                    help="Clip depth to this many meters before normalizing (tabletop ~1.0-1.5).")
     p.add_argument("--depth-min", type=float, default=0.0,
                    help="Lower clip (meters) for depth normalization.")
-    p.add_argument("--binarize-gripper", action=argparse.BooleanOptionalAction, default=False,
-                   help="Emit the gripper action as an absolute binary STATE (0=open, 1=closed) instead of "
-                        "the raw +-0.1 velocity-style command. The command stream is latched (close cmd -> 1, "
-                        "open cmd -> 0, hold keeps state) and runs shorter than --gripper-min-dwell native "
-                        "frames are merged away, killing the 1-2-frame close blips that resampling leaves. "
-                        "Matches the openpi convention (gripper absolute in [0,1]); deployment must map the "
-                        "predicted state back to open/close commands (threshold with hysteresis).")
     p.add_argument("--gripper-min-dwell", type=int, default=5,
-                   help="With --binarize-gripper: minimum run length (native ~38 Hz frames, default 5 "
-                        "~= 130 ms) for a gripper state segment; shorter runs merge into the prior state.")
+                   help="Minimum run length (native ~38 Hz frames, default 5 ~= 130 ms) for a binarized "
+                        "gripper state segment; shorter runs merge into the prior state. The gripper action "
+                        "is ALWAYS emitted as an absolute binary state (0=open, 1=closed): the command "
+                        "stream is latched (close cmd -> 1, open cmd -> 0, hold keeps state), matching the "
+                        "openpi convention; deployment (Pi05Agent) maps the predicted state back to "
+                        "open/close commands with hysteresis.")
     p.add_argument("--overwrite", action="store_true", help="Remove an existing output dataset first.")
     return p.parse_args(argv)
 
@@ -169,33 +168,30 @@ def binarize_gripper(fa, min_dwell):
     return state
 
 
-def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps, depth=None, grip_dwell=None):
+def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps, depth=None, grip_dwell=5):
     """(frames_per_cam, actions, states) for one demo's go-period, or None if empty.
 
-    Timestamp-binned at 1/fps: pose deltas summed per bin, gripper = last in bin,
-    image+state sampled at each bin start (frame chosen by the sidecar clock). When
+    Timestamp-binned at 1/fps: pose deltas summed per bin, image+state sampled at
+    each bin start (frame chosen by the sidecar clock). The gripper dim is the
+    latched binary state from ``binarize_gripper`` (sampled last-in-bin); crop and
+    close timing everywhere else stays based on the raw command stream. When
     ``depth`` is a (d_min, d_max) tuple, also emits ``<cam>_depth`` views from the
-    per-demo depth npz, sampled at the SAME frame indices as the RGB views. When
-    ``grip_dwell`` is set, the gripper dim is the latched binary state from
-    ``binarize_gripper`` (sampled last-in-bin like the raw command); crop/close
-    timing everywhere else stays based on the raw command stream.
+    per-demo depth npz, sampled at the SAME frame indices as the RGB views.
     """
     side = np.load(os.path.join(seed_dir, f"demo_{demo}_timestamps.npy")).astype(np.float64) / 1e9
     period = 1.0 / fps
-    gbin = binarize_gripper(fa, grip_dwell) if grip_dwell is not None else None
+    gbin = binarize_gripper(fa, grip_dwell)
     actions, states, idxs = [], [], []
     for t0 in np.arange(go, stop, period):
         js = np.nonzero((fa_ts >= t0) & (fa_ts < t0 + period))[0]
         if len(js):
             act = np.empty(7, np.float32)
             act[:GRIP] = fa[js, :GRIP].sum(0)        # sum pose deltas over the window
-            act[GRIP:] = fa[js[-1], GRIP:]           # last gripper
             j0 = int(js[0])
         else:                                        # fps above native: nearest single delta
             j0 = int(np.argmin(np.abs(fa_ts - t0)))
             act = fa[j0].astype(np.float32)
-        if gbin is not None:
-            act[GRIP] = gbin[js[-1] if len(js) else j0]
+        act[GRIP] = gbin[js[-1] if len(js) else j0]  # latched binary state, last-in-bin
         actions.append(act)
         states.append(proprio[j0])
         idxs.append(int(np.argmin(np.abs(side - t0))))
@@ -313,7 +309,7 @@ def main(argv=None):
         H, W = c.streams.video[0].height, c.streams.video[0].width
 
     depth_cfg = (args.depth_min, args.depth_max) if args.depth else None
-    grip_dwell = args.gripper_min_dwell if args.binarize_gripper else None
+    grip_dwell = args.gripper_min_dwell
     if args.depth and not glob.glob(os.path.join(next(iter(vids.values())), "demo_*_depth.npz")):
         sys.exit("--depth set but no <demo>_depth.npz found in the video dirs. This raw data was "
                  "collected without depth; recollect with the depth graph or drop --depth.")
