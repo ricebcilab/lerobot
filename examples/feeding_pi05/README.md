@@ -62,43 +62,27 @@ decorrelation. Single-process build: `convert_nwb_to_lerobot.py` with the same f
 Smoke-test first with `--seeds 0 --max-demos-per-seed 4 --overwrite`. Other flags:
 `--task-prompt`, `--min-go-seconds`, `--no-success-only`, `--balance-target {median,min,N}`.
 
-### 5. Finetune (action expert only)
-**Single GPU** (expert-only is ~18 GB, fits one RTX 6000 comfortably):
-```bash
-lerobot-train \
-    --dataset.repo_id=rice/feeding_pi05 \
-    --dataset.root="$RAW_ROOT/lerobot" \
-    --policy.type=pi05 \
-    --policy.pretrained_path=lerobot/pi05_base \
-    --policy.push_to_hub=false \
-    --policy.train_expert_only=true \
-    --policy.gradient_checkpointing=true \
-    --policy.dtype=bfloat16 \
-    --policy.device=cuda \
-    --policy.compile_model=false \
-    --batch_size=16 \
-    --steps=30000 \
-    --save_freq=5000 \
-    --job_name=pi05_feeding \
-    --output_dir="$RAW_ROOT/outputs/pi05_feeding" \
-    --wandb.enable=false
-```
-Or just edit and run `bash examples/feeding_pi05/train_feeding.sh`.
+### 5. Finetune (LoRA on LLM + action expert — the "v1" recipe)
+Edit and run `bash examples/feeding_pi05/train_feeding.sh` (canonical config,
+fully commented). Key points, validated at 18/20 matched-seed rollouts vs 3/20
+for the old expert-only finetune:
 
-**Two GPUs** (optional, ~2× faster — expert-only fits per-GPU so DDP is enough):
-```bash
-accelerate launch --multi_gpu --num_processes=2 --mixed_precision=bf16 \
-  $(which lerobot-train) \
-  --dataset.repo_id=rice/feeding_pi05 --dataset.root="$RAW_ROOT/lerobot" \
-  --policy.type=pi05 --policy.pretrained_path=lerobot/pi05_base \
-  --policy.push_to_hub=false \
-  --policy.train_expert_only=true --policy.gradient_checkpointing=true \
-  --policy.dtype=bfloat16 --batch_size=16 --steps=30000 \
-  --output_dir="$RAW_ROOT/outputs/pi05_feeding"
-```
-Note: effective batch = `batch_size × num_processes`; LeRobot does **not** auto-scale
-the LR, so adjust it yourself if you change the GPU count. (Full finetuning instead of
-expert-only on 48 GB cards needs FSDP via `accelerate config` — not required here.)
+- **LoRA r=32/α=64 on the PaliGemma LLM *and* action-expert attention q/v**
+  (`--peft.*` flags; `pip install peft` once). Adapting the LLM fixes language
+  grounding — expert-only training cannot. The stock pi05 PEFT defaults adapt
+  only the expert and reference stale pi0-era module names; use the explicit
+  `--peft.target_modules` regex from the script.
+- **Action/time projections fully trained** (`--peft.full_training_modules`):
+  the binarized gripper redefines the action space, a full-rank change.
+- **LR 10×** the full-FT default (`--policy.optimizer_lr=2.5e-4`), per
+  LeRobot's PEFT docs; `train_expert_only=false`, `freeze_vision_encoder=true`.
+- Single GPU: only 8.4M params train, ~14.5 GB at batch 16 (~4.8 s/step,
+  ~40 h / 30k steps on an RTX 6000 Ada). No DDP/FSDP needed.
+- Checkpoints are **adapter-only**: merge with pi-finetune's
+  `scripts/merge_lora_checkpoint.py` before rollout/deployment, and select the
+  checkpoint by rollout metrics (`scripts/select_checkpoint.py`), not loss.
+- Deployment maps the predicted binary gripper state to open/close commands
+  with hysteresis (built into brand-rice's `Pi05Agent`).
 
 ---
 
