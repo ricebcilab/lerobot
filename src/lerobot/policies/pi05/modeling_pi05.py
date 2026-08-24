@@ -18,6 +18,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
@@ -64,6 +65,10 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    # Optional guidance hook applied to x_t before each denoising step:
+    # (step_index, time, x_t) -> x_t. Lets callers steer sampling, e.g. by
+    # clamping known action dimensions during the early flow steps.
+    x_t_hook: Callable[[int, float, Tensor], Tensor] | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -831,10 +836,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         dt = -1.0 / num_steps
+        x_t_hook = kwargs.get("x_t_hook")
 
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
+            if x_t_hook is not None:
+                x_t = x_t_hook(step, time, x_t)
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
