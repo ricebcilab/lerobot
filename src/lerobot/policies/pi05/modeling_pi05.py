@@ -69,6 +69,12 @@ class ActionSelectKwargs(TypedDict, total=False):
     # (step_index, time, x_t) -> x_t. Lets callers steer sampling, e.g. by
     # clamping known action dimensions during the early flow steps.
     x_t_hook: Callable[[int, float, Tensor], Tensor] | None
+    # Optional initial-noise hook, called once the observation prefix is
+    # encoded: (velocity, noise) -> noise. `velocity(x_t, time)` evaluates the
+    # learned flow field for this observation and `noise` is the default
+    # Gaussian sample; the return value is where the denoising flow starts.
+    # Lets callers e.g. invert a reference action chunk (flow reversal).
+    noise_fn: Callable[[Callable[[Tensor, float], Tensor], Tensor], Tensor] | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -837,6 +843,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
         x_t_hook = kwargs.get("x_t_hook")
+        noise_fn = kwargs.get("noise_fn")
+        if noise_fn is not None:
+
+            def velocity(x_t, time):
+                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+                return self.denoise_step(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                )
+
+            noise = noise_fn(velocity, noise)
 
         x_t = noise
         for step in range(num_steps):

@@ -1,0 +1,36 @@
+# Experiment description for experiment.py (`experiment.sh --config <this file>`).
+#
+# Unknown keys are rejected, and a key set to null keeps the built-in default.
+
+experiment:
+  name: reverse_flow_control                 # goes into the output directory name
+  n_trials: 10                # number of trials to run
+  seed: 0                     # seeds the task schedule (same seed = same tasks)
+  task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
+  output_dir: outputs/pi05_libero_experiments
+
+scene:
+  suite: libero_goal       # libero_spatial | libero_object | libero_goal | libero_10 | libero_90 | libero_100
+  task_ids: null              # null = draw from every task in the suite, or e.g. [0, 3, 7]
+
+# Instruction handed to the VLA on every trial. The *human* is always shown the
+# real task; use a generic prompt to dissociate the two, or the literal string
+# `task` to give the VLA the scene's own instruction instead.
+prompt: "do something"
+
+policy:
+  path: lerobot/pi05_libero_finetuned
+  n_action_steps: 10
+  compile: false
+
+control:
+  mode: shared_reverse_flow_steering  # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
+  tau: 8                      # shared_flow_control only
+  input_noise: 0.0            # std of the Gaussian noise added to the operator's x/y/z (0 = off)
+  max_steps: null             # null = the suite's own episode length (teleop defaults to 900)
+  # Both corruptions are off unless a path is given here:
+  deterministic_corruption: null   # e.g. deterministic_corruption.yaml -- 3x3 M applied to the operator's command
+  flow_reversal_adapter: null      # e.g. flow_reversal_adapter.yaml   -- 7x7 F applied in the flow reversal
+
+server:
+  port: 8765
