@@ -1,0 +1,28 @@
+# Boot configuration for interactive.py (`interactive.sh --config [PATH]`).
+#
+# Every key here mirrors a command-line flag and is optional: delete a key (or
+# set it to null) to keep the built-in default, and any flag you also pass on
+# the command line overrides this file. Unknown keys are rejected so typos do
+# not silently do nothing.
+
+policy:
+  path: lerobot/pi05_libero_finetuned
+  n_action_steps: 10
+  compile: false
+
+scene:
+  suite: libero_spatial       # libero_spatial | libero_object | libero_goal | libero_10 | libero_90 | libero_100
+  task_id: 0
+
+control:
+  mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
+  tau: 5                      # shared_flow_control: leading denoising steps your input steers
+  input_noise: 0.0            # std of the Gaussian noise added to your x/y/z command (0 = off)
+  # Both corruptions are off unless a path is given here (or loaded live in the REPL):
+  deterministic_corruption: null   # e.g. deterministic_corruption.yaml -- 3x3 M applied to your command
+  flow_reversal_adapter: null      # e.g. flow_reversal_adapter.yaml   -- 7x7 F applied in the flow reversal
+
+server:
+  port: 8765
+
+output_dir: outputs/pi05_libero_interactive
