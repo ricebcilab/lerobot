@@ -61,6 +61,7 @@ from interactive import (
     load_adapter,
     load_corruption,
     make_handler,
+    mode_display,
     read_yaml_config,
     run_rollout,
     write_video,
@@ -90,6 +91,7 @@ EXPERIMENT_CONFIG_KEYS = {
     "control": {
         "mode": "mode",
         "tau": "tau",
+        "n_reverse_steps": "n_reverse_steps",
         "input_noise": "input_noise",
         "deterministic_corruption": "deterministic_corruption",
         "flow_reversal_adapter": "flow_reversal_adapter",
@@ -112,6 +114,7 @@ EXPERIMENT_DEFAULTS = {
     "compile": False,
     "mode": "shared_reverse_flow_steering",
     "tau": 5,
+    "n_reverse_steps": None,  # None = reverse all the way to noise
     "input_noise": 0.0,
     "deterministic_corruption": None,  # off unless a path is given
     "flow_reversal_adapter": None,  # off unless a path is given
@@ -143,6 +146,10 @@ def validate_experiment_config(cfg: dict, where: str) -> dict:
         fail("control.input_noise must be >= 0")
     if not isinstance(cfg["tau"], int) or cfg["tau"] < 0:
         fail("control.tau must be a non-negative integer")
+    if cfg["n_reverse_steps"] is not None and (
+        not isinstance(cfg["n_reverse_steps"], int) or cfg["n_reverse_steps"] < 1
+    ):
+        fail("control.n_reverse_steps must be a positive integer or null (null = all the way to noise)")
     if cfg["max_steps"] is not None and (not isinstance(cfg["max_steps"], int) or cfg["max_steps"] < 1):
         fail("control.max_steps must be a positive integer or null")
     if not isinstance(cfg["prompt"], str) or not cfg["prompt"].strip():
@@ -347,7 +354,8 @@ def main():
     }
     (run_dir / "config.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False))
 
-    mode, tau = cfg["mode"], cfg["tau"]
+    mode, tau, n_reverse = cfg["mode"], cfg["tau"], cfg["n_reverse_steps"]
+    runner.n_reverse_steps = n_reverse
     print(f"\nExperiment {cfg['name']}: {cfg['n_trials']} trials, mode {mode}, output {run_dir}")
     print(
         f'VLA prompt: "{cfg["prompt"]}"'
@@ -359,7 +367,7 @@ def main():
         print(describe_adapter(flow_adapter))
     if mode != "policy":
         chain.attach_spacemouse()
-    announce_mode(mode, tau, policy, flow_adapter)
+    announce_mode(mode, tau, policy, flow_adapter, n_reverse)
 
     results = []
     trials_path = run_dir / "trials.jsonl"
@@ -403,7 +411,7 @@ def main():
                 continue
 
             recorder = TrialRecorder(chain)
-            mode_label = f"{mode} tau={tau}" if mode == "shared_flow_control" else mode
+            mode_label = mode_display(mode, tau, n_reverse, policy.config.num_inference_steps)
             stream.set_status(mode=mode_label)
             started = time.time()
             success, steps, frames = run_rollout(
@@ -412,7 +420,7 @@ def main():
                 stream=stream,
                 autocast_ctx=autocast_ctx,
                 recorder=recorder,
-                **runner.kwargs(mode, tau),
+                **runner.kwargs(mode, tau, n_reverse),
                 **({"max_steps_override": cfg["max_steps"]} if cfg["max_steps"] else {}),
             )
             duration = time.time() - started
@@ -436,6 +444,11 @@ def main():
                 "vla_prompt": vla_prompt,
                 "mode": mode,
                 "tau": tau if mode == "shared_flow_control" else None,
+                "n_reverse_steps": (
+                    (n_reverse or policy.config.num_inference_steps)
+                    if mode == "shared_reverse_flow_steering"
+                    else None
+                ),
                 "input_noise": cfg["input_noise"],
                 "deterministic_corruption": chain.corruption.label,
                 "flow_reversal_adapter": flow_adapter.label,

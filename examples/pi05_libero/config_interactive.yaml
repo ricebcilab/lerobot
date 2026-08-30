@@ -17,6 +17,7 @@ scene:
 control:
   mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
   tau: 5                      # shared_flow_control: leading denoising steps your input steers
+  n_reverse_steps: null       # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
   input_noise: 0.0            # std of the Gaussian noise added to your x/y/z command (0 = off)
   # Both corruptions are off unless a path is given here (or loaded live in the REPL):
   deterministic_corruption: null   # e.g. deterministic_corruption.yaml -- 3x3 M applied to your command

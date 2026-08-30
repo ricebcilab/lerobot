@@ -26,6 +26,7 @@ policy:
 control:
   mode: shared_reverse_flow_steering  # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
   tau: 8                      # shared_flow_control only
+  n_reverse_steps: null       # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
   input_noise: 0.0            # std of the Gaussian noise added to the operator's x/y/z (0 = off)
   max_steps: null             # null = the suite's own episode length (teleop defaults to 900)
   # Both corruptions are off unless a path is given here:
