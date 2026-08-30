@@ -38,26 +38,27 @@ rejected and a key set to `null` keeps the built-in default, so a typo fails
 immediately instead of silently doing nothing. Only the keys you want to
 change need to be present.
 
-| Key                                | Default                           | Meaning                                                                                                                                          |
-| ---------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `experiment.name`                  | `experiment`                      | Goes into the output directory name                                                                                                              |
-| `experiment.n_trials`              | `10`                              | Number of trials                                                                                                                                 |
-| `experiment.seed`                  | `0`                               | Seeds the task schedule — same seed, same tasks                                                                                                  |
-| `experiment.task_order`            | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                      |
-| `experiment.output_dir`            | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                      |
-| `scene.suite`                      | `libero_spatial`                  | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                          |
-| `scene.task_ids`                   | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                         |
-| `prompt`                           | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                               |
-| `policy.path`                      | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                             |
-| `policy.n_action_steps`            | `10`                              | Actions executed per predicted chunk                                                                                                             |
-| `policy.compile`                   | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                       |
-| `control.mode`                     | `shared_reverse_flow_steering`    | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_reverse_flow_steering` — see [the mode table](README_interactive.md#modes) |
-| `control.tau`                      | `5`                               | `shared_flow_control` only                                                                                                                       |
-| `control.input_noise`              | `0.0`                             | Std of the Gaussian noise added to your x/y/z command                                                                                            |
-| `control.max_steps`                | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                          |
-| `control.deterministic_corruption` | `null`                            | Path to a 3×3 `M` YAML — **off unless a path is given**                                                                                          |
-| `control.flow_reversal_adapter`    | `null`                            | Path to a 7×7 `F` YAML — **off unless a path is given**                                                                                          |
-| `server.port`                      | `8765`                            | Live view port                                                                                                                                   |
+| Key                                | Default                           | Meaning                                                                                                                                                                               |
+| ---------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `experiment.name`                  | `experiment`                      | Goes into the output directory name                                                                                                                                                   |
+| `experiment.n_trials`              | `10`                              | Number of trials                                                                                                                                                                      |
+| `experiment.seed`                  | `0`                               | Seeds the task schedule — same seed, same tasks                                                                                                                                       |
+| `experiment.task_order`            | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                                           |
+| `experiment.output_dir`            | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                                           |
+| `scene.suite`                      | `libero_spatial`                  | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                               |
+| `scene.task_ids`                   | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                                                              |
+| `prompt`                           | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                                    |
+| `policy.path`                      | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                                                                  |
+| `policy.n_action_steps`            | `10`                              | Actions executed per predicted chunk                                                                                                                                                  |
+| `policy.compile`                   | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                                            |
+| `control.mode`                     | `shared_reverse_flow_steering`    | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_reverse_flow_steering` — see [the mode table](README_interactive.md#modes)                                      |
+| `control.tau`                      | `5`                               | `shared_flow_control` only                                                                                                                                                            |
+| `control.n_reverse_steps`          | `null`                            | `shared_reverse_flow_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise. See [Partial reversal](README_interactive.md#partial-reversal) |
+| `control.input_noise`              | `0.0`                             | Std of the Gaussian noise added to your x/y/z command                                                                                                                                 |
+| `control.max_steps`                | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                               |
+| `control.deterministic_corruption` | `null`                            | Path to a 3×3 `M` YAML — **off unless a path is given**                                                                                                                               |
+| `control.flow_reversal_adapter`    | `null`                            | Path to a 7×7 `F` YAML — **off unless a path is given**                                                                                                                               |
+| `server.port`                      | `8765`                            | Live view port                                                                                                                                                                        |
 
 A few keys can be overridden per run without editing the file:
 `--n-trials`, `--seed`, `--mode`, `--output-dir`, `--port`.
@@ -91,7 +92,7 @@ Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<name>/` containing:
 | `trial_XXX.mp4` | The rollout video (30 fps)                                                                                                                                                |
 
 `trials.jsonl` fields: `trial`, `suite`, `task_id`, `task_description`,
-`vla_prompt`, `mode`, `tau`, `input_noise`, `deterministic_corruption`,
+`vla_prompt`, `mode`, `tau`, `n_reverse_steps`, `input_noise`, `deterministic_corruption`,
 `flow_reversal_adapter`, `success`, `steps`, `duration_s`, `user_reads`
 (how many times the teleop input was sampled during that trial),
 `video`, `steps_file`, `finished_at`, plus the mode's steering statistics

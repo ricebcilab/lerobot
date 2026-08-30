@@ -439,7 +439,9 @@ class TeleopChain:
             print(f"SpaceMouse unavailable ({e}) — keyboard only.")
 
 
-def announce_mode(mode: str, tau: int, policy, flow_adapter: FlowAdapter) -> None:
+def announce_mode(
+    mode: str, tau: int, policy, flow_adapter: FlowAdapter, n_reverse_steps: int | None = None
+) -> None:
     """Print what the newly selected mode does (shared by the REPL and startup)."""
     if mode != "policy":
         print(
@@ -457,11 +459,20 @@ def announce_mode(mode: str, tau: int, policy, flow_adapter: FlowAdapter) -> Non
             f"{policy.config.num_inference_steps} denoising steps (idle input = pure policy)."
         )
     elif mode == "shared_reverse_flow_steering":
-        print(
-            "Shared reverse flow steering: your x/y/z defines a reference chunk that is "
-            f"inverted through the flow ({policy.config.num_inference_steps} reverse steps) to its "
-            "noise; pi0.5 then denoises from that noise (idle input = pure policy)."
-        )
+        total = policy.config.num_inference_steps
+        n = total if n_reverse_steps is None else n_reverse_steps
+        if n >= total:
+            print(
+                "Shared reverse flow steering: your x/y/z defines a reference chunk that is "
+                f"inverted through the flow ({total} reverse steps) to its noise; pi0.5 then "
+                "denoises from that noise (idle input = pure policy)."
+            )
+        else:
+            print(
+                "Shared reverse flow steering: your x/y/z defines a reference chunk that is "
+                f"inverted {n} of {total} steps (partway to noise, t={n / total:.1f}); pi0.5 then "
+                f"denoises from there in {total - n} steps (idle input = pure policy)."
+            )
         if flow_adapter.matrix is not None:
             print(describe_adapter(flow_adapter))
 
@@ -616,6 +627,7 @@ INTERACTIVE_CONFIG_KEYS = {
     "control": {
         "mode": "mode",
         "tau": "tau",
+        "n_reverse_steps": "n_reverse_steps",
         "input_noise": "input_noise",
         "deterministic_corruption": "deterministic_corruption",
         "flow_reversal_adapter": "flow_reversal_adapter",
@@ -735,14 +747,24 @@ class FlowControlPolicy:
 
 
 def reverse_flow(
-    x: torch.Tensor, velocity, num_steps: int, adapter: torch.Tensor | None = None
+    x: torch.Tensor,
+    velocity,
+    num_steps: int,
+    adapter: torch.Tensor | None = None,
+    n_reverse_steps: int | None = None,
 ) -> torch.Tensor:
-    """Integrate the flow backward (Euler, t: 0 -> 1) from a clean chunk to its latent noise.
+    """Integrate the flow backward (Euler, t: 0 -> 1) from a clean chunk toward its latent noise.
 
     Mirrors PI05Pytorch.sample_actions, which integrates x_{t+dt} = x_t + dt * v(x_t, t)
     with dt = -1/num_steps from t=1 (noise) to t=0 (action); here the same field is
     stepped with dt = +1/num_steps starting at t=0. This is the inversion of Flow
     Reversal Steering (Tang et al. 2026, arXiv:2606.13675).
+
+    The step size is always 1/`num_steps`, i.e. the policy's own schedule.
+    `n_reverse_steps` is how many of those steps to take: the default (None) runs
+    the whole way to t=1, pure noise, while a smaller count stops early and
+    returns a chunk at t = n_reverse_steps / num_steps, still carrying some of
+    the reference. The caller must then start the forward flow at that time.
 
     `adapter` is an optional (n, n) matrix F that adapts the velocity field of the
     reversal, x_t += h * (F @ v): it is applied to the first n action dimensions of
@@ -751,8 +773,9 @@ def reverse_flow(
     that produces the executed action still uses the policy's own field.
     """
     h = 1.0 / num_steps
+    steps = num_steps if n_reverse_steps is None else n_reverse_steps
     x_t = x
-    for step in range(num_steps):
+    for step in range(steps):
         v = velocity(x_t, step * h)
         if adapter is not None:
             n = adapter.shape[0]
@@ -776,15 +799,32 @@ class ReverseFlowSteeringPolicy:
 
     An optional `FlowAdapter` holding a 7x7 matrix F adapts the velocity field
     of the reversal only (x_t += h * F @ v); see `reverse_flow`.
+
+    `n_reverse_steps` stops the reversal early instead of going all the way to
+    noise: with n of the policy's N = num_inference_steps steps the reference is
+    only partially destroyed, landing at t = n/N, and the forward flow then runs
+    from there in N - n steps (so a steered chunk costs the same N velocity
+    evaluations as an unsteered one). Smaller n keeps more of the operator's
+    reference in the result, larger n leaves the policy more freedom; n = N (or
+    None) is the full reversal.
     """
 
     DEADBAND = FlowControlPolicy.DEADBAND
     GRIPPER_DIM = ACTION_LABELS.index("gripper")
 
-    def __init__(self, policy, reader: NoisyReader, postprocessor, adapter: FlowAdapter | None = None):
+    def __init__(
+        self,
+        policy,
+        reader: NoisyReader,
+        postprocessor,
+        adapter: FlowAdapter | None = None,
+        n_reverse_steps: int | None = None,
+    ):
         self._policy = policy
         self._reader = reader
         self._adapter = adapter
+        self.n_reverse_steps = n_reverse_steps  # validated by the setter below
+        self._pending_cmd: np.ndarray | None = None
         n_dims = len(ACTION_LABELS)
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:n_dims], std[:n_dims]
@@ -793,6 +833,27 @@ class ReverseFlowSteeringPolicy:
         self._last_reference: torch.Tensor | None = None
         self.steered_chunks = 0  # per-rollout count of chunks started from inverted noise
         self.reconstruction_errors: list[float] = []  # per steered chunk, in std units
+
+    @property
+    def n_reverse_steps(self) -> int | None:
+        return self._n_reverse_steps
+
+    @n_reverse_steps.setter
+    def n_reverse_steps(self, value: int | None) -> None:
+        total = self._policy.config.num_inference_steps
+        if value is not None and not (isinstance(value, int) and 1 <= value <= total):
+            raise ValueError(f"n_reverse_steps must be an integer in [1, {total}], got {value!r}")
+        self._n_reverse_steps = None if value == total else value
+
+    def _flow_kwargs(self) -> dict:
+        """Where the forward flow starts, once the reference has been reversed part-way."""
+        if self._n_reverse_steps is None:
+            return {}  # full reversal: the usual schedule from t=1 in N steps
+        total = self._policy.config.num_inference_steps
+        return {
+            "flow_start_time": self._n_reverse_steps / total,
+            "num_forward_steps": total - self._n_reverse_steps,
+        }
 
     def _normalize_gripper(self, gripper: float) -> float:
         return float((gripper - self._mean[self.GRIPPER_DIM]) / self._std[self.GRIPPER_DIM])
@@ -819,9 +880,11 @@ class ReverseFlowSteeringPolicy:
     @torch.compiler.disable
     def _noise_fn(self, velocity, noise: torch.Tensor) -> torch.Tensor:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
-        # this reads live teleop input and must stay eager.
-        cmd = self._reader.translation
-        if np.max(np.abs(cmd)) < self.DEADBAND:
+        # this builds the reference from live teleop input and must stay eager.
+        # `select_action` has already sampled the input (once per chunk) and put
+        # it in _pending_cmd, so the forward schedule it chose matches this hook.
+        cmd = self._pending_cmd
+        if cmd is None:
             self._last_reference = None
             return noise
         reference = self.reference_chunk(cmd).to(device=noise.device, dtype=noise.dtype)
@@ -833,13 +896,23 @@ class ReverseFlowSteeringPolicy:
         if adapter_matrix is not None:
             adapter_matrix = torch.as_tensor(adapter_matrix, dtype=noise.dtype, device=noise.device)
         return reverse_flow(
-            reference, velocity, self._policy.config.num_inference_steps, adapter=adapter_matrix
+            reference,
+            velocity,
+            self._policy.config.num_inference_steps,
+            adapter=adapter_matrix,
+            n_reverse_steps=self._n_reverse_steps,
         )
 
     def select_action(self, batch) -> torch.Tensor:
         # Same queue logic as PI05Policy.select_action, plus the noise hook.
         if len(self._queue) == 0:
-            chunk = self._policy.predict_action_chunk(batch, noise_fn=self._noise_fn)
+            # Sample the operator once per chunk: the forward schedule depends on
+            # whether we are steering, so it cannot be decided inside the hook.
+            cmd = self._reader.translation
+            steering = np.max(np.abs(cmd)) >= self.DEADBAND
+            self._pending_cmd = cmd if steering else None
+            flow_kwargs = self._flow_kwargs() if steering else {}
+            chunk = self._policy.predict_action_chunk(batch, noise_fn=self._noise_fn, **flow_kwargs)
             actions = chunk[:, : self._policy.config.n_action_steps]
             self._gripper_ref = float(actions[0, -1, self.GRIPPER_DIM])
             if self._last_reference is not None:
@@ -868,8 +941,10 @@ class ModeRunner:
         env_preprocessor,
         env_postprocessor,
         flow_adapter: FlowAdapter | None = None,
+        n_reverse_steps: int | None = None,
     ):
         self.policy = policy
+        self.n_reverse_steps = n_reverse_steps
         self.reader = reader
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
@@ -880,7 +955,7 @@ class ModeRunner:
         self.flow_policy: FlowControlPolicy | None = None
         self.frs_policy: ReverseFlowSteeringPolicy | None = None
 
-    def kwargs(self, mode: str, tau: int = 5) -> dict:
+    def kwargs(self, mode: str, tau: int = 5, n_reverse_steps: int | None = None) -> dict:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
         if mode == "teleop":
@@ -912,6 +987,9 @@ class ModeRunner:
                 self.frs_policy = ReverseFlowSteeringPolicy(
                     self.policy, self.reader, self.postprocessor, adapter=self.flow_adapter
                 )
+            self.frs_policy.n_reverse_steps = (
+                self.n_reverse_steps if n_reverse_steps is None else n_reverse_steps
+            )
             kwargs["policy"] = self.frs_policy
         return kwargs
 
@@ -921,7 +999,9 @@ class ModeRunner:
             return {"guided_denoising_steps": int(self.flow_policy.hook_calls)}
         if mode == "shared_reverse_flow_steering" and self.frs_policy is not None:
             errors = self.frs_policy.reconstruction_errors
+            total = self.policy.config.num_inference_steps
             return {
+                "n_reverse_steps": self.frs_policy.n_reverse_steps or total,
                 "steered_chunks": int(self.frs_policy.steered_chunks),
                 "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
             }
@@ -936,6 +1016,15 @@ class ModeRunner:
             detail = f" (mean |executed - reference| translation: {error:.2f} std)" if error else ""
             return f"reverse flow steering applied on {metrics['steered_chunks']} chunks{detail}"
         return ""
+
+
+def mode_display(mode: str, tau: int, n_reverse_steps: int | None, num_inference_steps: int) -> str:
+    """Short label for the terminal and the live view."""
+    if mode == "shared_flow_control":
+        return f"{mode} tau={tau}"
+    if mode == "shared_reverse_flow_steering":
+        return f"{mode} n={n_reverse_steps or num_inference_steps}"
+    return mode
 
 
 def slugify(text: str, max_words: int = 6) -> str:
@@ -972,6 +1061,15 @@ def main():
         type=int,
         default=5,
         help="shared_flow_control: number of leading denoising steps your input steers",
+    )
+    parser.add_argument(
+        "--n-reverse-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="shared_reverse_flow_steering: how many of the policy's denoising steps the reference "
+        "is reversed through (default: all of them, i.e. all the way to noise). A smaller N stops "
+        "part-way, keeping more of your reference; the forward flow then runs the remaining steps",
     )
     parser.add_argument(
         "--deterministic-corruption",
@@ -1029,6 +1127,8 @@ def main():
         parser.error("--input-noise must be >= 0")
     if not 0 <= args.tau <= 100:
         parser.error("--tau must be >= 0")
+    if args.n_reverse_steps is not None and args.n_reverse_steps < 1:
+        parser.error("--n-reverse-steps must be >= 1")
 
     init_logging()
     args.output_dir = Path(args.output_dir)
@@ -1090,6 +1190,7 @@ def main():
     suite, task_id = args.suite, args.task_id
     mode = args.mode
     tau = args.tau  # flow-control: how many leading denoising steps your input steers
+    n_reverse_steps = args.n_reverse_steps  # reverse-flow steering: None = all the way to noise
     runner = ModeRunner(
         policy,
         reader,
@@ -1103,7 +1204,8 @@ def main():
     print(f'Built-in instruction: "{vec_env.envs[0].task_description}"')
     print(
         "Type an instruction (empty = built-in), `tasks`, `task <suite> <id>`, "
-        "`mode policy|shared_override|shared_flow_control [tau]|shared_reverse_flow_steering|teleop`, "
+        "`mode policy|shared_override|shared_flow_control [tau]"
+        "|shared_reverse_flow_steering [n_reverse_steps]|teleop`, "
         "`noise [std]`, `corruption [path|off]`, `adapter [path|off]`, or `quit`.\n"
     )
     if corruption.matrix is not None:
@@ -1112,7 +1214,7 @@ def main():
         print(describe_adapter(flow_adapter) + "\n")
     if mode != "policy":
         chain.attach_spacemouse()
-        announce_mode(mode, tau, policy, flow_adapter)
+        announce_mode(mode, tau, policy, flow_adapter, n_reverse_steps)
         print()
     if noisy.std > 0:
         print(f"Input noise: std {noisy.std:.3f} on x/y/z at every step while you command.\n")
@@ -1132,9 +1234,15 @@ def main():
                 if new_mode not in MODES:
                     print(
                         "usage: mode policy|shared_override|shared_flow_control [tau]"
-                        "|shared_reverse_flow_steering|teleop"
+                        "|shared_reverse_flow_steering [n_reverse_steps]|teleop"
                     )
                     continue
+                if new_mode == "shared_reverse_flow_steering" and len(tokens) > 2:
+                    n_flow_steps = policy.config.num_inference_steps
+                    if not tokens[2].isdigit() or not 1 <= int(tokens[2]) <= n_flow_steps:
+                        print(f"n_reverse_steps must be an integer in [1, {n_flow_steps}]")
+                        continue
+                    n_reverse_steps = int(tokens[2])
                 if new_mode == "shared_flow_control" and len(tokens) > 2:
                     n_flow_steps = policy.config.num_inference_steps
                     if not tokens[2].isdigit() or not 0 <= int(tokens[2]) <= n_flow_steps:
@@ -1144,7 +1252,7 @@ def main():
                 if new_mode != "policy":
                     chain.attach_spacemouse()
                 mode = new_mode
-                announce_mode(mode, tau, policy, flow_adapter)
+                announce_mode(mode, tau, policy, flow_adapter, n_reverse_steps)
                 continue
 
             if line == "noise" or line.startswith("noise "):
@@ -1231,9 +1339,9 @@ def main():
                 continue
 
             prompt = "manual teleop" if mode == "teleop" else (line or vec_env.envs[0].task_description)
-            rollout_kwargs = runner.kwargs(mode, tau)
+            rollout_kwargs = runner.kwargs(mode, tau, n_reverse_steps)
 
-            mode_label = f"{mode} tau={tau}" if mode == "shared_flow_control" else mode
+            mode_label = mode_display(mode, tau, n_reverse_steps, policy.config.num_inference_steps)
             print(f'Running [{mode_label}]: "{prompt}"')
             start = time.time()
             stream.set_status(mode=mode_label)

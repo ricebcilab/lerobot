@@ -75,6 +75,13 @@ class ActionSelectKwargs(TypedDict, total=False):
     # Gaussian sample; the return value is where the denoising flow starts.
     # Lets callers e.g. invert a reference action chunk (flow reversal).
     noise_fn: Callable[[Callable[[Tensor, float], Tensor], Tensor], Tensor] | None
+    # Where the denoising flow starts, and how many Euler steps it takes to
+    # reach t=0. Default (1.0, num_inference_steps) is the usual schedule from
+    # pure noise. A caller that hands `noise_fn` a partially noised chunk --
+    # e.g. a reference reversed only part of the way -- sets `flow_start_time`
+    # to that chunk's time so the remaining integration is consistent.
+    flow_start_time: float | None
+    num_forward_steps: int | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -841,7 +848,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
         x_t_hook = kwargs.get("x_t_hook")
         noise_fn = kwargs.get("noise_fn")
         if noise_fn is not None:
@@ -857,9 +863,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             noise = noise_fn(velocity, noise)
 
+        # The flow normally runs from t=1 (noise) to t=0 in num_steps Euler steps.
+        # `flow_start_time` / `num_forward_steps` let a caller start part-way down
+        # instead; the step size adapts so the integration still lands on t=0.
+        start_time = kwargs.get("flow_start_time")
+        start_time = 1.0 if start_time is None else float(start_time)
+        num_forward_steps = kwargs.get("num_forward_steps")
+        num_forward_steps = num_steps if num_forward_steps is None else int(num_forward_steps)
+        if num_forward_steps < 1:
+            raise ValueError(f"num_forward_steps must be >= 1, got {num_forward_steps}")
+        dt = -start_time / num_forward_steps
+
         x_t = noise
-        for step in range(num_steps):
-            time = 1.0 + step * dt
+        for step in range(num_forward_steps):
+            time = start_time + step * dt
             if x_t_hook is not None:
                 x_t = x_t_hook(step, time, x_t)
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)

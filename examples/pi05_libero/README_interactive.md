@@ -46,6 +46,7 @@ the same list.
 | `--task-id N`                       | `0`                               | Starting scene index within the suite (`tasks` in the REPL lists them)                                                                                                                                                                                                                                                                                                       |
 | `--mode NAME`                       | `policy`                          | Control mode to start in (changeable live with `mode`)                                                                                                                                                                                                                                                                                                                       |
 | `--tau N`                           | `5`                               | `shared_flow_control`: leading denoising steps your input steers                                                                                                                                                                                                                                                                                                             |
+| `--n-reverse-steps N`               | all                               | `shared_reverse_flow_steering`: how many denoising steps the reference is reversed through. The default reverses all the way to noise; a smaller `N` stops part-way (see [Partial reversal](#partial-reversal))                                                                                                                                                              |
 | `--n-action-steps N`                | `10`                              | Actions executed per predicted chunk before the model re-plans (chunk size is 50)                                                                                                                                                                                                                                                                                            |
 | `--port N`                          | `8765`                            | Port of the live view, `http://localhost:<port>` (bound to 127.0.0.1)                                                                                                                                                                                                                                                                                                        |
 | `--deterministic-corruption [PATH]` | off                               | Multiply Δx/Δy/Δz of your SpaceMouse/keyboard command by a fixed 3×3 matrix `M` read from a YAML file at every control step (`x → M·x`). Without `PATH` the shipped [`deterministic_corruption.yaml`](deterministic_corruption.yaml) is used. Can be changed live with `corruption` (see [Deterministic corruption](#deterministic-corruption))                              |
@@ -117,17 +118,17 @@ driving. Keys are released automatically when the tab loses focus.
 
 The prompt shows the current mode, e.g. `policy>`. Lines are interpreted as:
 
-| Input                    | Effect                                                                                                                                                                                   |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| any text                 | Run one rollout with that text as the instruction to pi0.5                                                                                                                               |
-| empty line               | Run one rollout with the scene's built-in instruction (in `teleop` mode: start driving)                                                                                                  |
-| `tasks`                  | List the task ids and instructions of the current suite                                                                                                                                  |
-| `task <suite> <id>`      | Switch scene, e.g. `task libero_spatial 3` (rebuilds the env, no model reload)                                                                                                           |
-| `mode <name> [tau]`      | Switch control mode (see below); `tau` only applies to `shared_flow_control`                                                                                                             |
-| `noise [std]`            | Show (no argument) or set the std of the noise added to your x/y/z command, e.g. `noise 0.1`; `noise 0` turns it off. Takes effect from the next rollout step                            |
-| `corruption [path\|off]` | Show (no argument) the deterministic corruption matrix, load one from a YAML file (`corruption my_matrix.yaml`), or clear it (`corruption off`). Takes effect from the next rollout step |
-| `adapter [path\|off]`    | Show (no argument) the flow-reversal adapter `F`, load one from a YAML file (`adapter my_F.yaml`), or clear it (`adapter off`). Takes effect from the next predicted chunk               |
-| `quit`, `exit`, Ctrl-D   | Exit (env and server are shut down)                                                                                                                                                      |
+| Input                    | Effect                                                                                                                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| any text                 | Run one rollout with that text as the instruction to pi0.5                                                                                                                                   |
+| empty line               | Run one rollout with the scene's built-in instruction (in `teleop` mode: start driving)                                                                                                      |
+| `tasks`                  | List the task ids and instructions of the current suite                                                                                                                                      |
+| `task <suite> <id>`      | Switch scene, e.g. `task libero_spatial 3` (rebuilds the env, no model reload)                                                                                                               |
+| `mode <name> [tau\|n]`   | Switch control mode (see below). The trailing number is `tau` for `shared_flow_control` and `n_reverse_steps` for `shared_reverse_flow_steering`, e.g. `mode shared_reverse_flow_steering 4` |
+| `noise [std]`            | Show (no argument) or set the std of the noise added to your x/y/z command, e.g. `noise 0.1`; `noise 0` turns it off. Takes effect from the next rollout step                                |
+| `corruption [path\|off]` | Show (no argument) the deterministic corruption matrix, load one from a YAML file (`corruption my_matrix.yaml`), or clear it (`corruption off`). Takes effect from the next rollout step     |
+| `adapter [path\|off]`    | Show (no argument) the flow-reversal adapter `F`, load one from a YAML file (`adapter my_F.yaml`), or clear it (`adapter off`). Takes effect from the next predicted chunk                   |
+| `quit`, `exit`, Ctrl-D   | Exit (env and server are shut down)                                                                                                                                                          |
 
 Each rollout prints `step i/max` while running, then the outcome
 (`SUCCESS` / `no success`), duration, video path, and mode-specific
@@ -136,13 +137,13 @@ mode, which allows 900 steps (45 s at the 20 Hz control rate).
 
 ### Modes
 
-| Mode                           | Who drives     | What your input does                                                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `policy` (default)             | pi0.5          | Nothing — model-only rollout with your instruction                                                                                                                                                                                                                                                                                                                                                                |
-| `teleop`                       | you            | Your x/y/z and gripper are executed directly (`ZeroPolicy`, the model is not loaded into the loop). Press Enter to start                                                                                                                                                                                                                                                                                          |
-| `shared_override`              | pi0.5 + you    | Your Δx/Δy/Δz replace the model's translation in the executed action; rotation and gripper stay the model's                                                                                                                                                                                                                                                                                                       |
-| `shared_flow_control [tau]`    | pi0.5, steered | Your Δx/Δy/Δz (normalized to the model's action space) are written into dims 0-2 of `x_t` for the first `tau` of the 10 flow-matching denoising steps (default `tau=5`, allowed 0…10); the rest denoise freely. The executed action is the model's own                                                                                                                                                            |
-| `shared_reverse_flow_steering` | pi0.5, steered | Flow Reversal Steering ([Tang et al. 2026](https://arxiv.org/abs/2606.13675)): a reference chunk that servos in your direction at uniform velocity is integrated _backward_ through the model's velocity field for 10 steps to find its latent noise; the forward flow then starts from that noise instead of random noise. The executed action is the model's own, snapped to the nearest generalist action mode |
+| Mode                               | Who drives     | What your input does                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `policy` (default)                 | pi0.5          | Nothing — model-only rollout with your instruction                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `teleop`                           | you            | Your x/y/z and gripper are executed directly (`ZeroPolicy`, the model is not loaded into the loop). Press Enter to start                                                                                                                                                                                                                                                                                                                                                  |
+| `shared_override`                  | pi0.5 + you    | Your Δx/Δy/Δz replace the model's translation in the executed action; rotation and gripper stay the model's                                                                                                                                                                                                                                                                                                                                                               |
+| `shared_flow_control [tau]`        | pi0.5, steered | Your Δx/Δy/Δz (normalized to the model's action space) are written into dims 0-2 of `x_t` for the first `tau` of the 10 flow-matching denoising steps (default `tau=5`, allowed 0…10); the rest denoise freely. The executed action is the model's own                                                                                                                                                                                                                    |
+| `shared_reverse_flow_steering [n]` | pi0.5, steered | Flow Reversal Steering ([Tang et al. 2026](https://arxiv.org/abs/2606.13675)): a reference chunk that servos in your direction at uniform velocity is integrated _backward_ through the model's velocity field to find the noise it comes from; the forward flow then starts there instead of from random noise. The executed action is the model's own, snapped to the nearest generalist action mode. `n` (`--n-reverse-steps`) stops the reversal part-way — see below |
 
 In every shared mode, idle input (inside the 0.05 deadband) means pure
 policy — you can let go at any time. Switching to a non-`policy` mode
@@ -154,6 +155,44 @@ After a rollout the shared flow modes print how much steering happened:
 `shared_reverse_flow_steering` reports the number of steered chunks and the
 mean distance (in action-std units) between the executed translation and your
 reference.
+
+### Partial reversal
+
+By default `shared_reverse_flow_steering` reverses the reference through all 10
+denoising steps, i.e. all the way to noise (t = 1). `--n-reverse-steps n` (or
+`mode shared_reverse_flow_steering n`) stops after `n` of those steps, so the
+chunk still carries part of your reference at t = n/10, and the forward flow
+runs from there in the remaining `10 - n` steps:
+
+```
+reference --n steps of the reversal--> x at t = n/10 --(10 - n) forward steps--> executed chunk
+```
+
+- **Smaller `n` keeps more of your intent.** The reference is barely destroyed,
+  so the result stays close to what you commanded.
+- **Larger `n` gives the policy more freedom**, up to `n = 10`, which is the
+  full reversal (and the default).
+- **A steered chunk costs the same 10 velocity evaluations as an unsteered
+  one** for any `n < 10` (`n` reverse + `10 - n` forward), against 20 for the
+  full reversal — so partial reversal is roughly twice as fast per chunk.
+
+Measured on `lerobot/pi05_libero_finetuned` (libero_spatial task 0, a constant
++-0.6 z command, mean executed dz over one chunk):
+
+| `n`       | dz for "up" | dz for "down" | separation | \|executed - reference\| | s / chunk |
+| --------- | ----------- | ------------- | ---------- | ------------------------ | --------- |
+| 2         | -0.46       | +0.48         | 0.94       | 0.13 std                 | 0.16      |
+| 5         | -0.12       | +0.20         | 0.32       | 0.71 std                 | 0.16      |
+| 8         | +-0.00      | +0.03         | 0.03       | 1.03 std                 | 0.16      |
+| 10 (full) | -0.11       | +0.21         | 0.32       | 0.75 std                 | 0.24      |
+
+Note the dip at `n = 8`: because the forward flow gets `10 - n` steps, a large
+`n` means both a more thoroughly destroyed reference _and_ a coarser
+integration back to t = 0 (2 Euler steps at `n = 8`), which washes the steering
+out. `n` around 2-5 is the useful range on this checkpoint. Keeping the Euler
+step size fixed instead — `n` forward steps rather than `10 - n` — would avoid
+that coupling at the cost of a variable per-chunk budget; it is a one-line
+change in `ReverseFlowSteeringPolicy._flow_kwargs`.
 
 ### Input sources
 
