@@ -3,7 +3,7 @@
 # Unknown keys are rejected, and a key set to null keeps the built-in default.
 
 experiment:
-  name: reverse_flow_control                 # goes into the output directory name
+  name: reverse_flow_control_deterministic_corruption
   n_trials: 10                # number of trials to run
   seed: 0                     # seeds the task schedule (same seed = same tasks)
   task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
