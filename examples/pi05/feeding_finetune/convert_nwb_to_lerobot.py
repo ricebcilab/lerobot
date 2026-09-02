@@ -363,7 +363,7 @@ def main(argv=None):
 
     sample = glob.glob(os.path.join(next(iter(vids.values())), "demo_0_*overhead*.mp4"))[0]
     with av.open(sample) as c:
-        H, W = c.streams.video[0].height, c.streams.video[0].width
+        H, W = c.streams.video[0].height, c.streams.video[0].width  # noqa: N806
 
     depth_cfg = (args.depth_min, args.depth_max) if args.depth else None
     grip_dwell = args.gripper_min_dwell

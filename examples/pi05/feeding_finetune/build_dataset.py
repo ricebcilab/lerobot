@@ -101,7 +101,7 @@ def main():
             "--overwrite",
             *passthrough,
         ]
-        log = open(os.path.join(shard_base, f"part{i}.log"), "w")
+        log = open(os.path.join(shard_base, f"part{i}.log"), "w")  # noqa: SIM115
         workers.append((i, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env), log))
         shard_roots.append(root_i)
         shard_repo_ids.append(repo_i)
