@@ -221,17 +221,29 @@ def _small_policy():
 def test_sample_actions_noise_fn_replaces_starting_noise():
     policy, batch = _small_policy()
     seen = {}
+    replacement_noise = None
 
     def noise_fn(velocity, noise):
         seen["noise_shape"] = tuple(noise.shape)
         v = velocity(noise, 1.0)  # the velocity closure must evaluate the field
         seen["velocity_shape"] = tuple(v.shape)
-        return torch.zeros_like(noise)
+        nonlocal replacement_noise
+        replacement_noise = torch.zeros_like(noise)
+        return replacement_noise
+
+    def x_t_hook(step, time, x_t):
+        if step == 0:
+            seen["step0_x_t"] = x_t.clone()
+        return x_t
 
     with torch.inference_mode():
-        chunk = policy.predict_action_chunk(batch, noise_fn=noise_fn)
+        chunk = policy.predict_action_chunk(batch, noise_fn=noise_fn, x_t_hook=x_t_hook)
     assert seen["noise_shape"] == (1, policy.config.chunk_size, policy.config.max_action_dim)
     assert seen["velocity_shape"] == seen["noise_shape"]
+    # The loop starts from `x_t = noise` before the first hook call, so the x_t the
+    # hook sees at step 0 must be exactly what noise_fn returned, not the original
+    # sampled noise -- this is what proves the return value replaces the starting noise.
+    assert torch.equal(seen["step0_x_t"], replacement_noise)
     assert chunk.shape[0] == 1
 
 
