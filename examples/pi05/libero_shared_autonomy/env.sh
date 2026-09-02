@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Environment shared by every launcher in this folder. Source it; do not run it.
+# Environment for run.sh. Source it; do not run it.
 #
 # Keeps LIBERO's config, the Hugging Face hub cache and Matplotlib's cache under
 # the repo's ignored .cache/ directory, and selects EGL for headless MuJoCo.

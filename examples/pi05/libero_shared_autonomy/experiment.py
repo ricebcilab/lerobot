@@ -17,7 +17,10 @@ shared-autonomy mode from the config. The VLA itself only ever receives the
 config's `prompt` (e.g. "do something"), so the language instruction and the
 human intent can be dissociated on purpose.
 
-    ./experiment.sh --config configs/experiment/<condition>.yaml [--dry-run] [flags]
+    ./run.sh experiment --config <condition>.yaml [--dry-run] [flags]
+
+`--config` is looked up as given, then under configs/experiment/, so a bare
+condition name works from anywhere.
 
 Every run is written to `<output_dir>/<timestamp>_<config stem>/`:
 
@@ -141,6 +144,8 @@ def parse_args() -> tuple[argparse.Namespace, ExperimentSettings]:
         "--dry-run", action="store_true", help="validate the config, print the trial schedule and exit"
     )
     args = parser.parse_args()
+    if not Path(args.config).exists() and (EXPERIMENT_CONFIG_DIR / args.config).exists():
+        args.config = str(EXPERIMENT_CONFIG_DIR / args.config)  # a bare condition name
     if not Path(args.config).exists():
         found = sorted(p.name for p in EXPERIMENT_CONFIG_DIR.glob("*.yaml") if p.name != "base.yaml")
         parser.error(

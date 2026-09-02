@@ -150,7 +150,7 @@ class Session:
 
     @staticmethod
     def _build_env(suite: str, task_id: int):
-        """Build a 1-env SyncVectorEnv for one LIBERO scene, mirroring eval.sh settings."""
+        """Build a 1-env SyncVectorEnv for one LIBERO scene, mirroring the README's lerobot-eval settings."""
         env_cfg = LiberoEnvConfig(task=suite, task_ids=[task_id])
         envs_dict = make_env(env_cfg, n_envs=1, use_async_envs=False)
         vec_env = envs_dict[suite][task_id]

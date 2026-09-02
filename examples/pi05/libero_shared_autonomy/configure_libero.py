@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
 def find_libero_root() -> Path:
     spec = importlib.util.find_spec("libero")
     if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError("hf-libero is not installed; run setup.sh first")
+        raise RuntimeError("hf-libero is not installed; run `run.sh setup` first")
 
     package_root = Path(next(iter(spec.submodule_search_locations))) / "libero"
     if not package_root.is_dir():

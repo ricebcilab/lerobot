@@ -15,7 +15,7 @@ run one rollout in the chosen LIBERO scene feeding *your* text to the policy
 (instead of the task's built-in instruction), and stream frames live to a
 browser tab. An MP4 of each rollout is also saved.
 
-Launch via ./interactive.sh (sets MUJOCO_GL/caches and runs under uv), then
+Launch via `run.sh interactive` (sets MUJOCO_GL/caches and runs under uv), then
 open the printed URL. REPL commands:
 
     <any text>          run a rollout with that instruction

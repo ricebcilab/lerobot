@@ -10,64 +10,71 @@ checkpoint by default.
 From the repository root:
 
 ```bash
-./examples/pi05/libero_shared_autonomy/setup.sh
+./examples/pi05/libero_shared_autonomy/run.sh setup
 ```
 
-The setup script:
+`run.sh` is the only launcher in this folder: `run.sh setup` once, then
+`run.sh interactive`, `run.sh experiment`, or `run.sh <any command>` to run
+something else (such as `lerobot-eval` or `jupyter`) inside the example's
+environment. Every form sources `env.sh`, which sets `LIBERO_CONFIG_PATH`,
+`MUJOCO_GL`, `HF_HUB_CACHE` and `MPLCONFIGDIR` to paths under the repo's
+ignored `.cache/` directory (only if you have not already set them), and runs
+from the repo root under `uv run` with the `pi` and `libero` extras.
+
+The setup step:
 
 - installs the locked `pi` and `libero` extras into `.venv`;
 - writes a non-interactive LIBERO config under `.cache/libero`;
 - downloads `lerobot/libero-assets` there; and
 - links the installed `hf-libero` package to those project-local assets.
 
-The evaluation launcher also keeps Hugging Face model downloads and Matplotlib
-cache data under the project's ignored `.cache` directory. It leaves `HF_HOME`
-unchanged so an existing `hf auth login` credential remains available for the
-gated PaliGemma tokenizer used by Pi0.5.
-
-Both `.venv` and `.cache` are ignored by git. Re-running the script is safe.
-Every launcher in this folder sources `env.sh` first, which sets
-`LIBERO_CONFIG_PATH`, `MUJOCO_GL`, `HF_HUB_CACHE` and `MPLCONFIGDIR` to paths
-under the repo's `.cache/` directory (only if you have not already set them).
+`env.sh` leaves `HF_HOME` unchanged so an existing `hf auth login` credential
+remains available for the gated PaliGemma tokenizer used by Pi0.5. Both
+`.venv` and `.cache` are ignored by git. Re-running setup is safe.
 
 ## Smoke evaluation
 
-The default launcher evaluates task 0 of LIBERO-Spatial for one episode:
+Batch evaluation is plain `lerobot-eval` run through `run.sh`. This evaluates
+task 0 of LIBERO-Spatial for one episode:
 
 ```bash
-./examples/pi05/libero_shared_autonomy/eval.sh
+./examples/pi05/libero_shared_autonomy/run.sh lerobot-eval \
+  --output_dir=outputs/pi05_libero_eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --policy.n_action_steps=10 \
+  --policy.compile_model=true \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --env.task_ids='[0]' \
+  --eval.batch_size=1 \
+  --eval.n_episodes=1 \
+  --env.max_parallel_tasks=1
 ```
 
 This downloads the Pi0.5 checkpoint on first use. A CUDA GPU with a working
 driver is strongly recommended; Pi0.5 is too large for a practical CPU rollout.
 The PaliGemma tokenizer is gated: first accept its Hugging Face license and run
 `hf auth login`. The initial rollout may spend several minutes compiling the
-model; set `PI05_COMPILE_MODEL=false` to disable compilation.
+model; pass `--policy.compile_model=false` to disable compilation.
 
-The launcher is configured with environment variables. For example, run the
-four standard suites with 10 episodes per task:
+To run the four standard suites with 10 episodes per task, drop the
+`--env.task_ids` line and change `--env.task` and `--eval.n_episodes`:
 
 ```bash
-LIBERO_TASKS=libero_spatial,libero_object,libero_goal,libero_10 \
-LIBERO_TASK_IDS= \
-LIBERO_EPISODES=10 \
-./examples/pi05/libero_shared_autonomy/eval.sh
+./examples/pi05/libero_shared_autonomy/run.sh lerobot-eval \
+  --output_dir=outputs/pi05_libero_eval \
+  --policy.path=lerobot/pi05_libero_finetuned \
+  --policy.n_action_steps=10 \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --env.max_parallel_tasks=1
 ```
 
-Useful overrides:
+`--policy.path` accepts a local checkpoint directory as well as a Hub id.
 
-| Variable             | Default                         | Meaning                                      |
-| -------------------- | ------------------------------- | -------------------------------------------- |
-| `PI05_MODEL_ID`      | `lerobot/pi05_libero_finetuned` | Local checkpoint or Hub model ID             |
-| `LIBERO_TASKS`       | `libero_spatial`                | Comma-separated LIBERO suites                |
-| `LIBERO_TASK_IDS`    | `[0]`                           | Task IDs; set empty to run every task        |
-| `LIBERO_EPISODES`    | `1`                             | Episodes per task                            |
-| `LIBERO_BATCH_SIZE`  | `1`                             | Parallel evaluation environments             |
-| `PI05_ACTION_STEPS`  | `10`                            | Actions executed from each predicted chunk   |
-| `PI05_COMPILE_MODEL` | `true`                          | Enable the checkpoint's `torch.compile` path |
-| `LIBERO_OUTPUT_DIR`  | `outputs/pi05_libero_eval`      | Evaluation output directory                  |
-
-For headless execution the launcher sets `MUJOCO_GL=egl`. Override it (for
+For headless execution `env.sh` sets `MUJOCO_GL=egl`. Override it (for
 example, with `MUJOCO_GL=osmesa`) only if the machine's rendering setup requires
 another MuJoCo backend.
 
@@ -77,7 +84,7 @@ To type free-text instructions and watch the policy react, use the interactive
 launcher instead of the batch evaluation:
 
 ```bash
-./examples/pi05/libero_shared_autonomy/interactive.sh
+./examples/pi05/libero_shared_autonomy/run.sh interactive
 ```
 
 It loads the policy once, opens a live view at `http://localhost:8765` (VSCode
@@ -139,7 +146,7 @@ Input sources (both active at once; the SpaceMouse wins while deflected):
   forward. The page shows the held keys and gripper state under the action bars.
 
 The REPL command reference is `interactive.py --help`; settings can also come
-from `configs/interactive.yaml` (`interactive.sh --config`).
+from `configs/interactive.yaml` (`run.sh interactive --config`).
 
 ## Perturbing the operator
 
@@ -186,12 +193,12 @@ level.
 ## Experiments
 
 To run scripted, recorded trials from a YAML config instead of the REPL
-(shared-autonomy user studies), use `experiment.sh` with one of the shipped
-conditions:
+(shared-autonomy user studies), use `run.sh experiment` with one of the
+shipped conditions (a bare file name is looked up under `configs/experiment/`):
 
 ```bash
-./examples/pi05/libero_shared_autonomy/experiment.sh --config configs/experiment/reverse_flow_full.yaml
-./examples/pi05/libero_shared_autonomy/experiment.sh --config configs/experiment/reverse_flow_full.yaml --dry-run   # validate + print the schedule, run nothing
+./examples/pi05/libero_shared_autonomy/run.sh experiment --config reverse_flow_full.yaml
+./examples/pi05/libero_shared_autonomy/run.sh experiment --config reverse_flow_full.yaml --dry-run   # validate + print the schedule, run nothing
 ```
 
 `experiment.py` runs a scripted sequence of trials with the same policy, live

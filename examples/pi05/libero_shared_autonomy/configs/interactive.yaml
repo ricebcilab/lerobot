@@ -1,4 +1,4 @@
-# Settings for interactive.py (`interactive.sh --config [PATH]`).
+# Settings for interactive.py (`run.sh interactive --config [PATH]`).
 #
 # Every key mirrors a command-line flag. Delete a key or set it to null to keep
 # the built-in default; a flag passed on the command line still wins. Unknown
