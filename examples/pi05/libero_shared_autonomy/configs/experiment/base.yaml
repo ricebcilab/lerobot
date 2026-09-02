@@ -23,9 +23,9 @@ policy:
   compile: false
 
 control:
-  mode: shared_reverse_flow_steering
-  tau: 8                      # shared_flow_control only
-  n_reverse_steps: null       # shared_reverse_flow_steering only; null = all the way to noise
+  mode: shared_flow_reversal_steering
+  n_guided_steps: 8                      # shared_flow_control only
+  n_reversal_steps: null       # shared_flow_reversal_steering only; null = all the way to noise
   input_noise: 0.0
   max_steps: null             # null = the suite's own episode length
   corruption: null            # what the robot gets = M @ what the operator commanded (env units)

@@ -1,0 +1,6 @@
+# Shared flow control, n_guided_steps = 8, operator command rotated 20 degrees about z.
+extends: base.yaml
+control:
+  mode: shared_flow_control
+  n_guided_steps: 8
+  corruption: {rotation_z_deg: 20}

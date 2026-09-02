@@ -17,7 +17,7 @@ from teleop import build_corruption
 
 from lerobot.policies.pi05.steering import build_reversal_adapter
 
-MODES = ("policy", "shared_override", "shared_flow_control", "shared_reverse_flow_steering", "teleop")
+MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")
 PROMPT_FROM_TASK = "task"  # `prompt: task` gives the VLA the scene's own instruction
 
@@ -28,8 +28,8 @@ DEFAULT_INTERACTIVE_CONFIG = CONFIG_DIR / "interactive.yaml"
 @dataclass
 class ControlSettings:
     mode: str = "policy"
-    tau: int = 5
-    n_reverse_steps: int | None = None
+    n_guided_steps: int = 5
+    n_reversal_steps: int | None = None
     input_noise: float = 0.0
     max_steps: int | None = None
     corruption: dict | list | None = None  # spec as written
@@ -64,8 +64,8 @@ class ExperimentSettings:
 
 _CONTROL_SCHEMA = {
     "mode": "mode",
-    "tau": "tau",
-    "n_reverse_steps": "n_reverse_steps",
+    "n_guided_steps": "n_guided_steps",
+    "n_reversal_steps": "n_reversal_steps",
     "input_noise": "input_noise",
     "max_steps": "max_steps",
     "corruption": "corruption",
@@ -183,13 +183,13 @@ def build_control(flat: dict, where: str) -> ControlSettings:
     control = ControlSettings(**{k: flat[k] for k in ControlSettings.__dataclass_fields__ if k in flat})
     if control.mode not in MODES:
         _fail(where, f"control.mode must be one of {', '.join(MODES)}, got {control.mode!r}")
-    if not isinstance(control.tau, int) or control.tau < 0:
-        _fail(where, "control.tau must be a non-negative integer")
-    if control.n_reverse_steps is not None and (
-        not isinstance(control.n_reverse_steps, int) or control.n_reverse_steps < 1
+    if not isinstance(control.n_guided_steps, int) or control.n_guided_steps < 0:
+        _fail(where, "control.n_guided_steps must be a non-negative integer")
+    if control.n_reversal_steps is not None and (
+        not isinstance(control.n_reversal_steps, int) or control.n_reversal_steps < 1
     ):
         _fail(
-            where, "control.n_reverse_steps must be a positive integer or null (null = all the way to noise)"
+            where, "control.n_reversal_steps must be a positive integer or null (null = all the way to noise)"
         )
     if not isinstance(control.input_noise, int | float) or control.input_noise < 0:
         _fail(where, "control.input_noise must be >= 0")

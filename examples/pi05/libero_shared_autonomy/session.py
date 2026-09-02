@@ -31,8 +31,8 @@ from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.steering import (
     FlowControlPolicy,
+    FlowReversalSteeringPolicy,
     ReversalAdapter,
-    ReverseFlowSteeringPolicy,
 )
 from lerobot.utils.constants import ACTION
 
@@ -67,14 +67,14 @@ def _identity(x):
     return x
 
 
-def _teleop_hook(reader, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarray]:
+def _teleop_hook(source, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarray]:
     """Paste the teleop translation (and, for teleop mode, gripper) into the env action."""
 
     def hook(action: np.ndarray) -> np.ndarray:
         action = action.copy()
-        action[0, :3] = reader.translation
+        action[0, :3] = source.translation
         if paste_gripper:
-            action[0, 6] = reader.gripper
+            action[0, 6] = source.gripper
         return action
 
     return hook
@@ -127,11 +127,11 @@ class Session:
 
         self._zero_policy = _ZeroPolicy()
         self._flow_policy: FlowControlPolicy | None = None
-        self._frs_policy: ReverseFlowSteeringPolicy | None = None
+        self._frs_policy: FlowReversalSteeringPolicy | None = None
         self.mode = "policy"
-        self.tau = control.tau
-        self.n_reverse_steps = control.n_reverse_steps
-        self.set_mode(control.mode, control.tau, control.n_reverse_steps)
+        self.n_guided_steps = control.n_guided_steps
+        self.n_reversal_steps = control.n_reversal_steps
+        self.set_mode(control.mode, control.n_guided_steps, control.n_reversal_steps)
 
     @classmethod
     def from_settings(cls, settings: SessionSettings) -> "Session":
@@ -189,7 +189,7 @@ class Session:
     def _status_extra(self) -> dict:
         corruption, adapter = self.chain.corruption, self.adapter
         return {
-            "input_noise": self.chain.noisy.std,
+            "input_noise": self.chain.noisy.input_noise,
             "corruption": corruption.label if corruption.matrix is not None else None,
             "flow_adapter": adapter.label if adapter.matrix is not None else None,
         }
@@ -199,23 +199,25 @@ class Session:
         m, f = self.chain.corruption.matrix, self.adapter.matrix
         return {
             "corruption_matrix": None if m is None else m.tolist(),
-            "flow_adapter_matrix": None if f is None else f.tolist(),
+            "reversal_adapter_matrix": None if f is None else f.tolist(),
         }
 
     # ------------------------------------------------------------ mode
 
-    def set_mode(self, mode: str, tau: int | None = None, n_reverse_steps: int | None = None) -> None:
+    def set_mode(
+        self, mode: str, n_guided_steps: int | None = None, n_reversal_steps: int | None = None
+    ) -> None:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
         total = self.policy.config.num_inference_steps
-        if tau is not None:
-            if not isinstance(tau, int) or not 0 <= tau <= total:
-                raise ValueError(f"tau must be an integer in [0, {total}] (denoising steps)")
-            self.tau = tau
-        if n_reverse_steps is not None:
-            if not isinstance(n_reverse_steps, int) or not 1 <= n_reverse_steps <= total:
-                raise ValueError(f"n_reverse_steps must be an integer in [1, {total}]")
-            self.n_reverse_steps = n_reverse_steps
+        if n_guided_steps is not None:
+            if not isinstance(n_guided_steps, int) or not 0 <= n_guided_steps <= total:
+                raise ValueError(f"n_guided_steps must be an integer in [0, {total}] (denoising steps)")
+            self.n_guided_steps = n_guided_steps
+        if n_reversal_steps is not None:
+            if not isinstance(n_reversal_steps, int) or not 1 <= n_reversal_steps <= total:
+                raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
+            self.n_reversal_steps = n_reversal_steps
         self.mode = mode
         if mode != "policy":
             self.chain.attach_spacemouse()
@@ -223,9 +225,9 @@ class Session:
     def mode_label(self) -> str:
         """Short label for the terminal and the live view."""
         if self.mode == "shared_flow_control":
-            return f"{self.mode} tau={self.tau}"
-        if self.mode == "shared_reverse_flow_steering":
-            return f"{self.mode} n={self.n_reverse_steps or self.policy.config.num_inference_steps}"
+            return f"{self.mode} n_guided_steps={self.n_guided_steps}"
+        if self.mode == "shared_flow_reversal_steering":
+            return f"{self.mode} n={self.n_reversal_steps or self.policy.config.num_inference_steps}"
         return self.mode
 
     def announce_mode(self) -> str:
@@ -244,20 +246,20 @@ class Session:
             lines.append("Shared override: pi0.5 drives, your x/y/z replaces its translation.")
         elif self.mode == "shared_flow_control":
             lines.append(
-                f"Shared flow control: your x/y/z steers the first tau={self.tau} of "
+                f"Shared flow control: your x/y/z steers the first n_guided_steps={self.n_guided_steps} of "
                 f"{total} denoising steps (idle input = pure policy)."
             )
-        elif self.mode == "shared_reverse_flow_steering":
-            n = total if self.n_reverse_steps is None else self.n_reverse_steps
+        elif self.mode == "shared_flow_reversal_steering":
+            n = total if self.n_reversal_steps is None else self.n_reversal_steps
             if n >= total:
                 lines.append(
-                    "Shared reverse flow steering: your x/y/z defines a reference chunk that is "
+                    "Shared flow reversal steering: your x/y/z defines a reference chunk that is "
                     f"inverted through the flow ({total} reverse steps) to its noise; pi0.5 then "
                     "denoises from that noise (idle input = pure policy)."
                 )
             else:
                 lines.append(
-                    "Shared reverse flow steering: your x/y/z defines a reference chunk that is "
+                    "Shared flow reversal steering: your x/y/z defines a reference chunk that is "
                     f"inverted {n} of {total} steps (partway to noise, t={n / total:.1f}); pi0.5 then "
                     f"denoises from there in {total - n} steps (idle input = pure policy)."
                 )
@@ -266,7 +268,7 @@ class Session:
         return "\n".join(lines)
 
     def _rollout_kwargs(self) -> dict:
-        reader = self.chain.reader
+        source = self.chain.source
         if self.mode == "teleop":
             return {
                 "policy": self._zero_policy,
@@ -274,7 +276,7 @@ class Session:
                 "env_postprocessor": _identity,
                 "preprocessor": _identity,
                 "postprocessor": _identity,
-                "action_hook": _teleop_hook(reader, paste_gripper=True),
+                "action_hook": _teleop_hook(source, paste_gripper=True),
                 "max_steps": TELEOP_MAX_STEPS,
             }
         kwargs = {
@@ -287,30 +289,32 @@ class Session:
             "max_steps": None,
         }
         if self.mode == "shared_override":
-            kwargs["action_hook"] = _teleop_hook(reader, paste_gripper=False)
+            kwargs["action_hook"] = _teleop_hook(source, paste_gripper=False)
         elif self.mode == "shared_flow_control":
             if self._flow_policy is None:
-                self._flow_policy = FlowControlPolicy(self.policy, reader, self.tau, self.postprocessor)
-            self._flow_policy.tau = self.tau
-            kwargs["policy"] = self._flow_policy
-        elif self.mode == "shared_reverse_flow_steering":
-            if self._frs_policy is None:
-                self._frs_policy = ReverseFlowSteeringPolicy(
-                    self.policy, reader, self.postprocessor, adapter=self.adapter
+                self._flow_policy = FlowControlPolicy(
+                    self.policy, source, self.n_guided_steps, self.postprocessor
                 )
-            self._frs_policy.n_reverse_steps = self.n_reverse_steps
+            self._flow_policy.n_guided_steps = self.n_guided_steps
+            kwargs["policy"] = self._flow_policy
+        elif self.mode == "shared_flow_reversal_steering":
+            if self._frs_policy is None:
+                self._frs_policy = FlowReversalSteeringPolicy(
+                    self.policy, source, self.postprocessor, adapter=self.adapter
+                )
+            self._frs_policy.n_reversal_steps = self.n_reversal_steps
             kwargs["policy"] = self._frs_policy
         return kwargs
 
     def metrics(self) -> dict:
         """Steering statistics of the last rollout in the current mode."""
         if self.mode == "shared_flow_control" and self._flow_policy is not None:
-            return {"guided_denoising_steps": int(self._flow_policy.hook_calls)}
-        if self.mode == "shared_reverse_flow_steering" and self._frs_policy is not None:
+            return {"guided_steps": int(self._flow_policy.guided_steps)}
+        if self.mode == "shared_flow_reversal_steering" and self._frs_policy is not None:
             errors = self._frs_policy.reconstruction_errors
             total = self.policy.config.num_inference_steps
             return {
-                "n_reverse_steps": self._frs_policy.n_reverse_steps or total,
+                "n_reversal_steps": self._frs_policy.n_reversal_steps or total,
                 "steered_chunks": int(self._frs_policy.steered_chunks),
                 "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
             }
@@ -319,11 +323,11 @@ class Session:
     def stats_line(self) -> str:
         metrics = self.metrics()
         if self.mode == "shared_flow_control" and metrics:
-            return f"flow guidance applied on {metrics['guided_denoising_steps']} denoising steps"
-        if self.mode == "shared_reverse_flow_steering" and metrics:
+            return f"flow guidance applied on {metrics['guided_steps']} denoising steps"
+        if self.mode == "shared_flow_reversal_steering" and metrics:
             error = metrics["reconstruction_error_mean"]
             detail = f" (mean |executed - reference| translation: {error:.2f} std)" if error else ""
-            return f"reverse flow steering applied on {metrics['steered_chunks']} chunks{detail}"
+            return f"flow reversal steering applied on {metrics['steered_chunks']} chunks{detail}"
         return ""
 
     # ------------------------------------------------------------ rollout

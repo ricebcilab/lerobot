@@ -186,8 +186,8 @@ def _provenance(settings: ExperimentSettings, schedule: list[int], session: Sess
         "n_action_steps": settings.session.n_action_steps,
         "compile": settings.session.compile,
         "mode": control.mode,
-        "tau": control.tau,
-        "n_reverse_steps": control.n_reverse_steps,
+        "n_guided_steps": control.n_guided_steps,
+        "n_reversal_steps": control.n_reversal_steps,
         "input_noise": control.input_noise,
         "max_steps": control.max_steps,
         "corruption": control.corruption,
@@ -301,10 +301,10 @@ def main():
                 "task_description": task_description,
                 "vla_prompt": vla_prompt,
                 "mode": mode,
-                "tau": session.tau if mode == "shared_flow_control" else None,
+                "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
                 "input_noise": control.input_noise,
-                "deterministic_corruption": session.chain.corruption.label,
-                "flow_reversal_adapter": session.adapter.label,
+                "corruption": session.chain.corruption.label,
+                "reversal_adapter": session.adapter.label,
                 "success": bool(result.success),
                 "steps": int(result.steps),
                 "duration_s": round(duration, 2),
@@ -313,8 +313,10 @@ def main():
                 "steps_file": steps_name,
                 "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
                 **result.metrics,
-                "n_reverse_steps": (
-                    result.metrics.get("n_reverse_steps") if mode == "shared_reverse_flow_steering" else None
+                "n_reversal_steps": (
+                    result.metrics.get("n_reversal_steps")
+                    if mode == "shared_flow_reversal_steering"
+                    else None
                 ),
             }
             results.append(record)

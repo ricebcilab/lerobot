@@ -1,0 +1,8 @@
+# Flow reversal steering stopped after 5 of 10 steps (t = 0.5), command rotated
+# 20 degrees about z, same adapter as flow_reversal_full_rotz20.
+extends: base.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: 5
+  corruption: {rotation_z_deg: 20}
+  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}

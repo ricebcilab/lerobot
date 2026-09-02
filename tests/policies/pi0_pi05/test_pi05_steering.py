@@ -11,8 +11,8 @@ from lerobot.policies.pi05.steering import (
     GRIPPER_DIM,
     N_ACTION_DIMS,
     FlowControlPolicy,
+    FlowReversalSteeringPolicy,
     ReversalAdapter,
-    ReverseFlowSteeringPolicy,
     build_reversal_adapter,
     get_action_mean_std,
     reverse_flow,
@@ -136,7 +136,7 @@ def test_reverse_flow_constant_field_closed_form():
     x = torch.zeros(1, CHUNK, MAX_DIM)
     out = reverse_flow(x, lambda x_t, t: torch.ones_like(x_t), NUM_STEPS)
     torch.testing.assert_close(out, torch.ones_like(x))  # 10 steps of h=0.1, v=1
-    out = reverse_flow(x, lambda x_t, t: torch.ones_like(x_t), NUM_STEPS, n_reverse_steps=3)
+    out = reverse_flow(x, lambda x_t, t: torch.ones_like(x_t), NUM_STEPS, n_reversal_steps=3)
     torch.testing.assert_close(out, torch.full_like(x, 0.3))
 
 
@@ -181,7 +181,7 @@ def test_flow_control_writes_normalized_translation_for_tau_steps():
     wrapper.reset()
     action = wrapper.select_action({})
     assert action.shape == (1, MAX_DIM)
-    assert wrapper.hook_calls == 3
+    assert wrapper.guided_steps == 3
     expected = (np.array([0.5, 0.0, -0.5]) - 0.1) / 0.5
     np.testing.assert_allclose(action[0, :3].numpy(), expected, atol=1e-6)
     assert policy.resets == 1
@@ -192,19 +192,19 @@ def test_flow_control_skips_idle_input_and_queues_actions():
     wrapper = FlowControlPolicy(policy, Source(translation=(DEADBAND / 2, 0, 0)), 5, postprocessor())
     first = wrapper.select_action({})
     second = wrapper.select_action({})
-    assert wrapper.hook_calls == 0
+    assert wrapper.guided_steps == 0
     torch.testing.assert_close(first, torch.zeros(1, MAX_DIM))
     torch.testing.assert_close(second, torch.zeros(1, MAX_DIM))
     assert len(policy.calls) == 1  # n_action_steps=2 actions per chunk
 
 
-# ---------------------------------------------------------------- ReverseFlowSteeringPolicy
+# ---------------------------------------------------------------- FlowReversalSteeringPolicy
 
 
 def test_reverse_flow_steering_passes_schedule_only_while_steering():
     policy = FakePolicy()
     source = Source(translation=(0.0, 0.0, 0.0))
-    wrapper = ReverseFlowSteeringPolicy(policy, source, postprocessor(), n_reverse_steps=4)
+    wrapper = FlowReversalSteeringPolicy(policy, source, postprocessor(), n_reversal_steps=4)
     wrapper.select_action({})
     assert "flow_start_time" not in policy.calls[-1]
     assert wrapper.steered_chunks == 0
@@ -221,25 +221,25 @@ def test_reverse_flow_steering_passes_schedule_only_while_steering():
 
 def test_reverse_flow_steering_full_reversal_has_no_schedule_kwargs():
     policy = FakePolicy()
-    wrapper = ReverseFlowSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), postprocessor())
+    wrapper = FlowReversalSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), postprocessor())
     wrapper.select_action({})
     assert "flow_start_time" not in policy.calls[-1]
-    assert wrapper.n_reverse_steps is None
+    assert wrapper.n_reversal_steps is None
 
 
-def test_reverse_flow_steering_validates_n_reverse_steps():
-    wrapper = ReverseFlowSteeringPolicy(FakePolicy(), Source(), postprocessor())
+def test_reverse_flow_steering_validates_n_reversal_steps():
+    wrapper = FlowReversalSteeringPolicy(FakePolicy(), Source(), postprocessor())
     for bad in (0, 11, 2.5, "3"):
         with pytest.raises(ValueError):
-            wrapper.n_reverse_steps = bad
-    wrapper.n_reverse_steps = NUM_STEPS
-    assert wrapper.n_reverse_steps is None  # N means full reversal
+            wrapper.n_reversal_steps = bad
+    wrapper.n_reversal_steps = NUM_STEPS
+    assert wrapper.n_reversal_steps is None  # N means full reversal
 
 
 def test_reference_chunk_uses_last_gripper_and_normalization():
     policy = FakePolicy()
     post = postprocessor(mean=[0.0] * 6 + [0.5], std=[2.0] * 7)
-    wrapper = ReverseFlowSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), post)
+    wrapper = FlowReversalSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), post)
     ref = wrapper.reference_chunk(np.array([1.0, 0.0, 0.0]))
     assert ref.shape == (1, CHUNK, MAX_DIM)
     assert ref[0, 0, 0].item() == pytest.approx(0.5)  # (1 - 0) / 2

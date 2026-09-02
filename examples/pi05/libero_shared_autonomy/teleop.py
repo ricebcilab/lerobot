@@ -17,7 +17,7 @@ the policy:
         -> CommandCorruption (M @ x) -> NoisyReader (+ noise)
         -> RecordingReader (served)
 
-`TeleopChain` builds that pipeline; the modes consume `chain.reader`. Every
+`TeleopChain` builds that pipeline; the modes consume `chain.source`. Every
 reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
 (-1 open, +1 close), the `TeleopSource` protocol from
 `lerobot.policies.pi05.steering`.
@@ -319,32 +319,32 @@ class NoisyReader:
     noise — and clips the result to the env's [-1, 1] action range. Noise is
     only added while the source is actually commanding (deflected beyond
     DEADBAND): an idle source stays exactly idle, so the shared modes still
-    hand control back to the policy when you let go. `std` can be changed at
-    any time; 0 disables the noise. The gripper is passed through unchanged.
+    hand control back to the policy when you let go. `input_noise` can be changed
+    at any time; 0 disables the noise. The gripper is passed through unchanged.
     """
 
-    def __init__(self, source, std: float = 0.0, rng: np.random.Generator | None = None):
+    def __init__(self, source, input_noise: float = 0.0, rng: np.random.Generator | None = None):
         self.source = source
-        self.std = std
+        self.input_noise = input_noise
         self._rng = rng if rng is not None else np.random.default_rng()
 
     @property
-    def std(self) -> float:
-        return self._std
+    def input_noise(self) -> float:
+        return self._input_noise
 
-    @std.setter
-    def std(self, value: float) -> None:
+    @input_noise.setter
+    def input_noise(self, value: float) -> None:
         value = float(value)
         if not value >= 0.0:  # also rejects NaN
-            raise ValueError(f"noise std must be >= 0, got {value}")
-        self._std = value
+            raise ValueError(f"input_noise must be >= 0, got {value}")
+        self._input_noise = value
 
     @property
     def translation(self) -> np.ndarray:
         clean = np.asarray(self.source.translation, dtype=np.float64)
-        if self._std == 0.0 or np.max(np.abs(clean)) < DEADBAND:
+        if self._input_noise == 0.0 or np.max(np.abs(clean)) < DEADBAND:
             return clean
-        return np.clip(clean + self._rng.normal(0.0, self._std, size=3), -1.0, 1.0)
+        return np.clip(clean + self._rng.normal(0.0, self._input_noise, size=3), -1.0, 1.0)
 
     @property
     def gripper(self) -> float:
@@ -392,7 +392,7 @@ class TeleopChain:
 
         SpaceMouse + keyboard -> raw -> M @ x -> + noise -> served
 
-    `reader` is what the modes consume; `raw` and `served` are the recorders an
+    `source` is what the modes consume; `raw` and `served` are the recorders an
     experiment logs (`raw.last_translation` is the operator's true intent,
     `served.last_translation` what the policy actually got).
     """
@@ -403,11 +403,11 @@ class TeleopChain:
         self.combined = CombinedReader([keyboard])
         self.raw = RecordingReader(self.combined)
         self.corruption = CommandCorruption(self.raw)
-        self.noisy = NoisyReader(self.corruption, std=input_noise)
+        self.noisy = NoisyReader(self.corruption, input_noise=input_noise)
         self.served = RecordingReader(self.noisy)
 
     @property
-    def reader(self) -> RecordingReader:
+    def source(self) -> RecordingReader:
         return self.served
 
     def attach_spacemouse(self) -> None:

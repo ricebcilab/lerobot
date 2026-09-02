@@ -22,10 +22,10 @@ def test_trial_recorder_rows_and_per_trial_reads(tmp_path):
     kb = KeyboardReader(clock=lambda: 0.0)
     kb.update({"ArrowUp"}, toggles=0)
     chain = TeleopChain(kb)
-    chain.reader.translation  # noqa: B018 -- a read before the trial must not count
+    chain.source.translation  # noqa: B018 -- a read before the trial must not count
     recorder = TrialRecorder(chain)
     obs = {"robot_state": {"eef": {"pos": np.zeros((1, 3)), "quat": np.zeros((1, 4))}}}
-    chain.reader.translation  # noqa: B018
+    chain.source.translation  # noqa: B018
     recorder(
         step=1,
         observation=obs,

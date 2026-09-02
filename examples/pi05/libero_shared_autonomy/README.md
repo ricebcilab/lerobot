@@ -104,13 +104,13 @@ keyboard:
   not involved.
 - `mode shared_override` — pi0.5 drives, but your x/y/z replaces the
   model's translation in the executed action.
-- `mode shared_flow_control [tau]` — pi0.5 drives; while you are pushing, your
+- `mode shared_flow_control [n_guided_steps]` — pi0.5 drives; while you are pushing, your
   translation (normalized to the model's action space) is written into dims
-  0-2 of `x_t` for the first `tau` of the 10 flow-matching denoising steps of
+  0-2 of `x_t` for the first `n_guided_steps` of the 10 flow-matching denoising steps of
   each action chunk, and the remaining steps denoise freely. The executed
   action is entirely the model's output, steered through the early flow. Idle
   input = pure policy.
-- `mode shared_reverse_flow_steering [n]` — Flow Reversal Steering
+- `mode shared_flow_reversal_steering [n]` — Flow Reversal Steering
   ([Tang et al. 2026](https://arxiv.org/abs/2606.13675)): while you are
   pushing, a reference chunk that servos in your direction at uniform velocity
   (rotation zero, gripper held at the model's last command) is integrated
@@ -123,7 +123,7 @@ keyboard:
   prints how many chunks were steered and how far the executed translation
   landed from the reference (in action-std units). By default the reference is
   reversed through all 10 denoising steps, i.e. all the way to noise;
-  `--n-reverse-steps n` (or `mode shared_reverse_flow_steering n`) stops the
+  `--n-reversal-steps n` (or `mode shared_flow_reversal_steering n`) stops the
   reversal after `n` of them instead, so the chunk still carries part of your
   reference and the forward flow finishes it off — smaller `n` keeps more of
   your intent, larger `n` gives the policy more freedom (up to `n = 10`, the
@@ -168,7 +168,7 @@ studying how much steering the policy tolerates:
   ```
 
 - **Reversal adapter** — `control.reversal_adapter` (or `--reversal-adapter FILE`
-  / `adapter FILE` in the REPL) only affects `shared_reverse_flow_steering`: it
+  / `adapter FILE` in the REPL) only affects `shared_flow_reversal_steering`: it
   left-multiplies the velocity field used by the reverse integration with a
   fixed 7×7 matrix `F`, so only the noise that the forward flow starts from
   changes — the executed action still comes from the policy's own field:
@@ -197,8 +197,8 @@ To run scripted, recorded trials from a YAML config instead of the REPL
 shipped conditions (a bare file name is looked up under `configs/experiment/`):
 
 ```bash
-./examples/pi05/libero_shared_autonomy/run.sh experiment --config reverse_flow_full.yaml
-./examples/pi05/libero_shared_autonomy/run.sh experiment --config reverse_flow_full.yaml --dry-run   # validate + print the schedule, run nothing
+./examples/pi05/libero_shared_autonomy/run.sh experiment --config flow_reversal_full.yaml
+./examples/pi05/libero_shared_autonomy/run.sh experiment --config flow_reversal_full.yaml --dry-run   # validate + print the schedule, run nothing
 ```
 
 `experiment.py` runs a scripted sequence of trials with the same policy, live
@@ -221,17 +221,17 @@ instead, i.e. to run the conventional setup where both know the goal.
 Five condition files ship in `configs/experiment/`; each has `extends: base.yaml`
 and overrides only what it changes:
 
-- `flow_control_tau8.yaml` — shared flow control, `tau = 8`, clean operator command.
-- `flow_control_tau8_rotz20.yaml` — shared flow control, `tau = 8`, operator
+- `flow_control_8steps.yaml` — shared flow control, `n_guided_steps = 8`, clean operator command.
+- `flow_control_8steps_rotz20.yaml` — shared flow control, `n_guided_steps = 8`, operator
   command rotated 20° about z.
-- `reverse_flow_full.yaml` — reverse flow steering, full reversal to noise,
+- `flow_reversal_full.yaml` — flow reversal steering, full reversal to noise,
   clean operator command.
-- `reverse_flow_full_rotz20.yaml` — reverse flow steering, full reversal,
+- `flow_reversal_full_rotz20.yaml` — flow reversal steering, full reversal,
   command rotated 20° about z; the reversal adapter applies the same rotation
   to the velocity's translation block and freezes orientation and gripper
   during the reversal.
-- `reverse_flow_5steps_rotz20.yaml` — reverse flow steering stopped after 5 of
-  10 steps (t = 0.5), same rotation and adapter as `reverse_flow_full_rotz20`.
+- `flow_reversal_5steps_rotz20.yaml` — flow reversal steering stopped after 5 of
+  10 steps (t = 0.5), same rotation and adapter as `flow_reversal_full_rotz20`.
 
 ### Configuration
 
@@ -241,26 +241,26 @@ immediately instead of silently doing nothing. Only the keys you want to
 change need to be present; the run's name is the config file's stem (no
 `experiment.name` key).
 
-| Key                        | Default                           | Meaning                                                                                                                                                                |
-| -------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `experiment.n_trials`      | `10`                              | Number of trials                                                                                                                                                       |
-| `experiment.seed`          | `0`                               | Seeds the task schedule — same seed, same tasks                                                                                                                        |
-| `experiment.task_order`    | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                            |
-| `experiment.output_dir`    | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                            |
-| `scene.suite`              | `libero_goal`                     | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                |
-| `scene.task_ids`           | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                                               |
-| `prompt`                   | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                     |
-| `policy.path`              | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                                                   |
-| `policy.n_action_steps`    | `10`                              | Actions executed per predicted chunk                                                                                                                                   |
-| `policy.compile`           | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                             |
-| `control.mode`             | `shared_reverse_flow_steering`    | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_reverse_flow_steering` — see the mode list under [Interactive prompting](#interactive-prompting) |
-| `control.tau`              | `5`                               | `shared_flow_control` only                                                                                                                                             |
-| `control.n_reverse_steps`  | `null`                            | `shared_reverse_flow_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                  |
-| `control.input_noise`      | `0.0`                             | Std of the Gaussian noise added to your x/y/z command                                                                                                                  |
-| `control.max_steps`        | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                |
-| `control.corruption`       | `null`                            | Matrix spec applied to the operator's command — see [Perturbing the operator](#perturbing-the-operator); off unless set                                                |
-| `control.reversal_adapter` | `null`                            | Adapter spec for `shared_reverse_flow_steering`'s reverse integration — see [Perturbing the operator](#perturbing-the-operator); off unless set                        |
-| `server.port`              | `8765`                            | Live view port                                                                                                                                                         |
+| Key                        | Default                           | Meaning                                                                                                                                                                 |
+| -------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `experiment.n_trials`      | `10`                              | Number of trials                                                                                                                                                        |
+| `experiment.seed`          | `0`                               | Seeds the task schedule — same seed, same tasks                                                                                                                         |
+| `experiment.task_order`    | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                             |
+| `experiment.output_dir`    | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                             |
+| `scene.suite`              | `libero_goal`                     | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                 |
+| `scene.task_ids`           | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                                                |
+| `prompt`                   | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                      |
+| `policy.path`              | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                                                    |
+| `policy.n_action_steps`    | `10`                              | Actions executed per predicted chunk                                                                                                                                    |
+| `policy.compile`           | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                              |
+| `control.mode`             | `shared_flow_reversal_steering`   | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see the mode list under [Interactive prompting](#interactive-prompting) |
+| `control.n_guided_steps`   | `8` in `base.yaml` (built-in `5`) | `shared_flow_control` only                                                                                                                                              |
+| `control.n_reversal_steps` | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                  |
+| `control.input_noise`      | `0.0`                             | Std of the Gaussian noise added to your x/y/z command                                                                                                                   |
+| `control.max_steps`        | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                 |
+| `control.corruption`       | `null`                            | Matrix spec applied to the operator's command — see [Perturbing the operator](#perturbing-the-operator); off unless set                                                 |
+| `control.reversal_adapter` | `null`                            | Adapter spec for `shared_flow_reversal_steering`'s reverse integration — see [Perturbing the operator](#perturbing-the-operator); off unless set                        |
+| `server.port`              | `8765`                            | Live view port                                                                                                                                                          |
 
 A few keys can be overridden per run without editing the file:
 `--n-trials`, `--seed`, `--mode`, `--output-dir`, `--port`.
@@ -294,13 +294,13 @@ Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<config stem>/` containing:
 | `trial_XXX.mp4` | The rollout video (30 fps)                                                                                                                                                |
 
 `trials.jsonl` fields: `trial`, `suite`, `task_id`, `task_description`,
-`vla_prompt`, `mode`, `tau`, `n_reverse_steps`, `input_noise`, `deterministic_corruption`,
-`flow_reversal_adapter`, `success`, `steps`, `duration_s`, `user_reads`
+`vla_prompt`, `mode`, `n_guided_steps`, `n_reversal_steps`, `input_noise`, `corruption`,
+`reversal_adapter`, `success`, `steps`, `duration_s`, `user_reads`
 (how many times the teleop input was sampled during that trial),
 `video`, `steps_file`, `finished_at`, plus the mode's steering statistics
-(`guided_denoising_steps`, or `steered_chunks` and
-`reconstruction_error_mean`). `deterministic_corruption` and
-`flow_reversal_adapter` hold a short label of the configured spec (e.g.
+(`guided_steps`, or `steered_chunks` and
+`reconstruction_error_mean`). `corruption` and
+`reversal_adapter` hold a short label of the configured spec (e.g.
 `rotation_z_deg=20`) or the loaded file's name, and `null` when off.
 
 `trial_XXX.npz` arrays, one row per control step:
@@ -394,7 +394,7 @@ size of 1.
 - **The arm wanders or goes the wrong way while I hold a direction** — check
   `noise` and `corruption` in the REPL (both are shown in the live view when
   active); `noise 0` and `corruption off` disable them.
-- **`shared_reverse_flow_steering` behaves oddly** — check `adapter`; a
+- **`shared_flow_reversal_steering` behaves oddly** — check `adapter`; a
   non-identity `F` changes the reversal. `adapter off` restores the plain
   method.
 - **Port already in use** — pass `--port`.

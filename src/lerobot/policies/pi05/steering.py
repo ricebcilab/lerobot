@@ -20,8 +20,8 @@ Two ways for an operator's translation command to steer the policy without
 touching the executed action, which is always the model's own output:
 
 - ``FlowControlPolicy``: the command is written into dims 0-2 of ``x_t`` for the
-  first ``tau`` denoising steps of each chunk (the rest denoise freely).
-- ``ReverseFlowSteeringPolicy``: a uniform-velocity reference chunk built from
+  first ``n_guided_steps`` denoising steps of each chunk (the rest denoise freely).
+- ``FlowReversalSteeringPolicy``: a uniform-velocity reference chunk built from
   the command is integrated *backward* through the policy's velocity field to
   the latent noise that maps to it (Flow Reversal Steering, Tang et al. 2026,
   arXiv:2606.13675); the forward flow then starts from that noise.
@@ -150,7 +150,7 @@ def build_reversal_adapter(
 class ReversalAdapter:
     """Mutable holder for the reversal adapter F (None = off).
 
-    ``ReverseFlowSteeringPolicy`` reads the holder on every chunk, so replacing
+    ``FlowReversalSteeringPolicy`` reads the holder on every chunk, so replacing
     ``matrix`` takes effect immediately. ``label`` is display-only.
     """
 
@@ -191,7 +191,7 @@ def get_action_mean_std(postprocessor) -> tuple[np.ndarray, np.ndarray]:
 class FlowControlPolicy:
     """pi0.5 wrapper implementing shared_flow_control.
 
-    For the first `tau` of the chunk's denoising steps, the teleop
+    For the first `n_guided_steps` of the chunk's denoising steps, the teleop
     translation (SpaceMouse or keyboard, normalized into the model's action
     space) is written into dims 0-2 of x_t across the whole chunk; the
     remaining steps denoise freely. The executed action is entirely the
@@ -200,32 +200,32 @@ class FlowControlPolicy:
     policy.
     """
 
-    def __init__(self, policy, source: TeleopSource, tau: int, postprocessor):
+    def __init__(self, policy, source: TeleopSource, n_guided_steps: int, postprocessor):
         self._policy = policy
         self._source = source
-        self.tau = tau
+        self.n_guided_steps = n_guided_steps
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:3], std[:3]
         self._queue: deque = deque()
-        self.hook_calls = 0  # per-rollout count of guided denoising steps
+        self.guided_steps = 0  # per-rollout count of guided denoising steps
 
     def reset(self) -> None:
         self._policy.reset()
         self._queue.clear()
-        self.hook_calls = 0
+        self.guided_steps = 0
 
     @torch.compiler.disable
     def _x_t_hook(self, step: int, time_: float, x_t: torch.Tensor) -> torch.Tensor:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
         # the hook reads live teleop input and must stay eager.
-        if step >= self.tau:
+        if step >= self.n_guided_steps:
             return x_t
-        cmd = self._source.translation
-        if np.max(np.abs(cmd)) < DEADBAND:
+        command = self._source.translation
+        if np.max(np.abs(command)) < DEADBAND:
             return x_t
-        target = (cmd - self._mean) / self._std
+        target = (command - self._mean) / self._std
         x_t[..., :3] = torch.as_tensor(target, dtype=x_t.dtype, device=x_t.device)
-        self.hook_calls += 1
+        self.guided_steps += 1
         return x_t
 
     def select_action(self, batch) -> torch.Tensor:
@@ -242,7 +242,7 @@ def reverse_flow(
     velocity,
     num_steps: int,
     adapter: torch.Tensor | None = None,
-    n_reverse_steps: int | None = None,
+    n_reversal_steps: int | None = None,
 ) -> torch.Tensor:
     """Integrate the flow backward (Euler, t: 0 -> 1) from a clean chunk toward its latent noise.
 
@@ -252,9 +252,9 @@ def reverse_flow(
     Reversal Steering (Tang et al. 2026, arXiv:2606.13675).
 
     The step size is always 1/`num_steps`, i.e. the policy's own schedule.
-    `n_reverse_steps` is how many of those steps to take: the default (None) runs
+    `n_reversal_steps` is how many of those steps to take: the default (None) runs
     the whole way to t=1, pure noise, while a smaller count stops early and
-    returns a chunk at t = n_reverse_steps / num_steps, still carrying some of
+    returns a chunk at t = n_reversal_steps / num_steps, still carrying some of
     the reference. The caller must then start the forward flow at that time.
 
     `adapter` is an optional (n, n) matrix F that adapts the velocity field of the
@@ -264,7 +264,7 @@ def reverse_flow(
     that produces the executed action still uses the policy's own field.
     """
     h = 1.0 / num_steps
-    steps = num_steps if n_reverse_steps is None else n_reverse_steps
+    steps = num_steps if n_reversal_steps is None else n_reversal_steps
     x_t = x
     for step in range(steps):
         v = velocity(x_t, step * h)
@@ -275,8 +275,8 @@ def reverse_flow(
     return x_t
 
 
-class ReverseFlowSteeringPolicy:
-    """pi0.5 wrapper implementing shared_reverse_flow_steering (Flow Reversal Steering).
+class FlowReversalSteeringPolicy:
+    """pi0.5 wrapper implementing shared_flow_reversal_steering (Flow Reversal Steering).
 
     While the teleop input is deflected, a reference chunk that servos in the
     commanded direction at uniform velocity (rotation zero, gripper held at the
@@ -291,7 +291,7 @@ class ReverseFlowSteeringPolicy:
     An optional `ReversalAdapter` holding a 7x7 matrix F adapts the velocity field
     of the reversal only (x_t += h * F @ v); see `reverse_flow`.
 
-    `n_reverse_steps` stops the reversal early instead of going all the way to
+    `n_reversal_steps` stops the reversal early instead of going all the way to
     noise: with n of the policy's N = num_inference_steps steps the reference is
     only partially destroyed, landing at t = n/N, and the forward flow then runs
     from there in N - n steps (so a steered chunk costs the same N velocity
@@ -306,13 +306,13 @@ class ReverseFlowSteeringPolicy:
         source: TeleopSource,
         postprocessor,
         adapter: ReversalAdapter | None = None,
-        n_reverse_steps: int | None = None,
+        n_reversal_steps: int | None = None,
     ):
         self._policy = policy
         self._source = source
         self._adapter = adapter
-        self.n_reverse_steps = n_reverse_steps  # validated by the setter below
-        self._pending_cmd: np.ndarray | None = None
+        self.n_reversal_steps = n_reversal_steps  # validated by the setter below
+        self._pending_command: np.ndarray | None = None
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
         self._queue: deque = deque()
@@ -322,24 +322,24 @@ class ReverseFlowSteeringPolicy:
         self.reconstruction_errors: list[float] = []  # per steered chunk, in std units
 
     @property
-    def n_reverse_steps(self) -> int | None:
-        return self._n_reverse_steps
+    def n_reversal_steps(self) -> int | None:
+        return self._n_reversal_steps
 
-    @n_reverse_steps.setter
-    def n_reverse_steps(self, value: int | None) -> None:
+    @n_reversal_steps.setter
+    def n_reversal_steps(self, value: int | None) -> None:
         total = self._policy.config.num_inference_steps
         if value is not None and not (isinstance(value, int) and 1 <= value <= total):
-            raise ValueError(f"n_reverse_steps must be an integer in [1, {total}], got {value!r}")
-        self._n_reverse_steps = None if value == total else value
+            raise ValueError(f"n_reversal_steps must be an integer in [1, {total}], got {value!r}")
+        self._n_reversal_steps = None if value == total else value
 
     def _flow_kwargs(self) -> dict:
         """Where the forward flow starts, once the reference has been reversed part-way."""
-        if self._n_reverse_steps is None:
+        if self._n_reversal_steps is None:
             return {}  # full reversal: the usual schedule from t=1 in N steps
         total = self._policy.config.num_inference_steps
         return {
-            "flow_start_time": self._n_reverse_steps / total,
-            "num_forward_steps": total - self._n_reverse_steps,
+            "flow_start_time": self._n_reversal_steps / total,
+            "num_forward_steps": total - self._n_reversal_steps,
         }
 
     def _normalize_gripper(self, gripper: float) -> float:
@@ -353,10 +353,10 @@ class ReverseFlowSteeringPolicy:
         self.steered_chunks = 0
         self.reconstruction_errors = []
 
-    def reference_chunk(self, cmd: np.ndarray) -> torch.Tensor:
-        """Uniform-velocity chunk for env-space translation `cmd`, in the model's normalized space."""
+    def reference_chunk(self, command: np.ndarray) -> torch.Tensor:
+        """Uniform-velocity chunk for env-space translation `command`, in the model's normalized space."""
         env_action = np.zeros(N_ACTION_DIMS)
-        env_action[:3] = cmd
+        env_action[:3] = command
         normalized = (env_action - self._mean) / self._std
         normalized[GRIPPER_DIM] = self._gripper_ref
         cfg = self._policy.config
@@ -369,12 +369,12 @@ class ReverseFlowSteeringPolicy:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
         # this builds the reference from live teleop input and must stay eager.
         # `select_action` has already sampled the input (once per chunk) and put
-        # it in _pending_cmd, so the forward schedule it chose matches this hook.
-        cmd = self._pending_cmd
-        if cmd is None:
+        # it in _pending_command, so the forward schedule it chose matches this hook.
+        command = self._pending_command
+        if command is None:
             self._last_reference = None
             return noise
-        reference = self.reference_chunk(cmd).to(device=noise.device, dtype=noise.dtype)
+        reference = self.reference_chunk(command).to(device=noise.device, dtype=noise.dtype)
         self._last_reference = reference
         self.steered_chunks += 1
         adapter_matrix = (
@@ -387,7 +387,7 @@ class ReverseFlowSteeringPolicy:
             velocity,
             self._policy.config.num_inference_steps,
             adapter=adapter_matrix,
-            n_reverse_steps=self._n_reverse_steps,
+            n_reversal_steps=self._n_reversal_steps,
         )
 
     def select_action(self, batch) -> torch.Tensor:
@@ -395,9 +395,9 @@ class ReverseFlowSteeringPolicy:
         if len(self._queue) == 0:
             # Sample the operator once per chunk: the forward schedule depends on
             # whether we are steering, so it cannot be decided inside the hook.
-            cmd = self._source.translation
-            steering = np.max(np.abs(cmd)) >= DEADBAND
-            self._pending_cmd = cmd if steering else None
+            command = self._source.translation
+            steering = np.max(np.abs(command)) >= DEADBAND
+            self._pending_command = command if steering else None
             flow_kwargs = self._flow_kwargs() if steering else {}
             chunk = self._policy.predict_action_chunk(batch, noise_fn=self._noise_fn, **flow_kwargs)
             actions = chunk[:, : self._policy.config.n_action_steps]

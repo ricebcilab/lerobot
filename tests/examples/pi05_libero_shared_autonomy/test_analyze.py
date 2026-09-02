@@ -29,9 +29,9 @@ def make_run(root: Path, name: str, mode: str, outcomes: list[bool], corruption=
     run.mkdir(parents=True)
     config = {
         "mode": mode,
-        "tau": 8,
+        "n_guided_steps": 8,
         "corruption_matrix": corruption,
-        "flow_adapter_matrix": None,
+        "reversal_adapter_matrix": None,
         "schedule": [0, 1, 0],
     }
     (run / "config.yaml").write_text(yaml.safe_dump(config))
@@ -67,14 +67,14 @@ def test_end_to_end_on_synthetic_runs(tmp_path):
     rot = [[0.94, -0.34, 0.0], [0.34, 0.94, 0.0], [0.0, 0.0, 1.0]]
     a = make_run(tmp_path, "20260101_000000_flow_control", "shared_flow_control", [True, False, True])
     b = make_run(
-        tmp_path, "20260101_000001_reverse_flow", "shared_reverse_flow_steering", [True, True, True], rot
+        tmp_path, "20260101_000001_reverse_flow", "shared_flow_reversal_steering", [True, True, True], rot
     )
     (tmp_path / "20260101_000002_aborted").mkdir()
     assert find_runs(tmp_path) == [a, b]
 
     trials, configs = load_runs([a, b])
     assert len(trials) == 6 and set(trials["run"]) == {a.name, b.name}
-    assert label_for(configs[a.name]) == "FC tau=8" and label_for(configs[b.name]) == "RFS+M"
+    assert label_for(configs[a.name]) == "FC n_guided_steps=8" and label_for(configs[b.name]) == "FRS+M"
 
     table = success_table(trials, configs)
     assert table.loc[a.name, "successes"] == 2 and table.loc[b.name, "success_rate"] == 1.0
@@ -96,13 +96,13 @@ def test_end_to_end_on_synthetic_runs(tmp_path):
 
 
 def test_differing_settings_compares_nested_specs_by_json_form():
-    # Same mode (and hence the "mode" row is expected to be dropped); tau differs so the
-    # two configs get distinct labels (label_for uses mode + tau for shared_flow_control).
+    # Same mode (and hence the "mode" row is expected to be dropped); n_guided_steps differs so the
+    # two configs get distinct labels (label_for uses mode + n_guided_steps for shared_flow_control).
     configs = {
-        "a": {"mode": "shared_flow_control", "tau": 8, "corruption": None, "schedule": [0, 1, 2]},
+        "a": {"mode": "shared_flow_control", "n_guided_steps": 8, "corruption": None, "schedule": [0, 1, 2]},
         "b": {
             "mode": "shared_flow_control",
-            "tau": 5,
+            "n_guided_steps": 5,
             "corruption": {"rotation_z_deg": 20},
             "schedule": [2, 1, 0],
         },
@@ -120,9 +120,9 @@ def test_success_table_handles_a_run_with_no_trials(tmp_path):
     empty.mkdir()
     config = {
         "mode": "shared_flow_control",
-        "tau": 8,
+        "n_guided_steps": 8,
         "corruption_matrix": rot,
-        "flow_adapter_matrix": None,
+        "reversal_adapter_matrix": None,
         "schedule": [0, 1, 0],
     }
     (empty / "config.yaml").write_text(yaml.safe_dump(config))

@@ -14,9 +14,9 @@ scene:
   task_id: 0
 
 control:
-  mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
-  tau: 5                      # shared_flow_control: leading denoising steps your input steers
-  n_reverse_steps: null       # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
+  mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_flow_reversal_steering
+  n_guided_steps: 5                      # shared_flow_control: leading denoising steps your input steers
+  n_reversal_steps: null       # shared_flow_reversal_steering: steps to reverse the reference (null = all the way to noise)
   input_noise: 0.0            # std of the Gaussian noise added to your x/y/z command (0 = off)
   corruption: null            # what the robot gets = M @ what you commanded, e.g. {rotation_z_deg: 20}
   reversal_adapter: null      # reverse integration follows F @ v, e.g. {translation: corruption, orientation: zero, gripper: zero}

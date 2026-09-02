@@ -24,9 +24,9 @@ open the printed URL. REPL commands:
     task <suite> <id>   switch scene (e.g. `task libero_spatial 3`)
     mode <name> [n]     policy: pi0.5 only
                         shared_override: your x/y/z replaces pi0.5's translation
-                        shared_flow_control [tau]: your x/y/z steers dims 0-2 of x_t
-                        for the first tau denoising steps (default 5)
-                        shared_reverse_flow_steering [n_reverse_steps]: your x/y/z
+                        shared_flow_control [n_guided_steps]: your x/y/z steers dims 0-2 of x_t
+                        for the first n_guided_steps denoising steps (default 5)
+                        shared_flow_reversal_steering [n_reversal_steps]: your x/y/z
                         defines a reference chunk that is integrated backward
                         through the flow to its latent noise; the forward flow
                         starts from there (Flow Reversal Steering, arXiv:2606.13675)
@@ -85,14 +85,20 @@ def parse_args():
     parser.add_argument("--n-action-steps", dest="n_action_steps", type=int, default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--mode", default=None, choices=MODES, help="control mode to start in")
-    parser.add_argument("--tau", type=int, default=None, help="shared_flow_control: steps your input steers")
     parser.add_argument(
-        "--n-reverse-steps",
-        dest="n_reverse_steps",
+        "--n-guided-steps",
+        dest="n_guided_steps",
+        type=int,
+        default=None,
+        help="shared_flow_control: steps your input steers",
+    )
+    parser.add_argument(
+        "--n-reversal-steps",
+        dest="n_reversal_steps",
         type=int,
         default=None,
         metavar="N",
-        help="shared_reverse_flow_steering: reverse N of the denoising steps (default: all)",
+        help="shared_flow_reversal_steering: reverse N of the denoising steps (default: all)",
     )
     parser.add_argument(
         "--corruption",
@@ -105,7 +111,7 @@ def parse_args():
         dest="reversal_adapter",
         default=None,
         metavar="FILE",
-        help="YAML adapter spec for shared_reverse_flow_steering's reverse integration (x_t += h * F @ v)",
+        help="YAML adapter spec for shared_flow_reversal_steering's reverse integration (x_t += h * F @ v)",
     )
     parser.add_argument(
         "--input-noise",
@@ -141,19 +147,17 @@ def parse_args():
 
 
 def cmd_mode(session: Session, tokens: list[str]) -> None:
-    usage = (
-        "usage: mode policy|shared_override|shared_flow_control [tau]|shared_reverse_flow_steering [n]|teleop"
-    )
+    usage = "usage: mode policy|shared_override|shared_flow_control [n_guided_steps]|shared_flow_reversal_steering [n]|teleop"
     if len(tokens) < 2 or tokens[1] not in MODES:
         print(usage)
         return
     mode, arg = tokens[1], (tokens[2] if len(tokens) > 2 else None)
     kwargs = {}
     if arg is not None:
-        if mode not in ("shared_flow_control", "shared_reverse_flow_steering") or not arg.isdigit():
+        if mode not in ("shared_flow_control", "shared_flow_reversal_steering") or not arg.isdigit():
             print(usage)
             return
-        kwargs["tau" if mode == "shared_flow_control" else "n_reverse_steps"] = int(arg)
+        kwargs["n_guided_steps" if mode == "shared_flow_control" else "n_reversal_steps"] = int(arg)
     try:
         session.set_mode(mode, **kwargs)
     except ValueError as e:
@@ -167,14 +171,14 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
 def cmd_noise(session: Session, tokens: list[str]) -> None:
     if len(tokens) == 2:
         try:
-            session.chain.noisy.std = float(tokens[1])
+            session.chain.noisy.input_noise = float(tokens[1])
         except ValueError:
             print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
             return
     elif len(tokens) > 2:
         print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
         return
-    std = session.chain.noisy.std
+    std = session.chain.noisy.input_noise
     print(f"Input noise: std {std:.3f} on x/y/z while you command." if std > 0 else "Input noise: off.")
 
 
@@ -276,8 +280,8 @@ def main():
         print(session.adapter.describe() + "\n")
     if session.mode != "policy":
         print(session.announce_mode() + "\n")
-    if session.chain.noisy.std > 0:
-        print(f"Input noise: std {session.chain.noisy.std:.3f} on x/y/z while you command.\n")
+    if session.chain.noisy.input_noise > 0:
+        print(f"Input noise: std {session.chain.noisy.input_noise:.3f} on x/y/z while you command.\n")
 
     try:
         while True:

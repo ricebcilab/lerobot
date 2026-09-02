@@ -23,10 +23,13 @@ CONDITIONS = sorted(p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") i
 
 
 def test_deep_merge_overlay_wins_and_null_resets():
-    base = {"control": {"mode": "policy", "tau": 5}, "prompt": "x"}
-    merged = deep_merge(base, {"control": {"tau": None, "n_reverse_steps": 3}})
-    assert merged == {"control": {"mode": "policy", "tau": None, "n_reverse_steps": 3}, "prompt": "x"}
-    assert base["control"]["tau"] == 5  # not mutated
+    base = {"control": {"mode": "policy", "n_guided_steps": 5}, "prompt": "x"}
+    merged = deep_merge(base, {"control": {"n_guided_steps": None, "n_reversal_steps": 3}})
+    assert merged == {
+        "control": {"mode": "policy", "n_guided_steps": None, "n_reversal_steps": 3},
+        "prompt": "x",
+    }
+    assert base["control"]["n_guided_steps"] == 5  # not mutated
 
 
 def test_flatten_rejects_unknown_keys_and_skips_null():
@@ -34,8 +37,8 @@ def test_flatten_rejects_unknown_keys_and_skips_null():
     assert flatten({"control": {"mode": "teleop"}, "prompt": None}, schema, "f") == {"mode": "teleop"}
     with pytest.raises(ValueError, match="unknown key 'controls'"):
         flatten({"controls": {}}, schema, "f")
-    with pytest.raises(ValueError, match="control.tau"):
-        flatten({"control": {"tau": 1}}, schema, "f")
+    with pytest.raises(ValueError, match="control.n_guided_steps"):
+        flatten({"control": {"n_guided_steps": 1}}, schema, "f")
     with pytest.raises(ValueError, match="must be a mapping"):
         flatten({"control": 3}, schema, "f")
 
@@ -82,15 +85,15 @@ def test_every_shipped_condition_loads(name):
 
 
 def test_condition_matrices_resolve():
-    s = load_experiment_settings(CONFIG_DIR / "experiment" / "reverse_flow_5steps_rotz20.yaml", {})
+    s = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_5steps_rotz20.yaml", {})
     c = s.session.control
-    assert c.n_reverse_steps == 5
+    assert c.n_reversal_steps == 5
     np.testing.assert_allclose(c.corruption_matrix, rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :], 0)
     assert spec_label(c.corruption) == "rotation_z_deg=20"
-    clean = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_tau8.yaml", {})
-    assert clean.session.control.tau == 8 and clean.session.control.corruption_matrix is None
+    clean = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_8steps.yaml", {})
+    assert clean.session.control.n_guided_steps == 8 and clean.session.control.corruption_matrix is None
 
 
 def test_experiment_validation_errors(tmp_path):
@@ -109,8 +112,8 @@ def test_experiment_validation_errors(tmp_path):
         load_experiment_settings(write("prompt: ''"), {})
     with pytest.raises(ValueError, match="corruption"):
         load_experiment_settings(write("control: {reversal_adapter: {translation: corruption}}"), {})
-    with pytest.raises(ValueError, match="n_reverse_steps"):
-        load_experiment_settings(write("control: {n_reverse_steps: 0}"), {})
+    with pytest.raises(ValueError, match="n_reversal_steps"):
+        load_experiment_settings(write("control: {n_reversal_steps: 0}"), {})
 
 
 def test_experiment_cli_overrides(tmp_path):

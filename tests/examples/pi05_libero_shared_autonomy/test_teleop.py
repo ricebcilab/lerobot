@@ -103,14 +103,14 @@ def test_build_corruption_and_read_matrix_spec(tmp_path):
 
 def test_noisy_reader_is_seeded_and_idle_stays_idle():
     source = Source((0.5, 0.5, 0.5))
-    a = NoisyReader(source, std=0.1, rng=np.random.default_rng(1)).translation
-    b = NoisyReader(source, std=0.1, rng=np.random.default_rng(1)).translation
+    a = NoisyReader(source, input_noise=0.1, rng=np.random.default_rng(1)).translation
+    b = NoisyReader(source, input_noise=0.1, rng=np.random.default_rng(1)).translation
     np.testing.assert_array_equal(a, b)
     assert not np.array_equal(a, source.translation)
     source.translation = np.zeros(3)
-    np.testing.assert_array_equal(NoisyReader(source, std=0.1).translation, 0)
+    np.testing.assert_array_equal(NoisyReader(source, input_noise=0.1).translation, 0)
     with pytest.raises(ValueError):
-        NoisyReader(source, std=-1)
+        NoisyReader(source, input_noise=-1)
 
 
 def test_recording_reader_counts_reads():
@@ -128,7 +128,7 @@ def test_teleop_chain_order_and_records():
     kb.update({"ArrowRight"}, toggles=0)  # full push right at half speed
     chain = TeleopChain(kb, input_noise=0.0)
     chain.corruption.matrix = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
-    served = chain.reader.translation
+    served = chain.source.translation
     raw = chain.raw.last_translation
     assert chain.served.reads == 1 and chain.raw.reads == 1
     np.testing.assert_allclose(served, chain.corruption.matrix @ raw)

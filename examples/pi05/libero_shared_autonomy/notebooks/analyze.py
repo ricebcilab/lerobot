@@ -21,7 +21,7 @@ from lerobot.policies.pi05.steering import DEADBAND
 
 MODE_SHORT = {
     "shared_flow_control": "FC",
-    "shared_reverse_flow_steering": "RFS",
+    "shared_flow_reversal_steering": "FRS",
     "shared_override": "override",
     "teleop": "teleop",
     "policy": "policy",
@@ -34,15 +34,20 @@ def find_runs(root: Path) -> list[Path]:
     return sorted(p for p in Path(root).iterdir() if p.is_dir() and (p / "trials.jsonl").exists())
 
 
+def _adapter_matrix(config: dict):
+    """The resolved reversal adapter F of a run (pre-rename runs stored it as flow_adapter_matrix)."""
+    return config.get("reversal_adapter_matrix", config.get("flow_adapter_matrix"))
+
+
 def label_for(config: dict) -> str:
     """Short condition label from what actually varied: mode, corruption M, adapter F."""
     mode = MODE_SHORT.get(config["mode"], config["mode"])
     if config["mode"] == "shared_flow_control":
-        mode += f" tau={config['tau']}"
+        mode += f" n_guided_steps={config.get('n_guided_steps', config.get('tau'))}"  # tau: pre-rename runs
     tags = []
     if config.get("corruption_matrix") is not None:
         tags.append("+M")
-    if config.get("flow_adapter_matrix") is not None:
+    if _adapter_matrix(config) is not None:
         tags.append("+F")
     return mode + "".join(tags)
 
@@ -59,7 +64,7 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
     df["label"] = label_for(config)
     df["mode"] = config["mode"]
     df["corrupted"] = config.get("corruption_matrix") is not None
-    df["adapted"] = config.get("flow_adapter_matrix") is not None
+    df["adapted"] = _adapter_matrix(config) is not None
     df["run_dir"] = str(run_dir)
     return df, config
 
@@ -112,7 +117,7 @@ def success_table(trials: pd.DataFrame, configs: dict[str, dict]) -> pd.DataFram
             "label": label_for(configs[run]),
             "mode": configs[run]["mode"],
             "corrupted": configs[run].get("corruption_matrix") is not None,
-            "adapted": configs[run].get("flow_adapter_matrix") is not None,
+            "adapted": _adapter_matrix(configs[run]) is not None,
         }
         if len(group) == 0:
             rows.append(
