@@ -34,10 +34,8 @@ import argparse
 import datetime as dt
 import json
 import random
-import threading
 import time
 from contextlib import nullcontext
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -47,19 +45,18 @@ from interactive import (
     MODES,
     VIDEO_FPS,
     FlowAdapter,
-    FrameStream,
     ModeRunner,
     announce_mode,
     build_env,
     close_envs,
     flatten_config,
     list_tasks,
-    make_handler,
     mode_display,
     read_yaml_config,
     run_rollout,
     write_video,
 )
+from live_view import LiveView
 from teleop import KeyboardReader, TeleopChain, build_corruption, read_matrix_spec
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -290,7 +287,6 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------------------- teleop input
-    stream = FrameStream()
     keyboard = KeyboardReader()
     chain = TeleopChain(keyboard, input_noise=cfg["input_noise"])
     flow_adapter = FlowAdapter()
@@ -302,12 +298,18 @@ def main():
         path = Path(cfg["flow_reversal_adapter"])
         flow_adapter.matrix = build_reversal_adapter(read_matrix_spec(path))
         flow_adapter.label = path.name
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", cfg["port"]),
-        make_handler(stream, keyboard, chain.noisy, chain.corruption, flow_adapter),
+    view = LiveView(
+        cfg["port"],
+        keyboard,
+        lambda: {
+            "input_noise": chain.noisy.std,
+            "corruption": chain.corruption.label if chain.corruption.matrix is not None else None,
+            "flow_adapter": flow_adapter.label if flow_adapter.matrix is not None else None,
+        },
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"\nLive view: http://localhost:{cfg['port']}  (VSCode should auto-forward the port)\n")
+    view.start()
+    stream = view.stream
+    print(f"\nLive view: {view.url}  (VSCode should auto-forward the port)\n")
 
     # ---------------------------------------------------------------- policy
     print(f"Loading policy {cfg['policy_path']} ...")
@@ -474,7 +476,7 @@ def main():
         print("\nInterrupted.")
     finally:
         close_envs(envs_dict)
-        server.shutdown()
+        view.close()
 
     if results:
         wins = sum(r["success"] for r in results)
