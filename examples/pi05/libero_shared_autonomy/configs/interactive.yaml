@@ -1,0 +1,27 @@
+# Settings for interactive.py (`interactive.sh --config [PATH]`).
+#
+# Every key mirrors a command-line flag. Delete a key or set it to null to keep
+# the built-in default; a flag passed on the command line still wins. Unknown
+# keys are rejected so a typo cannot silently do nothing.
+
+policy:
+  path: lerobot/pi05_libero_finetuned
+  n_action_steps: 10
+  compile: false
+
+scene:
+  suite: libero_spatial       # libero_spatial | libero_object | libero_goal | libero_10 | libero_90 | libero_100
+  task_id: 0
+
+control:
+  mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
+  tau: 5                      # shared_flow_control: leading denoising steps your input steers
+  n_reverse_steps: null       # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
+  input_noise: 0.0            # std of the Gaussian noise added to your x/y/z command (0 = off)
+  corruption: null            # what the robot gets = M @ what you commanded, e.g. {rotation_z_deg: 20}
+  reversal_adapter: null      # reverse integration follows F @ v, e.g. {translation: corruption, orientation: zero, gripper: zero}
+
+server:
+  port: 8765
+
+output_dir: outputs/pi05_libero_interactive

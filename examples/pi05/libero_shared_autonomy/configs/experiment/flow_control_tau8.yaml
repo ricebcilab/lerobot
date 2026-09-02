@@ -1,0 +1,5 @@
+# Shared flow control, tau = 8, clean operator command.
+extends: base.yaml
+control:
+  mode: shared_flow_control
+  tau: 8
