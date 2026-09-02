@@ -57,6 +57,13 @@ repos:
     -   id: pyupgrade
         args: [--py312-plus]
 
+  ##### Notebooks #####
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        files: ^examples/pi05/.*\.ipynb$
+
   ##### Markdown Quality #####
   - repo: https://github.com/rbubley/mirrors-prettier
     rev: v3.6.2
