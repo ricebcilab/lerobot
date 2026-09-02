@@ -48,28 +48,24 @@ from interactive import (
     VIDEO_FPS,
     FlowAdapter,
     FrameStream,
-    KeyboardReader,
     ModeRunner,
-    TeleopChain,
     announce_mode,
     build_env,
     close_envs,
-    describe_adapter,
-    describe_corruption,
     flatten_config,
     list_tasks,
-    load_adapter,
-    load_corruption,
     make_handler,
     mode_display,
     read_yaml_config,
     run_rollout,
     write_video,
 )
+from teleop import KeyboardReader, TeleopChain, build_corruption, read_matrix_spec
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs import make_env_pre_post_processors
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.pi05.steering import build_reversal_adapter
 from lerobot.utils.utils import init_logging
 
 DEFAULT_EXPERIMENT_CONFIG_FILE = Path(__file__).resolve().parent / "config_experiment.yaml"
@@ -299,9 +295,13 @@ def main():
     chain = TeleopChain(keyboard, input_noise=cfg["input_noise"])
     flow_adapter = FlowAdapter()
     if cfg["deterministic_corruption"]:
-        load_corruption(chain.corruption, Path(cfg["deterministic_corruption"]))
+        path = Path(cfg["deterministic_corruption"])
+        chain.corruption.matrix = build_corruption(read_matrix_spec(path))
+        chain.corruption.label = path.name
     if cfg["flow_reversal_adapter"]:
-        load_adapter(flow_adapter, Path(cfg["flow_reversal_adapter"]))
+        path = Path(cfg["flow_reversal_adapter"])
+        flow_adapter.matrix = build_reversal_adapter(read_matrix_spec(path))
+        flow_adapter.label = path.name
     server = ThreadingHTTPServer(
         ("127.0.0.1", cfg["port"]),
         make_handler(stream, keyboard, chain.noisy, chain.corruption, flow_adapter),
@@ -362,9 +362,9 @@ def main():
         + ("  (the scene's own instruction)" if cfg["prompt"] == PROMPT_FROM_TASK else "")
     )
     if chain.corruption.matrix is not None:
-        print(describe_corruption(chain.corruption))
+        print(chain.corruption.describe())
     if flow_adapter.matrix is not None:
-        print(describe_adapter(flow_adapter))
+        print(flow_adapter.describe())
     if mode != "policy":
         chain.attach_spacemouse()
     announce_mode(mode, tau, policy, flow_adapter, n_reverse)

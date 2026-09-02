@@ -8,18 +8,22 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Teleop input sources for the interactive LIBERO runner besides the SpaceMouse.
+"""Operator input for the LIBERO shared-autonomy runners.
 
-`KeyboardReader` is fed by the browser live view (keydown/keyup events are
-POSTed to /keys by the page) and exposes the same `translation` / `gripper`
-interface as `spacemouse.SpaceMouseReader`. `CombinedReader` merges several
-such sources so a SpaceMouse and the keyboard can be used in the same session.
-`MatrixReader` applies a fixed 3x3 matrix to the merged command (deterministic
-corruption, loaded from YAML by `load_corruption_matrix`), `NoisyReader`
-perturbs it with isotropic Gaussian noise, and `RecordingReader` remembers what
-was served so an experiment can log exactly the command the policy consumed.
+Where the operator's command comes from and what happens to it on the way to
+the policy:
+
+    SpaceMouse + keyboard -> CombinedReader -> RecordingReader (raw)
+        -> CommandCorruption (M @ x) -> NoisyReader (+ noise)
+        -> RecordingReader (served)
+
+`TeleopChain` builds that pipeline; the modes consume `chain.reader`. Every
+reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
+(-1 open, +1 close), the `TeleopSource` protocol from
+`lerobot.policies.pi05.steering`.
 """
 
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -27,13 +31,119 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from spacemouse import AXIS_SCALE, GRIPPER_CLOSE, GRIPPER_OPEN, normalize
 
-from lerobot.policies.pi05.steering import validate_matrix
+from lerobot.policies.pi05.steering import (
+    DEADBAND,
+    GRIPPER_CLOSE,
+    GRIPPER_OPEN,
+    translation_matrix,
+    validate_matrix,
+)
+
+__all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN"]  # re-exported for readers of this module
+
+SPACEMOUSE_HID_ID = "0000046D:0000C62B"  # vendor:product as it appears in /sys uevent
+AXIS_SCALE = 350.0
+# Map device channels (0=x: right push +, 1=y: pull-toward-you push +, 2=z:
+# press-down +) onto the arm action dims [Δx, Δy, Δz]. Tuned by feel on the
+# real device so each push moves the arm the same way: forward push → forward,
+# left push → left, pull up → up. If a direction feels wrong, flip its sign;
+# if two axes are crossed, swap their AXIS_SOURCE entries.
+AXIS_SOURCE = np.array([1, 0, 2])  # device channel feeding each action dim
+AXIS_SIGN = np.array([1.0, -1.0, -1.0])
+
+
+def find_spacemouse_device(hid_id: str = SPACEMOUSE_HID_ID) -> str:
+    """Locate the SpaceMouse /dev/hidraw node via /sys/class/hidraw."""
+    for sysdir in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        uevent = sysdir / "device" / "uevent"
+        try:
+            if hid_id in uevent.read_text():
+                return f"/dev/{sysdir.name}"
+        except OSError:
+            continue
+    raise FileNotFoundError(
+        f"No SpaceMouse (HID id {hid_id}) found under /sys/class/hidraw. Is it plugged in?"
+    )
+
+
+def parse_report(data: bytes) -> tuple[str, tuple | int | None]:
+    """Parse one raw hidraw report (report id is the first byte).
+
+    Returns ("translation", (x, y, z)) with raw int16 counts,
+    ("buttons", bitmask), or ("other", None).
+    """
+    if len(data) >= 7 and data[0] == 1:
+        return "translation", struct.unpack_from("<hhh", data, 1)
+    if len(data) >= 2 and data[0] == 3:
+        bits = int.from_bytes(data[1:5], "little")
+        return "buttons", bits
+    return "other", None
+
+
+def normalize(raw_xyz: tuple[int, int, int]) -> np.ndarray:
+    """Raw int16 counts → env-action range [-1, 1] via the AXIS_SOURCE/AXIS_SIGN map."""
+    scaled = np.clip(np.array(raw_xyz, dtype=np.float64) / AXIS_SCALE, -1.0, 1.0)
+    return scaled[AXIS_SOURCE] * AXIS_SIGN
+
+
+class SpaceMouseReader:
+    """Background thread reading translation + buttons from the SpaceMouse.
+
+    `translation` is the current stick deflection in [-1, 1]^3 (zero at rest —
+    the device sends a zeroing report on release). Any button press toggles
+    `gripper` between open (-1) and close (+1).
+    """
+
+    def __init__(self, device_path: str | None = None):
+        self.device_path = device_path or find_spacemouse_device()
+        self._file = open(self.device_path, "rb", buffering=0)  # noqa: SIM115
+        self._lock = threading.Lock()
+        self._translation = np.zeros(3)
+        self._gripper = GRIPPER_OPEN
+        self._prev_buttons = 0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                data = self._file.read(64)
+            except (OSError, ValueError):  # unplugged or closed
+                break
+            if not data:
+                break
+            self._handle(data)
+
+    def _handle(self, data: bytes) -> None:
+        kind, payload = parse_report(data)
+        if kind == "translation":
+            values = normalize(payload)
+            with self._lock:
+                self._translation = values
+        elif kind == "buttons":
+            with self._lock:
+                pressed = payload & ~self._prev_buttons
+                self._prev_buttons = payload
+                if pressed:
+                    self._gripper = GRIPPER_CLOSE if self._gripper == GRIPPER_OPEN else GRIPPER_OPEN
+
+    @property
+    def translation(self) -> np.ndarray:
+        with self._lock:
+            return self._translation.copy()
+
+    @property
+    def gripper(self) -> float:
+        with self._lock:
+            return self._gripper
+
+    def close(self) -> None:
+        self._file.close()
+
 
 DEFAULT_SPEED = 0.5  # fraction of full-scale deflection a held key produces
 FAST_KEY = "shift"  # hold for full-scale (1.0) deflection
-DEADBAND = 0.05  # below this a source counts as idle (matches FlowControlPolicy)
 STALE_AFTER = 1.0  # seconds without a page update before held keys are dropped
 
 # Each key is a full-scale push on the SpaceMouse's *device* axes (x: right +,
@@ -144,34 +254,7 @@ class CombinedReader:
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
 
 
-def load_matrix(path: str | Path, size: int = 3, keys: Iterable[str] = ("M", "matrix")) -> np.ndarray:
-    """Read a `size` x `size` matrix from a YAML file.
-
-    Accepted layouts: a top-level key from `keys` holding `size` rows of
-    `size` numbers, or the bare list of rows. Raises ValueError for anything
-    else (and OSError if the file cannot be read).
-    """
-    path = Path(path)
-    keys = tuple(keys)
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    if isinstance(data, dict):
-        for key in keys:
-            if key in data:
-                data = data[key]
-                break
-        else:
-            expected = " (or ".join(f"`{k}:`" for k in keys) + ")" * (len(keys) - 1)
-            raise ValueError(f"{path}: expected a top-level {expected} key holding a {size}x{size} matrix")
-    return validate_matrix(data, size, str(path))
-
-
-def load_corruption_matrix(path: str | Path) -> np.ndarray:
-    """Read the 3x3 teleop corruption matrix M from a YAML file."""
-    return load_matrix(path, size=3, keys=("M", "matrix"))
-
-
-class MatrixReader:
+class CommandCorruption:
     """Deterministically corrupt a teleop source's translation: x -> M @ x.
 
     `matrix` is a 3x3 array-like (rows = output axes, columns = input axes) or
@@ -206,6 +289,26 @@ class MatrixReader:
     @property
     def gripper(self) -> float:
         return self.source.gripper
+
+    def describe(self) -> str:
+        if self._matrix is None:
+            return "Command corruption: off."
+        rows = "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in self._matrix)
+        return f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = [{rows}]."
+
+
+def build_corruption(spec, where: str = "corruption") -> np.ndarray | None:
+    """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows) or None."""
+    return None if spec is None else translation_matrix(spec, where)
+
+
+def read_matrix_spec(path: str | Path):
+    """Read a matrix spec from a YAML file (for the REPL's live `corruption` / `adapter` commands)."""
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        raise ValueError(f"{path}: empty file")
+    return data
 
 
 class NoisyReader:
@@ -278,3 +381,42 @@ class RecordingReader:
     def gripper(self) -> float:
         self.last_gripper = self.source.gripper
         return self.last_gripper
+
+
+class TeleopChain:
+    """The teleop input pipeline shared by the runner and the experiment driver.
+
+    Sources (SpaceMouse first, then keyboard) are merged, the raw command is
+    recorded, then the deterministic corruption and the Gaussian noise are
+    applied, and the value finally served is recorded too:
+
+        SpaceMouse + keyboard -> raw -> M @ x -> + noise -> served
+
+    `reader` is what the modes consume; `raw` and `served` are the recorders an
+    experiment logs (`raw.last_translation` is the operator's true intent,
+    `served.last_translation` what the policy actually got).
+    """
+
+    def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
+        self.keyboard = keyboard
+        self.spacemouse = None
+        self.combined = CombinedReader([keyboard])
+        self.raw = RecordingReader(self.combined)
+        self.corruption = CommandCorruption(self.raw)
+        self.noisy = NoisyReader(self.corruption, std=input_noise)
+        self.served = RecordingReader(self.noisy)
+
+    @property
+    def reader(self) -> RecordingReader:
+        return self.served
+
+    def attach_spacemouse(self) -> None:
+        """Connect a SpaceMouse and give it priority over the keyboard (no-op if already tried)."""
+        if self.spacemouse is not None:
+            return
+        try:
+            self.spacemouse = SpaceMouseReader()
+            self.combined.sources.insert(0, self.spacemouse)
+            print(f"SpaceMouse connected ({self.spacemouse.device_path}); any button toggles the gripper.")
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            print(f"SpaceMouse unavailable ({e}) — keyboard only.")

@@ -79,15 +79,13 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
-from spacemouse import SpaceMouseReader
-from teleop_input import (
-    CombinedReader,
+from teleop import (
+    CommandCorruption,
     KeyboardReader,
-    MatrixReader,
     NoisyReader,
-    RecordingReader,
-    load_corruption_matrix,
-    load_matrix,
+    TeleopChain,
+    build_corruption,
+    read_matrix_spec,
 )
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -101,10 +99,10 @@ from lerobot.envs import (
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.steering import (
-    N_ACTION_DIMS,
     FlowControlPolicy,
     ReversalAdapter as FlowAdapter,
     ReverseFlowSteeringPolicy,
+    build_reversal_adapter,
 )
 from lerobot.utils.constants import ACTION
 from lerobot.utils.io_utils import write_video
@@ -281,7 +279,7 @@ def make_handler(
     stream: FrameStream,
     keyboard: KeyboardReader,
     noisy: NoisyReader,
-    corruption: MatrixReader,
+    corruption: CommandCorruption,
     adapter: FlowAdapter,
 ):
     class Handler(BaseHTTPRequestHandler):
@@ -358,59 +356,6 @@ def make_handler(
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_reverse_flow_steering", "teleop")
 
 
-def load_flow_adapter(path: str | Path):
-    """Read the 7x7 flow-reversal adapter F from a YAML file."""
-    return load_matrix(path, size=N_ACTION_DIMS, keys=("F", "matrix"))
-
-
-def load_adapter(adapter: FlowAdapter, path: Path) -> None:
-    adapter.matrix = load_flow_adapter(path)
-    adapter.label = path.name
-
-
-def describe_adapter(adapter: FlowAdapter) -> str:
-    return adapter.describe()
-
-
-class TeleopChain:
-    """The teleop input pipeline shared by the runner and the experiment driver.
-
-    Sources (SpaceMouse first, then keyboard) are merged, the raw command is
-    recorded, then the deterministic corruption and the Gaussian noise are
-    applied, and the value finally served is recorded too:
-
-        SpaceMouse + keyboard -> raw -> M @ x -> + noise -> served
-
-    `reader` is what the modes consume; `raw` and `served` are the recorders an
-    experiment logs (`raw.last_translation` is the operator's true intent,
-    `served.last_translation` what the policy actually got).
-    """
-
-    def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
-        self.keyboard = keyboard
-        self.spacemouse = None
-        self.combined = CombinedReader([keyboard])
-        self.raw = RecordingReader(self.combined)
-        self.corruption = MatrixReader(self.raw)
-        self.noisy = NoisyReader(self.corruption, std=input_noise)
-        self.served = RecordingReader(self.noisy)
-
-    @property
-    def reader(self) -> RecordingReader:
-        return self.served
-
-    def attach_spacemouse(self) -> None:
-        """Connect a SpaceMouse and give it priority over the keyboard (no-op if already tried)."""
-        if self.spacemouse is not None:
-            return
-        try:
-            self.spacemouse = SpaceMouseReader()
-            self.combined.sources.insert(0, self.spacemouse)
-            print(f"SpaceMouse connected ({self.spacemouse.device_path}); any button toggles the gripper.")
-        except (FileNotFoundError, PermissionError, OSError) as e:
-            print(f"SpaceMouse unavailable ({e}) — keyboard only.")
-
-
 def announce_mode(
     mode: str, tau: int, policy, flow_adapter: FlowAdapter, n_reverse_steps: int | None = None
 ) -> None:
@@ -446,7 +391,7 @@ def announce_mode(
                 f"denoises from there in {total - n} steps (idle input = pure policy)."
             )
         if flow_adapter.matrix is not None:
-            print(describe_adapter(flow_adapter))
+            print(flow_adapter.describe())
 
 
 class ZeroPolicy:
@@ -572,22 +517,6 @@ def run_rollout(
 
 
 DEFAULT_CORRUPTION_FILE = Path(__file__).resolve().parent / "deterministic_corruption.yaml"
-
-
-def load_corruption(corruption: MatrixReader, path: Path) -> None:
-    """Load M from `path` into the reader (raises OSError / ValueError on a bad file)."""
-    corruption.matrix = load_corruption_matrix(path)
-    corruption.label = path.name
-
-
-def describe_corruption(corruption: MatrixReader) -> str:
-    if corruption.matrix is None:
-        return "Deterministic corruption: off (load one with `corruption <file.yaml>`)."
-    rows = "; ".join(" ".join(f"{v:+.3f}" for v in row) for row in corruption.matrix)
-    return (
-        f"Deterministic corruption: x/y/z -> M @ x/y/z at every step while you command, "
-        f"M from {corruption.label} = [{rows}]."
-    )
 
 
 DEFAULT_INTERACTIVE_CONFIG_FILE = Path(__file__).resolve().parent / "config_interactive.yaml"
@@ -873,13 +802,17 @@ def main():
     corruption, noisy, reader = chain.corruption, chain.noisy, chain.reader
     if args.deterministic_corruption is not None:
         try:
-            load_corruption(corruption, Path(args.deterministic_corruption))
+            path = Path(args.deterministic_corruption)
+            corruption.matrix = build_corruption(read_matrix_spec(path))
+            corruption.label = path.name
         except (OSError, ValueError) as e:
             parser.error(f"--deterministic-corruption: {e}")
     flow_adapter = FlowAdapter()  # 7x7 F for the reverse integration (off until a file is loaded)
     if args.flow_reversal_adapter is not None:
         try:
-            load_adapter(flow_adapter, Path(args.flow_reversal_adapter))
+            path = Path(args.flow_reversal_adapter)
+            flow_adapter.matrix = build_reversal_adapter(read_matrix_spec(path))
+            flow_adapter.label = path.name
         except (OSError, ValueError) as e:
             parser.error(f"--flow-reversal-adapter: {e}")
     server = ThreadingHTTPServer(
@@ -942,9 +875,9 @@ def main():
         "`noise [std]`, `corruption [path|off]`, `adapter [path|off]`, or `quit`.\n"
     )
     if corruption.matrix is not None:
-        print(describe_corruption(corruption) + "\n")
+        print(corruption.describe() + "\n")
     if flow_adapter.matrix is not None:
-        print(describe_adapter(flow_adapter) + "\n")
+        print(flow_adapter.describe() + "\n")
     if mode != "policy":
         chain.attach_spacemouse()
         announce_mode(mode, tau, policy, flow_adapter, n_reverse_steps)
@@ -1015,14 +948,16 @@ def main():
                     flow_adapter.label = None
                 elif len(tokens) == 2:
                     try:
-                        load_adapter(flow_adapter, Path(tokens[1]))
+                        path = Path(tokens[1])
+                        flow_adapter.matrix = build_reversal_adapter(read_matrix_spec(path))
+                        flow_adapter.label = path.name
                     except (OSError, ValueError) as e:
                         print(f"could not load flow-reversal adapter: {e}")
                         continue
                 elif len(tokens) > 2:
                     print("usage: adapter [<file.yaml>|off]")
                     continue
-                print(describe_adapter(flow_adapter))
+                print(flow_adapter.describe())
                 continue
 
             if line == "corruption" or line.startswith("corruption "):
@@ -1032,14 +967,16 @@ def main():
                     corruption.label = None
                 elif len(tokens) == 2:
                     try:
-                        load_corruption(corruption, Path(tokens[1]))
+                        path = Path(tokens[1])
+                        corruption.matrix = build_corruption(read_matrix_spec(path))
+                        corruption.label = path.name
                     except (OSError, ValueError) as e:
                         print(f"could not load corruption matrix: {e}")
                         continue
                 elif len(tokens) > 2:
                     print("usage: corruption [<file.yaml>|off]")
                     continue
-                print(describe_corruption(corruption))
+                print(corruption.describe())
                 continue
 
             if line == "tasks":
