@@ -24,7 +24,7 @@ policy:
 
 control:
   mode: shared_reverse_flow_steering
-  tau: 5                      # shared_flow_control only
+  tau: 8                      # shared_flow_control only
   n_reverse_steps: null       # shared_reverse_flow_steering only; null = all the way to noise
   input_noise: 0.0
   max_steps: null             # null = the suite's own episode length

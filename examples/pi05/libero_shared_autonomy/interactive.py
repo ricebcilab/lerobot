@@ -159,7 +159,9 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
     except ValueError as e:
         print(e)
         return
-    print(session.announce_mode())
+    text = session.announce_mode()
+    if text:
+        print(text)
 
 
 def cmd_noise(session: Session, tokens: list[str]) -> None:
@@ -260,7 +262,6 @@ def main():
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
     session = Session(settings)
-    print(f"\nLive view: {session.view.url}  (VSCode should auto-forward the port)\n")
     session.show_scene()
     session.view.stream.set_status(state="idle: type a prompt in the terminal")
     print(f"Scene: {session.suite} task {session.task_id}")

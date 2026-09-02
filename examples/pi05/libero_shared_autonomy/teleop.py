@@ -147,7 +147,7 @@ FAST_KEY = "shift"  # hold for full-scale (1.0) deflection
 STALE_AFTER = 1.0  # seconds without a page update before held keys are dropped
 
 # Each key is a full-scale push on the SpaceMouse's *device* axes (x: right +,
-# y: toward-you +, z: press-down +) and goes through spacemouse.normalize(), so
+# y: toward-you +, z: press-down +) and goes through normalize(), so
 # the keyboard inherits the AXIS_SOURCE/AXIS_SIGN tuning of the physical stick:
 # ArrowUp moves the arm exactly like pushing the stick forward.
 KEY_PUSH = {

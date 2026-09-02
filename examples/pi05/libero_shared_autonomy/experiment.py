@@ -222,9 +222,8 @@ def main():
     run_dir = settings.output_dir / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{settings.name}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    settings.session.suite, settings.session.task_id = settings.session.suite, schedule[0]
+    settings.session.task_id = schedule[0]
     session = Session(settings.session)
-    print(f"\nLive view: {session.view.url}  (VSCode should auto-forward the port)\n")
     (run_dir / "config.yaml").write_text(
         yaml.safe_dump(_provenance(settings, schedule, session), sort_keys=False)
     )
@@ -298,11 +297,6 @@ def main():
                 "vla_prompt": vla_prompt,
                 "mode": mode,
                 "tau": session.tau if mode == "shared_flow_control" else None,
-                "n_reverse_steps": (
-                    (session.n_reverse_steps or session.policy.config.num_inference_steps)
-                    if mode == "shared_reverse_flow_steering"
-                    else None
-                ),
                 "input_noise": control.input_noise,
                 "deterministic_corruption": session.chain.corruption.label,
                 "flow_reversal_adapter": session.adapter.label,
@@ -314,6 +308,9 @@ def main():
                 "steps_file": steps_name,
                 "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
                 **result.metrics,
+                "n_reverse_steps": (
+                    result.metrics.get("n_reverse_steps") if mode == "shared_reverse_flow_steering" else None
+                ),
             }
             results.append(record)
             with open(trials_path, "a") as f:

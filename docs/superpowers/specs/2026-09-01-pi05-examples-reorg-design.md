@@ -382,9 +382,9 @@ the five modes, and one two-trial experiment with `reverse_flow_5steps_rotz20.ya
 
 ## 10. Merge and history
 
-1. Merge (a regular merge; `main` gained the spec commit after the branch point) `main`
-   to `origin/pi05-libero-shared-autonomy-experiments`.
-2. Create branch `reorg-pi05-examples` in a worktree.
+1. Merge `origin/pi05-libero-shared-autonomy-experiments` into `main` (a regular merge;
+   `main` gained the spec commit after the branch point).
+2. Create branch `reorg-pi05-examples` (in place; the checkout had no venv to duplicate).
 3. Reorganize in a series of commits, each leaving tests green:
    move feeding; move libero folder and add `env.sh`; extract `steering.py` with tests;
    `teleop.py`; `live_view.py` and `session.py`; `config.py` and configs; rewrite entry

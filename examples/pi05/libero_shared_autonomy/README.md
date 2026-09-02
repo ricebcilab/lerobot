@@ -325,8 +325,8 @@ z["user_translation_raw"], z["action"], z["eef_pos"], bool(z["success"])
 ## Analysis
 
 [`notebooks/analyze_experiments.ipynb`](notebooks/analyze_experiments.ipynb)
-imports [`notebooks/analyze.py`](notebooks/analyze.py), which loads the two
-most recent run directories and reports success rate with Wilson 95%
+imports [`notebooks/analyze.py`](notebooks/analyze.py), which loads every run
+directory that contains a `trials.jsonl` and reports success rate with Wilson 95%
 intervals, a paired per-trial comparison, a per-task breakdown, step counts
 split by outcome, and how much the operator actually steered. Point `RUN_DIRS`
 at other directories to compare anything else. Its functions:

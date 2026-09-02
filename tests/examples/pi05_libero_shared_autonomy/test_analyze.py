@@ -13,6 +13,7 @@ if str(NOTEBOOKS) not in sys.path:
 from analyze import (  # noqa: E402
     compare,
     describe_rotation,
+    differing_settings,
     find_runs,
     input_activity,
     label_for,
@@ -92,3 +93,44 @@ def test_end_to_end_on_synthetic_runs(tmp_path):
 
     assert "rotation about z" in describe_rotation(np.array(rot))
     assert describe_rotation(np.eye(3)) == "identity (no-op)"
+
+
+def test_differing_settings_compares_nested_specs_by_json_form():
+    # Same mode (and hence the "mode" row is expected to be dropped); tau differs so the
+    # two configs get distinct labels (label_for uses mode + tau for shared_flow_control).
+    configs = {
+        "a": {"mode": "shared_flow_control", "tau": 8, "corruption": None, "schedule": [0, 1, 2]},
+        "b": {
+            "mode": "shared_flow_control",
+            "tau": 5,
+            "corruption": {"rotation_z_deg": 20},
+            "schedule": [2, 1, 0],
+        },
+    }
+    result = differing_settings(configs, ["mode", "corruption"])
+    assert list(result.index) == ["corruption", "schedule"]
+    assert "mode" not in result.index
+    assert "corruption" in result.index
+
+
+def test_success_table_handles_a_run_with_no_trials(tmp_path):
+    rot = None
+    a = make_run(tmp_path, "20260101_000000_flow_control", "shared_flow_control", [True, False, True])
+    empty = tmp_path / "20260101_000001_empty"
+    empty.mkdir()
+    config = {
+        "mode": "shared_flow_control",
+        "tau": 8,
+        "corruption_matrix": rot,
+        "flow_adapter_matrix": None,
+        "schedule": [0, 1, 0],
+    }
+    (empty / "config.yaml").write_text(yaml.safe_dump(config))
+    (empty / "trials.jsonl").write_text("")
+
+    trials, configs = load_runs([a, empty])
+    table = success_table(trials, configs)
+    assert table.loc[empty.name, "trials"] == 0
+    assert table.loc[empty.name, "successes"] == 0
+    assert np.isnan(table.loc[empty.name, "success_rate"])
+    assert table.loc[a.name, "trials"] == 3

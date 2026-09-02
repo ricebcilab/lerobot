@@ -30,7 +30,6 @@ from lerobot.envs import (
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.steering import (
-    DEADBAND,
     FlowControlPolicy,
     ReversalAdapter,
     ReverseFlowSteeringPolicy,
@@ -72,9 +71,8 @@ def _teleop_hook(reader, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarr
     """Paste the teleop translation (and, for teleop mode, gripper) into the env action."""
 
     def hook(action: np.ndarray) -> np.ndarray:
-        cmd = reader.translation
-        if paste_gripper or np.max(np.abs(cmd)) >= DEADBAND:
-            action[0, :3] = cmd
+        action = action.copy()
+        action[0, :3] = reader.translation
         if paste_gripper:
             action[0, 6] = reader.gripper
         return action
@@ -94,6 +92,7 @@ class Session:
         self.set_reversal_adapter(control.reversal_adapter_matrix, spec_label(control.reversal_adapter))
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
         self.view.start()
+        print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
 
         logging.info(f"Loading policy {settings.policy_path} ...")
         self.policy_cfg = PreTrainedConfig.from_pretrained(settings.policy_path)

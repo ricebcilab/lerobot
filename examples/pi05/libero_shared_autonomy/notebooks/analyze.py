@@ -53,7 +53,8 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
         json.loads(line) for line in (run_dir / "trials.jsonl").read_text().splitlines() if line.strip()
     ]
     config = yaml.safe_load((run_dir / "config.yaml").read_text())
-    df = pd.DataFrame(trials)
+    columns = ["trial", "task_id", "success", "steps", "duration_s", "steps_file"]
+    df = pd.DataFrame(trials, columns=columns) if not trials else pd.DataFrame(trials)
     df["run"] = run_dir.name
     df["label"] = label_for(config)
     df["mode"] = config["mode"]
@@ -106,15 +107,31 @@ def success_table(trials: pd.DataFrame, configs: dict[str, dict]) -> pd.DataFram
     rows = []
     for run in configs:
         group = trials[trials["run"] == run]
+        base = {
+            "run": run,
+            "label": label_for(configs[run]),
+            "mode": configs[run]["mode"],
+            "corrupted": configs[run].get("corruption_matrix") is not None,
+            "adapted": configs[run].get("flow_adapter_matrix") is not None,
+        }
+        if len(group) == 0:
+            rows.append(
+                {
+                    **base,
+                    "trials": 0,
+                    "successes": 0,
+                    "success_rate": np.nan,
+                    "ci95_low": np.nan,
+                    "ci95_high": np.nan,
+                    "median_steps_success": np.nan,
+                }
+            )
+            continue
         n, k = len(group), int(group["success"].sum())
         low, high = wilson(k, n)
         rows.append(
             {
-                "run": run,
-                "label": label_for(configs[run]),
-                "mode": configs[run]["mode"],
-                "corrupted": configs[run].get("corruption_matrix") is not None,
-                "adapted": configs[run].get("flow_adapter_matrix") is not None,
+                **base,
                 "trials": n,
                 "successes": k,
                 "success_rate": k / n if n else np.nan,
@@ -124,6 +141,21 @@ def success_table(trials: pd.DataFrame, configs: dict[str, dict]) -> pd.DataFram
             }
         )
     return pd.DataFrame(rows).set_index("run")
+
+
+def differing_settings(configs: dict[str, dict], keys: list[str]) -> pd.DataFrame:
+    """Settings that are not identical across runs (rows = keys, columns = run labels).
+
+    Nested values (matrix specs) are compared by their JSON form so dicts do not
+    break pandas' uniqueness check.
+    """
+
+    def flat(value):
+        return json.dumps(value, sort_keys=True) if isinstance(value, dict | list) else value
+
+    setup = pd.DataFrame({label_for(c): {k: flat(c.get(k)) for k in keys} for c in configs.values()})
+    setup.loc["schedule"] = [str(c.get("schedule")) for c in configs.values()]
+    return setup[setup.nunique(axis=1, dropna=False) > 1]
 
 
 def compare(trials: pd.DataFrame, a: str, b: str) -> dict:
