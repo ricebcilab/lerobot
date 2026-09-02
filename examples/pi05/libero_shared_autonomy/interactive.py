@@ -150,7 +150,7 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
     mode, arg = tokens[1], (tokens[2] if len(tokens) > 2 else None)
     kwargs = {}
     if arg is not None:
-        if not arg.isdigit():
+        if mode not in ("shared_flow_control", "shared_reverse_flow_steering") or not arg.isdigit():
             print(usage)
             return
         kwargs["tau" if mode == "shared_flow_control" else "n_reverse_steps"] = int(arg)
