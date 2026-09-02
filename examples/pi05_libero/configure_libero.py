@@ -19,7 +19,6 @@ from pathlib import Path
 
 import yaml
 
-
 ASSET_SUBDIRECTORIES = (
     "articulated_objects",
     "stable_scanned_objects",
@@ -131,4 +130,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

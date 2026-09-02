@@ -22,32 +22,34 @@
 
 ## File map
 
-| Path | Responsibility |
-| --- | --- |
-| `src/lerobot/policies/pi05/steering.py` | Steering algorithms, matrix builders, `ReversalAdapter`, `TeleopSource` protocol, action-dim constants |
-| `examples/pi05/README.md` | Index of the two pipelines |
-| `examples/pi05/feeding_finetune/*` | Moved feeding pipeline, renamed scripts |
-| `examples/pi05/libero_shared_autonomy/env.sh` | Shared environment block for launchers |
-| `.../teleop.py` | SpaceMouse, keyboard, merge, corruption, noise, recording, `TeleopChain` |
-| `.../live_view.py` | HTML page, `FrameStream`, `LiveView` HTTP server |
-| `.../session.py` | `Session`, `RolloutResult`, mode wiring, rollout loop |
-| `.../config.py` | Settings dataclasses, YAML read/merge/flatten/validate, matrix spec resolution |
-| `.../interactive.py` | REPL over a `Session` |
-| `.../experiment.py` | Scheduled trials over a `Session`, `TrialRecorder` |
-| `.../notebooks/analyze.py`, `analyze_experiments.ipynb` | Analysis library and stripped notebook |
-| `.../configs/interactive.yaml`, `configs/experiment/*.yaml` | Settings files |
-| `tests/policies/pi0_pi05/test_pi05_steering.py` | CPU tests for steering |
-| `tests/policies/pi0_pi05/test_pi05.py` | Sampler hook tests (GPU + HF token) |
-| `tests/examples/pi05_libero_shared_autonomy/*` | CPU tests for config, teleop, experiment helpers, analyze |
+| Path                                                        | Responsibility                                                                                         |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `src/lerobot/policies/pi05/steering.py`                     | Steering algorithms, matrix builders, `ReversalAdapter`, `TeleopSource` protocol, action-dim constants |
+| `examples/pi05/README.md`                                   | Index of the two pipelines                                                                             |
+| `examples/pi05/feeding_finetune/*`                          | Moved feeding pipeline, renamed scripts                                                                |
+| `examples/pi05/libero_shared_autonomy/env.sh`               | Shared environment block for launchers                                                                 |
+| `.../teleop.py`                                             | SpaceMouse, keyboard, merge, corruption, noise, recording, `TeleopChain`                               |
+| `.../live_view.py`                                          | HTML page, `FrameStream`, `LiveView` HTTP server                                                       |
+| `.../session.py`                                            | `Session`, `RolloutResult`, mode wiring, rollout loop                                                  |
+| `.../config.py`                                             | Settings dataclasses, YAML read/merge/flatten/validate, matrix spec resolution                         |
+| `.../interactive.py`                                        | REPL over a `Session`                                                                                  |
+| `.../experiment.py`                                         | Scheduled trials over a `Session`, `TrialRecorder`                                                     |
+| `.../notebooks/analyze.py`, `analyze_experiments.ipynb`     | Analysis library and stripped notebook                                                                 |
+| `.../configs/interactive.yaml`, `configs/experiment/*.yaml` | Settings files                                                                                         |
+| `tests/policies/pi0_pi05/test_pi05_steering.py`             | CPU tests for steering                                                                                 |
+| `tests/policies/pi0_pi05/test_pi05.py`                      | Sampler hook tests (GPU + HF token)                                                                    |
+| `tests/examples/pi05_libero_shared_autonomy/*`              | CPU tests for config, teleop, experiment helpers, analyze                                              |
 
 ---
 
 ### Task 0: Merge the branch and set up the environment
 
 **Files:**
+
 - Modify: git history only
 
 **Interfaces:**
+
 - Produces: a `reorg-pi05-examples` branch containing the branch's files at `examples/pi05_libero/`, and a `.venv` where `uv run --no-sync pytest` works.
 
 - [ ] **Step 1: Merge the branch into main**
@@ -97,6 +99,7 @@ Expected: tests pass or skip; pre-commit passes (the merged branch was committed
 ### Task 1: Move the feeding pipeline
 
 **Files:**
+
 - Move: `examples/feeding_pi05/` to `examples/pi05/feeding_finetune/`
 - Rename: `build_dataset_parallel.py` to `build_dataset.py`, `train_feeding.sh` to `train.sh`
 - Modify: `examples/pi05/feeding_finetune/README.md`, `build_dataset.py`, `train.sh`
@@ -149,11 +152,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 2: Move the LIBERO folder and share the launcher environment
 
 **Files:**
+
 - Move: `examples/pi05_libero/` to `examples/pi05/libero_shared_autonomy/`
 - Create: `examples/pi05/libero_shared_autonomy/env.sh`
 - Modify: `setup.sh`, `eval.sh`, `interactive.sh`, `experiment.sh` in the new folder
 
 **Interfaces:**
+
 - Produces: `env.sh` exporting `REPO_ROOT`, `SCRIPT_DIR`, `LIBERO_CONFIG_PATH`, `MUJOCO_GL`, `HF_HUB_CACHE`, `MPLCONFIGDIR`; the launchers `source` it.
 
 - [ ] **Step 1: Move the folder**
@@ -265,14 +270,17 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 3: Extract the steering algorithms into `src/lerobot/policies/pi05/steering.py`
 
 **Files:**
+
 - Create: `src/lerobot/policies/pi05/steering.py`
 - Create: `tests/policies/pi0_pi05/test_pi05_steering.py`
 - Modify: `examples/pi05/libero_shared_autonomy/interactive.py` (delete the moved definitions, import them), `experiment.py` (import `FlowAdapter` as `ReversalAdapter`), `teleop_input.py` (import `validate_matrix` from steering)
 
 **Interfaces:**
+
 - Produces (all in `lerobot.policies.pi05.steering`):
   - `ACTION_DIMS: tuple[str, ...]`, `N_ACTION_DIMS = 7`, `GRIPPER_DIM = 6`, `DEADBAND = 0.05`, `GRIPPER_OPEN = -1.0`, `GRIPPER_CLOSE = 1.0`
   - `class TeleopSource(Protocol)` with properties `translation -> np.ndarray`, `gripper -> float`
@@ -786,12 +794,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 4: Tests for the sampler hooks in `modeling_pi05.py`
 
 **Files:**
+
 - Modify: `tests/policies/pi0_pi05/test_pi05.py` (append)
 
 **Interfaces:**
+
 - Consumes: `PI05Pytorch.sample_actions(..., noise_fn=, flow_start_time=, num_forward_steps=)` as merged from the branch.
 
 These need the real model (the sampler encodes a prefix with PaliGemma), so they carry the file's existing `@require_cuda` and `@require_hf_token` decorators, like `test_policy_instantiation`.
@@ -883,12 +894,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 5: `teleop.py`: one module for operator input
 
 **Files:**
+
 - Move: `examples/pi05/libero_shared_autonomy/teleop_input.py` to `teleop.py`
 - Delete: `examples/pi05/libero_shared_autonomy/spacemouse.py` (content merged into `teleop.py`)
 - Modify: `interactive.py`, `experiment.py` (imports)
 - Create: `tests/examples/__init__.py`, `tests/examples/pi05_libero_shared_autonomy/__init__.py`, `conftest.py`, `test_teleop.py`
 
 **Interfaces:**
+
 - Produces (module `teleop`, importable once the example dir is on `sys.path`):
   - SpaceMouse: `SPACEMOUSE_HID_ID`, `AXIS_SCALE`, `AXIS_SOURCE`, `AXIS_SIGN`, `find_spacemouse_device`, `parse_report`, `normalize`, `SpaceMouseReader`
   - Keyboard: `KEY_PUSH`, `DEFAULT_SPEED`, `FAST_KEY`, `STALE_AFTER`, `KeyboardReader(speed, stale_after, clock)` with `update(held, toggles)`, `translation`, `gripper`, `held`
@@ -1218,9 +1231,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 6: `config.py` and the new config files
 
 **Files:**
+
 - Create: `examples/pi05/libero_shared_autonomy/config.py`
 - Create: `configs/interactive.yaml`, `configs/experiment/base.yaml` and the five condition files
 - Create: `tests/examples/pi05_libero_shared_autonomy/test_config.py`
@@ -1228,6 +1243,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 The old `config_*.yaml`, `deterministic_corruption.yaml` and `flow_reversal_adapter.yaml` stay until Task 9 rewrites the entry points that still read them.
 
 **Interfaces:**
+
 - Produces (module `config`):
   - `MODES`, `TASK_ORDERS`, `PROMPT_FROM_TASK`, `CONFIG_DIR`, `DEFAULT_INTERACTIVE_CONFIG`
   - `@dataclass ControlSettings(mode, tau, n_reverse_steps, input_noise, max_steps, corruption, reversal_adapter, corruption_matrix, reversal_adapter_matrix)`
@@ -1256,16 +1272,16 @@ policy:
   compile: false
 
 scene:
-  suite: libero_spatial       # libero_spatial | libero_object | libero_goal | libero_10 | libero_90 | libero_100
+  suite: libero_spatial # libero_spatial | libero_object | libero_goal | libero_10 | libero_90 | libero_100
   task_id: 0
 
 control:
-  mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
-  tau: 5                      # shared_flow_control: leading denoising steps your input steers
-  n_reverse_steps: null       # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
-  input_noise: 0.0            # std of the Gaussian noise added to your x/y/z command (0 = off)
-  corruption: null            # what the robot gets = M @ what you commanded, e.g. {rotation_z_deg: 20}
-  reversal_adapter: null      # reverse integration follows F @ v, e.g. {translation: corruption, orientation: zero, gripper: zero}
+  mode: policy # policy | teleop | shared_override | shared_flow_control | shared_reverse_flow_steering
+  tau: 5 # shared_flow_control: leading denoising steps your input steers
+  n_reverse_steps: null # shared_reverse_flow_steering: steps to reverse the reference (null = all the way to noise)
+  input_noise: 0.0 # std of the Gaussian noise added to your x/y/z command (0 = off)
+  corruption: null # what the robot gets = M @ what you commanded, e.g. {rotation_z_deg: 20}
+  reversal_adapter: null # reverse integration follows F @ v, e.g. {translation: corruption, orientation: zero, gripper: zero}
 
 server:
   port: 8765
@@ -1281,14 +1297,14 @@ output_dir: outputs/pi05_libero_interactive
 # keys are rejected; a key set to null keeps the built-in default.
 
 experiment:
-  n_trials: 10                # trials per run
-  seed: 0                     # seeds the task schedule (same seed = same tasks in every condition)
-  task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
+  n_trials: 10 # trials per run
+  seed: 0 # seeds the task schedule (same seed = same tasks in every condition)
+  task_order: random # random (uniform, with replacement) | shuffled (permutations) | sequential
   output_dir: outputs/pi05_libero_experiments
 
 scene:
   suite: libero_goal
-  task_ids: null              # null = every task in the suite, or e.g. [0, 3, 7]
+  task_ids: null # null = every task in the suite, or e.g. [0, 3, 7]
 
 # Instruction handed to the VLA on every trial. The human is always shown the
 # real task; a generic prompt dissociates the two. The literal string `task`
@@ -1302,12 +1318,12 @@ policy:
 
 control:
   mode: shared_reverse_flow_steering
-  tau: 5                      # shared_flow_control only
-  n_reverse_steps: null       # shared_reverse_flow_steering only; null = all the way to noise
+  tau: 5 # shared_flow_control only
+  n_reverse_steps: null # shared_reverse_flow_steering only; null = all the way to noise
   input_noise: 0.0
-  max_steps: null             # null = the suite's own episode length
-  corruption: null            # what the robot gets = M @ what the operator commanded (env units)
-  reversal_adapter: null      # reverse integration follows F @ v (normalized action space)
+  max_steps: null # null = the suite's own episode length
+  corruption: null # what the robot gets = M @ what the operator commanded (env units)
+  reversal_adapter: null # reverse integration follows F @ v (normalized action space)
 
 server:
   port: 8765
@@ -1333,7 +1349,7 @@ extends: base.yaml
 control:
   mode: shared_flow_control
   tau: 8
-  corruption: {rotation_z_deg: 20}
+  corruption: { rotation_z_deg: 20 }
 ```
 
 `reverse_flow_full.yaml`:
@@ -1356,8 +1372,9 @@ extends: base.yaml
 control:
   mode: shared_reverse_flow_steering
   n_reverse_steps: null
-  corruption: {rotation_z_deg: 20}
-  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}
+  corruption: { rotation_z_deg: 20 }
+  reversal_adapter:
+    { translation: corruption, orientation: zero, gripper: zero }
 ```
 
 `reverse_flow_5steps_rotz20.yaml`:
@@ -1369,8 +1386,9 @@ extends: base.yaml
 control:
   mode: shared_reverse_flow_steering
   n_reverse_steps: 5
-  corruption: {rotation_z_deg: 20}
-  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}
+  corruption: { rotation_z_deg: 20 }
+  reversal_adapter:
+    { translation: corruption, orientation: zero, gripper: zero }
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -1791,13 +1809,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 7: `live_view.py`: the browser window
 
 **Files:**
+
 - Create: `examples/pi05/libero_shared_autonomy/live_view.py`
 - Modify: `interactive.py`, `experiment.py` (use `LiveView`)
 
 **Interfaces:**
+
 - Produces (module `live_view`):
   - `ACTION_LABELS = ["Δx", "Δy", "Δz", "Δroll", "Δpitch", "Δyaw", "gripper"]`
   - `FrameStream` (unchanged: `publish(rgb)`, `wait_frame(last_seq, timeout)`, `set_status(**kw)`, `get_status()`)
@@ -1923,6 +1944,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 8: `session.py` and the rewritten `interactive.py`
 
 **Files:**
+
 - Create: `examples/pi05/libero_shared_autonomy/session.py`
 - Rewrite: `examples/pi05/libero_shared_autonomy/interactive.py`
 - Delete: `configs`' predecessor `config_interactive.yaml`, `deterministic_corruption.yaml`, `flow_reversal_adapter.yaml`
@@ -1930,6 +1952,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 After this task `experiment.py` is broken (it still imports from the old `interactive`); Task 9 rewrites it. Nothing under `tests/` imports `experiment` yet, so the test suite stays green.
 
 **Interfaces:**
+
 - Consumes: `config.SessionSettings`, `teleop.TeleopChain`, `live_view.LiveView`, `steering.*`
 - Produces (module `session`):
   - `VIDEO_FPS = 30`, `RATE_HZ = 20`, `TELEOP_MAX_STEPS = 900`
@@ -2671,14 +2694,17 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 9: Rewrite `experiment.py` over `Session`
 
 **Files:**
+
 - Rewrite: `examples/pi05/libero_shared_autonomy/experiment.py`
 - Delete: the five old `config_experiment_*.yaml`
 - Create: `tests/examples/pi05_libero_shared_autonomy/test_experiment.py`
 
 **Interfaces:**
+
 - Consumes: `config.load_experiment_settings`, `config.PROMPT_FROM_TASK`, `session.Session`, `session.RolloutResult`, `teleop.TeleopChain`
 - Produces (module `experiment`): `build_schedule(task_ids, n_trials, order, seed) -> list[int]`, `TrialRecorder(chain)` with `__call__(step=, observation=, action=, reward=, terminated=, truncated=, info=)`, `rows`, `total_reads`, `save(path, **scalars)`, `prompt_for(prompt_setting, task_description) -> str`, `parse_args()`, `main()`
 
@@ -3101,12 +3127,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 10: `notebooks/analyze.py`, the stripped notebook, and the nbstripout hook
 
 **Files:**
+
 - Create: `examples/pi05/libero_shared_autonomy/notebooks/analyze.py`
 - Move: `examples/pi05/libero_shared_autonomy/analyze_experiments.ipynb` to `notebooks/analyze_experiments.ipynb` (rewritten, outputs cleared)
 - Modify: `.pre-commit-config.yaml`
 - Create: `tests/examples/pi05_libero_shared_autonomy/test_analyze.py`
 
 **Interfaces:**
+
 - Produces (module `analyze`, importable with `notebooks/` on `sys.path`):
   - `DEADBAND` (from steering), `MODE_SHORT`
   - `find_runs(root: Path) -> list[Path]` (run dirs that contain `trials.jsonl`, sorted)
@@ -3503,12 +3531,12 @@ Expected: exits 0 when `outputs/pi05_libero_experiments` holds at least two runs
 In `.pre-commit-config.yaml`, after the `pyupgrade` repo block:
 
 ```yaml
-  ##### Notebooks #####
-  - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
-    hooks:
-      - id: nbstripout
-        files: ^examples/pi05/.*\.ipynb$
+##### Notebooks #####
+- repo: https://github.com/kynan/nbstripout
+  rev: 0.8.1
+  hooks:
+    - id: nbstripout
+      files: ^examples/pi05/.*\.ipynb$
 ```
 
 Then:
@@ -3533,9 +3561,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 11: Documentation and spec touch-up
 
 **Files:**
+
 - Create: `examples/pi05/README.md`
 - Rewrite: `examples/pi05/libero_shared_autonomy/README.md`
 - Delete: `examples/pi05/libero_shared_autonomy/README_interactive.md`, `README_experiment.md`
@@ -3550,9 +3580,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 Two pipelines built on LeRobot's pi0.5 policy.
 
-| Folder | What it does | Start here |
-| --- | --- | --- |
-| [`feeding_finetune/`](feeding_finetune/) | LoRA fine-tune pi0.5 on the OmniGibson Kinova feeding task from NWB recordings | `bash examples/pi05/feeding_finetune/train.sh` |
+| Folder                                               | What it does                                                                                        | Start here                                        |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| [`feeding_finetune/`](feeding_finetune/)             | LoRA fine-tune pi0.5 on the OmniGibson Kinova feeding task from NWB recordings                      | `bash examples/pi05/feeding_finetune/train.sh`    |
 | [`libero_shared_autonomy/`](libero_shared_autonomy/) | Evaluate, drive and study shared-autonomy steering of pi0.5 on LIBERO with a SpaceMouse or keyboard | `./examples/pi05/libero_shared_autonomy/setup.sh` |
 
 The two do not share code: the feeding pipeline is a dataset converter plus a
@@ -3607,6 +3637,7 @@ Expected: pre-commit passes (prettier may reflow the Markdown tables; re-add aft
 ### Task 12: Runtime verification on the GPU and merge
 
 **Files:**
+
 - None created; produces run directories under `outputs/` (ignored by git)
 
 - [ ] **Step 1: Full test suite for the touched areas**

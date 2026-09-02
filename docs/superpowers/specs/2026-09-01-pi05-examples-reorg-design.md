@@ -317,8 +317,9 @@ extends: base.yaml
 control:
   mode: shared_reverse_flow_steering
   n_reverse_steps: 5
-  corruption: {rotation_z_deg: 20}
-  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}
+  corruption: { rotation_z_deg: 20 }
+  reversal_adapter:
+    { translation: corruption, orientation: zero, gripper: zero }
 ```
 
 The five conditions reproduce the five files on the branch exactly (the branch's

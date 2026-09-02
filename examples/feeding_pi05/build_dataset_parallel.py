@@ -14,6 +14,7 @@ own dataset dir -- then merges the shards into one LeRobotDataset with
 Unrecognized flags (e.g. ``--no-success-only``, ``--min-go-seconds 0.5``) are
 forwarded verbatim to every converter worker.
 """
+
 import argparse
 import glob
 import os
@@ -42,7 +43,7 @@ def split_even(items, n):
     out, i = [], 0
     for g in range(n):
         size = k + (1 if g < m else 0)
-        out.append(items[i:i + size])
+        out.append(items[i : i + size])
         i += size
     return [g for g in out if g]
 
@@ -54,7 +55,9 @@ def main():
     p.add_argument("--workers", type=int, default=8, help="Number of parallel converter processes.")
     p.add_argument("--repo-id", default="rice/feeding_pi05", help="Final merged dataset repo id.")
     p.add_argument("--output-root", default=None, help="Final dataset dir. Default: <raw-root>/lerobot")
-    p.add_argument("--shard-root", default=None, help="Where shards are staged. Default: <raw-root>/lerobot_shards")
+    p.add_argument(
+        "--shard-root", default=None, help="Where shards are staged. Default: <raw-root>/lerobot_shards"
+    )
     p.add_argument("--keep-shards", action="store_true", help="Don't delete shard datasets after merge.")
     args, passthrough = p.parse_known_args()
 
@@ -66,7 +69,9 @@ def main():
     if not seeds:
         sys.exit(f"No seeds with both NWB and video found under {raw_root}")
     groups = split_even(seeds, min(args.workers, len(seeds)))
-    print(f"{len(seeds)} seeds -> {len(groups)} workers: " + " | ".join(",".join(map(str, g)) for g in groups))
+    print(
+        f"{len(seeds)} seeds -> {len(groups)} workers: " + " | ".join(",".join(map(str, g)) for g in groups)
+    )
 
     if os.path.exists(shard_base):
         shutil.rmtree(shard_base)
@@ -80,10 +85,22 @@ def main():
     for i, g in enumerate(groups):
         root_i = os.path.join(shard_base, f"part{i}")
         repo_i = f"{args.repo_id}_part{i}"
-        cmd = [sys.executable, CONVERTER,
-               "--raw-root", raw_root, "--fps", str(args.fps),
-               "--seeds", ",".join(map(str, g)),
-               "--output-root", root_i, "--repo-id", repo_i, "--overwrite", *passthrough]
+        cmd = [
+            sys.executable,
+            CONVERTER,
+            "--raw-root",
+            raw_root,
+            "--fps",
+            str(args.fps),
+            "--seeds",
+            ",".join(map(str, g)),
+            "--output-root",
+            root_i,
+            "--repo-id",
+            repo_i,
+            "--overwrite",
+            *passthrough,
+        ]
         log = open(os.path.join(shard_base, f"part{i}.log"), "w")
         workers.append((i, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env), log))
         shard_roots.append(root_i)

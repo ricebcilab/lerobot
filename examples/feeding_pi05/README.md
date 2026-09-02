@@ -15,12 +15,14 @@ Assumes Linux/Windows with conda, an NVIDIA GPU, and the raw collection copied t
 `$RAW_ROOT` (the folder containing `NWB/` and `videos/`).
 
 ### 0. Clone the fork
+
 ```bash
 git clone https://github.com/ricebcilab/lerobot.git
 cd lerobot
 ```
 
 ### 1. Create the env and install
+
 ```bash
 conda create -y -n lerobot-pi05 python=3.12
 conda activate lerobot-pi05
@@ -29,6 +31,7 @@ pip install pynwb                 # only needed to BUILD the dataset (the conver
 ```
 
 ### 2. Install a CUDA build of torch (the default wheel is CPU-only)
+
 ```bash
 # cu128 works for Blackwell (RTX 50xx / RTX PRO 6000) and Ada/Ampere too.
 pip install --force-reinstall --no-deps \
@@ -37,16 +40,20 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  #
 ```
 
 ### 3. HuggingFace auth (one-time, for the gated base model + tokenizer)
+
 First, while logged into huggingface.co, click **Agree** on both gated pages:
-- https://huggingface.co/google/paligemma-3b-pt-224  (pi05 tokenizer)
-- https://huggingface.co/lerobot/pi05_base            (base checkpoint)
+
+- https://huggingface.co/google/paligemma-3b-pt-224 (pi05 tokenizer)
+- https://huggingface.co/lerobot/pi05_base (base checkpoint)
 
 Then log in (token from https://huggingface.co/settings/tokens, read scope):
+
 ```bash
 hf auth login
 ```
 
 ### 4. Build the dataset (object-balanced, pixels-only)
+
 ```bash
 export RAW_ROOT=/path/to/pi-finetune          # folder with NWB/ and videos/
 python examples/feeding_pi05/build_dataset_parallel.py \
@@ -55,6 +62,7 @@ python examples/feeding_pi05/build_dataset_parallel.py \
     --balance-objects --mid-approach-crops
 # -> writes "$RAW_ROOT/lerobot_v0" (a subfolder; never overwrites your raw NWB/videos)
 ```
+
 `--balance-objects` equalizes episodes per food category (global, deterministic across
 shards; downsample the common, oversample the rare toward the per-category median) so the
 policy can't lean on an object-size close cue. `--mid-approach-crops` adds grasp-timing
@@ -63,11 +71,12 @@ Smoke-test first with `--seeds 0 --max-demos-per-seed 4 --overwrite`. Other flag
 `--task-prompt`, `--min-go-seconds`, `--no-success-only`, `--balance-target {median,min,N}`.
 
 ### 5. Finetune (LoRA on LLM + action expert — the "v1" recipe)
+
 Edit and run `bash examples/feeding_pi05/train_feeding.sh` (canonical config,
 fully commented). Key points, validated at 18/20 matched-seed rollouts vs 3/20
 for the old expert-only finetune:
 
-- **LoRA r=32/α=64 on the PaliGemma LLM *and* action-expert attention q/v**
+- **LoRA r=32/α=64 on the PaliGemma LLM _and_ action-expert attention q/v**
   (`--peft.*` flags; `pip install peft` once). Adapting the LLM fixes language
   grounding — expert-only training cannot. The stock pi05 PEFT defaults adapt
   only the expert and reference stale pi0-era module names; use the explicit
@@ -87,17 +96,21 @@ for the old expert-only finetune:
 ---
 
 ## Alternative: skip raw-data transfer via the Hub
+
 Build the dataset once on the machine that has the raw data, push it, then on the
 workstation just pull by `repo_id` (no `$RAW_ROOT`, no conversion, no pynwb):
+
 ```python
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 LeRobotDataset("rice/feeding_pi05", root="$RAW_ROOT/lerobot").push_to_hub(private=True)
 ```
+
 Then drop `--dataset.root` from the train command; it downloads to `HF_LEROBOT_HOME`.
 
 ---
 
 ## Data facts (verified)
+
 - 5000 trials, 40 seeds × 125 demos, 3 cams @ **224×224**, frames frame-locked.
 - Actions = per-step EEF pose deltas `[dx,dy,dz,drx,dry,drz, gripper]`; state =
   24-d proprio; task = `"Reach, grasp and bring to mouth the {food}"` (19 foods),
@@ -112,6 +125,7 @@ Then drop `--dataset.root` from the train command; it downloads to `HF_LEROBOT_H
 - pi05 QUANTILE normalization is data-driven: `finalize()` writes `q01/q99` stats.
 
 ## Gotchas
+
 - 16 GB GPU: keep `train_expert_only=true` + `gradient_checkpointing=true` +
   `dtype=bfloat16`, lower `batch_size` if you OOM.
 - `compile_model=false` on Windows (triton/torch.compile is unreliable there).

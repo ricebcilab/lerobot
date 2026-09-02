@@ -24,6 +24,7 @@ refuses to write over your raw NWB/ or videos/).
 
     python convert_nwb_to_lerobot.py --raw-root D:/Robotics/results/pi-finetune --fps 30
 """
+
 import argparse
 import glob
 import os
@@ -46,48 +47,90 @@ CLOSE_THRESH = -0.02  # gripper action below this counts as "closing"
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--raw-root", default="D:/Robotics/results/pi-finetune",
-                   help="Folder containing NWB/ and videos/ (the raw collection).")
+    p.add_argument(
+        "--raw-root",
+        default="D:/Robotics/results/pi-finetune",
+        help="Folder containing NWB/ and videos/ (the raw collection).",
+    )
     p.add_argument("--output-root", default=None, help="Output dataset dir. Default: <raw-root>/lerobot")
     p.add_argument("--repo-id", default="rice/feeding_pi05", help="Dataset repo id (metadata only).")
-    p.add_argument("--task-prompt", default="Reach, grasp and bring to mouth the {food}",
-                   help="Language instruction; '{food}' is filled from the trial's text cue.")
-    p.add_argument("--fps", type=int, default=30,
-                   help="Output control rate (Hz). Native ~38; pose deltas are summed when fps<native.")
+    p.add_argument(
+        "--task-prompt",
+        default="Reach, grasp and bring to mouth the {food}",
+        help="Language instruction; '{food}' is filled from the trial's text cue.",
+    )
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="Output control rate (Hz). Native ~38; pose deltas are summed when fps<native.",
+    )
     p.add_argument("--min-go-seconds", type=float, default=0.5, help="Drop demos with a shorter go-period.")
-    p.add_argument("--success-only", action=argparse.BooleanOptionalAction, default=True,
-                   help="Keep only successful trials (use --no-success-only to include failures).")
+    p.add_argument(
+        "--success-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep only successful trials (use --no-success-only to include failures).",
+    )
     p.add_argument("--seeds", default=None, help="Comma/range of seed indices, e.g. '0,1,2' or '0-9'.")
     p.add_argument("--max-demos-per-seed", type=int, default=None, help="Cap demos per seed (smoke test).")
-    p.add_argument("--mid-approach-crops", action=argparse.BooleanOptionalAction, default=False,
-                   help="For each kept demo, ALSO emit a cropped episode starting 0.3-1.0 s (uniform) "
-                        "before the first gripper close (decorrelates grasp timing from episode time).")
-    p.add_argument("--balance-objects", action=argparse.BooleanOptionalAction, default=False,
-                   help="Balance the dataset across food categories (the trial text cue): downsample "
-                        "over-represented foods and oversample (duplicate) under-represented ones toward "
-                        "a per-category target. The plan is GLOBAL over all seeds in --raw-root and "
-                        "deterministic per (seed, demo), so parallel shards stay consistent.")
-    p.add_argument("--balance-target", default="median",
-                   help="Per-category episode target when --balance-objects: 'median' (default), 'min', "
-                        "or an integer count.")
-    p.add_argument("--balance-max-oversample", type=int, default=4,
-                   help="Cap the duplication factor for rare categories (safety against tiny categories).")
-    p.add_argument("--depth", action=argparse.BooleanOptionalAction, default=False,
-                   help="Emit metric depth as EXTRA camera views (observation.images.<cam>_depth), read "
-                        "from the per-demo <demo>_depth.npz written by the depth collection graph. pi05 "
-                        "has no native depth channel, so depth is clipped+normalized to a 3-channel image "
-                        "and consumed as additional cameras (see --depth-max/--depth-min).")
-    p.add_argument("--depth-max", type=float, default=1.5,
-                   help="Clip depth to this many meters before normalizing (tabletop ~1.0-1.5).")
-    p.add_argument("--depth-min", type=float, default=0.0,
-                   help="Lower clip (meters) for depth normalization.")
-    p.add_argument("--gripper-min-dwell", type=int, default=5,
-                   help="Minimum run length (native ~38 Hz frames, default 5 ~= 130 ms) for a binarized "
-                        "gripper state segment; shorter runs merge into the prior state. The gripper action "
-                        "is ALWAYS emitted as an absolute binary state (0=open, 1=closed): the command "
-                        "stream is latched (close cmd -> 1, open cmd -> 0, hold keeps state), matching the "
-                        "openpi convention; deployment (Pi05Agent) maps the predicted state back to "
-                        "open/close commands with hysteresis.")
+    p.add_argument(
+        "--mid-approach-crops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For each kept demo, ALSO emit a cropped episode starting 0.3-1.0 s (uniform) "
+        "before the first gripper close (decorrelates grasp timing from episode time).",
+    )
+    p.add_argument(
+        "--balance-objects",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Balance the dataset across food categories (the trial text cue): downsample "
+        "over-represented foods and oversample (duplicate) under-represented ones toward "
+        "a per-category target. The plan is GLOBAL over all seeds in --raw-root and "
+        "deterministic per (seed, demo), so parallel shards stay consistent.",
+    )
+    p.add_argument(
+        "--balance-target",
+        default="median",
+        help="Per-category episode target when --balance-objects: 'median' (default), 'min', "
+        "or an integer count.",
+    )
+    p.add_argument(
+        "--balance-max-oversample",
+        type=int,
+        default=4,
+        help="Cap the duplication factor for rare categories (safety against tiny categories).",
+    )
+    p.add_argument(
+        "--depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Emit metric depth as EXTRA camera views (observation.images.<cam>_depth), read "
+        "from the per-demo <demo>_depth.npz written by the depth collection graph. pi05 "
+        "has no native depth channel, so depth is clipped+normalized to a 3-channel image "
+        "and consumed as additional cameras (see --depth-max/--depth-min).",
+    )
+    p.add_argument(
+        "--depth-max",
+        type=float,
+        default=1.5,
+        help="Clip depth to this many meters before normalizing (tabletop ~1.0-1.5).",
+    )
+    p.add_argument(
+        "--depth-min", type=float, default=0.0, help="Lower clip (meters) for depth normalization."
+    )
+    p.add_argument(
+        "--gripper-min-dwell",
+        type=int,
+        default=5,
+        help="Minimum run length (native ~38 Hz frames, default 5 ~= 130 ms) for a binarized "
+        "gripper state segment; shorter runs merge into the prior state. The gripper action "
+        "is ALWAYS emitted as an absolute binary state (0=open, 1=closed): the command "
+        "stream is latched (close cmd -> 1, open cmd -> 0, hold keeps state), matching the "
+        "openpi convention; deployment (Pi05Agent) maps the predicted state back to "
+        "open/close commands with hysteresis.",
+    )
     p.add_argument("--overwrite", action="store_true", help="Remove an existing output dataset first.")
     return p.parse_args(argv)
 
@@ -186,9 +229,9 @@ def build_episode(seed_dir, demo, fa, proprio, fa_ts, go, stop, fps, depth=None,
         js = np.nonzero((fa_ts >= t0) & (fa_ts < t0 + period))[0]
         if len(js):
             act = np.empty(7, np.float32)
-            act[:GRIP] = fa[js, :GRIP].sum(0)        # sum pose deltas over the window
+            act[:GRIP] = fa[js, :GRIP].sum(0)  # sum pose deltas over the window
             j0 = int(js[0])
-        else:                                        # fps above native: nearest single delta
+        else:  # fps above native: nearest single delta
             j0 = int(np.argmin(np.abs(fa_ts - t0)))
             act = fa[j0].astype(np.float32)
         act[GRIP] = gbin[js[-1] if len(js) else j0]  # latched binary state, last-in-bin
@@ -228,6 +271,7 @@ def build_balance_plan(nwbs, vids, args):
     oversampled by duplicating demos up to the target (capped by --balance-max-oversample).
     """
     from pynwb import NWBHDF5IO
+
     by_cat = {}  # category -> list of (rank_key, seed, demo)
     for nwb_path in nwbs:
         seed = seed_index_of(nwb_path)
@@ -239,7 +283,9 @@ def build_balance_plan(nwbs, vids, args):
         for demo in range(n_demos):
             row = df.iloc[demo]
             go, stop = float(row["go_cue_time"]), float(row["stop_time"])
-            if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
+            if (args.success_only and not bool(row["trial_result_result"])) or (
+                stop - go
+            ) < args.min_go_seconds:
                 continue
             cat = str(row["trial_info_text_cue"])
             by_cat.setdefault(cat, []).append((_rank_key(seed, demo), seed, demo))
@@ -274,8 +320,14 @@ def build_balance_plan(nwbs, vids, args):
 def save_episode(ds, ep, task):
     frames, actions, states = ep
     for i in range(len(actions)):
-        ds.add_frame({"observation.state": states[i], "action": actions[i], "task": task,
-                      **{f"observation.images.{n}": frames[n][i] for n in frames}})
+        ds.add_frame(
+            {
+                "observation.state": states[i],
+                "action": actions[i],
+                "task": task,
+                **{f"observation.images.{n}": frames[n][i] for n in frames},
+            }
+        )
     ds.save_episode(parallel_encoding=False)
 
 
@@ -284,9 +336,14 @@ def main(argv=None):
     from pynwb import NWBHDF5IO
 
     output_root = os.path.abspath(args.output_root or os.path.join(args.raw_root, "lerobot"))
-    if output_root == os.path.abspath(args.raw_root) or os.path.isdir(os.path.join(output_root, "NWB")) \
-            or glob.glob(os.path.join(output_root, "videos", "*seed*")):
-        sys.exit(f"REFUSING: {output_root} holds raw NWB/videos (would be clobbered). Pick another --output-root.")
+    if (
+        output_root == os.path.abspath(args.raw_root)
+        or os.path.isdir(os.path.join(output_root, "NWB"))
+        or glob.glob(os.path.join(output_root, "videos", "*seed*"))
+    ):
+        sys.exit(
+            f"REFUSING: {output_root} holds raw NWB/videos (would be clobbered). Pick another --output-root."
+        )
     if os.path.exists(output_root):
         if not args.overwrite:
             sys.exit(f"{output_root} exists. Pass --overwrite to rebuild.")
@@ -311,23 +368,52 @@ def main(argv=None):
     depth_cfg = (args.depth_min, args.depth_max) if args.depth else None
     grip_dwell = args.gripper_min_dwell
     if args.depth and not glob.glob(os.path.join(next(iter(vids.values())), "demo_*_depth.npz")):
-        sys.exit("--depth set but no <demo>_depth.npz found in the video dirs. This raw data was "
-                 "collected without depth; recollect with the depth graph or drop --depth.")
+        sys.exit(
+            "--depth set but no <demo>_depth.npz found in the video dirs. This raw data was "
+            "collected without depth; recollect with the depth graph or drop --depth."
+        )
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
     features = {
-        "observation.state": {"dtype": "float32", "shape": (24,),
-                              "names": {"axes": [f"proprio_{i}" for i in range(24)]}},
-            "action": {"dtype": "float32", "shape": (7,),
-                   "names": {"axes": ["dx", "dy", "dz", "drx", "dry", "drz", "gripper"]}},
-        **{f"observation.images.{n}": {"dtype": "video", "shape": (H, W, 3),
-                                       "names": ["height", "width", "channels"]} for n in CAMS},
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (24,),
+            "names": {"axes": [f"proprio_{i}" for i in range(24)]},
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": {"axes": ["dx", "dy", "dz", "drx", "dry", "drz", "gripper"]},
+        },
+        **{
+            f"observation.images.{n}": {
+                "dtype": "video",
+                "shape": (H, W, 3),
+                "names": ["height", "width", "channels"],
+            }
+            for n in CAMS
+        },
     }
     if args.depth:
-        features.update({f"observation.images.{n}_depth": {"dtype": "video", "shape": (H, W, 3),
-                         "names": ["height", "width", "channels"]} for n in CAMS})
-    ds = LeRobotDataset.create(repo_id=args.repo_id, fps=args.fps, features=features,
-                               root=output_root, robot_type="kinova_gen3", use_videos=True)
+        features.update(
+            {
+                f"observation.images.{n}_depth": {
+                    "dtype": "video",
+                    "shape": (H, W, 3),
+                    "names": ["height", "width", "channels"],
+                }
+                for n in CAMS
+            }
+        )
+    ds = LeRobotDataset.create(
+        repo_id=args.repo_id,
+        fps=args.fps,
+        features=features,
+        root=output_root,
+        robot_type="kinova_gen3",
+        use_videos=True,
+    )
 
     kept = dropped = crops = balance_skipped = no_close_skipped = 0
     for nwb_path in nwbs:
@@ -344,30 +430,37 @@ def main(argv=None):
         n_demos = len(df) if args.max_demos_per_seed is None else min(args.max_demos_per_seed, len(df))
         s_kept = 0
         for demo in range(n_demos):
-
             row = df.iloc[demo]
             go, stop = float(row["go_cue_time"]), float(row["stop_time"])
-            if (args.success_only and not bool(row["trial_result_result"])) or (stop - go) < args.min_go_seconds:
-                dropped += 1; continue
+            if (args.success_only and not bool(row["trial_result_result"])) or (
+                stop - go
+            ) < args.min_go_seconds:
+                dropped += 1
+                continue
 
             # Object balancing: emit this demo `n_emit` times (0 = drop, >1 = oversample).
             n_emit = balance_plan.get((seed, demo), 0) if balance_plan is not None else 1
             if n_emit == 0:
-                balance_skipped += 1; continue
+                balance_skipped += 1
+                continue
             t_close = first_close_time(fa, fa_ts, go, stop)
 
             # A real feeding success must close the gripper
             if t_close is None and bool(row["trial_result_result"]):
                 print(f"[seed {seed}] demo {demo}: success without gripper close (sim glitch), dropping")
-                no_close_skipped += 1; continue
+                no_close_skipped += 1
+                continue
             try:
-                ep = build_episode(vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps, depth_cfg,
-                                   grip_dwell)
+                ep = build_episode(
+                    vids[seed], demo, fa, proprio, fa_ts, go, stop, args.fps, depth_cfg, grip_dwell
+                )
             except (av.FFmpegError, LookupError, FileNotFoundError, KeyError) as e:
                 print(f"[seed {seed}] demo {demo}: undecodable video/depth, dropping demo ({e})")
-                dropped += 1; continue
+                dropped += 1
+                continue
             if ep is None:
-                dropped += 1; continue
+                dropped += 1
+                continue
             task = args.task_prompt.format(food=str(row["trial_info_text_cue"]))
 
             ep2 = None
@@ -375,8 +468,18 @@ def main(argv=None):
                 crop_go = t_close - float(np.random.default_rng([2, seed, demo]).uniform(0.3, 1.0))
                 if crop_go > go and (stop - crop_go) >= args.min_go_seconds:
                     try:
-                        ep2 = build_episode(vids[seed], demo, fa, proprio, fa_ts, crop_go, stop, args.fps,
-                                            depth_cfg, grip_dwell)
+                        ep2 = build_episode(
+                            vids[seed],
+                            demo,
+                            fa,
+                            proprio,
+                            fa_ts,
+                            crop_go,
+                            stop,
+                            args.fps,
+                            depth_cfg,
+                            grip_dwell,
+                        )
                     except (av.FFmpegError, LookupError, FileNotFoundError, KeyError) as e:
                         print(f"[seed {seed}] demo {demo}: undecodable video/depth, dropping crop ({e})")
                         ep2 = None
@@ -384,7 +487,8 @@ def main(argv=None):
             # Emit the (already-decoded) base episode and its crop n_emit times each.
             for _ in range(n_emit):
                 save_episode(ds, ep, task)
-                kept += 1; s_kept += 1
+                kept += 1
+                s_kept += 1
                 if ep2 is not None:
                     save_episode(ds, ep2, task)
                     crops += 1
@@ -392,9 +496,11 @@ def main(argv=None):
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
 
     ds.finalize()
-    print(f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, {dropped} dropped, "
-          f"{balance_skipped} balance-subsampled out, {no_close_skipped} no-close sim glitches. "
-          f"Dataset at {output_root}")
+    print(
+        f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, {dropped} dropped, "
+        f"{balance_skipped} balance-subsampled out, {no_close_skipped} no-close sim glitches. "
+        f"Dataset at {output_root}"
+    )
     print("finalize() computed q01/q99 stats -> pi05 QUANTILE normalization is data-driven.")
 
 
