@@ -193,8 +193,8 @@ Pure functions, no torch or LIBERO import.
 - `deep_merge(base, overlay) -> dict` (overlay wins; a `null` in the overlay resets the
   key to the built-in default, matching today's "null keeps the default" rule).
 - `flatten(data, schema, where) -> dict`, rejecting unknown keys as today.
-- `resolve_paths(flat, config_path)`: every key listed as a path becomes absolute
-  relative to the config file's directory.
+- No path resolution is needed: after matrices moved inline, no config key names a
+  file. `policy.path` may be a Hub id and is passed through untouched.
 - `load_interactive_settings(path, cli_overrides) -> SessionSettings`.
 - `load_experiment_settings(path, cli_overrides) -> ExperimentSettings`: reads
   `base.yaml` from the same directory as the condition file when the condition file has
@@ -382,7 +382,8 @@ the five modes, and one two-trial experiment with `reverse_flow_5steps_rotz20.ya
 
 ## 10. Merge and history
 
-1. Fast-forward `main` to `origin/pi05-libero-shared-autonomy-experiments`.
+1. Merge (a regular merge; `main` gained the spec commit after the branch point) `main`
+   to `origin/pi05-libero-shared-autonomy-experiments`.
 2. Create branch `reorg-pi05-examples` in a worktree.
 3. Reorganize in a series of commits, each leaving tests green:
    move feeding; move libero folder and add `env.sh`; extract `steering.py` with tests;
