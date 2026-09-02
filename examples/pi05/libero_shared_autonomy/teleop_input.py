@@ -29,6 +29,8 @@ import numpy as np
 import yaml
 from spacemouse import AXIS_SCALE, GRIPPER_CLOSE, GRIPPER_OPEN, normalize
 
+from lerobot.policies.pi05.steering import validate_matrix
+
 DEFAULT_SPEED = 0.5  # fraction of full-scale deflection a held key produces
 FAST_KEY = "shift"  # hold for full-scale (1.0) deflection
 DEADBAND = 0.05  # below this a source counts as idle (matches FlowControlPolicy)
@@ -140,19 +142,6 @@ class CombinedReader:
     def gripper(self) -> float:
         n_closed = sum(source.gripper == GRIPPER_CLOSE for source in self.sources)
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
-
-
-def validate_matrix(matrix, size: int = 3, where: str = "matrix") -> np.ndarray:
-    """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
-    try:
-        m = np.asarray(matrix, dtype=np.float64)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{where}: entries must be numbers ({e})") from e
-    if m.shape != (size, size):
-        raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
-    if not np.all(np.isfinite(m)):
-        raise ValueError(f"{where}: entries must be finite")
-    return m
 
 
 def load_matrix(path: str | Path, size: int = 3, keys: Iterable[str] = ("M", "matrix")) -> np.ndarray:
