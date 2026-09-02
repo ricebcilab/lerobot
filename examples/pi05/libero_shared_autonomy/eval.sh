@@ -9,15 +9,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 set -euo pipefail
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-
-export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${REPO_ROOT}/.cache/libero}"
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-${REPO_ROOT}/.cache/huggingface/hub}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/.cache/matplotlib}"
-mkdir -p "${HF_HUB_CACHE}" "${MPLCONFIGDIR}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/env.sh"
 
 PI05_MODEL_ID="${PI05_MODEL_ID:-lerobot/pi05_libero_finetuned}"
 LIBERO_TASKS="${LIBERO_TASKS:-libero_spatial}"
@@ -35,7 +27,7 @@ if [[ -n "${LIBERO_TASK_IDS}" ]]; then
 fi
 
 cd "${REPO_ROOT}"
-exec uv run --locked --extra pi --extra libero lerobot-eval \
+exec "${UV_RUN[@]}" lerobot-eval \
     --output_dir="${LIBERO_OUTPUT_DIR}" \
     --policy.path="${PI05_MODEL_ID}" \
     --policy.n_action_steps="${PI05_ACTION_STEPS}" \
