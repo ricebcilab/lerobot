@@ -161,3 +161,93 @@ def test_config_creation():
     except Exception as e:
         print(f"Config creation failed: {e}")
         raise
+
+
+def _small_policy():
+    """A pi0.5 with 7-dim actions, batch built the same way as test_policy_instantiation
+    (through the pre-processor), since `predict_action_chunk` requires the batch to already
+    contain tokenized-language keys that only the pre-processor adds -- a raw batch with a
+    `"task"` string is not enough.
+    """
+    set_seed(0)
+    config = PI05Config(max_action_dim=7, max_state_dim=14, dtype="float32", num_inference_steps=4)
+    from lerobot.configs.types import FeatureType, PolicyFeature
+
+    config.input_features = {
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(14,)),
+        "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+    }
+    config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+
+    dataset_stats = {
+        "observation.state": {
+            "mean": torch.zeros(14),
+            "std": torch.ones(14),
+            "min": torch.zeros(14),
+            "max": torch.ones(14),
+            "q01": torch.zeros(14),
+            "q99": torch.ones(14),
+        },
+        "action": {
+            "mean": torch.zeros(7),
+            "std": torch.ones(7),
+            "min": torch.zeros(7),
+            "max": torch.ones(7),
+            "q01": torch.zeros(7),
+            "q99": torch.ones(7),
+        },
+        "observation.images.base_0_rgb": {
+            "mean": torch.zeros(3, 224, 224),
+            "std": torch.ones(3, 224, 224),
+            "q01": torch.zeros(3, 224, 224),
+            "q99": torch.ones(3, 224, 224),
+        },
+    }
+
+    policy = PI05Policy(config).to("cuda").eval()
+    preprocessor, _ = make_pi05_pre_post_processors(config=config, dataset_stats=dataset_stats)
+    device = config.device
+    batch = {
+        "observation.state": torch.zeros(1, 14, dtype=torch.float32, device=device),
+        "observation.images.base_0_rgb": torch.zeros(1, 3, 224, 224, dtype=torch.float32, device=device),
+        "task": ["do something"],
+    }
+    batch = preprocessor(batch)
+    return policy, batch
+
+
+@require_cuda
+@require_hf_token
+def test_sample_actions_noise_fn_replaces_starting_noise():
+    policy, batch = _small_policy()
+    seen = {}
+
+    def noise_fn(velocity, noise):
+        seen["noise_shape"] = tuple(noise.shape)
+        v = velocity(noise, 1.0)  # the velocity closure must evaluate the field
+        seen["velocity_shape"] = tuple(v.shape)
+        return torch.zeros_like(noise)
+
+    with torch.inference_mode():
+        chunk = policy.predict_action_chunk(batch, noise_fn=noise_fn)
+    assert seen["noise_shape"] == (1, policy.config.chunk_size, policy.config.max_action_dim)
+    assert seen["velocity_shape"] == seen["noise_shape"]
+    assert chunk.shape[0] == 1
+
+
+@require_cuda
+@require_hf_token
+def test_sample_actions_partial_schedule_lands_on_zero():
+    policy, batch = _small_policy()
+    times = []
+
+    def x_t_hook(step, time, x_t):
+        times.append(round(time, 6))
+        return x_t
+
+    with torch.inference_mode():
+        policy.predict_action_chunk(batch, x_t_hook=x_t_hook, flow_start_time=0.5, num_forward_steps=2)
+    assert times == [0.5, 0.25]  # two Euler steps of -0.25 from t=0.5 reach t=0
+
+    with pytest.raises(ValueError, match="num_forward_steps"), torch.inference_mode():
+        policy.predict_action_chunk(batch, flow_start_time=0.5, num_forward_steps=0)
