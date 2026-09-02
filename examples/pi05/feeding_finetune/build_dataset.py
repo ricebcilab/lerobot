@@ -9,7 +9,7 @@ worker processes -- each runs the converter on a disjoint seed subset into its
 own dataset dir -- then merges the shards into one LeRobotDataset with
 ``aggregate_datasets``. On a many-core box this is ~Nx faster.
 
-    python build_dataset_parallel.py --raw-root "$RAW_ROOT" --fps 30 --workers 8
+    python build_dataset.py --raw-root "$RAW_ROOT" --fps 30 --workers 8
 
 Unrecognized flags (e.g. ``--no-success-only``, ``--min-go-seconds 0.5``) are
 forwarded verbatim to every converter worker.

@@ -5,7 +5,7 @@ feeding task, from the OmniGibson NWB + mp4 collection.
 
 - `convert_nwb_to_lerobot.py` — adapter: NWB + mp4 (+ per-frame timestamp sidecar)
   → `LeRobotDataset`. Timestamp-aligned, go-period only, success/min-length filters.
-- `train_feeding.sh` — `lerobot-train` launch for pi05.
+- `train.sh` — `lerobot-train` launch for pi05.
 
 ---
 
@@ -56,7 +56,7 @@ hf auth login
 
 ```bash
 export RAW_ROOT=/path/to/pi-finetune          # folder with NWB/ and videos/
-python examples/feeding_pi05/build_dataset_parallel.py \
+python examples/pi05/feeding_finetune/build_dataset.py \
     --raw-root "$RAW_ROOT" --fps 30 --workers 12 \
     --output-root "$RAW_ROOT/lerobot_v0" --repo-id rice/feeding_pi05_v0 \
     --balance-objects --mid-approach-crops
@@ -72,7 +72,7 @@ Smoke-test first with `--seeds 0 --max-demos-per-seed 4 --overwrite`. Other flag
 
 ### 5. Finetune (LoRA on LLM + action expert — the "v1" recipe)
 
-Edit and run `bash examples/feeding_pi05/train_feeding.sh` (canonical config,
+Edit and run `bash examples/pi05/feeding_finetune/train.sh` (canonical config,
 fully commented). Key points, validated at 18/20 matched-seed rollouts vs 3/20
 for the old expert-only finetune:
 

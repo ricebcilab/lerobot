@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LoRA-finetune pi-0.5 on the OmniGibson feeding dataset (the "v1" recipe).
 # Run inside the `lerobot-pi05` conda env (`pip install peft` once) after
-# building the dataset with convert_nwb_to_lerobot.py / build_dataset_parallel.py
+# building the dataset with convert_nwb_to_lerobot.py / build_dataset.py
 # (object-BALANCED, pixels-only; the gripper is always binarized).
 #
 # Recipe notes (validated 2026-08: 18/20 matched-seed rollouts vs 3/20 for the
