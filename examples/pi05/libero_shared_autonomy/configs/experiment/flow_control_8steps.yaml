@@ -1,5 +1,0 @@
-# Shared flow control, n_guided_steps = 8, clean operator command.
-extends: base.yaml
-control:
-  mode: shared_flow_control
-  n_guided_steps: 8

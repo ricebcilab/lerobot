@@ -8,6 +8,7 @@ into arrays (see `lerobot.policies.pi05.steering` for the accepted forms).
 """
 
 import copy
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -226,11 +227,51 @@ def load_interactive_settings(path: str | Path | None, overrides: dict) -> Sessi
     return _session_from_flat(flat, where, SessionSettings())
 
 
-def load_experiment_settings(path: str | Path, overrides: dict) -> ExperimentSettings:
-    """Settings for experiment.py: the condition file (with extends) then CLI overrides."""
+def parse_set(item: str) -> tuple[list[str], object]:
+    """Parse a `--set KEY=VALUE` item: a dotted YAML path and a YAML-parsed value."""
+    key, sep, raw = item.partition("=")
+    key = key.strip()
+    if not sep or not key or not all(part.isidentifier() for part in key.split(".")):
+        raise ValueError(
+            f"--set expects KEY=VALUE with a dotted key such as control.n_guided_steps=4, got {item!r}"
+        )
+    return key.split("."), yaml.safe_load(raw) if raw.strip() else None
+
+
+def sets_to_tree(items: list[str]) -> dict:
+    """Nested mapping from `--set` items, later items winning: ['control.n_guided_steps=4'] -> {'control': {...}}."""
+    tree: dict = {}
+    for item in items:
+        parts, value = parse_set(item)
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"--set {item}: '{part}' is not a section")
+        node[parts[-1]] = value
+    return tree
+
+
+def set_label(items: list[str]) -> str:
+    """Filesystem-safe suffix describing `--set` items: control.n_guided_steps=4 -> n_guided_steps-4."""
+    parts = []
+    for item in items:
+        keys, value = parse_set(item)
+        text = "null" if value is None else re.sub(r"[^A-Za-z0-9._=,+-]", "", str(value).replace(": ", "="))
+        parts.append(f"{keys[-1]}-{text[:40]}")
+    return "_".join(parts)
+
+
+def load_experiment_settings(
+    path: str | Path, overrides: dict, sets: list[str] | None = None
+) -> ExperimentSettings:
+    """Settings for experiment.py: the condition file (with extends), `--set` items, then flat CLI overrides."""
     path = Path(path)
     where = str(path)
-    flat = flatten(load_yaml_with_extends(path), EXPERIMENT_SCHEMA, where)
+    data = load_yaml_with_extends(path)
+    if sets:
+        data = deep_merge(data, sets_to_tree(sets))
+    flat = flatten(data, EXPERIMENT_SCHEMA, where)
     flat.update({k: v for k, v in overrides.items() if v is not None})
     defaults = ExperimentSettings(name=path.stem, session=SessionSettings())
     session_defaults = SessionSettings(output_dir=defaults.output_dir)

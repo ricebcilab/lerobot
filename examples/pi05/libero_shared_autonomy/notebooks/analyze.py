@@ -44,6 +44,9 @@ def label_for(config: dict) -> str:
     mode = MODE_SHORT.get(config["mode"], config["mode"])
     if config["mode"] == "shared_flow_control":
         mode += f" n_guided_steps={config.get('n_guided_steps', config.get('tau'))}"  # tau: pre-rename runs
+    elif config["mode"] == "shared_flow_reversal_steering":
+        depth = config.get("n_reversal_steps")
+        mode += " full" if depth is None else f" n_reversal_steps={depth}"
     tags = []
     if config.get("corruption_matrix") is not None:
         tags.append("+M")

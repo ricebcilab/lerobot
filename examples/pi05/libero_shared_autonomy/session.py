@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-from config import MODES, SessionSettings, spec_label
+from config import MODES, ControlSettings, SessionSettings, spec_label
 from live_view import ACTION_LABELS, LiveView
 from teleop import KeyboardReader, TeleopChain
 
@@ -88,8 +88,6 @@ class Session:
         self.keyboard = KeyboardReader()
         self.chain = TeleopChain(self.keyboard, input_noise=control.input_noise)
         self.adapter = ReversalAdapter()
-        self.set_corruption(control.corruption_matrix, spec_label(control.corruption))
-        self.set_reversal_adapter(control.reversal_adapter_matrix, spec_label(control.reversal_adapter))
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
         self.view.start()
         print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
@@ -131,7 +129,7 @@ class Session:
         self.mode = "policy"
         self.n_guided_steps = control.n_guided_steps
         self.n_reversal_steps = control.n_reversal_steps
-        self.set_mode(control.mode, control.n_guided_steps, control.n_reversal_steps)
+        self.apply_control(control)
 
     @classmethod
     def from_settings(cls, settings: SessionSettings) -> "Session":
@@ -221,6 +219,17 @@ class Session:
         self.mode = mode
         if mode != "policy":
             self.chain.attach_spacemouse()
+
+    def apply_control(self, control: ControlSettings) -> None:
+        """Put the session in the state a `control:` block describes (mode, depths, noise, matrices)."""
+        self.set_corruption(control.corruption_matrix, spec_label(control.corruption))
+        self.set_reversal_adapter(control.reversal_adapter_matrix, spec_label(control.reversal_adapter))
+        self.chain.noisy.input_noise = control.input_noise
+        total = self.policy.config.num_inference_steps
+        if control.n_reversal_steps is not None and not 1 <= control.n_reversal_steps <= total:
+            raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
+        self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
+        self.set_mode(control.mode, control.n_guided_steps)
 
     def mode_label(self) -> str:
         """Short label for the terminal and the live view."""

@@ -74,7 +74,7 @@ def test_end_to_end_on_synthetic_runs(tmp_path):
 
     trials, configs = load_runs([a, b])
     assert len(trials) == 6 and set(trials["run"]) == {a.name, b.name}
-    assert label_for(configs[a.name]) == "FC n_guided_steps=8" and label_for(configs[b.name]) == "FRS+M"
+    assert label_for(configs[a.name]) == "FC n_guided_steps=8" and label_for(configs[b.name]) == "FRS full+M"
 
     table = success_table(trials, configs)
     assert table.loc[a.name, "successes"] == 2 and table.loc[b.name, "success_rate"] == 1.0

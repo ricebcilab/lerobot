@@ -1,0 +1,9 @@
+# Arm 3: Flow Reversal Steering with the reversal adapter (our addition). The
+# adapter reshapes the velocity field during the reversal only: its translation
+# block is the known corruption M, and orientation/gripper are frozen.
+#   sweep the depth:  --sweep control.n_reversal_steps=2,4,6,8,10
+extends: base.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: null
+  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}

@@ -1,10 +1,12 @@
-# Shared settings for every experiment condition in this folder. A condition
-# file says `extends: base.yaml` and overrides only what it changes. Unknown
-# keys are rejected; a key set to null keeps the built-in default.
+# Shared settings for every experiment arm in this folder. An arm file says
+# `extends: base.yaml` and overrides only what it changes; on the command line,
+# `--set KEY=VALUE` overrides any key and `--sweep KEY=V1,V2,...` runs one block
+# per value. Unknown keys are rejected; a key set to null keeps the built-in
+# default.
 
 experiment:
-  n_trials: 10                # trials per run
-  seed: 0                     # seeds the task schedule (same seed = same tasks in every condition)
+  n_trials: 10                # trials per block
+  seed: 0                     # seeds the task schedule (same seed = same tasks in every arm)
   task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
   output_dir: outputs/pi05_libero_experiments
 
@@ -24,12 +26,14 @@ policy:
 
 control:
   mode: shared_flow_reversal_steering
-  n_guided_steps: 8                      # shared_flow_control only
-  n_reversal_steps: null       # shared_flow_reversal_steering only; null = all the way to noise
+  n_guided_steps: 8           # shared_flow_control only: denoising steps the operator's command is written into
+  n_reversal_steps: null      # shared_flow_reversal_steering only; null = reverse all the way to noise
   input_noise: 0.0
   max_steps: null             # null = the suite's own episode length
-  corruption: null            # what the robot gets = M @ what the operator commanded (env units)
-  reversal_adapter: null      # reverse integration follows F @ v (normalized action space)
+  # The known corruption every arm is studied under: what the robot gets is
+  # M @ what the operator commanded (env units). `--set control.corruption=null` for a clean run.
+  corruption: {rotation_z_deg: 20}
+  reversal_adapter: null      # reverse integration follows F @ v; the *_adapted arm sets it
 
 server:
   port: 8765

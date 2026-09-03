@@ -14,6 +14,9 @@ from config import (
     load_experiment_settings,
     load_interactive_settings,
     load_yaml_with_extends,
+    parse_set,
+    set_label,
+    sets_to_tree,
     spec_label,
 )
 
@@ -84,16 +87,53 @@ def test_every_shipped_condition_loads(name):
     assert s.session.suite == "libero_goal" and s.seed == 0 and s.prompt == "do something"
 
 
-def test_condition_matrices_resolve():
-    s = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_5steps_rotz20.yaml", {})
-    c = s.session.control
-    assert c.n_reversal_steps == 5
+def test_arm_files_resolve():
+    adapted = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20_adapted.yaml", {})
+    c = adapted.session.control
+    assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
     np.testing.assert_allclose(c.corruption_matrix, rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :], 0)
     assert spec_label(c.corruption) == "rotation_z_deg=20"
-    clean = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_8steps.yaml", {})
-    assert clean.session.control.n_guided_steps == 8 and clean.session.control.corruption_matrix is None
+    native = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml", {})
+    assert native.session.control.reversal_adapter_matrix is None
+    np.testing.assert_allclose(native.session.control.corruption_matrix, rotation_about_z(20))
+    fc = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml", {})
+    assert fc.session.control.mode == "shared_flow_control" and fc.session.control.n_guided_steps == 8
+
+
+def test_parse_set_and_tree():
+    assert parse_set("control.n_guided_steps=4") == (["control", "n_guided_steps"], 4)
+    assert parse_set("control.corruption=null") == (["control", "corruption"], None)
+    assert parse_set("control.reversal_adapter={translation: corruption, gripper: zero}") == (
+        ["control", "reversal_adapter"],
+        {"translation": "corruption", "gripper": "zero"},
+    )
+    assert sets_to_tree(["control.n_guided_steps=4", "experiment.seed=3", "control.n_guided_steps=6"]) == {
+        "control": {"n_guided_steps": 6},
+        "experiment": {"seed": 3},
+    }
+    for bad in ("n_guided_steps", "=4", "control.bad key=1"):
+        with pytest.raises(ValueError, match="--set"):
+            parse_set(bad)
+    assert (
+        set_label(["control.n_guided_steps=4", "control.corruption=null"])
+        == "n_guided_steps-4_corruption-null"
+    )
+
+
+def test_sets_override_the_file_and_are_validated():
+    path = CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml"
+    s = load_experiment_settings(path, {}, sets=["control.n_guided_steps=4", "control.corruption=null"])
+    assert s.session.control.n_guided_steps == 4 and s.session.control.corruption_matrix is None
+    s = load_experiment_settings(
+        path, {}, sets=["control.mode=shared_flow_reversal_steering", "control.n_reversal_steps=5"]
+    )
+    assert s.session.control.n_reversal_steps == 5
+    with pytest.raises(ValueError, match="unknown key"):
+        load_experiment_settings(path, {}, sets=["control.depth=4"])
+    with pytest.raises(ValueError, match="control.mode"):
+        load_experiment_settings(path, {}, sets=["control.mode=nope"])
 
 
 def test_experiment_validation_errors(tmp_path):

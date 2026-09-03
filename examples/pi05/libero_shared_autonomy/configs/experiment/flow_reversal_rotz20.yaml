@@ -1,0 +1,8 @@
+# Arm 2: native Flow Reversal Steering under the known corruption, no adapter.
+# The reference chunk built from the operator's command is reversed through the
+# policy's own velocity field; n_reversal_steps = null reverses all the way.
+#   sweep the depth:  --sweep control.n_reversal_steps=2,4,6,8,10
+extends: base.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: null

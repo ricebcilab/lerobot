@@ -1,5 +1,0 @@
-# Flow reversal steering, full reversal to noise, clean operator command.
-extends: base.yaml
-control:
-  mode: shared_flow_reversal_steering
-  n_reversal_steps: null

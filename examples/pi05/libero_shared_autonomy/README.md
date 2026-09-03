@@ -194,11 +194,12 @@ level.
 
 To run scripted, recorded trials from a YAML config instead of the REPL
 (shared-autonomy user studies), use `run.sh experiment` with one of the
-shipped conditions (a bare file name is looked up under `configs/experiment/`):
+shipped arms (a bare file name is looked up under `configs/experiment/`):
 
 ```bash
-./examples/pi05/libero_shared_autonomy/run.sh experiment --config flow_reversal_full.yaml
-./examples/pi05/libero_shared_autonomy/run.sh experiment --config flow_reversal_full.yaml --dry-run   # validate + print the schedule, run nothing
+R=./examples/pi05/libero_shared_autonomy/run.sh
+$R experiment --config flow_reversal_rotz20.yaml --dry-run   # validate + print the schedule, run nothing
+$R experiment --config flow_reversal_rotz20.yaml             # one block of n_trials
 ```
 
 `experiment.py` runs a scripted sequence of trials with the same policy, live
@@ -216,30 +217,48 @@ manipulation priors while you supply the intent through the shared-autonomy
 channel. Set `prompt: task` to give the VLA the scene's own instruction
 instead, i.e. to run the conventional setup where both know the goal.
 
-### Conditions
+### Arms, overrides and sweeps
 
-Five condition files ship in `configs/experiment/`; each has `extends: base.yaml`
-and overrides only what it changes:
+`configs/experiment/base.yaml` holds everything the study shares, including the
+known corruption (`corruption: {rotation_z_deg: 20}`: the operator's command is
+rotated 20° about z before the policy sees it). Three arm files extend it:
 
-- `flow_control_8steps.yaml` — shared flow control, `n_guided_steps = 8`, clean operator command.
-- `flow_control_8steps_rotz20.yaml` — shared flow control, `n_guided_steps = 8`, operator
-  command rotated 20° about z.
-- `flow_reversal_full.yaml` — flow reversal steering, full reversal to noise,
-  clean operator command.
-- `flow_reversal_full_rotz20.yaml` — flow reversal steering, full reversal,
-  command rotated 20° about z; the reversal adapter applies the same rotation
-  to the velocity's translation block and freezes orientation and gripper
-  during the reversal.
-- `flow_reversal_5steps_rotz20.yaml` — flow reversal steering stopped after 5 of
-  10 steps (t = 0.5), same rotation and adapter as `flow_reversal_full_rotz20`.
+- `flow_control_rotz20.yaml` — shared flow control; the operator's command is
+  written into the first `n_guided_steps` denoising steps of every chunk.
+- `flow_reversal_rotz20.yaml` — native Flow Reversal Steering; the reference
+  chunk is reversed `n_reversal_steps` of the way to noise (`null` = all the way).
+- `flow_reversal_rotz20_adapted.yaml` — Flow Reversal Steering with the
+  reversal adapter, our addition: the velocity field used by the reversal is
+  reshaped by `F`, whose translation block is the known corruption and whose
+  orientation and gripper blocks are zero.
+
+The depth of each method is a sweep variable rather than a file. `--set KEY=VALUE`
+overrides any YAML key (dotted path, value parsed as YAML) and `--sweep KEY=V1,V2,...`
+runs one block of `n_trials` per value with a single policy load, pausing for Enter
+before each block's first trial:
+
+```bash
+R=./examples/pi05/libero_shared_autonomy/run.sh
+$R experiment --config flow_control_rotz20.yaml           --sweep control.n_guided_steps=2,4,6,8,10
+$R experiment --config flow_reversal_rotz20.yaml          --sweep control.n_reversal_steps=2,4,6,8,10
+$R experiment --config flow_reversal_rotz20_adapted.yaml  --sweep control.n_reversal_steps=2,4,6,8,10
+
+$R experiment --config flow_control_rotz20.yaml --set control.corruption=null      # a clean run
+$R experiment --config flow_reversal_rotz20.yaml --set control.n_reversal_steps=5 --set experiment.seed=1
+```
+
+Each block gets its own run directory named after the file and the overrides in
+force, e.g. `20260903_101500_flow_reversal_rotz20_n_reversal_steps-4/`, and its
+`config.yaml` lists the overrides under `overrides`. Keys that would need a
+different policy (`policy.*`, `server.port`) cannot change between blocks.
 
 ### Configuration
 
 Everything lives in the YAML file you pass to `--config`. Unknown keys are
 rejected and a key set to `null` keeps the built-in default, so a typo fails
 immediately instead of silently doing nothing. Only the keys you want to
-change need to be present; the run's name is the config file's stem (no
-`experiment.name` key).
+change need to be present; the run's name is the config file's stem plus any
+`--set`/`--sweep` values (no `experiment.name` key).
 
 | Key                        | Default                           | Meaning                                                                                                                                                                 |
 | -------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -277,7 +296,8 @@ Press Enter to start (s = skip this trial, q = end the experiment):
 ```
 
 `Enter` starts the rollout, `s` skips the trial without recording it, `q` ends
-the experiment (everything recorded so far is kept). Drive with the SpaceMouse
+the current block (everything recorded so far is kept; a sweep moves on to its
+next block). Drive with the SpaceMouse
 and/or the keyboard exactly as in the interactive runner — click the live view
 first so it captures your keys. The rollout ends on success, on the episode
 limit, or at `control.max_steps`.

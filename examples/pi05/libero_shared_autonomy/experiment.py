@@ -17,12 +17,14 @@ shared-autonomy mode from the config. The VLA itself only ever receives the
 config's `prompt` (e.g. "do something"), so the language instruction and the
 human intent can be dissociated on purpose.
 
-    ./run.sh experiment --config <condition>.yaml [--dry-run] [flags]
+    ./run.sh experiment --config <condition>.yaml [--set KEY=VALUE ...] [--sweep KEY=V1,V2,...] [--dry-run]
 
 `--config` is looked up as given, then under configs/experiment/, so a bare
 condition name works from anywhere.
 
-Every run is written to `<output_dir>/<timestamp>_<config stem>/`:
+`--set` overrides one YAML key (dotted path, YAML value); `--sweep` runs one block of
+`n_trials` per listed value with a single policy load. Every block is written to
+`<output_dir>/<timestamp>_<config stem>[_<key>-<value>...]/`:
 
     config.yaml     the resolved configuration, schedule and the matrices in force
     trials.jsonl    one JSON record per completed trial
@@ -35,11 +37,19 @@ import datetime as dt
 import json
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import yaml
-from config import CONFIG_DIR, MODES, PROMPT_FROM_TASK, ExperimentSettings, load_experiment_settings
+from config import (
+    CONFIG_DIR,
+    MODES,
+    PROMPT_FROM_TASK,
+    ExperimentSettings,
+    load_experiment_settings,
+    set_label,
+)
 from session import VIDEO_FPS, Session
 from teleop import TeleopChain
 
@@ -126,22 +136,61 @@ def prompt_for(prompt_setting: str, task_description: str) -> str:
     return task_description if prompt_setting == PROMPT_FROM_TASK else prompt_setting
 
 
-def parse_args() -> tuple[argparse.Namespace, ExperimentSettings]:
+@dataclass
+class Block:
+    """One run: a condition file plus the `--set` items in force (a sweep expands to several)."""
+
+    name: str
+    sets: list[str]
+
+
+def expand_blocks(stem: str, sets: list[str], sweep: str | None) -> list[Block]:
+    """The blocks a command line describes: one per sweep value, or a single block without --sweep."""
+    if sweep is None:
+        return [Block(stem + (f"_{set_label(sets)}" if sets else ""), list(sets))]
+    key, sep, values = sweep.partition("=")
+    values = [v.strip() for v in values.split(",") if v.strip()]
+    if not sep or not key.strip() or not values:
+        raise ValueError(f"--sweep expects KEY=v1,v2,... such as control.n_guided_steps=2,4,8, got {sweep!r}")
+    blocks = []
+    for value in values:
+        block_sets = [*sets, f"{key.strip()}={value}"]
+        blocks.append(Block(f"{stem}_{set_label(block_sets)}", block_sets))
+    return blocks
+
+
+def parse_args() -> tuple[argparse.Namespace, list[Block]]:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--config", required=True, metavar="PATH", help="experiment YAML (a condition file)")
     parser.add_argument(
-        "--n-trials", dest="n_trials", type=int, default=None, help="override experiment.n_trials"
+        "--config", required=True, metavar="PATH", help="condition YAML (bare name = shipped)"
     )
-    parser.add_argument("--seed", type=int, default=None, help="override experiment.seed")
-    parser.add_argument("--mode", default=None, choices=MODES, help="override control.mode")
     parser.add_argument(
-        "--output-dir", dest="output_dir", default=None, help="override experiment.output_dir"
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override one YAML key by dotted path, value parsed as YAML (repeatable), "
+        "e.g. --set control.n_guided_steps=4 --set control.corruption=null",
     )
-    parser.add_argument("--port", type=int, default=None, help="override server.port")
     parser.add_argument(
-        "--dry-run", action="store_true", help="validate the config, print the trial schedule and exit"
+        "--sweep",
+        default=None,
+        metavar="KEY=V1,V2,...",
+        help="run one block of n_trials per value of KEY, in this process with a single policy load, "
+        "e.g. --sweep control.n_reversal_steps=2,4,6,8,10",
+    )
+    parser.add_argument(
+        "--n-trials", dest="n_trials", type=int, default=None, help="= --set experiment.n_trials"
+    )
+    parser.add_argument("--seed", type=int, default=None, help="= --set experiment.seed")
+    parser.add_argument("--mode", default=None, choices=MODES, help="= --set control.mode")
+    parser.add_argument("--output-dir", dest="output_dir", default=None, help="= --set experiment.output_dir")
+    parser.add_argument("--port", type=int, default=None, help="= --set server.port")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="validate the config, print each block's schedule and exit"
     )
     args = parser.parse_args()
     if not Path(args.config).exists() and (EXPERIMENT_CONFIG_DIR / args.config).exists():
@@ -151,12 +200,18 @@ def parse_args() -> tuple[argparse.Namespace, ExperimentSettings]:
         parser.error(
             f"--config: {args.config} not found. Available in {EXPERIMENT_CONFIG_DIR}: {', '.join(found)}"
         )
-    overrides = {k: getattr(args, k) for k in ("n_trials", "seed", "mode", "output_dir", "port")}
     try:
-        settings = load_experiment_settings(args.config, overrides)
-    except (OSError, ValueError) as e:
-        parser.error(f"--config: {e}")
-    return args, settings
+        blocks = expand_blocks(Path(args.config).stem, args.sets, args.sweep)
+    except ValueError as e:
+        parser.error(str(e))
+    return args, blocks
+
+
+def _load_block(args: argparse.Namespace, block: Block) -> ExperimentSettings:
+    overrides = {k: getattr(args, k) for k in ("n_trials", "seed", "mode", "output_dir", "port")}
+    settings = load_experiment_settings(args.config, overrides, sets=block.sets)
+    settings.name = block.name
+    return settings
 
 
 def _resolve_task_ids(settings: ExperimentSettings, where: str) -> list[int]:
@@ -171,10 +226,13 @@ def _resolve_task_ids(settings: ExperimentSettings, where: str) -> list[int]:
     return settings.task_ids
 
 
-def _provenance(settings: ExperimentSettings, schedule: list[int], session: Session | None) -> dict:
+def _provenance(
+    settings: ExperimentSettings, block: Block, schedule: list[int], session: Session | None
+) -> dict:
     control = settings.session.control
     resolved = {
         "name": settings.name,
+        "overrides": list(block.sets),
         "n_trials": settings.n_trials,
         "seed": settings.seed,
         "task_order": settings.task_order,
@@ -201,40 +259,14 @@ def _provenance(settings: ExperimentSettings, schedule: list[int], session: Sess
     return resolved
 
 
-def main():
-    args, settings = parse_args()
-    try:
-        task_ids = _resolve_task_ids(settings, args.config)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
-    settings.task_ids = task_ids
-    schedule = build_schedule(task_ids, settings.n_trials, settings.task_order, settings.seed)
-    tasks = Session.list_tasks(settings.session.suite)
-    control = settings.session.control
+_FIXED_PER_PROCESS = ("policy_path", "n_action_steps", "compile", "port")
 
-    if args.dry_run:
-        print(f"Config OK ({args.config}).\nTrial schedule ({settings.task_order}, seed {settings.seed}):")
-        for i, task_id in enumerate(schedule):
-            print(f"  trial {i:03d}: {settings.session.suite} task {task_id}: {tasks[task_id]}")
-        print(f'\nVLA prompt: "{settings.prompt}"   mode: {control.mode}')
-        if control.corruption_matrix is not None:
-            print(f"corruption M = {np.array2string(control.corruption_matrix, precision=3)}")
-        if control.reversal_adapter_matrix is not None:
-            print(f"reversal adapter F = {np.array2string(control.reversal_adapter_matrix, precision=3)}")
-        return
 
-    init_logging()
-    run_dir = settings.output_dir / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{settings.name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    settings.session.task_id = schedule[0]
-    session = Session(settings.session)
-    (run_dir / "config.yaml").write_text(
-        yaml.safe_dump(_provenance(settings, schedule, session), sort_keys=False)
+def _print_block_header(index: int, total: int, settings: ExperimentSettings, session: Session) -> None:
+    print("\n" + "#" * 78)
+    print(
+        f"BLOCK {index + 1}/{total}: {settings.name}: {settings.n_trials} trials, mode {session.mode_label()}"
     )
-
-    mode = session.mode
-    print(f"\nExperiment {settings.name}: {settings.n_trials} trials, mode {mode}, output {run_dir}")
     print(
         f'VLA prompt: "{settings.prompt}"'
         + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else "")
@@ -243,105 +275,177 @@ def main():
         print(session.chain.corruption.describe())
     if session.adapter.matrix is not None:
         print(session.adapter.describe())
-    print(session.announce_mode())
+    text = session.announce_mode()
+    if text:
+        print(text)
+    print("#" * 78)
 
-    results = []
+
+def run_block(
+    session: Session, settings: ExperimentSettings, schedule: list[int], run_dir: Path
+) -> list[dict]:
+    """Run one block's trials in `session`, writing trials.jsonl and per-trial files under run_dir.
+
+    Returns the trial records. Raises StopIteration-free: `q` ends the block early and returns
+    what was recorded; a KeyboardInterrupt propagates after the partial results are on disk.
+    """
+    control = settings.session.control
+    mode = session.mode
+    results: list[dict] = []
     trials_path = run_dir / "trials.jsonl"
+    for trial, task_id in enumerate(schedule):
+        if (settings.session.suite, task_id) != (session.suite, session.task_id):
+            session.set_scene(settings.session.suite, task_id)  # a new scene needs its own env + processors
+        task_description = session.task_description
+        vla_prompt = prompt_for(settings.prompt, task_description)
+
+        print("\n" + "=" * 78)
+        print(f"TRIAL {trial + 1}/{settings.n_trials}   {settings.session.suite} task {task_id}")
+        print(f"YOUR TASK: {task_description}")
+        print(f'VLA prompt: "{vla_prompt}"   mode: {session.mode_label()}')
+        print("=" * 78)
+        session.show_scene()
+        # `task` stays up for the whole trial; rollout only overwrites `prompt`,
+        # which is already the VLA's, so nothing visibly changes when it starts.
+        session.view.stream.set_status(
+            task=f"TRIAL {trial + 1}/{settings.n_trials}: {task_description}",
+            prompt=vla_prompt,
+            state="get ready",
+            mode=session.mode_label(),
+        )
+        try:
+            answer = input("Press Enter to start (s = skip this trial, q = end this block): ")
+        except EOFError:
+            answer = "q"
+        if answer.strip().lower() == "q":
+            print("Ending the block early.")
+            break
+        if answer.strip().lower() == "s":
+            print("Skipped.")
+            continue
+
+        recorder = TrialRecorder(session.chain)
+        started = time.time()
+        result = session.rollout(vla_prompt, recorder=recorder, max_steps=control.max_steps)
+        duration = time.time() - started
+
+        video_name, steps_name = f"trial_{trial:03d}.mp4", f"trial_{trial:03d}.npz"
+        write_video(run_dir / video_name, result.frames, fps=VIDEO_FPS)
+        recorder.save(
+            run_dir / steps_name,
+            task_description=task_description,
+            vla_prompt=vla_prompt,
+            success=result.success,
+            mode=mode,
+            task_id=task_id,
+        )
+        record = {
+            "trial": trial,
+            "suite": settings.session.suite,
+            "task_id": task_id,
+            "task_description": task_description,
+            "vla_prompt": vla_prompt,
+            "mode": mode,
+            "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
+            "input_noise": control.input_noise,
+            "corruption": session.chain.corruption.label,
+            "reversal_adapter": session.adapter.label,
+            "success": bool(result.success),
+            "steps": int(result.steps),
+            "duration_s": round(duration, 2),
+            "user_reads": recorder.total_reads,
+            "video": video_name,
+            "steps_file": steps_name,
+            "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
+            **result.metrics,
+            "n_reversal_steps": (
+                result.metrics.get("n_reversal_steps") if mode == "shared_flow_reversal_steering" else None
+            ),
+        }
+        results.append(record)
+        with open(trials_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+        print(f"{'SUCCESS' if result.success else 'no success'} after {result.steps} steps ({duration:.0f}s)")
+        stats = session.stats_line()
+        if stats:
+            print(stats)
+        print(f"saved {steps_name} + {video_name}")
+    if results:
+        wins = sum(r["success"] for r in results)
+        print(
+            f"\n{settings.name}: {len(results)} trials, {wins} success ({wins / len(results):.0%}), "
+            f"mean {np.mean([r['steps'] for r in results]):.0f} steps"
+        )
+    print(f"Data: {run_dir}")
+    return results
+
+
+def main():
+    args, blocks = parse_args()
     try:
-        for trial, task_id in enumerate(schedule):
-            if task_id != session.task_id:  # a new scene needs its own env + processors
-                session.set_scene(settings.session.suite, task_id)
-            task_description = session.task_description
-            vla_prompt = prompt_for(settings.prompt, task_description)
-
-            print("\n" + "=" * 78)
-            print(f"TRIAL {trial + 1}/{settings.n_trials}   {settings.session.suite} task {task_id}")
-            print(f"YOUR TASK: {task_description}")
-            print(f'VLA prompt: "{vla_prompt}"   mode: {mode}')
-            print("=" * 78)
-            session.show_scene()
-            # `task` stays up for the whole trial; rollout only overwrites `prompt`,
-            # which is already the VLA's, so nothing visibly changes when it starts.
-            session.view.stream.set_status(
-                task=f"TRIAL {trial + 1}/{settings.n_trials}: {task_description}",
-                prompt=vla_prompt,
-                state="get ready",
-                mode=session.mode_label(),
+        plan = []
+        for block in blocks:
+            settings = _load_block(args, block)
+            settings.task_ids = _resolve_task_ids(settings, args.config)
+            schedule = build_schedule(
+                settings.task_ids, settings.n_trials, settings.task_order, settings.seed
             )
-            try:
-                answer = input("Press Enter to start (s = skip this trial, q = end the experiment): ")
-            except EOFError:
-                answer = "q"
-            if answer.strip().lower() == "q":
-                print("Ending the experiment early.")
-                break
-            if answer.strip().lower() == "s":
-                print("Skipped.")
-                continue
+            plan.append((block, settings, schedule))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--config: {e}") from e
+    first = plan[0][1].session
+    for _, settings, _ in plan[1:]:
+        for key in _FIXED_PER_PROCESS:
+            if getattr(settings.session, key) != getattr(first, key):
+                raise SystemExit(f"--sweep/--set cannot change {key} between blocks (one policy per process)")
 
-            recorder = TrialRecorder(session.chain)
-            started = time.time()
-            result = session.rollout(vla_prompt, recorder=recorder, max_steps=control.max_steps)
-            duration = time.time() - started
-
-            video_name, steps_name = f"trial_{trial:03d}.mp4", f"trial_{trial:03d}.npz"
-            write_video(run_dir / video_name, result.frames, fps=VIDEO_FPS)
-            recorder.save(
-                run_dir / steps_name,
-                task_description=task_description,
-                vla_prompt=vla_prompt,
-                success=result.success,
-                mode=mode,
-                task_id=task_id,
-            )
-            record = {
-                "trial": trial,
-                "suite": settings.session.suite,
-                "task_id": task_id,
-                "task_description": task_description,
-                "vla_prompt": vla_prompt,
-                "mode": mode,
-                "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
-                "input_noise": control.input_noise,
-                "corruption": session.chain.corruption.label,
-                "reversal_adapter": session.adapter.label,
-                "success": bool(result.success),
-                "steps": int(result.steps),
-                "duration_s": round(duration, 2),
-                "user_reads": recorder.total_reads,
-                "video": video_name,
-                "steps_file": steps_name,
-                "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
-                **result.metrics,
-                "n_reversal_steps": (
-                    result.metrics.get("n_reversal_steps")
-                    if mode == "shared_flow_reversal_steering"
-                    else None
-                ),
-            }
-            results.append(record)
-            with open(trials_path, "a") as f:
-                f.write(json.dumps(record) + "\n")
-
+    if args.dry_run:
+        for _block, settings, schedule in plan:
+            control = settings.session.control
+            tasks = Session.list_tasks(settings.session.suite)
             print(
-                f"{'SUCCESS' if result.success else 'no success'} after {result.steps} steps ({duration:.0f}s)"
+                f"Config OK ({args.config}). Block {settings.name}: schedule ({settings.task_order}, seed {settings.seed}):"
             )
-            stats = session.stats_line()
-            if stats:
-                print(stats)
-            print(f"saved {steps_name} + {video_name}")
+            for i, task_id in enumerate(schedule):
+                print(f"  trial {i:03d}: {settings.session.suite} task {task_id}: {tasks[task_id]}")
+            print(
+                f'VLA prompt: "{settings.prompt}"   mode: {control.mode}   '
+                f"n_guided_steps: {control.n_guided_steps}   n_reversal_steps: {control.n_reversal_steps}"
+            )
+            if control.corruption_matrix is not None:
+                print(f"corruption M = {np.array2string(control.corruption_matrix, precision=3)}")
+            if control.reversal_adapter_matrix is not None:
+                print(f"reversal adapter F = {np.array2string(control.reversal_adapter_matrix, precision=3)}")
+            print()
+        return
+
+    init_logging()
+    first_settings = plan[0][1]
+    first_settings.session.task_id = plan[0][2][0]
+    session = Session(first_settings.session)
+    all_results: dict[str, list[dict]] = {}
+    try:
+        for index, (block, settings, schedule) in enumerate(plan):
+            session.apply_control(settings.session.control)
+            run_dir = settings.output_dir / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{settings.name}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "config.yaml").write_text(
+                yaml.safe_dump(_provenance(settings, block, schedule, session), sort_keys=False)
+            )
+            _print_block_header(index, len(plan), settings, session)
+            all_results[settings.name] = run_block(session, settings, schedule, run_dir)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
         session.close()
 
-    if results:
-        wins = sum(r["success"] for r in results)
-        print(
-            f"\n{len(results)} trials, {wins} success ({wins / len(results):.0%}), "
-            f"mean {np.mean([r['steps'] for r in results]):.0f} steps"
-        )
-    print(f"Data: {run_dir}")
+    if len(all_results) > 1:
+        print("\nSummary:")
+        for name, results in all_results.items():
+            wins = sum(r["success"] for r in results)
+            rate = f"{wins}/{len(results)} = {wins / len(results):.0%}" if results else "no trials"
+            print(f"  {name}: {rate}")
 
 
 if __name__ == "__main__":

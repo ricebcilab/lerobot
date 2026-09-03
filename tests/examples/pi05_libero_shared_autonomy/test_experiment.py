@@ -1,5 +1,6 @@
 import numpy as np
-from experiment import TrialRecorder, build_schedule, prompt_for
+import pytest
+from experiment import TrialRecorder, build_schedule, expand_blocks, prompt_for
 from teleop import KeyboardReader, TeleopChain
 
 
@@ -51,3 +52,19 @@ def test_trial_recorder_rows_and_per_trial_reads(tmp_path):
     z = np.load(tmp_path / "t.npz")
     assert z["action"].shape == (2, 7) and bool(z["success"]) and int(z["task_id"]) == 3
     assert z["user_translation_raw"].shape == (2, 3) and z["terminated"].tolist() == [False, True]
+
+
+def test_expand_blocks_names_and_sets():
+    [single] = expand_blocks("flow_control_rotz20", [], None)
+    assert single.name == "flow_control_rotz20" and single.sets == []
+    [one] = expand_blocks("flow_control_rotz20", ["control.corruption=null"], None)
+    assert one.name == "flow_control_rotz20_corruption-null"
+    blocks = expand_blocks("flow_reversal_rotz20", ["experiment.seed=1"], "control.n_reversal_steps=2, 4,10")
+    assert [b.name for b in blocks] == [
+        "flow_reversal_rotz20_seed-1_n_reversal_steps-2",
+        "flow_reversal_rotz20_seed-1_n_reversal_steps-4",
+        "flow_reversal_rotz20_seed-1_n_reversal_steps-10",
+    ]
+    assert blocks[0].sets == ["experiment.seed=1", "control.n_reversal_steps=2"]
+    with pytest.raises(ValueError, match="--sweep"):
+        expand_blocks("x", [], "control.n_reversal_steps")

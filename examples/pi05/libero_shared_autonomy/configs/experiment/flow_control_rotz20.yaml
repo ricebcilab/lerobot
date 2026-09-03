@@ -1,0 +1,7 @@
+# Arm 1: shared flow control under the known corruption. The operator's command
+# is written into the first n_guided_steps denoising steps of every chunk.
+#   sweep the depth:  --sweep control.n_guided_steps=2,4,6,8,10
+extends: base.yaml
+control:
+  mode: shared_flow_control
+  n_guided_steps: 8
