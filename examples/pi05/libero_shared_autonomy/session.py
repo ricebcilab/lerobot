@@ -8,7 +8,9 @@ optional per-step recorder (experiments).
 """
 
 import logging
+import os
 import time
+import webbrowser
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -17,7 +19,7 @@ import numpy as np
 import torch
 from config import MODES, ControlSettings, SessionSettings, spec_label
 from live_view import ACTION_LABELS, LiveView
-from teleop import KeyboardReader, TeleopChain
+from teleop import KeyboardReader, PolicyOperator, TeleopChain
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs import (
@@ -33,6 +35,7 @@ from lerobot.policies.pi05.steering import (
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     ReversalAdapter,
+    get_action_mean_std,
 )
 from lerobot.utils.constants import ACTION
 
@@ -87,10 +90,17 @@ class Session:
 
         self.keyboard = KeyboardReader()
         self.chain = TeleopChain(self.keyboard, input_noise=control.input_noise)
+        # A synthetic operator (the task-prompted policy) replaces the SpaceMouse/keyboard.
+        self.operator: PolicyOperator | None = None
+        if settings.operator == "policy":
+            self.operator = PolicyOperator(settings.n_action_steps)
+            self.chain.attach_operator(self.operator)
         self.adapter = ReversalAdapter()
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
         self.view.start()
         print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            webbrowser.open(self.view.url)  # a graphical session: open the page; otherwise use the URL above
 
         logging.info(f"Loading policy {settings.policy_path} ...")
         self.policy_cfg = PreTrainedConfig.from_pretrained(settings.policy_path)
@@ -122,6 +132,8 @@ class Session:
             if self.policy_cfg.use_amp
             else nullcontext()
         )
+        if self.operator is not None:
+            self.operator_mean, self.operator_std = get_action_mean_std(self.postprocessor)
 
         self._zero_policy = _ZeroPolicy()
         self._flow_policy: FlowControlPolicy | None = None
@@ -129,6 +141,8 @@ class Session:
         self.mode = "policy"
         self.n_guided_steps = control.n_guided_steps
         self.n_reversal_steps = control.n_reversal_steps
+        self.operator_dims = tuple(control.operator_dims)
+        self._scene_names: dict | None = None
         self.apply_control(control)
 
     @classmethod
@@ -165,9 +179,56 @@ class Session:
         close_envs(self.envs_dict)
         self.env_cfg, self.envs_dict, self.vec_env = env_cfg, envs_dict, vec_env
         self.suite, self.task_id = suite, task_id
+        self._scene_names = None
         self.env_preprocessor, self.env_postprocessor = make_env_pre_post_processors(
             env_cfg=env_cfg, policy_cfg=self.policy_cfg
         )
+
+    # ------------------------------------------------------------ scene state (mode recording)
+
+    def _sim(self):
+        env = self.vec_env.envs[0]
+        env = getattr(env, "unwrapped", env)
+        return env._env.env  # lerobot LiberoEnv -> hf-libero OffScreenRenderEnv -> BDDL domain env
+
+    def scene_state(self) -> dict | None:
+        """Object positions and articulation joint values, for recording which mode a trial expressed.
+
+        Call it before stepping the env: after a terminating step the vector env has already reset.
+
+        Returns {"object_names", "object_pos" (K, 3), "articulation_names", "articulation_qpos" (J,)}
+        or None when the simulator is not reachable. Robot joints are excluded; free joints
+        are reported through their body position, slide/hinge joints (drawers, knobs) by value.
+        """
+        try:
+            domain = self._sim()
+            sim, model = domain.sim, domain.sim.model
+            if self._scene_names is None:
+                objects = {**domain.objects_dict, **domain.fixtures_dict}
+                bodies = {name: model.body_name2id(obj.root_body) for name, obj in objects.items()}
+                joints = []
+                for name in model.joint_names:
+                    if name.startswith(("robot", "gripper")):
+                        continue
+                    if model.jnt_type[model.joint_name2id(name)] in (2, 3):  # slide, hinge
+                        joints.append((name, model.get_joint_qpos_addr(name)))
+                self._scene_names = {"bodies": bodies, "joints": joints}
+            names = self._scene_names
+            return {
+                "object_names": list(names["bodies"]),
+                "object_pos": np.array(
+                    [sim.data.body_xpos[i] for i in names["bodies"].values()], dtype=np.float32
+                ),
+                "articulation_names": [n for n, _ in names["joints"]],
+                "articulation_qpos": np.array(
+                    [sim.data.qpos[a] for _, a in names["joints"]], dtype=np.float32
+                ),
+            }
+        except Exception as e:  # noqa: BLE001 -- recording must never abort a trial
+            if self._scene_names is not False:
+                logging.warning(f"scene state unavailable ({e!r}); mode recording off")
+                self._scene_names = False
+            return None
 
     def show_scene(self) -> None:
         """Reset the env and put its first frame on the live view."""
@@ -217,7 +278,7 @@ class Session:
                 raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
             self.n_reversal_steps = n_reversal_steps
         self.mode = mode
-        if mode != "policy":
+        if mode != "policy" and self.operator is None:
             self.chain.attach_spacemouse()
 
     def apply_control(self, control: ControlSettings) -> None:
@@ -229,6 +290,9 @@ class Session:
         if control.n_reversal_steps is not None and not 1 <= control.n_reversal_steps <= total:
             raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
+        self.operator_dims = tuple(control.operator_dims)
+        if self._frs_policy is not None:
+            self._frs_policy.operator_dims = self.operator_dims
         self.set_mode(control.mode, control.n_guided_steps)
 
     def mode_label(self) -> str:
@@ -309,9 +373,14 @@ class Session:
         elif self.mode == "shared_flow_reversal_steering":
             if self._frs_policy is None:
                 self._frs_policy = FlowReversalSteeringPolicy(
-                    self.policy, source, self.postprocessor, adapter=self.adapter
+                    self.policy,
+                    source,
+                    self.postprocessor,
+                    adapter=self.adapter,
+                    operator_dims=self.operator_dims,
                 )
             self._frs_policy.n_reversal_steps = self.n_reversal_steps
+            self._frs_policy.operator_dims = self.operator_dims
             kwargs["policy"] = self._frs_policy
         return kwargs
 
@@ -369,6 +438,8 @@ class Session:
         step = 0
         while step < max_steps:
             step_start = time.time()
+            if self.operator is not None and step % self.settings.n_action_steps == 0:
+                self._refresh_operator(observation)  # before the wrappers sample the source
             obs = preprocess_observation(observation)
             obs["task"] = [prompt]
             obs = env_preprocessor(obs)
@@ -382,6 +453,9 @@ class Session:
                 action_numpy = action_hook(action_numpy)
 
             previous_observation = observation
+            # Scene state *before* the step: the vector env auto-resets on termination, so the
+            # post-step state of a final step would be the next episode's fresh scene.
+            scene = self.scene_state() if recorder is not None else None
             observation, reward, terminated, truncated, info = vec_env.step(action_numpy)
             step += 1
             if recorder is not None:
@@ -393,6 +467,7 @@ class Session:
                     terminated=terminated,
                     truncated=truncated,
                     info=info,
+                    scene=scene,
                 )
             stream.set_status(step=step, action=action_numpy[0].tolist())
 
@@ -416,12 +491,23 @@ class Session:
             print(f"\r  step {step}/{max_steps}", end="", flush=True)
 
             leftover = 1.0 / RATE_HZ - (time.time() - step_start)
-            if leftover > 0:
+            if leftover > 0 and self.operator is None:  # real-time pacing only matters to a human
                 time.sleep(leftover)
 
         print()
         stream.set_status(state="success" if success else "failed")
         return RolloutResult(success=success, steps=step, frames=frames, metrics=self.metrics())
+
+    def _refresh_operator(self, observation) -> None:
+        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator."""
+        obs = preprocess_observation(observation)
+        obs["task"] = [self.task_description]
+        obs = self.env_preprocessor(obs)
+        obs = self.preprocessor(obs)
+        with torch.inference_mode(), self.autocast_ctx:
+            chunk = self.policy.predict_action_chunk(obs)
+        chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
+        self.operator.refresh(chunk * self.operator_std + self.operator_mean)  # back to env units
 
     def close(self) -> None:
         close_envs(self.envs_dict)

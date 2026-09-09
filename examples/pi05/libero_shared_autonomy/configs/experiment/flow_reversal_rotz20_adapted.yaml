@@ -1,9 +1,10 @@
 # Arm 3: Flow Reversal Steering with the reversal adapter (our addition). The
 # adapter reshapes the velocity field during the reversal only: its translation
-# block is the known corruption M, and orientation/gripper are frozen.
+# block is the known corruption M; orientation and gripper are left to the
+# policy's own field (identity), so the only change from arm 2 is the rotation.
 #   sweep the depth:  --sweep control.n_reversal_steps=2,4,6,8,10
-extends: base.yaml
+extends: base_rotz20.yaml
 control:
   mode: shared_flow_reversal_steering
   n_reversal_steps: null
-  reversal_adapter: {translation: corruption, orientation: zero, gripper: zero}
+  reversal_adapter: {translation: corruption, orientation: identity, gripper: identity}

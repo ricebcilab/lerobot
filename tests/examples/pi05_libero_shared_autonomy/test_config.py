@@ -22,7 +22,9 @@ from config import (
 
 from lerobot.policies.pi05.steering import rotation_about_z
 
-CONDITIONS = sorted(p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if p.name != "base.yaml")
+CONDITIONS = sorted(
+    p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if not p.name.startswith("base")
+)
 
 
 def test_deep_merge_overlay_wins_and_null_resets():
@@ -93,7 +95,9 @@ def test_arm_files_resolve():
     assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
     np.testing.assert_allclose(c.corruption_matrix, rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))
-    np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :], 0)
+    np.testing.assert_allclose(c.reversal_adapter_matrix[3:, 3:], np.eye(4))  # orientation/gripper: identity
+    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, 3:], 0)
+    np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :3], 0)
     assert spec_label(c.corruption) == "rotation_z_deg=20"
     native = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml", {})
     assert native.session.control.reversal_adapter_matrix is None
@@ -164,6 +168,24 @@ def test_experiment_cli_overrides(tmp_path):
     assert s.output_dir == Path("o") and s.prompt == "task"
 
 
-def test_base_yaml_matches_dataclass_defaults():
-    data = yaml.safe_load((CONFIG_DIR / "experiment" / "base.yaml").read_text())
+def test_base_rotz20_yaml_matches_dataclass_defaults():
+    data = yaml.safe_load((CONFIG_DIR / "experiment" / "base_rotz20.yaml").read_text())
     assert set(data) == {"experiment", "scene", "prompt", "policy", "control", "server"}
+
+
+def test_operator_settings():
+    path = CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml"
+    default = load_experiment_settings(path, {})
+    assert default.session.operator == "human"
+    assert default.session.control.operator_dims == ["translation"]
+    s = load_experiment_settings(
+        path, {}, sets=["operator=policy", "control.operator_dims=[translation, gripper]"]
+    )
+    assert s.session.operator == "policy"
+    assert s.session.control.operator_dims == ["translation", "gripper"]
+    with pytest.raises(ValueError, match="operator"):
+        load_experiment_settings(path, {}, sets=["operator=robot"])
+    with pytest.raises(ValueError, match="operator_dims"):
+        load_experiment_settings(path, {}, sets=["control.operator_dims=[wrist]"])
+    with pytest.raises(ValueError, match="operator_dims"):
+        load_experiment_settings(path, {}, sets=["control.operator_dims=translation"])

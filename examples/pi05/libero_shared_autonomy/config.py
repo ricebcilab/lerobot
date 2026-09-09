@@ -16,10 +16,11 @@ import numpy as np
 import yaml
 from teleop import build_corruption
 
-from lerobot.policies.pi05.steering import build_reversal_adapter
+from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, build_reversal_adapter
 
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")
+OPERATORS = ("human", "policy")  # who drives: SpaceMouse/keyboard, or the task-prompted policy itself
 PROMPT_FROM_TASK = "task"  # `prompt: task` gives the VLA the scene's own instruction
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -35,6 +36,7 @@ class ControlSettings:
     max_steps: int | None = None
     corruption: dict | list | None = None  # spec as written
     reversal_adapter: dict | None = None  # spec as written
+    operator_dims: list[str] = field(default_factory=lambda: ["translation"])  # what the operator commands
     corruption_matrix: np.ndarray | None = field(default=None, repr=False)
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
 
@@ -48,6 +50,7 @@ class SessionSettings:
     task_id: int = 0
     port: int = 8765
     output_dir: Path = Path("outputs/pi05_libero_interactive")
+    operator: str = "human"
     control: ControlSettings = field(default_factory=ControlSettings)
 
 
@@ -71,6 +74,7 @@ _CONTROL_SCHEMA = {
     "max_steps": "max_steps",
     "corruption": "corruption",
     "reversal_adapter": "reversal_adapter",
+    "operator_dims": "operator_dims",
 }
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
 
@@ -91,6 +95,7 @@ EXPERIMENT_SCHEMA = {
     },
     "scene": {"suite": "suite", "task_ids": "task_ids"},
     "prompt": "prompt",
+    "operator": "operator",
     "policy": _POLICY_SCHEMA,
     "control": _CONTROL_SCHEMA,
     "server": {"port": "port"},
@@ -196,6 +201,12 @@ def build_control(flat: dict, where: str) -> ControlSettings:
         _fail(where, "control.input_noise must be >= 0")
     if control.max_steps is not None and (not isinstance(control.max_steps, int) or control.max_steps < 1):
         _fail(where, "control.max_steps must be a positive integer or null")
+    dims = control.operator_dims
+    if not isinstance(dims, list) or not dims or any(d not in OPERATOR_DIM_GROUPS for d in dims):
+        _fail(
+            where,
+            f"control.operator_dims must be a non-empty list drawn from {', '.join(OPERATOR_DIM_GROUPS)}, got {dims!r}",
+        )
     control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
     control.reversal_adapter_matrix = build_reversal_adapter(
         control.reversal_adapter, control.corruption_matrix, f"{where}: control.reversal_adapter"
@@ -212,10 +223,13 @@ def _session_from_flat(flat: dict, where: str, defaults: SessionSettings) -> Ses
         task_id=flat.get("task_id", defaults.task_id),
         port=flat.get("port", defaults.port),
         output_dir=Path(flat.get("output_dir", defaults.output_dir)),
+        operator=flat.get("operator", defaults.operator),
         control=build_control(flat, where),
     )
     if not isinstance(session.n_action_steps, int) or session.n_action_steps < 1:
         _fail(where, "policy.n_action_steps must be a positive integer")
+    if session.operator not in OPERATORS:
+        _fail(where, f"operator must be one of {', '.join(OPERATORS)}, got {session.operator!r}")
     return session
 
 

@@ -35,6 +35,7 @@ class FakePolicy:
         )
         self.calls: list[dict] = []
         self.resets = 0
+        self.last_latent: torch.Tensor | None = None
 
     def reset(self):
         self.resets += 1
@@ -45,6 +46,7 @@ class FakePolicy:
         noise_fn = kwargs.get("noise_fn")
         if noise_fn is not None:
             x = noise_fn(lambda x_t, t: torch.ones_like(x_t), x)
+            self.last_latent = x.clone()
         hook = kwargs.get("x_t_hook")
         if hook is not None:
             for step in range(NUM_STEPS):
@@ -244,3 +246,76 @@ def test_reference_chunk_uses_last_gripper_and_normalization():
     assert ref.shape == (1, CHUNK, MAX_DIM)
     assert ref[0, 0, 0].item() == pytest.approx(0.5)  # (1 - 0) / 2
     assert ref[0, 0, GRIPPER_DIM].item() == pytest.approx((-1.0 - 0.5) / 2.0)  # open at start
+
+
+# ---------------------------------------------------------------- delegation to the policy
+
+
+def test_forward_flow_constant_field_closed_form():
+    from lerobot.policies.pi05.steering import forward_flow
+
+    x = torch.zeros(1, CHUNK, MAX_DIM)
+    times = []
+
+    def velocity(x_t, t):
+        times.append(round(t, 6))
+        return torch.ones_like(x_t)
+
+    out = forward_flow(x, velocity, NUM_STEPS, stop_at=4)  # 6 steps of -h * 1 from t=1 down to t=0.4
+    assert out[0, 0, 0].item() == pytest.approx(-0.6)
+    assert times == pytest.approx([1.0, 0.9, 0.8, 0.7, 0.6, 0.5])
+    assert forward_flow(x, velocity, NUM_STEPS)[0, 0, 0].item() == pytest.approx(-1.0)
+
+
+def test_delegation_mask_marks_uncommanded_dims_and_tail():
+    from lerobot.policies.pi05.steering import delegation_mask
+
+    mask = delegation_mask(CHUNK, MAX_DIM, ("translation",), pinned_steps=2)
+    assert mask.shape == (CHUNK, MAX_DIM)
+    assert not mask[:2, :3].any()  # translation, first two steps: the operator's
+    assert mask[:2, 3:].all()  # rotation, gripper, padding: the policy's
+    assert mask[2:, :].all()  # tail of the chunk: the policy's
+    full = delegation_mask(CHUNK, MAX_DIM, ("translation", "rotation", "gripper"), pinned_steps=None)
+    assert not full[:, :N_ACTION_DIMS].any() and full[:, N_ACTION_DIMS:].all()
+    with pytest.raises(ValueError, match="operator_dims"):
+        delegation_mask(CHUNK, MAX_DIM, ("translation", "wrist"), pinned_steps=2)
+
+
+def test_reverse_flow_steering_delegates_uncommanded_elements():
+    # FakePolicy: reference reversed under v=1 gains +h per step; the initial noise is zeros.
+    policy = FakePolicy()
+    source = Source(translation=(1.0, 0.0, 0.0))
+    wrapper = FlowReversalSteeringPolicy(policy, source, postprocessor())  # full reversal
+    wrapper.select_action({})
+    latent = policy.last_latent
+    assert latent[0, 0, 0].item() == pytest.approx(1.0 + 1.0)  # reference + 10 * 0.1
+    assert latent[0, 0, 3:].abs().max().item() == 0.0  # rotation, gripper, padding = fresh noise
+    assert latent[0, 2:, :].abs().max().item() == 0.0  # tail beyond n_action_steps = fresh noise
+
+    wrapper = FlowReversalSteeringPolicy(policy, source, postprocessor(), n_reversal_steps=4)
+    wrapper.select_action({})
+    latent = policy.last_latent
+    assert latent[0, 0, 0].item() == pytest.approx(1.0 + 0.4)
+    assert latent[0, 0, 3].item() == pytest.approx(-0.6)  # unsteered state at t = 0.4
+
+    wrapper = FlowReversalSteeringPolicy(
+        policy,
+        source,
+        postprocessor(),
+        operator_dims=("translation", "rotation", "gripper"),
+        pinned_steps=None,
+    )
+    wrapper.select_action({})
+    latent = policy.last_latent
+    assert latent[0, 3, 5].item() == pytest.approx(0.0 + 1.0)  # rotation at the last step: kept
+    assert latent[0, 3, N_ACTION_DIMS].item() == 0.0  # padding: always the policy's
+
+
+def test_operator_dims_setter_rebuilds_the_mask():
+    wrapper = FlowReversalSteeringPolicy(FakePolicy(), Source(), postprocessor())
+    assert wrapper.operator_dims == ("translation",)
+    assert wrapper._delegated[0, 3].item() is True
+    wrapper.operator_dims = ["translation", "rotation"]
+    assert wrapper._delegated[0, 3].item() is False
+    with pytest.raises(ValueError, match="operator_dims"):
+        wrapper.operator_dims = ["translation", "wrist"]

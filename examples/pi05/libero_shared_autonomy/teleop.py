@@ -35,6 +35,7 @@ import yaml
 from lerobot.policies.pi05.steering import (
     DEADBAND,
     GRIPPER_CLOSE,
+    GRIPPER_DIM,
     GRIPPER_OPEN,
     translation_matrix,
     validate_matrix,
@@ -254,6 +255,42 @@ class CombinedReader:
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
 
 
+class PolicyOperator:
+    """A synthetic operator: the task-prompted policy's own plan, sampled like a SpaceMouse.
+
+    `refresh(chunk)` takes an action chunk in env units (steps x 7) and turns it
+    into one command per chunk, the way the SpaceMouse is read once per chunk:
+    translation = mean over the first `n_action_steps` steps, clipped to [-1, 1];
+    gripper = close iff that mean gripper command is > 0. The command holds until
+    the next refresh, like a stick held in place. Placed in front of the human
+    sources (`TeleopChain.attach_operator`), so the corruption, the noise and the
+    recorders treat it exactly like a person.
+    """
+
+    def __init__(self, n_action_steps: int):
+        self.n_action_steps = n_action_steps
+        self._translation = np.zeros(3)
+        self._gripper = GRIPPER_OPEN
+        self.refreshes = 0
+
+    def refresh(self, chunk) -> None:
+        chunk = np.asarray(chunk, dtype=np.float64)[: self.n_action_steps]
+        self._translation = np.clip(chunk[:, :3].mean(axis=0), -1.0, 1.0)
+        self._gripper = GRIPPER_CLOSE if chunk[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
+        self.refreshes += 1
+
+    def idle(self) -> None:
+        self._translation = np.zeros(3)
+
+    @property
+    def translation(self) -> np.ndarray:
+        return self._translation.copy()
+
+    @property
+    def gripper(self) -> float:
+        return self._gripper
+
+
 class CommandCorruption:
     """Deterministically corrupt a teleop source's translation: x -> M @ x.
 
@@ -400,6 +437,7 @@ class TeleopChain:
     def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
         self.keyboard = keyboard
         self.spacemouse = None
+        self.operator = None
         self.combined = CombinedReader([keyboard])
         self.raw = RecordingReader(self.combined)
         self.corruption = CommandCorruption(self.raw)
@@ -409,6 +447,11 @@ class TeleopChain:
     @property
     def source(self) -> RecordingReader:
         return self.served
+
+    def attach_operator(self, operator) -> None:
+        """Put a synthetic operator (e.g. `PolicyOperator`) in front of every human source."""
+        self.operator = operator
+        self.combined.sources.insert(0, operator)
 
     def attach_spacemouse(self) -> None:
         """Connect a SpaceMouse and give it priority over the keyboard (no-op if already tried)."""

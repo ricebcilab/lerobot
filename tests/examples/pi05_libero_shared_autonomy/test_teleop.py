@@ -141,3 +141,29 @@ def test_module_reexports_shared_constants():
 
     assert teleop.DEADBAND is steering.DEADBAND
     assert teleop.GRIPPER_OPEN == steering.GRIPPER_OPEN
+
+
+def test_policy_operator_averages_the_executed_prefix_and_clips():
+    op = teleop.PolicyOperator(n_action_steps=2)
+    np.testing.assert_array_equal(op.translation, np.zeros(3))
+    assert op.gripper == GRIPPER_OPEN
+    chunk = np.array(
+        [[0.4, 0.0, 0.0, 0, 0, 0, 1.0], [0.8, 0.0, 0.0, 0, 0, 0, 1.0], [9.0, 9.0, 9.0, 0, 0, 0, -1.0]]
+    )
+    op.refresh(chunk)
+    np.testing.assert_allclose(op.translation, [0.6, 0.0, 0.0])
+    assert op.gripper == GRIPPER_CLOSE
+    op.refresh(np.array([[2.0, -3.0, 0.0, 0, 0, 0, -1.0]]))
+    np.testing.assert_allclose(op.translation, [1.0, -1.0, 0.0])
+    assert op.gripper == GRIPPER_OPEN
+
+
+def test_teleop_chain_attach_operator_takes_priority():
+    keyboard = KeyboardReader(clock=Clock().now)
+    chain = TeleopChain(keyboard)
+    op = teleop.PolicyOperator(n_action_steps=1)
+    chain.attach_operator(op)
+    assert chain.combined.sources[0] is op
+    op.refresh(np.array([[0.5, 0.0, 0.0, 0, 0, 0, -1.0]]))
+    np.testing.assert_allclose(chain.source.translation, [0.5, 0.0, 0.0])
+    np.testing.assert_allclose(chain.raw.last_translation, [0.5, 0.0, 0.0])

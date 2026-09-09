@@ -29,6 +29,12 @@ touching the executed action, which is always the model's own output:
 Both read an operator ``TeleopSource`` and the checkpoint's action statistics
 from the postprocessor. ``reverse_flow`` is the integrator; ``ReversalAdapter``
 holds an optional 7x7 matrix F that adapts the reversal's velocity field only.
+
+Elements of the reference the operator does not command (``operator_dims``
+selects which of translation / rotation / gripper they do), the padding dims and
+the steps beyond ``pinned_steps`` are *delegated* to the policy: after the
+reversal their latent is replaced by the unsteered one (fresh Gaussian noise for
+a full reversal), the noise-space in-painting of Tang et al., App. D.
 """
 
 from collections import deque
@@ -42,6 +48,12 @@ ACTION_DIMS = ("dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper")
 N_ACTION_DIMS = len(ACTION_DIMS)
 GRIPPER_DIM = ACTION_DIMS.index("gripper")
 GRIPPER_OPEN = -1.0
+# Groups of action dims an operator can command; anything else is the policy's.
+OPERATOR_DIM_GROUPS = {
+    "translation": slice(0, 3),
+    "rotation": slice(3, 6),
+    "gripper": slice(GRIPPER_DIM, GRIPPER_DIM + 1),
+}
 GRIPPER_CLOSE = 1.0
 DEADBAND = 0.05  # below this (env units, full deflection = 1) the operator counts as idle
 
@@ -275,6 +287,42 @@ def reverse_flow(
     return x_t
 
 
+def forward_flow(x: torch.Tensor, velocity, num_steps: int, stop_at: int | None = None) -> torch.Tensor:
+    """Integrate the flow forward (Euler) from noise at t=1 down to t = stop_at / num_steps.
+
+    Mirrors PI05Pytorch.sample_actions without hooks: x_{t-h} = x_t - h * v(x_t, t). With
+    ``stop_at`` None it runs all the way to t=0 (the unsteered action chunk); with
+    ``stop_at = n`` it takes ``num_steps - n`` steps and returns the unsteered state at
+    t = n / num_steps, i.e. where a reversal stopped after ``n`` steps would sit.
+    """
+    h = 1.0 / num_steps
+    steps = num_steps if stop_at is None else num_steps - stop_at
+    x_t = x
+    for step in range(steps):
+        x_t = x_t - h * velocity(x_t, 1.0 - step * h)
+    return x_t
+
+
+def delegation_mask(
+    chunk_size: int, max_action_dim: int, operator_dims: tuple[str, ...], pinned_steps: int | None
+) -> torch.Tensor:
+    """(chunk_size, max_action_dim) bool mask of the reference elements left to the policy.
+
+    True = delegated: the dims outside ``operator_dims`` (names from OPERATOR_DIM_GROUPS),
+    the padding dims beyond the env's 7, and every dim of the steps from ``pinned_steps``
+    on (None = the whole chunk stays pinned).
+    """
+    unknown = [d for d in operator_dims if d not in OPERATOR_DIM_GROUPS]
+    if unknown:
+        raise ValueError(f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})")
+    mask = torch.ones(chunk_size, max_action_dim, dtype=torch.bool)
+    for name in operator_dims:
+        mask[:, OPERATOR_DIM_GROUPS[name]] = False
+    if pinned_steps is not None:
+        mask[pinned_steps:, :] = True
+    return mask
+
+
 class FlowReversalSteeringPolicy:
     """pi0.5 wrapper implementing shared_flow_reversal_steering (Flow Reversal Steering).
 
@@ -298,6 +346,14 @@ class FlowReversalSteeringPolicy:
     evaluations as an unsteered one). Smaller n keeps more of the operator's
     reference in the result, larger n leaves the policy more freedom; n = N (or
     None) is the full reversal.
+
+    `operator_dims` names the dim groups the operator commands (default: only
+    translation) and `pinned_steps` how many leading steps of the chunk the
+    reference constrains (default: the policy's n_action_steps, i.e. the executed
+    prefix; None = all of it). Everything else is delegated to the policy: after
+    the reversal, those latent elements are replaced with the unsteered latent at
+    the same time -- the chunk's own Gaussian sample for a full reversal, else the
+    unsteered flow integrated down to t = n/N (N - n extra velocity evaluations).
     """
 
     def __init__(
@@ -307,11 +363,15 @@ class FlowReversalSteeringPolicy:
         postprocessor,
         adapter: ReversalAdapter | None = None,
         n_reversal_steps: int | None = None,
+        operator_dims: tuple[str, ...] = ("translation",),
+        pinned_steps: int | None = -1,
     ):
         self._policy = policy
         self._source = source
         self._adapter = adapter
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
+        self.pinned_steps = policy.config.n_action_steps if pinned_steps == -1 else pinned_steps
+        self.operator_dims = operator_dims  # the setter builds the delegation mask
         self._pending_command: np.ndarray | None = None
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
@@ -320,6 +380,17 @@ class FlowReversalSteeringPolicy:
         self._last_reference: torch.Tensor | None = None
         self.steered_chunks = 0  # per-rollout count of chunks started from inverted noise
         self.reconstruction_errors: list[float] = []  # per steered chunk, in std units
+
+    @property
+    def operator_dims(self) -> tuple[str, ...]:
+        return self._operator_dims
+
+    @operator_dims.setter
+    def operator_dims(self, value) -> None:
+        cfg = self._policy.config
+        dims = tuple(value)
+        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self.pinned_steps)
+        self._operator_dims = dims
 
     @property
     def n_reversal_steps(self) -> int | None:
@@ -382,13 +453,21 @@ class FlowReversalSteeringPolicy:
         )
         if adapter_matrix is not None:
             adapter_matrix = torch.as_tensor(adapter_matrix, dtype=noise.dtype, device=noise.device)
-        return reverse_flow(
-            reference,
-            velocity,
-            self._policy.config.num_inference_steps,
-            adapter=adapter_matrix,
-            n_reversal_steps=self._n_reversal_steps,
+        total = self._policy.config.num_inference_steps
+        latent = reverse_flow(
+            reference, velocity, total, adapter=adapter_matrix, n_reversal_steps=self._n_reversal_steps
         )
+        delegated = self._delegated.to(noise.device)
+        if not delegated.any():
+            return latent
+        # Delegated elements follow the unsteered flow: at t=1 that is the chunk's own
+        # Gaussian sample (Tang et al., App. D: the freed noises are set to N(0, I)).
+        unsteered = (
+            noise
+            if self._n_reversal_steps is None
+            else forward_flow(noise, velocity, total, stop_at=self._n_reversal_steps)
+        )
+        return torch.where(delegated, unsteered, latent)
 
     def select_action(self, batch) -> torch.Tensor:
         # Same queue logic as PI05Policy.select_action, plus the noise hook.

@@ -82,14 +82,23 @@ class TrialRecorder:
         self._reads = chain.served.reads
         self.reads_at_start = chain.served.reads  # the counter is session-wide, so baseline it
         self.rows: list[dict] = []
+        self.scene_rows: list[dict | None] = []  # object positions / articulations before each step
         self.start = time.time()
+
+    @property
+    def scene_first(self) -> dict | None:
+        return next((row for row in self.scene_rows if row is not None), None)
+
+    @property
+    def scene_last(self) -> dict | None:
+        return next((row for row in reversed(self.scene_rows) if row is not None), None)
 
     @property
     def total_reads(self) -> int:
         """How many times the teleop input was sampled during *this* trial."""
         return self._chain.served.reads - self.reads_at_start
 
-    def __call__(self, step, observation, action, reward, terminated, truncated, info):
+    def __call__(self, step, observation, action, reward, terminated, truncated, info, scene=None):
         state = observation.get("robot_state", {}) if isinstance(observation, dict) else {}
         eef = state.get("eef", {})
         gripper = state.get("gripper", {})
@@ -112,6 +121,7 @@ class TrialRecorder:
                 "truncated": bool(np.asarray(truncated).reshape(-1)[0]),
             }
         )
+        self.scene_rows.append(scene)
         self._reads = reads
 
     def save(self, path: Path, **scalars) -> None:
@@ -119,7 +129,44 @@ class TrialRecorder:
         if self.rows:
             for key in self.rows[0]:
                 arrays[key] = np.stack([np.asarray(row[key]) for row in self.rows])
+        first = self.scene_first
+        if first is not None:
+            k, j = len(first["object_names"]), len(first["articulation_names"])
+            nan_pos, nan_q = np.full((k, 3), np.nan, np.float32), np.full(j, np.nan, np.float32)
+            arrays["object_names"] = np.asarray(first["object_names"])
+            arrays["articulation_names"] = np.asarray(first["articulation_names"])
+            arrays["object_pos"] = np.stack(
+                [nan_pos if r is None else r["object_pos"] for r in self.scene_rows]
+            )
+            arrays["articulation_qpos"] = np.stack(
+                [nan_q if r is None else r["articulation_qpos"] for r in self.scene_rows]
+            )
         np.savez_compressed(path, **arrays, **{k: np.asarray(v) for k, v in scalars.items()})
+
+
+def summarize_scene_motion(
+    start: dict | None, end: dict | None, object_threshold: float = 0.02, articulation_threshold: float = 0.01
+) -> dict:
+    """Which scene elements moved between two scene states, and the one that moved most (the mode).
+
+    Objects count by displacement (m) above `object_threshold`, articulations (drawers, knobs)
+    by joint change above `articulation_threshold`. Returns {"mode": name or None, "moved": {name: change}}.
+    """
+    if start is None or end is None:
+        return {"mode": None, "moved": {}}
+    moved: dict[str, float] = {}
+    for name, p0, p1 in zip(start["object_names"], start["object_pos"], end["object_pos"], strict=True):
+        d = float(np.linalg.norm(np.asarray(p1) - np.asarray(p0)))
+        if d > object_threshold:
+            moved[name] = d
+    for name, q0, q1 in zip(
+        start["articulation_names"], start["articulation_qpos"], end["articulation_qpos"], strict=True
+    ):
+        d = float(abs(q1 - q0))
+        if d > articulation_threshold:
+            moved[name] = d
+    mode = max(moved, key=moved.get) if moved else None
+    return {"mode": mode, "moved": moved}
 
 
 def _first(value, size: int) -> np.ndarray:
@@ -196,7 +243,7 @@ def parse_args() -> tuple[argparse.Namespace, list[Block]]:
     if not Path(args.config).exists() and (EXPERIMENT_CONFIG_DIR / args.config).exists():
         args.config = str(EXPERIMENT_CONFIG_DIR / args.config)  # a bare condition name
     if not Path(args.config).exists():
-        found = sorted(p.name for p in EXPERIMENT_CONFIG_DIR.glob("*.yaml") if p.name != "base.yaml")
+        found = sorted(p.name for p in EXPERIMENT_CONFIG_DIR.glob("*.yaml") if not p.name.startswith("base"))
         parser.error(
             f"--config: {args.config} not found. Available in {EXPERIMENT_CONFIG_DIR}: {', '.join(found)}"
         )
@@ -240,6 +287,8 @@ def _provenance(
         "suite": settings.session.suite,
         "task_ids": settings.task_ids,
         "prompt": settings.prompt,
+        "operator": settings.session.operator,
+        "operator_dims": list(control.operator_dims),
         "policy_path": settings.session.policy_path,
         "n_action_steps": settings.session.n_action_steps,
         "compile": settings.session.compile,
@@ -252,6 +301,7 @@ def _provenance(
         "reversal_adapter": control.reversal_adapter,
         "port": settings.session.port,
         "schedule": schedule,
+        "scene_rows": "before_step",  # per-step scene state is taken before the action is applied
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
     if session is not None:
@@ -271,6 +321,10 @@ def _print_block_header(index: int, total: int, settings: ExperimentSettings, se
         f'VLA prompt: "{settings.prompt}"'
         + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else "")
     )
+    print(
+        f"operator: {settings.session.operator}   "
+        f"operator commands: {', '.join(settings.session.control.operator_dims)}"
+    )
     if session.chain.corruption.matrix is not None:
         print(session.chain.corruption.describe())
     if session.adapter.matrix is not None:
@@ -286,8 +340,9 @@ def run_block(
 ) -> list[dict]:
     """Run one block's trials in `session`, writing trials.jsonl and per-trial files under run_dir.
 
-    Returns the trial records. Raises StopIteration-free: `q` ends the block early and returns
-    what was recorded; a KeyboardInterrupt propagates after the partial results are on disk.
+    Before each trial the live view offers "Start trial" / "Skip trial" buttons and the
+    loop blocks until one is clicked. Returns the trial records; a KeyboardInterrupt
+    (Ctrl+C in the terminal) propagates after the partial results are on disk.
     """
     control = settings.session.control
     mode = session.mode
@@ -313,16 +368,13 @@ def run_block(
             state="get ready",
             mode=session.mode_label(),
         )
-        try:
-            answer = input("Press Enter to start (s = skip this trial, q = end this block): ")
-        except EOFError:
-            answer = "q"
-        if answer.strip().lower() == "q":
-            print("Ending the block early.")
-            break
-        if answer.strip().lower() == "s":
-            print("Skipped.")
-            continue
+        if session.operator is None:
+            print("Waiting for Start trial / Skip trial in the live view (Ctrl+C ends the run) ...")
+            if session.view.wait_command(("start", "skip")) == "skip":
+                print("Skipped.")
+                continue
+        else:
+            print("operator=policy: starting the trial without waiting.")
 
         recorder = TrialRecorder(session.chain)
         started = time.time()
@@ -339,18 +391,23 @@ def run_block(
             mode=mode,
             task_id=task_id,
         )
+        motion = summarize_scene_motion(recorder.scene_first, recorder.scene_last)
         record = {
             "trial": trial,
             "suite": settings.session.suite,
             "task_id": task_id,
             "task_description": task_description,
             "vla_prompt": vla_prompt,
+            "operator": settings.session.operator,
+            "operator_dims": list(control.operator_dims),
             "mode": mode,
             "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
             "input_noise": control.input_noise,
             "corruption": session.chain.corruption.label,
             "reversal_adapter": session.adapter.label,
             "success": bool(result.success),
+            "mode_expressed": motion["mode"],
+            "moved": {k: round(v, 4) for k, v in motion["moved"].items()},
             "steps": int(result.steps),
             "duration_s": round(duration, 2),
             "user_reads": recorder.total_reads,
@@ -366,7 +423,10 @@ def run_block(
         with open(trials_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-        print(f"{'SUCCESS' if result.success else 'no success'} after {result.steps} steps ({duration:.0f}s)")
+        print(
+            f"{'SUCCESS' if result.success else 'no success'} after {result.steps} steps ({duration:.0f}s)"
+            + (f"   moved most: {motion['mode']}" if motion["mode"] else "")
+        )
         stats = session.stats_line()
         if stats:
             print(stats)
@@ -411,7 +471,8 @@ def main():
                 print(f"  trial {i:03d}: {settings.session.suite} task {task_id}: {tasks[task_id]}")
             print(
                 f'VLA prompt: "{settings.prompt}"   mode: {control.mode}   '
-                f"n_guided_steps: {control.n_guided_steps}   n_reversal_steps: {control.n_reversal_steps}"
+                f"n_guided_steps: {control.n_guided_steps}   n_reversal_steps: {control.n_reversal_steps}   "
+                f"operator: {settings.session.operator} ({', '.join(control.operator_dims)})"
             )
             if control.corruption_matrix is not None:
                 print(f"corruption M = {np.array2string(control.corruption_matrix, precision=3)}")

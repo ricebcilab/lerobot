@@ -68,3 +68,50 @@ def test_expand_blocks_names_and_sets():
     assert blocks[0].sets == ["experiment.seed=1", "control.n_reversal_steps=2"]
     with pytest.raises(ValueError, match="--sweep"):
         expand_blocks("x", [], "control.n_reversal_steps")
+
+
+def test_summarize_scene_motion_picks_the_largest_change():
+    from experiment import summarize_scene_motion
+
+    start = {
+        "object_names": ["bowl", "plate"],
+        "object_pos": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        "articulation_names": ["cabinet_top", "cabinet_middle"],
+        "articulation_qpos": np.array([0.0, 0.0]),
+    }
+    end = {
+        "object_names": ["bowl", "plate"],
+        "object_pos": np.array([[0.0, 0.0, 0.0], [1.0, 0.03, 0.0]]),
+        "articulation_names": ["cabinet_top", "cabinet_middle"],
+        "articulation_qpos": np.array([0.0, -0.15]),
+    }
+    summary = summarize_scene_motion(start, end)
+    assert summary["mode"] == "cabinet_middle"
+    assert summary["moved"] == pytest.approx({"plate": 0.03, "cabinet_middle": 0.15})
+    assert summarize_scene_motion(start, start) == {"mode": None, "moved": {}}
+    assert summarize_scene_motion(None, end) == {"mode": None, "moved": {}}
+
+
+def test_trial_recorder_keeps_scene_rows_and_saves_them(tmp_path):
+    from experiment import summarize_scene_motion
+
+    recorder = TrialRecorder(TeleopChain(KeyboardReader(clock=lambda: 0.0)))
+    common = {"observation": {}, "action": np.zeros((1, 7)), "reward": np.array([0.0]), "info": {}}
+
+    def scene(x):
+        return {
+            "object_names": ["bowl"],
+            "object_pos": np.array([[x, 0.0, 0.0]], dtype=np.float32),
+            "articulation_names": ["drawer"],
+            "articulation_qpos": np.array([0.0], dtype=np.float32),
+        }
+
+    recorder(step=1, terminated=np.array([False]), truncated=np.array([False]), scene=scene(0.0), **common)
+    recorder(step=2, terminated=np.array([False]), truncated=np.array([False]), scene=None, **common)
+    recorder(step=3, terminated=np.array([True]), truncated=np.array([False]), scene=scene(0.3), **common)
+    assert recorder.scene_first["object_pos"][0, 0] == 0.0 and recorder.scene_last["object_pos"][0, 0] == 0.3
+    assert summarize_scene_motion(recorder.scene_first, recorder.scene_last)["mode"] == "bowl"
+    recorder.save(tmp_path / "t.npz", success=True)
+    z = np.load(tmp_path / "t.npz")
+    assert z["object_pos"].shape == (3, 1, 3) and np.isnan(z["object_pos"][1]).all()
+    assert list(z["object_names"]) == ["bowl"] and z["articulation_qpos"].shape == (3, 1)

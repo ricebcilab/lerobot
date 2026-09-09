@@ -8,7 +8,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""The operator's browser window: live frames, status, and keyboard capture."""
+"""The operator's browser window: live frames, status, keyboard capture and trial buttons."""
 
 import io
 import json
@@ -49,12 +49,19 @@ PAGE = """<!doctype html>
   #keys .held { color: #6cf; }
   #keys .focus { color: #fc6; }
   kbd { background: #222; border: 1px solid #444; border-radius: 3px; padding: 0 4px; color: #ccc; }
+  #controls { margin: 0.6em auto; min-height: 2.4em; }
+  #controls button { font: inherit; font-size: 1.05em; padding: 0.4em 1.2em; margin: 0 0.4em;
+                     border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  #controls button:hover { background: #333; }
+  #controls button[data-cmd="start"] { border-color: #6f6; color: #6f6; }
+  #controls button[data-cmd="skip"] { border-color: #fc6; color: #fc6; }
 </style>
 </head>
 <body>
 <h3>LIBERO interactive</h3>
 <img src="/stream">
 <div id="status">connecting...</div>
+<div id="controls"></div>
 <div id="actions"></div>
 <div id="keys"></div>
 <script>
@@ -88,6 +95,25 @@ window.addEventListener("keyup", e => {
 window.addEventListener("blur", () => { held.clear(); sendKeys(); });
 document.addEventListener("visibilitychange", () => { if (document.hidden) { held.clear(); sendKeys(); } });
 setInterval(() => { if (held.size) sendKeys(); }, 300);
+// Trial control (experiment.py): the server offers commands while it waits for
+// the operator; they are shown as buttons and the click is POSTed to /control.
+const COMMAND_LABELS = {start: "Start trial", skip: "Skip trial"};
+let shownControls = null;
+function renderControls(list) {
+  const key = list.join(",");
+  if (key === shownControls) return;
+  shownControls = key;
+  const el = document.getElementById("controls");
+  el.innerHTML = list.map(c =>
+    '<button data-cmd="' + c + '">' + (COMMAND_LABELS[c] || c) + '</button>').join("");
+  for (const b of el.querySelectorAll("button")) {
+    b.addEventListener("click", () => {
+      fetch("/control", {method: "POST", headers: {"Content-Type": "application/json"},
+                         body: JSON.stringify({command: b.dataset.cmd})}).catch(() => {});
+      b.blur();  // keep Space for the gripper, not for re-activating the button
+    });
+  }
+}
 function actionRow(label, v) {
   // Signed bar centered at zero; values live in [-1, 1] (clamped for display).
   const pct = Math.min(Math.abs(v), 1) * 50;
@@ -111,6 +137,7 @@ async function poll() {
         : '<div class="prompt">&quot;' + s.prompt + '&quot;</div>') +
       '<div>step ' + s.step + ' / ' + s.max_steps + ' &mdash; ' + state +
       ' <span style="color:#888">(' + s.mode + ')</span></div>';
+    renderControls(s.controls || []);
     if (s.action) {
       document.getElementById("actions").innerHTML =
         s.action_labels.map((l, i) => actionRow(l, s.action[i])).join("");
@@ -177,11 +204,15 @@ class FrameStream:
 
 
 class LiveView:
-    """Serves the page, the MJPEG stream, a status JSON, and takes keyboard events.
+    """Serves the page, the MJPEG stream, a status JSON, keyboard events and trial buttons.
 
     `status_extra()` is called on every /status request and merged into the
     stream's status dict, so the view needs no knowledge of the teleop chain
     beyond the keyboard reader it feeds.
+
+    `wait_command(options)` offers `options` as buttons on the page and blocks
+    until the operator clicks one; the offer is withdrawn as soon as it is
+    taken, so a click outside a wait is rejected rather than queued.
     """
 
     def __init__(self, port: int, keyboard: KeyboardReader, status_extra: Callable[[], dict]):
@@ -190,6 +221,9 @@ class LiveView:
         self._keyboard = keyboard
         self._status_extra = status_extra
         self._server: ThreadingHTTPServer | None = None
+        self._command_cond = threading.Condition()
+        self._offered: tuple[str, ...] = ()
+        self._chosen: str | None = None
 
     @property
     def url(self) -> str:
@@ -204,8 +238,32 @@ class LiveView:
             self._server.shutdown()
             self._server = None
 
+    def wait_command(self, options: tuple[str, ...]) -> str:
+        """Show `options` as buttons and block until the operator picks one; returns the pick."""
+        with self._command_cond:
+            self._offered, self._chosen = tuple(options), None
+            while self._chosen is None:
+                self._command_cond.wait(0.2)  # a finite wait keeps Ctrl+C responsive
+            chosen = self._chosen
+            self._offered, self._chosen = (), None
+            return chosen
+
+    def offered_commands(self) -> list[str]:
+        with self._command_cond:
+            return list(self._offered)
+
+    def submit_command(self, command: str) -> bool:
+        """Accept `command` if it is currently on offer and not yet taken; True when accepted."""
+        with self._command_cond:
+            if command not in self._offered or self._chosen is not None:
+                return False
+            self._chosen = command
+            self._command_cond.notify_all()
+            return True
+
     def _handler(self):
         stream, keyboard, status_extra = self.stream, self._keyboard, self._status_extra
+        view = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):  # keep the terminal clean for the REPL
@@ -223,6 +281,7 @@ class LiveView:
                     status = stream.get_status()
                     status["keys"] = sorted(keyboard.held)
                     status["keyboard_gripper"] = keyboard.gripper
+                    status["controls"] = view.offered_commands()
                     status.update(status_extra())
                     body = json.dumps(status).encode()
                     self.send_response(200)
@@ -254,6 +313,21 @@ class LiveView:
                     self.send_error(404)
 
             def do_POST(self):
+                if self.path == "/control":
+                    try:
+                        payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                        command = payload["command"]
+                        if not isinstance(command, str):
+                            raise TypeError("command must be a str")
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400)
+                        return
+                    if not view.submit_command(command):
+                        self.send_error(409, "command not on offer")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
                 if self.path != "/keys":
                     self.send_error(404)
                     return

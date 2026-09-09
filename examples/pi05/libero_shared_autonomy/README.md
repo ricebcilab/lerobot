@@ -87,7 +87,7 @@ launcher instead of the batch evaluation:
 ./examples/pi05/libero_shared_autonomy/run.sh interactive
 ```
 
-It loads the policy once, opens a live view at `http://localhost:8765` (VSCode
+It loads the policy once, opens a live view at `http://localhost:8765` in your browser when a display is available (VSCode
 forwards the port automatically) showing the camera stream plus the policy's
 per-step action vector (labeled end-effector deltas and gripper command), and
 drops into a REPL: type any instruction
@@ -129,7 +129,13 @@ keyboard:
   your intent, larger `n` gives the policy more freedom (up to `n = 10`, the
   default), and any `n < 10` costs the same 10 velocity evaluations as an
   unsteered chunk (`n` reverse + `10 - n` forward) against 20 for the full
-  reversal, roughly twice as fast per chunk.
+  reversal, roughly twice as fast per chunk. Only what you command is kept
+  from the reference: after the reversal, the latent of the rotation and
+  gripper dims, of the padding dims and of every step beyond the executed
+  prefix is replaced by the unsteered latent (fresh Gaussian noise for a full
+  reversal), the noise-space in-painting of Tang et al., App. D, so those are
+  the policy's to decide. `control.operator_dims` (experiments) changes which
+  dims count as commanded.
 
 Input sources (both active at once; the SpaceMouse wins while deflected):
 
@@ -219,7 +225,7 @@ instead, i.e. to run the conventional setup where both know the goal.
 
 ### Arms, overrides and sweeps
 
-`configs/experiment/base.yaml` holds everything the study shares, including the
+`configs/experiment/base_rotz20.yaml` holds everything the study shares, including the
 known corruption (`corruption: {rotation_z_deg: 20}`: the operator's command is
 rotated 20° about z before the policy sees it). Three arm files extend it:
 
@@ -230,12 +236,13 @@ rotated 20° about z before the policy sees it). Three arm files extend it:
 - `flow_reversal_rotz20_adapted.yaml` — Flow Reversal Steering with the
   reversal adapter, our addition: the velocity field used by the reversal is
   reshaped by `F`, whose translation block is the known corruption and whose
-  orientation and gripper blocks are zero.
+  orientation and gripper blocks are identity, so the only difference from
+  the native arm is the rotation applied to the reversal's translation.
 
 The depth of each method is a sweep variable rather than a file. `--set KEY=VALUE`
 overrides any YAML key (dotted path, value parsed as YAML) and `--sweep KEY=V1,V2,...`
-runs one block of `n_trials` per value with a single policy load, pausing for Enter
-before each block's first trial:
+runs one block of `n_trials` per value with a single policy load, waiting for you
+to click **Start trial** before each trial:
 
 ```bash
 R=./examples/pi05/libero_shared_autonomy/run.sh
@@ -273,12 +280,14 @@ change need to be present; the run's name is the config file's stem plus any
 | `policy.n_action_steps`    | `10`                              | Actions executed per predicted chunk                                                                                                                                    |
 | `policy.compile`           | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                              |
 | `control.mode`             | `shared_flow_reversal_steering`   | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see the mode list under [Interactive prompting](#interactive-prompting) |
-| `control.n_guided_steps`   | `8` in `base.yaml` (built-in `5`) | `shared_flow_control` only                                                                                                                                              |
+| `control.n_guided_steps`   | `8` in `base_rotz20.yaml` (built-in `5`) | `shared_flow_control` only                                                                                                                                              |
 | `control.n_reversal_steps` | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                  |
 | `control.input_noise`      | `0.0`                             | Std of the Gaussian noise added to your x/y/z command                                                                                                                   |
 | `control.max_steps`        | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                 |
 | `control.corruption`       | `null`                            | Matrix spec applied to the operator's command — see [Perturbing the operator](#perturbing-the-operator); off unless set                                                 |
 | `control.reversal_adapter` | `null`                            | Adapter spec for `shared_flow_reversal_steering`'s reverse integration — see [Perturbing the operator](#perturbing-the-operator); off unless set                        |
+| `control.operator_dims`    | `[translation]`                   | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                            |
+| `operator`                 | `human`                           | `human` (SpaceMouse / keyboard) or `policy`: the task-prompted policy drives, corrupted exactly like a person — see [Synthetic operator](#synthetic-operator-and-the-oracle-sweep) |
 | `server.port`              | `8765`                            | Live view port                                                                                                                                                          |
 
 A few keys can be overridden per run without editing the file:
@@ -289,18 +298,14 @@ A few keys can be overridden per run without editing the file:
 For each trial the terminal prints the trial number, the scene, **your** task
 and the VLA prompt. The live view shows the reset scene with your task on its
 own line and the VLA prompt beneath it; both stay up for the whole trial, so
-nothing changes on screen when the rollout actually begins. Then:
-
-```
-Press Enter to start (s = skip this trial, q = end the experiment):
-```
-
-`Enter` starts the rollout, `s` skips the trial without recording it, `q` ends
-the current block (everything recorded so far is kept; a sweep moves on to its
-next block). Drive with the SpaceMouse
-and/or the keyboard exactly as in the interactive runner — click the live view
-first so it captures your keys. The rollout ends on success, on the episode
-limit, or at `control.max_steps`.
+nothing changes on screen when the rollout actually begins. Two buttons appear
+under the status line while the run waits for you: **Start trial** starts the
+rollout and **Skip trial** skips it without recording anything. The buttons are
+only shown while a trial is waiting, so a click at any other time does nothing.
+The terminal takes no input; `Ctrl+C` there ends the run, keeping everything
+recorded so far. Drive with the SpaceMouse and/or the keyboard exactly as in
+the interactive runner — clicking a button also gives the page keyboard focus.
+The rollout ends on success, on the episode limit, or at `control.max_steps`.
 
 ### What gets recorded
 
@@ -314,8 +319,13 @@ Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<config stem>/` containing:
 | `trial_XXX.mp4` | The rollout video (30 fps)                                                                                                                                                |
 
 `trials.jsonl` fields: `trial`, `suite`, `task_id`, `task_description`,
-`vla_prompt`, `mode`, `n_guided_steps`, `n_reversal_steps`, `input_noise`, `corruption`,
-`reversal_adapter`, `success`, `steps`, `duration_s`, `user_reads`
+`vla_prompt`, `operator`, `operator_dims`, `mode`, `n_guided_steps`, `n_reversal_steps`,
+`input_noise`, `corruption`, `reversal_adapter`, `success`, `mode_expressed`
+(the scene element that moved most during the trial — an object name or an
+articulation joint such as `wooden_cabinet_1_middle_level` — or `null` when
+nothing moved; the behaviour the policy actually expressed, whether or not it
+was the task), `moved` (every element that moved, with its displacement in m
+or joint units), `steps`, `duration_s`, `user_reads`
 (how many times the teleop input was sampled during that trial),
 `video`, `steps_file`, `finished_at`, plus the mode's steering statistics
 (`guided_steps`, or `steered_chunks` and
@@ -337,6 +347,8 @@ Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<config stem>/` containing:
 | `gripper_qpos`                                                 | `(T, 2)`           | Gripper joint positions                                                                                                         |
 | `joint_pos`                                                    | `(T, 7)`           | Arm joint positions                                                                                                             |
 | `reward`, `terminated`, `truncated`                            | `(T,)`             | Environment response                                                                                                            |
+| `object_names`, `object_pos`                                   | `(K,)`, `(T, K, 3)` | Every scene object / fixture and its position before each step (the state the action was applied to)                          |
+| `articulation_names`, `articulation_qpos`                      | `(J,)`, `(T, J)`   | Every non-robot slide / hinge joint (drawers, knobs, doors) and its value before each step                                      |
 | `task_description`, `vla_prompt`, `mode`, `task_id`, `success` | scalars            | Trial identity, so a single `.npz` stands alone                                                                                 |
 
 Missing robot-state fields are recorded as `NaN` rather than aborting a trial.
@@ -344,10 +356,37 @@ Loading a trial is just:
 
 ```python
 import json, numpy as np
+
 trials = [json.loads(line) for line in open(run_dir / "trials.jsonl")]
 z = np.load(run_dir / "trial_000.npz")
 z["user_translation_raw"], z["action"], z["eef_pos"], bool(z["success"])
 ```
+
+### Synthetic operator and the oracle sweep
+
+`operator: policy` (or `--set operator=policy`) replaces the SpaceMouse and
+keyboard with the policy itself: at every chunk boundary the same checkpoint is
+queried with the scene's **real** instruction, the translation of its planned
+chunk (mean over the executed prefix, clipped like a stick) becomes the
+operator's command, and that command goes through the same corruption, noise
+and recorders as a person's. The executing policy still only sees the arm's
+prompt. Trials start without waiting for the button and the 20 Hz pacing is
+dropped, so a block runs unattended. `user_translation_raw` is then the
+oracle's clean intent and `user_translation` what the policy got.
+
+`oracle_sweep.sh` runs the whole grid this way — the three arms swept over
+depth on every LIBERO-Goal task, plus two policy-only anchors per task (the
+arm's prompt = floor, the real task = ceiling):
+
+```bash
+./examples/pi05/libero_shared_autonomy/oracle_sweep.sh                         # everything, ~a few hours
+TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 ./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+```
+
+Runs land in `outputs/pi05_libero_oracle_sweep/`;
+[`notebooks/analyze_sweep.ipynb`](notebooks/analyze_sweep.ipynb) compares the
+methods on them (success vs. controlled steps, per-task breakdown, whether the
+expressed behaviour was the task's, and how much of the intent got through).
 
 ## Analysis
 
@@ -358,18 +397,25 @@ intervals, a paired per-trial comparison, a per-task breakdown, step counts
 split by outcome, and how much the operator actually steered. Point `RUN_DIRS`
 at other directories to compare anything else. Its functions:
 
-- `find_runs(root)` — run directories under `root` that recorded at least one
-  trial, oldest first.
-- `load_runs(run_dirs)` — loads `trials.jsonl` and `config.yaml` for each run
-  into one combined `DataFrame` plus a dict of configs.
-- `success_table(trials, configs)` — per-run trial and success counts, success
-  rate, and a Wilson 95% confidence interval.
-- `compare` / `paired_comparisons` — a paired per-trial comparison between two
-  (or every pair of) runs via McNemar's exact test, using trials that share
-  the same task schedule (same suite, seed and `task_order`).
-- `input_activity(trials)` — per-trial operator engagement (fraction of steps
-  commanding, mean speed and corruption shift while commanding, gripper-closed
-  fraction, teleop reads), derived from the `.npz` step arrays.
+- `find_runs(root)` / `load_runs(run_dirs)` — the run directories under
+  `root` that recorded a trial, and their `trials.jsonl` + `config.yaml` as one
+  `DataFrame` (each trial tagged with the run's method, depth and operator)
+  plus a dict of configs.
+- `rate_table(trials, by)` — trial and success counts, rate and Wilson 95%
+  interval per group of columns (`["run"]`, `["method", "depth"]`, ...);
+  `success_table(trials, configs)` is the per-run view with labels and median
+  steps, `best_depth` and `per_task_table` the per-method views.
+- `paired_test(trials, by, a, b, pair_on)` / `paired_comparisons` — McNemar's
+  exact test between two runs (paired by trial) or two methods (paired by task
+  and trial), on the trials both completed.
+- `task_targets` / `with_mode_accuracy` — which scene element each task is
+  about (from the ceiling anchor) and whether each trial expressed it.
+- `step_metrics(trials)` — per-trial operator engagement and intent
+  transmission from the `.npz` step arrays (fraction of steps commanding,
+  speed, corruption shift, gripper, reads, and the cosine between the executed
+  translation and the raw vs. the corrupted command).
+- `plot_performance_vs_depth(trials, ax, metric)` — one line per method,
+  rate of `metric` against controlled denoising steps.
 
 Jupyter is not part of the `pi`/`libero` extras; run it without touching the
 project environment with:

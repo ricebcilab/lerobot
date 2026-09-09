@@ -1,5 +1,5 @@
 # Shared settings for every experiment arm in this folder. An arm file says
-# `extends: base.yaml` and overrides only what it changes; on the command line,
+# `extends: base_rotz20.yaml` and overrides only what it changes; on the command line,
 # `--set KEY=VALUE` overrides any key and `--sweep KEY=V1,V2,...` runs one block
 # per value. Unknown keys are rejected; a key set to null keeps the built-in
 # default.
