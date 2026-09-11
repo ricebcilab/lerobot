@@ -13,13 +13,77 @@ From the repository root:
 ./examples/pi05/libero_shared_autonomy/run.sh setup
 ```
 
-`run.sh` is the only launcher in this folder: `run.sh setup` once, then
+`run.sh` is the shared launcher: `run.sh setup` once, then
 `run.sh interactive`, `run.sh experiment`, or `run.sh <any command>` to run
 something else (such as `lerobot-eval` or `jupyter`) inside the example's
 environment. Every form sources `env.sh`, which sets `LIBERO_CONFIG_PATH`,
 `MUJOCO_GL`, `HF_HUB_CACHE` and `MPLCONFIGDIR` to paths under the repo's
 ignored `.cache/` directory (only if you have not already set them), and runs
 from the repo root under `uv run` with the `pi` and `libero` extras.
+
+Keep the shared launcher and environment at this level. Study scripts live in
+`experiments/`, YAML settings in `configs/experiment/`, and analysis in `notebooks/`:
+
+```text
+env.sh                              shared environment
+run.sh                              shared launcher
+experiment.py                       trial runner
+experiments/oracle_sweep.sh          synthetic-operator study
+experiments/task_audit.sh            picks the human-pilot task (SpaceMouse-like operator)
+experiments/human_pilot.sh           human depth sweep
+notebooks/analyze_human_pilot.ipynb  human success-versus-depth figure
+```
+
+Run the human pilot (task 4, 10 trials per method/depth, depths 1/2/4/6/8,
+150 trials total) with:
+
+```bash
+bash examples/pi05/libero_shared_autonomy/experiments/human_pilot.sh --dry-run
+bash examples/pi05/libero_shared_autonomy/experiments/human_pilot.sh
+```
+
+The live view is at `http://localhost:8773`; the first arm opens it in a
+browser, and the same tab follows the next arms (see [Interactive prompting](#interactive-prompting)).
+Set `HF_HUB_OFFLINE=1` once everything is cached: the gated PaliGemma tokenizer
+is otherwise re-checked against the Hub at every arm launch, and an expired
+token kills the run. All methods use +20° input corruption; the adapted arm uses
+F@40. Human input has no synthetic delay. Each attempt has a 600-step cap.
+`TASK`, `N_TRIALS`, `SEED`, `DEPTHS`, `ORDER` (e.g. `adapted fc frs`), `PORT`,
+and `OUT` can be overridden as environment variables. Use a separate `OUT` per
+participant/session and vary method/depth order to address practice and
+fatigue. Set `ROOT` in
+[analyze_human_pilot.ipynb](notebooks/analyze_human_pilot.ipynb) to that output
+directory; Run All exports PNG, SVG, and CSV under its `figures/` directory.
+The notebook checks counts and reset pairing and labels incomplete data as partial.
+
+#### Why task 4 and depths 1-8
+
+Task 1 ("put the bowl on the stove") saturated in a first human session: FC
+reached 100% by depth 6, leaving nothing to separate. `experiments/task_audit.sh`
+picked the replacement by running tasks 4-8 with the SpaceMouse-like synthetic
+operator (`policy_operator: {update_every_steps: 20, delay_steps: 4}`, see
+[SpaceMouse-like timing](#spacemouse-like-timing-the-next-experiment)) at
+20 matched trials per cell, seed 0, with FC over depths 4-10, native FRS over
+1-4 and FRS+F@40 over 1-6, plus the policy-alone ceiling. Tasks 0/2/3/9 were
+left out because the oracle sweep scores them ~0 for every method. Success at
+each method's best depth:
+
+| Task                          | Ceiling | FC      | FRS native | FRS+F@40 | Adapted − FC (McNemar, 20 pairs) |
+| ----------------------------- | ------: | ------- | ---------- | -------- | -------------------------------- |
+| **4** bowl on top of cabinet  |     100 | d4: 20  | d1: 45     | d2: 60   | **+40, p = 0.021**               |
+| 5 push plate to front of stove |      95 | d8: 30  | d4: 25     | d2: 25   | −4, p = 1.0                      |
+| 6 cream cheese in bowl        |     100 | d8: 15  | d2: 25     | d1: 25   | +10, p = 0.69                    |
+| 7 turn on stove               |     100 | d10: 85 | d1: 85     | d1: 85   | 0, p = 1.0                       |
+| 8 bowl on plate               |     100 | d6: 55  | d4: 80     | d4: 65   | +9, p = 0.69                     |
+
+Task 4 is the only one where the adapted arm beats FC at both methods' best
+depths, with a 100% ceiling and FC far from it. Adapted vs. native FRS on
+task 4 is +15 points but not significant at 20 pairs (p = 0.55). The timing
+profile is what opens the gap: under the immediate oracle the same task gives
+FC d10 95% and FRS d1 100%. The reversal arms fall off by depth 4 on most
+tasks, so the pilot sweeps 1/2/4/6/8 rather than 2-10. One seed and one
+operator profile: the pilot is also a test of whether a person behaves like
+(20, 4).
 
 The setup step:
 
@@ -90,7 +154,9 @@ launcher instead of the batch evaluation:
 It loads the policy once, opens a live view at `http://localhost:8765` in your browser when a display is available (VSCode
 forwards the port automatically) showing the camera stream plus the policy's
 per-step action vector (labeled end-effector deltas and gripper command), and
-drops into a REPL: type any instruction
+drops into a REPL. A tab already polling the port is reused rather than opened
+again, and it reconnects by itself when the next run on that port starts, so a
+chain of runs (the study scripts) keeps a single tab. Type any instruction
 (or press Enter for the scene's built-in one) to run a rollout in the current
 LIBERO scene. Each rollout is also saved as an MP4 under
 `outputs/pi05_libero_interactive/`. Use `tasks` to list the current suite's
@@ -401,13 +467,13 @@ prompt. Trials start without waiting for the button and the 20 Hz pacing is
 dropped, so a block runs unattended. `user_translation_raw` is the consumed
 operator command before corruption/noise and `user_translation` what the policy got.
 
-`oracle_sweep.sh` runs the whole grid this way — the three arms swept over
+`experiments/oracle_sweep.sh` runs the whole grid this way — the three arms swept over
 depth on every LIBERO-Goal task, plus two policy-only anchors per task (the
 arm's prompt = floor, the real task = ceiling):
 
 ```bash
-./examples/pi05/libero_shared_autonomy/oracle_sweep.sh                         # everything, ~a few hours
-TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 ./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+./examples/pi05/libero_shared_autonomy/experiments/oracle_sweep.sh                         # everything, ~a few hours
+TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 ./examples/pi05/libero_shared_autonomy/experiments/oracle_sweep.sh
 ```
 
 Corrected runs land in `outputs/pi05_libero_oracle_sweep_v2/`;
@@ -471,7 +537,7 @@ subset when comparing timing profiles. Do not select an input impairment merely
 because it produces an FRS win.
 
 ```bash
-S=./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+S=./examples/pi05/libero_shared_autonomy/experiments/oracle_sweep.sh
 FC_DEPTHS=2,4,6,8,10 FRS_DEPTHS=2,4,6,8,10 N_TRIALS=5 SEED=0 \
   OUT=outputs/pi05_libero_spacemouse_u20_d4 "$S" \
   --set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4 --dry-run
@@ -514,7 +580,7 @@ depth sweep. The old best depth may change now that forward integration uses
 the correct step size. The full grid has 2,100 trials (21 conditions × 10 tasks × 10 resets):
 
 ```bash
-S=./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+S=./examples/pi05/libero_shared_autonomy/experiments/oracle_sweep.sh
 FC_DEPTHS=2,4,6,8,10 FRS_DEPTHS=1,2,3,4,6,8,10 N_TRIALS=10 SEED=0 \
   OUT=outputs/pi05_libero_oracle_sweep_v2 "$S" --dry-run
 # Run the same command without --dry-run to collect the corrected baseline.

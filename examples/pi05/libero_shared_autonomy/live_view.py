@@ -124,9 +124,17 @@ function actionRow(label, v) {
     pct + '%;background:' + color + '"></span></span>' +
     '<span class="aval">' + v.toFixed(2) + '</span></div>';
 }
+// The server is restarted between experiment runs; the poll below survives
+// that (fetch just fails until it is back), but the MJPEG <img> does not, so
+// the first successful poll after an outage reloads the stream.
+let offline = false;
 async function poll() {
   try {
     const s = await (await fetch("/status")).json();
+    if (offline) {
+      offline = false;
+      document.querySelector("img").src = "/stream?" + Date.now();
+    }
     let state = s.state;
     if (state === "success") state = '<span class="ok">SUCCESS</span>';
     if (state === "failed") state = '<span class="fail">no success</span>';
@@ -152,7 +160,7 @@ async function poll() {
       '<kbd>PgUp</kbd>/<kbd>PgDn</kbd> or <kbd>W</kbd>/<kbd>S</kbd> up/down &middot; ' +
       '<kbd>Space</kbd> gripper (' + (s.keyboard_gripper > 0 ? "closed" : "open") + ') &middot; ' +
       '<kbd>Shift</kbd> fast' + corruption + noise + adapter + heldKeys + focus;
-  } catch (e) {}
+  } catch (e) { offline = true; }
   setTimeout(poll, 200);
 }
 poll();
@@ -224,6 +232,7 @@ class LiveView:
         self._command_cond = threading.Condition()
         self._offered: tuple[str, ...] = ()
         self._chosen: str | None = None
+        self.page_seen = False  # a page has polled /status, e.g. a tab left open from the previous run
 
     @property
     def url(self) -> str:
@@ -277,7 +286,8 @@ class LiveView:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
-                elif self.path == "/status":
+                elif self.path.startswith("/status"):
+                    view.page_seen = True
                     status = stream.get_status()
                     status["keys"] = sorted(keyboard.held)
                     status["keyboard_gripper"] = keyboard.gripper
@@ -289,7 +299,7 @@ class LiveView:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
-                elif self.path == "/stream":
+                elif self.path.startswith("/stream"):
                     self.send_response(200)
                     self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                     self.send_header("Cache-Control", "no-cache")

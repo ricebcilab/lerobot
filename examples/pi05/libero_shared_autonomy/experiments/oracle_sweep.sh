@@ -18,12 +18,12 @@
 #   TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 oracle_sweep.sh
 #   FC_DEPTHS=8,10 FRS_DEPTHS=2,4,6 SEED=0 oracle_sweep.sh --dry-run
 #
-# Runs are written under $OUT (default outputs/pi05_libero_oracle_sweep); the
+# Runs are written under $OUT (default outputs/pi05_libero_oracle_sweep_v2); the
 # notebook notebooks/analyze_sweep.ipynb reads them after setting ROOT to $OUT.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RUN="${SCRIPT_DIR}/run.sh"
+RUN="${SCRIPT_DIR}/../run.sh"
 
 OUT="${OUT:-outputs/pi05_libero_oracle_sweep_v2}"
 TASKS="${TASKS:-0 1 2 3 4 5 6 7 8 9}"

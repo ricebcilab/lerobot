@@ -102,8 +102,6 @@ class Session:
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
         self.view.start()
         print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
-        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-            webbrowser.open(self.view.url)  # a graphical session: open the page; otherwise use the URL above
 
         logging.info(f"Loading policy {settings.policy_path} ...")
         self.policy_cfg = PreTrainedConfig.from_pretrained(settings.policy_path)
@@ -147,6 +145,13 @@ class Session:
         self.operator_dims = tuple(control.operator_dims)
         self._scene_names: dict | None = None
         self.apply_control(control)
+
+        # In a graphical session, open the page only if no tab is already
+        # polling us: a tab left open from the previous run (the study scripts
+        # chain several) has had the whole model load to make itself known.
+        graphical = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if graphical and not self.view.page_seen:
+            webbrowser.open(self.view.url)
 
     @classmethod
     def from_settings(cls, settings: SessionSettings) -> "Session":
