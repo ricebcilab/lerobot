@@ -124,12 +124,14 @@ keyboard:
   landed from the reference (in action-std units). By default the reference is
   reversed through all 10 denoising steps, i.e. all the way to noise;
   `--n-reversal-steps n` (or `mode shared_flow_reversal_steering n`) stops the
-  reversal after `n` of them instead, so the chunk still carries part of your
-  reference and the forward flow finishes it off — smaller `n` keeps more of
-  your intent, larger `n` gives the policy more freedom (up to `n = 10`, the
-  default), and any `n < 10` costs the same 10 velocity evaluations as an
-  unsteered chunk (`n` reverse + `10 - n` forward) against 20 for the full
-  reversal, roughly twice as fast per chunk. Only what you command is kept
+  reversal after `n` of them instead, before delegation and forward integration
+  back to actions. Depth's effect on intent preservation must be measured
+  (`n = 10` is the full-reversal default). Reversal and forward integration both use step size 0.1: `n`
+  reverse steps are followed by `n` forward steps. With the delegation below,
+  a steered chunk costs **10 + n velocity evaluations** (`n` reverse,
+  `10 - n` to obtain the unsteered state, and `n` forward), against 10 for FC
+  or an unsteered chunk and 20 for full reversal. These counts exclude the
+  synthetic operator's separate policy query. Only what you command is kept
   from the reference: after the reversal, the latent of the rotation and
   gripper dims, of the padding dims and of every step beyond the executed
   prefix is replaced by the unsteered latent (fresh Gaussian noise for a full
@@ -160,8 +162,9 @@ Three ways to make the operator's command less than perfect, useful for
 studying how much steering the policy tolerates:
 
 - **Input noise** — `--input-noise STD` (or `noise STD` in the REPL) adds
-  independent Gaussian noise to Δx, Δy and Δz of your command at every control
-  step while you are commanding; `0` (the default) is off.
+  independent Gaussian noise to Δx, Δy and Δz whenever the command is sampled
+  while you are commanding (once per chunk in FC/FRS, once per control step in
+  teleop/override); `0` (the default) is off.
 - **Command corruption** — `control.corruption` in a config (or
   `--corruption FILE` / `corruption FILE` in the REPL) left-multiplies your
   Δx/Δy/Δz by a fixed 3×3 matrix `M` before it reaches the policy:
@@ -176,7 +179,7 @@ studying how much steering the policy tolerates:
 - **Reversal adapter** — `control.reversal_adapter` (or `--reversal-adapter FILE`
   / `adapter FILE` in the REPL) only affects `shared_flow_reversal_steering`: it
   left-multiplies the velocity field used by the reverse integration with a
-  fixed 7×7 matrix `F`, so only the noise that the forward flow starts from
+  fixed 7×7 **environment-space** matrix `F`, so only the noise that the forward flow starts from
   changes — the executed action still comes from the policy's own field:
 
   ```yaml
@@ -191,6 +194,11 @@ studying how much steering the policy tolerates:
     gripper: identity
   reversal_adapter: {F: [[..7 rows..]]} # literal
   ```
+
+  Before applying `F` to normalized velocities, the wrapper converts it to
+  `S⁻¹ F S`, where `S` is the diagonal matrix of action standard deviations.
+  This applies to literal matrices as well as block specifications. Velocity
+  transforms have no mean offset. Both matrices are saved in the run config.
 
 A file loaded through `--corruption FILE` / `--reversal-adapter FILE` (or live,
 with `corruption FILE` / `adapter FILE`) holds the same spec forms at its top
@@ -270,7 +278,7 @@ change need to be present; the run's name is the config file's stem plus any
 | Key                        | Default                           | Meaning                                                                                                                                                                 |
 | -------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `experiment.n_trials`      | `10`                              | Number of trials                                                                                                                                                        |
-| `experiment.seed`          | `0`                               | Seeds the task schedule — same seed, same tasks                                                                                                                         |
+| `experiment.seed`          | `0`                               | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and input-noise streams |
 | `experiment.task_order`    | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                             |
 | `experiment.output_dir`    | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                             |
 | `scene.suite`              | `libero_goal`                     | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                 |
@@ -288,12 +296,24 @@ change need to be present; the run's name is the config file's stem plus any
 | `control.reversal_adapter` | `null`                            | Adapter spec for `shared_flow_reversal_steering`'s reverse integration — see [Perturbing the operator](#perturbing-the-operator); off unless set                        |
 | `control.operator_dims`    | `[translation]`                   | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                            |
 | `operator`                 | `human`                           | `human` (SpaceMouse / keyboard) or `policy`: the task-prompted policy drives, corrupted exactly like a person — see [Synthetic operator](#synthetic-operator-and-the-oracle-sweep) |
+| `policy_operator.update_every_steps` | `null` | Environment steps between synthetic intent queries; null uses `policy.n_action_steps`. Requires `operator: policy` |
+| `policy_operator.delay_steps` | `0` | Environment steps from observing the scene to delivering that synthetic command |
 | `server.port`              | `8765`                            | Live view port                                                                                                                                                          |
 
 A few keys can be overridden per run without editing the file:
 `--n-trials`, `--seed`, `--mode`, `--output-dir`, `--port`.
 
 ### Running a session
+
+Experiments reset once per trial, using its explicit initial-state ID and
+environment seed. The preview and rollout use the same reset. Assignments are
+independent of depth-block order and previous successes. Inference noise is
+seeded separately for the operator and executing policy at each chunk boundary.
+FC and FRS both consume one corrupted/noisy command per action chunk.
+The single `seed` controls reproducibility: each task draws from a seeded
+permutation of its available initial states, reshuffling after a complete pass.
+Different seeds can reuse states; they do not automatically define disjoint
+development/evaluation sets.
 
 For each trial the terminal prints the trial number, the scene, **your** task
 and the VLA prompt. The live view shows the reset scene with your task on its
@@ -333,6 +353,13 @@ or joint units), `steps`, `duration_s`, `user_reads`
 `reversal_adapter` hold a short label of the configured spec (e.g.
 `rotation_z_deg=20`) or the loaded file's name, and `null` when off.
 
+Corrected runs also record `init_state_id`, `env_seed`, `policy_seed`,
+`operator_seed`, `input_noise_seed`, `pair_id` and `initial_state_hash` in
+both the trial record and `.npz`. The hash fingerprints settled simulator
+positions, velocities and actuator state, rounded to eight decimal places.
+`steered_chunk_velocity_evaluations` reports the executing policy's cost per
+steered chunk, excluding the operator. Run configs carry `implementation_version: 2`.
+
 `trial_XXX.npz` arrays, one row per control step:
 
 | Array                                                          | Shape              | Contents                                                                                                                        |
@@ -365,14 +392,14 @@ z["user_translation_raw"], z["action"], z["eef_pos"], bool(z["success"])
 ### Synthetic operator and the oracle sweep
 
 `operator: policy` (or `--set operator=policy`) replaces the SpaceMouse and
-keyboard with the policy itself: at every chunk boundary the same checkpoint is
+keyboard with the policy itself: by default, at every chunk boundary the same checkpoint is
 queried with the scene's **real** instruction, the translation of its planned
 chunk (mean over the executed prefix, clipped like a stick) becomes the
 operator's command, and that command goes through the same corruption, noise
 and recorders as a person's. The executing policy still only sees the arm's
 prompt. Trials start without waiting for the button and the 20 Hz pacing is
-dropped, so a block runs unattended. `user_translation_raw` is then the
-oracle's clean intent and `user_translation` what the policy got.
+dropped, so a block runs unattended. `user_translation_raw` is the consumed
+operator command before corruption/noise and `user_translation` what the policy got.
 
 `oracle_sweep.sh` runs the whole grid this way — the three arms swept over
 depth on every LIBERO-Goal task, plus two policy-only anchors per task (the
@@ -383,10 +410,163 @@ arm's prompt = floor, the real task = ceiling):
 TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 ./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
 ```
 
-Runs land in `outputs/pi05_libero_oracle_sweep/`;
+Corrected runs land in `outputs/pi05_libero_oracle_sweep_v2/`;
 [`notebooks/analyze_sweep.ipynb`](notebooks/analyze_sweep.ipynb) compares the
 methods on them (success vs. controlled steps, per-task breakdown, whether the
 expressed behaviour was the task's, and how much of the intent got through).
+Set the notebook's `ROOT` to that new directory and rerun its cells. Historical
+notebook outputs describe the old implementation and must be regenerated.
+`load_runs` rejects pooling corrected and legacy runs, and `paired_test` rejects
+legacy runs without verified pairing metadata.
+
+### SpaceMouse-like timing: the next experiment
+
+The corrected oracle results select FC depth 10 and FRS depth 1.
+One hypothesis is that these settings work well because the current operator is
+a task-aware policy giving precise continuous commands with no reaction delay.
+The results do not establish that corruption severity is the limiting factor.
+Test the operator's timing before increasing corruption or tuning another adaptor.
+
+The synthetic operator now supports continuous direction and magnitude with
+slower intent updates and delayed delivery:
+
+```yaml
+operator: policy
+policy_operator:
+  update_every_steps: 20
+  delay_steps: 4
+```
+
+At 20 environment steps/second, this proposes new intent once per second and
+delivers it 0.2 seconds after observing the scene. It holds the preceding command
+until delivery, starts idle with the gripper open, and resets its queue every
+trial. Both translation and gripper are delayed; the current xyz-only arms
+consume only translation. Directions are continuous, without axis quantization.
+This models **intent update timing**, not the hardware's sampling rate, and the
+numbers are experimental assumptions rather than a validated human model. The
+underlying policy still supplies privileged task knowledge and precise directions.
+
+FC and FRS consume commands every 10 environment steps by default. A command
+generated at step 0 and delivered at step 4 is first consumed at step 10; the
+robot therefore sees a 0.5-second delay. Delays 1 through 10 have the same
+consumption schedule when queries are aligned to chunk boundaries. Avoid a dense
+sub-chunk delay sweep: it repeats equivalent conditions. Changing the action
+chunk length is a separate experiment, since it also changes policy feedback.
+
+Use a factorial timing ablation, keeping the +20-degree corruption and F@20 fixed:
+
+| Profile | Update steps | Delay steps | Purpose |
+| --- | ---: | ---: | --- |
+| Immediate oracle | 10 | 0 | Existing reference |
+| Slower intent | 20 | 0 | Isolate held/stale intent |
+| Delayed intent | 10 | 4 | Isolate reaction delay |
+| Slower + delayed | 20 | 4 | Initial SpaceMouse-like profile |
+
+For each new profile, compare FC, native FRS, and FRS+F@20 at depths 2/4/6/8/10.
+Depth 1 is excluded from the next experiment; its oracle optimum need not carry
+over to human input. Start with 5 paired trials on each of all ten
+tasks, seed 0. This is 850 trials per profile including the two anchors. Existing
+reference runs contain those first five seeded trials per task; select that same
+subset when comparing timing profiles. Do not select an input impairment merely
+because it produces an FRS win.
+
+```bash
+S=./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+FC_DEPTHS=2,4,6,8,10 FRS_DEPTHS=2,4,6,8,10 N_TRIALS=5 SEED=0 \
+  OUT=outputs/pi05_libero_spacemouse_u20_d4 "$S" \
+  --set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4 --dry-run
+# Remove --dry-run to collect. Repeat with (20,0) and (10,4), each in its own OUT.
+```
+
+Keep profiles in separate output roots; `load_runs` rejects pooling different
+synthetic timing profiles and adds an `operator_profile` column. The resolved
+timing settings are stored in `config.yaml` and each JSON trial record. New NPZ
+arrays support diagnostics:
+
+- `oracle_translation`: latest computed task-policy command, even if still awaiting
+  delivery. This is not a fresh oracle query on every recorded frame.
+- `operator_translation`: currently delivered source command before corruption.
+- `operator_command_age_steps`: age since that delivered command was generated,
+  or -1 before the first delivery. Age is evaluated before the recorded action.
+- `operator_query_count`: cumulative queries in the trial.
+
+The delivered source can change between policy chunk boundaries. Use
+`user_translation_raw` and `user_reads` to identify what was actually consumed;
+the source diagnostics alone do not identify the command behind a queued action.
+
+Compare success, completion steps, task breakdowns, query counts, and videos at
+grasp/contact transitions. If FC's preferred depth decreases or FRS's increases,
+that supports the excessive-oracle-authority hypothesis; neither shift nor an
+FRS win is guaranteed. A static rotation adaptor cannot directly repair stale
+intent, so timing robustness and adaptor benefit must be measured separately.
+After the pilot, check these timing assumptions against recorded SpaceMouse use,
+then freeze each method's best configuration and confirm on new seeds with paired
+resets. New seeds can revisit the same physical states; account for that in uncertainty.
+
+### Experiments after the implementation corrections
+
+The baseline, angle ablation, and confirmation below have now been collected;
+in the corrected output directories. These commands document that study. The timing
+ablation above is the next priority.
+
+First rerun all ten tasks under the original 20-degree corruption, with a fresh
+depth sweep. The old best depth may change now that forward integration uses
+the correct step size. The full grid has 2,100 trials (21 conditions × 10 tasks × 10 resets):
+
+```bash
+S=./examples/pi05/libero_shared_autonomy/oracle_sweep.sh
+FC_DEPTHS=2,4,6,8,10 FRS_DEPTHS=1,2,3,4,6,8,10 N_TRIALS=10 SEED=0 \
+  OUT=outputs/pi05_libero_oracle_sweep_v2 "$S" --dry-run
+# Run the same command without --dry-run to collect the corrected baseline.
+```
+
+`FC_DEPTHS` and `FRS_DEPTHS` independently choose method depths; `DEPTHS` remains
+a fallback for both. `SEED` controls initial-state selection and stochastic
+replicates. Every method receives the same assignments. Additional
+arguments are passed to `experiment`, so `--dry-run` validates without loading a policy.
+
+Next, select a shallow FRS depth on these development states and test adaptor
+angles `-20, 0, 10, 20, 30, 40` with the corruption held at +20 degrees. For example,
+for depth 2 (replace it if the corrected sweep selects a different depth):
+
+```bash
+R=./examples/pi05/libero_shared_autonomy/run.sh
+"$R" experiment --config flow_reversal_rotz20_adapted.yaml \
+  --set operator=policy --set experiment.task_order=sequential --n-trials=100 \
+  --set control.n_reversal_steps=2 --seed=0 \
+  --sweep control.reversal_adapter.translation.rotation_z_deg=-20,0,10,20,30,40 \
+  --output-dir=outputs/pi05_libero_adapter_angles_v2
+```
+
+Keep angle variants separate in analysis: group by `run` and use
+`paired_test(trials, "run", run_a, run_b)`; pooling every angle under `FRS+F`
+would obscure which configuration is being evaluated. Add a clean-command control
+for every arm (`--set control.corruption=null`; adapted FRS also needs
+`--set control.reversal_adapter.translation=identity`).
+
+Then freeze the selected FC depth, FRS depth and adaptor angle. Compare the
+selected configurations with multiple new seeds and 20 trials per task.
+For the original +20-degree adaptor, the confirmation grid can be run as:
+
+```bash
+# Substitute the depths selected on development states before running.
+FC_DEPTHS=10 FRS_DEPTHS=2 N_TRIALS=20 SEED=1 \
+  OUT=outputs/pi05_libero_confirm_v2 "$S"
+```
+
+Repeat with other seeds, leaving the selected configurations fixed. For a tuned
+adaptor angle, invoke its selected `experiment` command separately with the same
+seed and per-task trial counts. Compare best FC against best FRS+F using
+`paired_test(selected_trials, "method", "FC", "FRS+F")`, which pairs by `pair_id`.
+With multiple seeds, do not pass only `(task_id, trial)` as pairing keys. Seeds
+can reuse initial states: also report uncertainty grouped by task/reset, rather than
+treating every stochastic replicate as a new independent scene.
+
+After establishing these corrected baselines, test guidance horizons of 10, 20
+and 50 steps and coherent policy-based reference chunks. These are algorithm
+ablations requiring additional configuration/code; the fixes preserve FRS's
+existing executed-prefix delegation. Review failures on tasks 0, 2, 3 and 9,
+while retaining all ten tasks in the final evaluation.
 
 ## Analysis
 
@@ -405,9 +585,9 @@ at other directories to compare anything else. Its functions:
   interval per group of columns (`["run"]`, `["method", "depth"]`, ...);
   `success_table(trials, configs)` is the per-run view with labels and median
   steps, `best_depth` and `per_task_table` the per-method views.
-- `paired_test(trials, by, a, b, pair_on)` / `paired_comparisons` — McNemar's
-  exact test between two runs (paired by trial) or two methods (paired by task
-  and trial), on the trials both completed.
+- `paired_test(trials, by, a, b, pair_on=None)` / `paired_comparisons` — McNemar's
+  exact test on matching `pair_id` values and verified identical initial-state
+  hashes. Explicit keys are also verified; duplicate or unverified pairs fail.
 - `task_targets` / `with_mode_accuracy` — which scene element each task is
   about (from the ceiling anchor) and whether each trial expressed it.
 - `step_metrics(trials)` — per-trial operator engagement and intent

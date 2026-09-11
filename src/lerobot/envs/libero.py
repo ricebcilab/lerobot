@@ -324,13 +324,25 @@ class LiberoEnv(gym.Env):
             "Please switch to an image-based obs_type (e.g. 'pixels', 'pixels_agent_pos')."
         )
 
-    def reset(self, seed=None, **kwargs):
+    def reset(
+        self, seed: int | None = None, options: dict[str, Any] | None = None, **kwargs: Any
+    ) -> tuple[RobotObservation, dict[str, Any]]:
+        requested_state = (options or {}).get("init_state_id")
+        if requested_state is not None:
+            if not self.init_states or self._init_states is None:
+                raise ValueError("An explicit init_state_id requires init_states=True")
+            if type(requested_state) is not int or not 0 <= requested_state < len(self._init_states):
+                raise ValueError(f"init_state_id must be an integer in [0, {len(self._init_states) - 1}]")
+            self.init_state_id = requested_state
         self._ensure_env()
+        assert self._env is not None
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
+        state_id: int | None = None
         if self.init_states and self._init_states is not None:
-            raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
+            state_id = self.init_state_id % len(self._init_states)
+            raw_obs = self._env.set_init_state(self._init_states[state_id])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
@@ -348,7 +360,7 @@ class LiberoEnv(gym.Env):
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
-        info = {"is_success": False}
+        info = {"is_success": False, "init_state_id": state_id}
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:

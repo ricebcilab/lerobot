@@ -160,7 +160,7 @@ def build_reversal_adapter(
 
 
 class ReversalAdapter:
-    """Mutable holder for the reversal adapter F (None = off).
+    """Mutable holder for the environment-space reversal adapter F (None = off).
 
     ``FlowReversalSteeringPolicy`` reads the holder on every chunk, so replacing
     ``matrix`` takes effect immediately. ``label`` is display-only.
@@ -183,7 +183,17 @@ class ReversalAdapter:
             return "Reversal adapter: off."
         identity = " (identity, a no-op)" if np.allclose(self._matrix, np.eye(N_ACTION_DIMS)) else ""
         rows = "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in self._matrix)
-        return f"Reversal adapter: reverse integration uses x_t += h * F @ v, F = {self.label}{identity} = [{rows}]."
+        return f"Reversal adapter: environment-space F = {self.label}{identity} = [{rows}]."
+
+    def normalized_matrix(self, std: np.ndarray) -> np.ndarray | None:
+        """Convert an environment-space velocity transform to normalized coordinates: S^-1 F S.
+
+        Velocities have no mean offset. Apply this to all seven dimensions so literal
+        matrices that mix translation, orientation and gripper use the same convention.
+        """
+        if self.matrix is None:
+            return None
+        return self.matrix * std[np.newaxis, :] / std[:, np.newaxis]
 
 
 # ---------------------------------------------------------------- FlowControlPolicy
@@ -220,20 +230,22 @@ class FlowControlPolicy:
         self._mean, self._std = mean[:3], std[:3]
         self._queue: deque = deque()
         self.guided_steps = 0  # per-rollout count of guided denoising steps
+        self._pending_command: np.ndarray | None = None
 
     def reset(self) -> None:
         self._policy.reset()
         self._queue.clear()
         self.guided_steps = 0
+        self._pending_command = None
 
     @torch.compiler.disable
     def _x_t_hook(self, step: int, time_: float, x_t: torch.Tensor) -> torch.Tensor:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
-        # the hook reads live teleop input and must stay eager.
+        # the hook uses the current chunk's teleop command and must stay eager.
         if step >= self.n_guided_steps:
             return x_t
-        command = self._source.translation
-        if np.max(np.abs(command)) < DEADBAND:
+        command = self._pending_command
+        if command is None:
             return x_t
         target = (command - self._mean) / self._std
         x_t[..., :3] = torch.as_tensor(target, dtype=x_t.dtype, device=x_t.device)
@@ -243,6 +255,12 @@ class FlowControlPolicy:
     def select_action(self, batch) -> torch.Tensor:
         # Same queue logic as PI05Policy.select_action, plus the guidance hook.
         if len(self._queue) == 0:
+            # Hold one consumed command (including its noise) for the whole chunk,
+            # matching FRS and the synthetic operator's refresh cadence.
+            command = self._source.translation if self.n_guided_steps else None
+            self._pending_command = (
+                command if command is not None and np.max(np.abs(command)) >= DEADBAND else None
+            )
             chunk = self._policy.predict_action_chunk(batch, x_t_hook=self._x_t_hook)
             actions = chunk[:, : self._policy.config.n_action_steps]
             self._queue.extend(actions.transpose(0, 1))
@@ -269,8 +287,9 @@ def reverse_flow(
     returns a chunk at t = n_reversal_steps / num_steps, still carrying some of
     the reference. The caller must then start the forward flow at that time.
 
-    `adapter` is an optional (n, n) matrix F that adapts the velocity field of the
-    reversal, x_t += h * (F @ v): it is applied to the first n action dimensions of
+    `adapter` is an optional (n, n) matrix F, already in normalized coordinates,
+    that adapts the reversal's velocity field, x_t += h * (F @ v): it is applied
+    to the first n action dimensions of
     every velocity evaluation (the env's 7 here), leaving the padding dimensions
     alone. F = I is an exact no-op. Only the reversal is adapted; the forward flow
     that produces the executed action still uses the policy's own field.
@@ -341,11 +360,12 @@ class FlowReversalSteeringPolicy:
 
     `n_reversal_steps` stops the reversal early instead of going all the way to
     noise: with n of the policy's N = num_inference_steps steps the reference is
-    only partially destroyed, landing at t = n/N, and the forward flow then runs
-    from there in N - n steps (so a steered chunk costs the same N velocity
-    evaluations as an unsteered one). Smaller n keeps more of the operator's
-    reference in the result, larger n leaves the policy more freedom; n = N (or
-    None) is the full reversal.
+    integrated up to t = n/N, and the forward flow then runs
+    from there in n steps, maintaining the policy's step size in both directions.
+    With delegation, a steered chunk costs N + n velocity evaluations: n reverse,
+    N - n to obtain the unsteered state, and n forward. Depth changes how far
+    inversion travels before delegation and reconstruction; its effect on
+    intent preservation is empirical. n = N (or None) is the full reversal.
 
     `operator_dims` names the dim groups the operator commands (default: only
     translation) and `pinned_steps` how many leading steps of the chunk the
@@ -410,7 +430,7 @@ class FlowReversalSteeringPolicy:
         total = self._policy.config.num_inference_steps
         return {
             "flow_start_time": self._n_reversal_steps / total,
-            "num_forward_steps": total - self._n_reversal_steps,
+            "num_forward_steps": self._n_reversal_steps,
         }
 
     def _normalize_gripper(self, gripper: float) -> float:
@@ -448,9 +468,7 @@ class FlowReversalSteeringPolicy:
         reference = self.reference_chunk(command).to(device=noise.device, dtype=noise.dtype)
         self._last_reference = reference
         self.steered_chunks += 1
-        adapter_matrix = (
-            None if self._adapter is None or self._adapter.matrix is None else self._adapter.matrix
-        )
+        adapter_matrix = None if self._adapter is None else self._adapter.normalized_matrix(self._std)
         if adapter_matrix is not None:
             adapter_matrix = torch.as_tensor(adapter_matrix, dtype=noise.dtype, device=noise.device)
         total = self._policy.config.num_inference_steps

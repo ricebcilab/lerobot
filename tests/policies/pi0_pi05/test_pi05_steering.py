@@ -131,6 +131,21 @@ def test_reversal_adapter_holder():
         holder.matrix = np.eye(3)
 
 
+def test_adapter_normalization_preserves_environment_velocity_transform():
+    # Unequal scales and cross-group mixing expose copying F directly into model space.
+    std = np.array([0.3, 0.4, 0.5, 0.04, 0.06, 0.08, 1.0])
+    matrix = np.eye(7)
+    matrix[:3, :3] = rotation_about_z(20)
+    matrix[0, 3] = 0.2
+    adapter = ReversalAdapter(matrix)
+    normalized_velocity = np.arange(1.0, 8.0)
+    actual = std * (adapter.normalized_matrix(std) @ normalized_velocity)
+    expected = matrix @ (std * normalized_velocity)
+    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_allclose(ReversalAdapter(np.eye(7)).normalized_matrix(std), np.eye(7))
+    assert ReversalAdapter().normalized_matrix(std) is None
+
+
 # ---------------------------------------------------------------- reverse_flow
 
 
@@ -200,6 +215,26 @@ def test_flow_control_skips_idle_input_and_queues_actions():
     assert len(policy.calls) == 1  # n_action_steps=2 actions per chunk
 
 
+def test_flow_control_consumes_one_noisy_command_per_chunk():
+    class ChangingSource:
+        reads = 0
+
+        @property
+        def translation(self):
+            self.reads += 1
+            return np.array([self.reads / 10, 0.0, 0.0])
+
+    source = ChangingSource()
+    wrapper = FlowControlPolicy(FakePolicy(), source, NUM_STEPS, postprocessor())
+    first = wrapper.select_action({})
+    second = wrapper.select_action({})
+    assert source.reads == 1
+    torch.testing.assert_close(first, second)
+    assert first[0, 0].item() == pytest.approx(0.1)
+    wrapper.select_action({})
+    assert source.reads == 2
+
+
 # ---------------------------------------------------------------- FlowReversalSteeringPolicy
 
 
@@ -216,7 +251,7 @@ def test_reverse_flow_steering_passes_schedule_only_while_steering():
     wrapper.select_action({})  # served from the queue, no new call
     assert len(policy.calls) == 2
     assert policy.calls[-1]["flow_start_time"] == pytest.approx(0.4)
-    assert policy.calls[-1]["num_forward_steps"] == 6
+    assert policy.calls[-1]["num_forward_steps"] == 4
     assert wrapper.steered_chunks == 1
     assert len(wrapper.reconstruction_errors) == 1
 
@@ -227,6 +262,56 @@ def test_reverse_flow_steering_full_reversal_has_no_schedule_kwargs():
     wrapper.select_action({})
     assert "flow_start_time" not in policy.calls[-1]
     assert wrapper.n_reversal_steps is None
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4, 8, 10])
+def test_partial_reversal_roundtrip_and_evaluation_budget(depth):
+    class IntegratingPolicy(FakePolicy):
+        def predict_action_chunk(self, batch, **kwargs):
+            self.times = []
+
+            def velocity(x, time):
+                self.times.append(time)
+                return torch.ones_like(x)
+
+            x = kwargs["noise_fn"](velocity, torch.zeros(1, CHUNK, MAX_DIM))
+            start = kwargs.get("flow_start_time", 1.0)
+            steps = kwargs.get("num_forward_steps", NUM_STEPS)
+            dt = -start / steps
+            self.forward_dt = dt
+            for i in range(steps):
+                x = x + dt * velocity(x, start + i * dt)
+            return x
+
+    policy = IntegratingPolicy()
+    wrapper = FlowReversalSteeringPolicy(
+        policy, Source((0.5, 0.0, -0.5)), postprocessor(), n_reversal_steps=depth
+    )
+    actual = wrapper.select_action({})
+    # Exact constant-field inversion preserves the commanded dimensions, while
+    # delegated ones complete the ordinary noise -> action trajectory.
+    torch.testing.assert_close(actual[0, :3], torch.tensor([0.5, 0.0, -0.5]))
+    torch.testing.assert_close(actual[0, 3:], torch.full((MAX_DIM - 3,), -1.0))
+    assert policy.forward_dt == pytest.approx(-1.0 / NUM_STEPS)
+    assert len(policy.times) == NUM_STEPS + depth
+
+
+def test_wrapper_converts_adapter_before_reversal():
+    policy = FakePolicy()
+    std = np.array([2.0, 4.0, 6.0, 1.0, 1.0, 1.0, 1.0])
+    matrix = np.eye(7)
+    matrix[:3, :3] = rotation_about_z(90)
+    wrapper = FlowReversalSteeringPolicy(
+        policy,
+        Source((1.0, 0.0, 0.0)),
+        postprocessor(std=std),
+        adapter=ReversalAdapter(matrix),
+        n_reversal_steps=2,
+    )
+    wrapper.select_action({})
+    physical_delta = matrix @ std  # FakePolicy uses normalized v = ones.
+    expected = np.array([1.0, 0.0, 0.0]) / std[:3] + 0.2 * physical_delta[:3] / std[:3]
+    np.testing.assert_allclose(policy.last_latent[0, 0, :3].numpy(), expected, atol=1e-6)
 
 
 def test_reverse_flow_steering_validates_n_reversal_steps():

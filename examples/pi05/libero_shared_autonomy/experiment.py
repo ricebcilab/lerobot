@@ -37,7 +37,7 @@ import datetime as dt
 import json
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +50,7 @@ from config import (
     load_experiment_settings,
     set_label,
 )
+from reproducibility import trial_specs
 from session import VIDEO_FPS, Session
 from teleop import TeleopChain
 
@@ -57,6 +58,12 @@ from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
 EXPERIMENT_CONFIG_DIR = CONFIG_DIR / "experiment"
+
+
+def build_trial_specs(settings: ExperimentSettings, schedule: list[int]):
+    suite = settings.session.suite
+    counts = {task: Session.initial_state_count(suite, task) for task in set(schedule)}
+    return trial_specs(schedule, suite, settings.seed, counts)
 
 
 def build_schedule(task_ids: list[int], n_trials: int, order: str, seed: int) -> list[int]:
@@ -104,6 +111,7 @@ class TrialRecorder:
         gripper = state.get("gripper", {})
         joints = state.get("joints", {})
         reads = self._chain.served.reads
+        operator = self._chain.operator
         self.rows.append(
             {
                 "t": time.time() - self.start,
@@ -112,6 +120,14 @@ class TrialRecorder:
                 "user_translation_raw": np.asarray(self._chain.raw.last_translation, dtype=np.float32),
                 "user_gripper": float(self._chain.served.last_gripper),
                 "user_reads": reads - self._reads,  # 0 = the input was not consulted this step
+                "oracle_translation": (
+                    operator.oracle_translation.copy() if operator is not None else np.full(3, np.nan)
+                ),
+                "operator_translation": (
+                    operator.translation if operator is not None else np.full(3, np.nan)
+                ),
+                "operator_command_age_steps": operator.command_age_steps if operator is not None else -1,
+                "operator_query_count": operator.refreshes if operator is not None else 0,
                 "eef_pos": _first(eef.get("pos"), 3),
                 "eef_quat": _first(eef.get("quat"), 4),
                 "gripper_qpos": _first(gripper.get("qpos"), 2),
@@ -282,12 +298,17 @@ def _provenance(
         "overrides": list(block.sets),
         "n_trials": settings.n_trials,
         "seed": settings.seed,
+        "initial_state_sampling": "per_task_seeded_permutation",
+        "implementation_version": 2,
+        "flow_schedule": "symmetric_euler",
+        "command_sampling": "once_per_chunk",
         "task_order": settings.task_order,
         "output_dir": str(settings.output_dir),
         "suite": settings.session.suite,
         "task_ids": settings.task_ids,
         "prompt": settings.prompt,
         "operator": settings.session.operator,
+        "policy_operator": asdict(settings.session.policy_operator),
         "operator_dims": list(control.operator_dims),
         "policy_path": settings.session.policy_path,
         "n_action_steps": settings.session.n_action_steps,
@@ -301,6 +322,7 @@ def _provenance(
         "reversal_adapter": control.reversal_adapter,
         "port": settings.session.port,
         "schedule": schedule,
+        "trial_specs": [spec.metadata() for spec in build_trial_specs(settings, schedule)],
         "scene_rows": "before_step",  # per-step scene state is taken before the action is applied
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
@@ -309,7 +331,7 @@ def _provenance(
     return resolved
 
 
-_FIXED_PER_PROCESS = ("policy_path", "n_action_steps", "compile", "port")
+_FIXED_PER_PROCESS = ("policy_path", "n_action_steps", "compile", "port", "operator")
 
 
 def _print_block_header(index: int, total: int, settings: ExperimentSettings, session: Session) -> None:
@@ -325,6 +347,8 @@ def _print_block_header(index: int, total: int, settings: ExperimentSettings, se
         f"operator: {settings.session.operator}   "
         f"operator commands: {', '.join(settings.session.control.operator_dims)}"
     )
+    if settings.session.operator == "policy":
+        print(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
     if session.chain.corruption.matrix is not None:
         print(session.chain.corruption.describe())
     if session.adapter.matrix is not None:
@@ -348,7 +372,9 @@ def run_block(
     mode = session.mode
     results: list[dict] = []
     trials_path = run_dir / "trials.jsonl"
-    for trial, task_id in enumerate(schedule):
+    specs = build_trial_specs(settings, schedule)
+    for trial, spec in enumerate(specs):
+        task_id = spec.task_id
         if (settings.session.suite, task_id) != (session.suite, session.task_id):
             session.set_scene(settings.session.suite, task_id)  # a new scene needs its own env + processors
         task_description = session.task_description
@@ -359,7 +385,8 @@ def run_block(
         print(f"YOUR TASK: {task_description}")
         print(f'VLA prompt: "{vla_prompt}"   mode: {session.mode_label()}')
         print("=" * 78)
-        session.show_scene()
+        initial_observation = session.show_scene(spec)
+        identity = {**spec.metadata(), "initial_state_hash": session.initial_state_hash()}
         # `task` stays up for the whole trial; rollout only overwrites `prompt`,
         # which is already the VLA's, so nothing visibly changes when it starts.
         session.view.stream.set_status(
@@ -378,7 +405,13 @@ def run_block(
 
         recorder = TrialRecorder(session.chain)
         started = time.time()
-        result = session.rollout(vla_prompt, recorder=recorder, max_steps=control.max_steps)
+        result = session.rollout(
+            vla_prompt,
+            recorder=recorder,
+            max_steps=control.max_steps,
+            initial_observation=initial_observation,
+            trial_spec=spec,
+        )
         duration = time.time() - started
 
         video_name, steps_name = f"trial_{trial:03d}.mp4", f"trial_{trial:03d}.npz"
@@ -389,16 +422,18 @@ def run_block(
             vla_prompt=vla_prompt,
             success=result.success,
             mode=mode,
-            task_id=task_id,
+            **identity,
         )
         motion = summarize_scene_motion(recorder.scene_first, recorder.scene_last)
         record = {
+            **identity,
             "trial": trial,
             "suite": settings.session.suite,
             "task_id": task_id,
             "task_description": task_description,
             "vla_prompt": vla_prompt,
             "operator": settings.session.operator,
+            "policy_operator": asdict(settings.session.policy_operator),
             "operator_dims": list(control.operator_dims),
             "mode": mode,
             "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
@@ -467,13 +502,18 @@ def main():
             print(
                 f"Config OK ({args.config}). Block {settings.name}: schedule ({settings.task_order}, seed {settings.seed}):"
             )
-            for i, task_id in enumerate(schedule):
-                print(f"  trial {i:03d}: {settings.session.suite} task {task_id}: {tasks[task_id]}")
+            for i, spec in enumerate(build_trial_specs(settings, schedule)):
+                print(
+                    f"  trial {i:03d}: {spec.suite} task {spec.task_id}, "
+                    f"init_state_id={spec.init_state_id}, env_seed={spec.env_seed}: {tasks[spec.task_id]}"
+                )
             print(
                 f'VLA prompt: "{settings.prompt}"   mode: {control.mode}   '
                 f"n_guided_steps: {control.n_guided_steps}   n_reversal_steps: {control.n_reversal_steps}   "
                 f"operator: {settings.session.operator} ({', '.join(control.operator_dims)})"
             )
+            if settings.session.operator == "policy":
+                print(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
             if control.corruption_matrix is not None:
                 print(f"corruption M = {np.array2string(control.corruption_matrix, precision=3)}")
             if control.reversal_adapter_matrix is not None:
@@ -489,6 +529,8 @@ def main():
     try:
         for index, (block, settings, schedule) in enumerate(plan):
             session.apply_control(settings.session.control)
+            if session.operator is not None:
+                session.operator.configure(settings.session.policy_operator)
             run_dir = settings.output_dir / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{settings.name}"
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "config.yaml").write_text(

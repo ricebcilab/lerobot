@@ -140,6 +140,21 @@ def test_sets_override_the_file_and_are_validated():
         load_experiment_settings(path, {}, sets=["control.mode=nope"])
 
 
+def test_policy_operator_timing_overrides_and_defaults():
+    path = CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml"
+    default = load_experiment_settings(path, {}, sets=["operator=policy"])
+    assert default.session.policy_operator.update_every_steps is None
+    assert default.session.policy_operator.delay_steps == 0
+    sets = ["policy_operator.update_every_steps=20", "policy_operator.delay_steps=4"]
+    settings = load_experiment_settings(path, {}, sets=["operator=policy", *sets])
+    assert settings.session.policy_operator.update_every_steps == 20
+    assert settings.session.policy_operator.delay_steps == 4
+    with pytest.raises(ValueError, match="require operator=policy"):
+        load_experiment_settings(path, {}, sets=sets)
+    with pytest.raises(ValueError, match="positive integer"):
+        load_experiment_settings(path, {}, sets=["operator=policy", "policy_operator.update_every_steps=0"])
+
+
 def test_experiment_validation_errors(tmp_path):
     def write(text):
         p = tmp_path / "c.yaml"
@@ -158,6 +173,9 @@ def test_experiment_validation_errors(tmp_path):
         load_experiment_settings(write("control: {reversal_adapter: {translation: corruption}}"), {})
     with pytest.raises(ValueError, match="n_reversal_steps"):
         load_experiment_settings(write("control: {n_reversal_steps: 0}"), {})
+    for value in (-1, 0.5, True):
+        with pytest.raises(ValueError, match="seed"):
+            load_experiment_settings(write(f"experiment: {{seed: {value}}}"), {})
 
 
 def test_experiment_cli_overrides(tmp_path):

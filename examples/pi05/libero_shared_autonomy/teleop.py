@@ -26,7 +26,9 @@ reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
 import struct
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -255,29 +257,80 @@ class CombinedReader:
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
 
 
+@dataclass
+class PolicyOperatorSettings:
+    """Simulated intent-update timing, measured in environment steps, not wall time."""
+
+    update_every_steps: int | None = None  # None = the executing policy's chunk interval
+    delay_steps: int = 0
+
+    def __post_init__(self):
+        if self.update_every_steps is not None and (
+            type(self.update_every_steps) is not int or self.update_every_steps < 1
+        ):
+            raise ValueError("policy_operator.update_every_steps must be a positive integer or null")
+        if type(self.delay_steps) is not int or self.delay_steps < 0:
+            raise ValueError("policy_operator.delay_steps must be a non-negative integer")
+
+
 class PolicyOperator:
     """A synthetic operator: the task-prompted policy's own plan, sampled like a SpaceMouse.
 
-    `refresh(chunk)` takes an action chunk in env units (steps x 7) and turns it
-    into one command per chunk, the way the SpaceMouse is read once per chunk:
+    `refresh(chunk, step)` takes an action chunk in env units (steps x 7) and turns it
+    into a continuous translation and a binary gripper command:
     translation = mean over the first `n_action_steps` steps, clipped to [-1, 1];
     gripper = close iff that mean gripper command is > 0. The command holds until
-    the next refresh, like a stick held in place. Placed in front of the human
+    the next delivery, like a stick held in place. Intent updates and delivery
+    delay are configurable in environment steps; defaults preserve the immediate
+    once-per-chunk oracle. Placed in front of the human
     sources (`TeleopChain.attach_operator`), so the corruption, the noise and the
     recorders treat it exactly like a person.
     """
 
-    def __init__(self, n_action_steps: int):
+    def __init__(self, n_action_steps: int, settings: PolicyOperatorSettings | None = None):
         self.n_action_steps = n_action_steps
+        self.configure(settings or PolicyOperatorSettings())
+
+    def configure(self, settings: PolicyOperatorSettings) -> None:
+        self.settings = settings
+        self.update_every_steps = settings.update_every_steps or self.n_action_steps
+        self.reset()
+
+    def reset(self) -> None:
         self._translation = np.zeros(3)
         self._gripper = GRIPPER_OPEN
+        self.oracle_translation = np.zeros(3)
+        self._pending: deque = deque()
+        self._generated_at: int | None = None
+        self._step = 0
         self.refreshes = 0
 
-    def refresh(self, chunk) -> None:
+    def should_refresh(self, step: int) -> bool:
+        return step % self.update_every_steps == 0
+
+    def refresh(self, chunk, step: int = 0) -> None:
+        """Compute intent from the observation at `step`; deliver it after the configured delay."""
         chunk = np.asarray(chunk, dtype=np.float64)[: self.n_action_steps]
-        self._translation = np.clip(chunk[:, :3].mean(axis=0), -1.0, 1.0)
-        self._gripper = GRIPPER_CLOSE if chunk[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
+        translation = np.clip(chunk[:, :3].mean(axis=0), -1.0, 1.0)
+        gripper = GRIPPER_CLOSE if chunk[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
+        self.oracle_translation = translation.copy()
+        self._pending.append((step + self.settings.delay_steps, step, translation, gripper))
         self.refreshes += 1
+        self.advance(step)
+
+    def advance(self, step: int) -> None:
+        """Deliver ready commands and hold the latest one between intent updates.
+
+        Before the first delayed command arrives the source is idle. FC and FRS
+        still consume the source only at their action-chunk boundaries.
+        """
+        self._step = step
+        while self._pending and self._pending[0][0] <= step:
+            _, self._generated_at, self._translation, self._gripper = self._pending.popleft()
+
+    @property
+    def command_age_steps(self) -> int:
+        return -1 if self._generated_at is None else self._step - self._generated_at
 
     def idle(self) -> None:
         self._translation = np.zeros(3)

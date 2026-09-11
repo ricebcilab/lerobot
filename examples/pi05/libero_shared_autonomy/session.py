@@ -7,6 +7,7 @@ of the env's task description, an optional action hook (teleop modes) and an
 optional per-step recorder (experiments).
 """
 
+import hashlib
 import logging
 import os
 import time
@@ -14,11 +15,13 @@ import webbrowser
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import cache
 
 import numpy as np
 import torch
 from config import MODES, ControlSettings, SessionSettings, spec_label
 from live_view import ACTION_LABELS, LiveView
+from reproducibility import TrialSpec
 from teleop import KeyboardReader, PolicyOperator, TeleopChain
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -93,7 +96,7 @@ class Session:
         # A synthetic operator (the task-prompted policy) replaces the SpaceMouse/keyboard.
         self.operator: PolicyOperator | None = None
         if settings.operator == "policy":
-            self.operator = PolicyOperator(settings.n_action_steps)
+            self.operator = PolicyOperator(settings.n_action_steps, settings.policy_operator)
             self.chain.attach_operator(self.operator)
         self.adapter = ReversalAdapter()
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
@@ -159,6 +162,14 @@ class Session:
         if suite not in bench:
             raise ValueError(f"Unknown suite '{suite}'. Available: {', '.join(sorted(bench))}")
         return [t.language for t in bench[suite]().tasks]
+
+    @staticmethod
+    @cache
+    def initial_state_count(suite: str, task_id: int) -> int:
+        """Read reset counts without constructing an environment or loading the policy."""
+        from lerobot.envs.libero import _get_suite, get_task_init_states
+
+        return len(get_task_init_states(_get_suite(suite), task_id))
 
     @staticmethod
     def _build_env(suite: str, task_id: int):
@@ -230,10 +241,24 @@ class Session:
                 self._scene_names = False
             return None
 
-    def show_scene(self) -> None:
-        """Reset the env and put its first frame on the live view."""
-        self.vec_env.reset()
+    def show_scene(self, trial_spec: TrialSpec | None = None):
+        """Reset once and return the observation displayed to the operator."""
+        kwargs = (
+            {}
+            if trial_spec is None
+            else {"seed": trial_spec.env_seed, "options": {"init_state_id": trial_spec.init_state_id}}
+        )
+        observation, _ = self.vec_env.reset(**kwargs)
         self.view.stream.publish(self.vec_env.envs[0].render())
+        return observation
+
+    def initial_state_hash(self) -> str:
+        """Fingerprint the settled robot/object positions, velocities and actuator state."""
+        data = self._sim().sim.data
+        state = np.concatenate([data.qpos, data.qvel, data.act])
+        state = np.round(state, 8).astype("<f8")
+        state[state == 0] = 0  # canonicalize signed zero after rounding
+        return hashlib.sha256(state.tobytes()).hexdigest()
 
     # ------------------------------------------------------------ operator perturbations
 
@@ -256,9 +281,13 @@ class Session:
     def resolved_matrices(self) -> dict:
         """For run provenance: the matrices in force, as lists (None when off)."""
         m, f = self.chain.corruption.matrix, self.adapter.matrix
+        _, std = get_action_mean_std(self.postprocessor)
+        normalized = self.adapter.normalized_matrix(std[:7])
         return {
             "corruption_matrix": None if m is None else m.tolist(),
             "reversal_adapter_matrix": None if f is None else f.tolist(),
+            "reversal_adapter_coordinates": "environment",
+            "reversal_adapter_normalized_matrix": None if normalized is None else normalized.tolist(),
         }
 
     # ------------------------------------------------------------ mode
@@ -334,7 +363,7 @@ class Session:
                 lines.append(
                     "Shared flow reversal steering: your x/y/z defines a reference chunk that is "
                     f"inverted {n} of {total} steps (partway to noise, t={n / total:.1f}); pi0.5 then "
-                    f"denoises from there in {total - n} steps (idle input = pure policy)."
+                    f"denoises from there in {n} steps (idle input = pure policy)."
                 )
             if self.adapter.matrix is not None:
                 lines.append(self.adapter.describe())
@@ -387,12 +416,16 @@ class Session:
     def metrics(self) -> dict:
         """Steering statistics of the last rollout in the current mode."""
         if self.mode == "shared_flow_control" and self._flow_policy is not None:
-            return {"guided_steps": int(self._flow_policy.guided_steps)}
+            return {
+                "guided_steps": int(self._flow_policy.guided_steps),
+                "steered_chunk_velocity_evaluations": self.policy.config.num_inference_steps,
+            }
         if self.mode == "shared_flow_reversal_steering" and self._frs_policy is not None:
             errors = self._frs_policy.reconstruction_errors
             total = self.policy.config.num_inference_steps
             return {
                 "n_reversal_steps": self._frs_policy.n_reversal_steps or total,
+                "steered_chunk_velocity_evaluations": total + (self._frs_policy.n_reversal_steps or total),
                 "steered_chunks": int(self._frs_policy.steered_chunks),
                 "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
             }
@@ -410,7 +443,14 @@ class Session:
 
     # ------------------------------------------------------------ rollout
 
-    def rollout(self, prompt: str, recorder=None, max_steps: int | None = None) -> RolloutResult:
+    def rollout(
+        self,
+        prompt: str,
+        recorder=None,
+        max_steps: int | None = None,
+        initial_observation=None,
+        trial_spec: TrialSpec | None = None,
+    ) -> RolloutResult:
         """One rollout in the current scene and mode, driven by `prompt`.
 
         `recorder(step=, observation=, action=, reward=, terminated=, truncated=, info=)`
@@ -426,7 +466,13 @@ class Session:
         vec_env = self.vec_env
 
         policy.reset()
-        observation, _ = vec_env.reset()
+        if self.operator is not None:
+            self.operator.reset()
+        observation = initial_observation
+        if observation is None:
+            observation = self.show_scene(trial_spec)
+        if trial_spec is not None:
+            self.chain.noisy._rng = np.random.default_rng(trial_spec.input_noise_seed)
         max_steps = max_steps or k["max_steps"] or int(vec_env.call("_max_episode_steps")[0])
         frames = [vec_env.envs[0].render()]
         stream.publish(frames[-1])
@@ -438,12 +484,19 @@ class Session:
         step = 0
         while step < max_steps:
             step_start = time.time()
-            if self.operator is not None and step % self.settings.n_action_steps == 0:
-                self._refresh_operator(observation)  # before the wrappers sample the source
+            chunk_index = step // self.settings.n_action_steps
+            if self.operator is not None:
+                if self.operator.should_refresh(step):
+                    if trial_spec is not None:
+                        torch.manual_seed((trial_spec.operator_seed + self.operator.refreshes) % 2**32)
+                    self._refresh_operator(observation, step=step)
+                self.operator.advance(step)  # deliver before the wrappers sample the source
             obs = preprocess_observation(observation)
             obs["task"] = [prompt]
             obs = env_preprocessor(obs)
             obs = preprocessor(obs)
+            if trial_spec is not None and step % self.settings.n_action_steps == 0:
+                torch.manual_seed((trial_spec.policy_seed + chunk_index) % 2**32)
             with torch.inference_mode(), self.autocast_ctx:
                 action = policy.select_action(obs)
             action = postprocessor(action)
@@ -498,7 +551,7 @@ class Session:
         stream.set_status(state="success" if success else "failed")
         return RolloutResult(success=success, steps=step, frames=frames, metrics=self.metrics())
 
-    def _refresh_operator(self, observation) -> None:
+    def _refresh_operator(self, observation, step: int = 0) -> None:
         """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator."""
         obs = preprocess_observation(observation)
         obs["task"] = [self.task_description]
@@ -507,7 +560,7 @@ class Session:
         with torch.inference_mode(), self.autocast_ctx:
             chunk = self.policy.predict_action_chunk(obs)
         chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
-        self.operator.refresh(chunk * self.operator_std + self.operator_mean)  # back to env units
+        self.operator.refresh(chunk * self.operator_std + self.operator_mean, step=step)  # env units
 
     def close(self) -> None:
         close_envs(self.envs_dict)

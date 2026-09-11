@@ -24,6 +24,8 @@ def write_run(root: Path, name: str, config: dict, records: list[dict], task_of=
                 "trial": i,
                 "task_id": task_of(i),
                 "task_description": f"task {task_of(i)}",
+                "pair_id": f"task-{task_of(i)}-state-{i}",
+                "initial_state_hash": f"state-{task_of(i)}-{i}",
                 "steps": 100 + i,
                 "duration_s": 5.0,
                 "steps_file": f"trial_{i:03d}.npz",
@@ -65,6 +67,23 @@ def outcomes(*flags):
 
 
 # ---------------------------------------------------------------- loading and describing
+
+
+def test_operator_profiles_cannot_be_silently_pooled(tmp_path):
+    a = write_run(tmp_path, "immediate", config(operator="policy"), outcomes(True))
+    b = write_run(
+        tmp_path, "delayed", config(operator="policy", policy_operator={"delay_steps": 4}), outcomes(False)
+    )
+    with pytest.raises(ValueError, match="operator timing profiles"):
+        analyze.load_runs([a, b])
+    c = write_run(
+        tmp_path,
+        "explicit_default",
+        config(operator="policy", policy_operator={"update_every_steps": 10, "delay_steps": 0}),
+        outcomes(True),
+    )
+    df, _ = analyze.load_runs([a, c])
+    assert df.operator_profile.nunique() == 1
 
 
 def test_method_depth_and_label():
@@ -210,6 +229,27 @@ def test_paired_test_by_run_and_by_method(tmp_path):
 
 
 # ---------------------------------------------------------------- expressed behaviour
+
+
+def test_paired_test_rejects_missing_mismatched_and_duplicate_pairs(tmp_path):
+    write_run(tmp_path, "a", config(), outcomes(True))
+    write_run(tmp_path, "b", config(reversal_adapter_matrix=np.eye(7).tolist()), outcomes(False))
+    trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
+    with pytest.raises(ValueError, match="Unverified pairing"):
+        analyze.paired_test(trials.drop(columns="pair_id"), "method", "FRS", "FRS+F")
+    bad = trials.copy()
+    bad.loc[bad["method"] == "FRS+F", "initial_state_hash"] = "different"
+    with pytest.raises(ValueError, match="Unmatched initial_state_hash"):
+        analyze.paired_test(bad, "method", "FRS", "FRS+F")
+    with pytest.raises(ValueError, match="Duplicate pairing"):
+        analyze.paired_test(analyze.pd.concat([trials, trials]), "method", "FRS", "FRS+F")
+
+
+def test_load_runs_rejects_mixing_legacy_and_corrected_results(tmp_path):
+    write_run(tmp_path, "old", config(), outcomes(True))
+    write_run(tmp_path, "new", config(implementation_version=2), outcomes(True))
+    with pytest.raises(ValueError, match="legacy and corrected"):
+        analyze.load_runs(analyze.find_runs(tmp_path))
 
 
 def test_mode_accuracy_from_the_ceiling_anchor(tmp_path):

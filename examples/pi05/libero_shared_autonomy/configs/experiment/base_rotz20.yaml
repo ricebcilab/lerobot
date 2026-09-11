@@ -6,7 +6,7 @@
 
 experiment:
   n_trials: 10                # trials per block
-  seed: 0                     # seeds the task schedule (same seed = same tasks in every arm)
+  seed: 0                     # task schedule, initial-state permutations, env, policy, operator and input noise
   task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
   output_dir: outputs/pi05_libero_experiments
 

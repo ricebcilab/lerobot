@@ -9,8 +9,8 @@ floor = the arm's prompt, ceiling = the scene's own instruction), its *depth*
 (the denoising steps the operator controls: `n_guided_steps` for FC,
 `n_reversal_steps` for the reversal arms) and who the operator was.
 
-Runs that share suite, seed and task_order see the same task schedule, so
-trial i is the same scene reset across them and comparisons can be paired.
+Pairing requires recorded pair IDs and matching initial-state hashes. Legacy
+runs only shared a task schedule, which does not establish matched resets.
 
 Sections: loading, describing what was run, rates, paired tests, expressed
 behaviour, step arrays, plots.
@@ -111,6 +111,18 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
     df["method"] = method_of(config)
     df["depth"] = depth_of(config)
     df["operator"] = config.get("operator", "human")
+    timing = config.get("policy_operator", {})
+    df["operator_profile"] = (
+        json.dumps(
+            {
+                "update_every_steps": timing.get("update_every_steps") or config.get("n_action_steps", 10),
+                "delay_steps": timing.get("delay_steps", 0),
+            },
+            sort_keys=True,
+        )
+        if config.get("operator", "human") == "policy"
+        else "human"
+    )
     df["corrupted"] = config.get("corruption_matrix") is not None
     df["adapted"] = adapter_matrix(config) is not None
     return df, config
@@ -123,6 +135,18 @@ def load_runs(run_dirs: list[Path]) -> tuple[pd.DataFrame, dict[str, dict]]:
         df, config = load_run(run_dir)
         frames.append(df)
         configs[Path(run_dir).name] = config
+    versions = {c.get("implementation_version", 1) for c in configs.values()}
+    if len(versions) > 1:
+        raise ValueError(
+            "Do not pool legacy and corrected runs; load a separate output directory per version."
+        )
+    profiles = {
+        profile for frame in frames for profile in frame["operator_profile"].unique() if profile != "human"
+    }
+    if len(profiles) > 1:
+        raise ValueError(
+            "Do not pool operator timing profiles; load a separate output directory per profile."
+        )
     return pd.concat(frames, ignore_index=True), configs
 
 
@@ -271,24 +295,39 @@ def paired_test(
     by: str,
     a: str,
     b: str,
-    pair_on: list[str] = ("trial",),
+    pair_on: list[str] | None = None,
     metric: str = "success",
 ) -> dict:
-    """McNemar's exact test of `by == a` against `by == b`, on the `pair_on` keys both completed.
+    """McNemar's exact test on verified matching resets, defaulting to recorded pair IDs.
 
     `paired_test(trials, "run", a, b)` compares two runs trial by trial;
     `paired_test(trials[trials.depth == 4], "method", "FRS", "FRS+F", ["task_id", "trial"])`
     compares two methods at one depth, paired by scene reset and pooled over tasks.
     """
-    pair_on = list(pair_on)
-    pa = trials[trials[by] == a].drop_duplicates(pair_on).set_index(pair_on)[metric]
-    pb = trials[trials[by] == b].drop_duplicates(pair_on).set_index(pair_on)[metric]
+    required = ["pair_id", "initial_state_hash"]
+    selected = trials[trials[by].isin([a, b])]
+    if any(k not in selected for k in required) or selected[required].isna().any().any():
+        raise ValueError(
+            "Unverified pairing: pair_id and initial_state_hash are required. "
+            "Legacy task/trial numbers do not identify matching resets; rerun with explicit initial states."
+        )
+    pair_on = ["pair_id"] if pair_on is None else list(pair_on)
+    arms = [selected[selected[by] == arm] for arm in (a, b)]
+    if any(arm.duplicated(pair_on).any() for arm in arms):
+        raise ValueError("Duplicate pairing keys: select one condition per arm or use pair_on=['pair_id'].")
+    pa, pb = [arm.set_index(pair_on) for arm in arms]
     both = pa.index.intersection(pb.index)
-    return {"A": a, "B": b, **mcnemar(pa.loc[both].values, pb.loc[both].values)}
+    for key in required:
+        va, vb = pa.loc[both].reset_index()[key], pb.loc[both].reset_index()[key]
+        if not va.equals(vb):
+            raise ValueError(
+                f"Unmatched {key}: the requested pairs do not share the same trial setup and state."
+            )
+    return {"A": a, "B": b, **mcnemar(pa.loc[both, metric].values, pb.loc[both, metric].values)}
 
 
 def paired_comparisons(
-    trials: pd.DataFrame, by: str = "run", pair_on: list[str] = ("trial",)
+    trials: pd.DataFrame, by: str = "run", pair_on: list[str] | None = None
 ) -> pd.DataFrame:
     """`paired_test` over every pair of values of `by`, in order of first appearance."""
     values = list(dict.fromkeys(trials[by]))
@@ -387,7 +426,7 @@ def plot_performance_vs_depth(trials: pd.DataFrame, ax, metric: str = "success",
             continue
         err = np.vstack([group["rate"] - group["ci95_low"], group["ci95_high"] - group["rate"]])
         ax.errorbar(group["depth"], group["rate"], yerr=err, marker="o", capsize=3, label=method)
-    ax.set_xlabel("controlled denoising steps (n_guided_steps / n_reversal_steps)")
+    ax.set_xlabel("method depth (FC guided steps / FRS reversal steps)")
     ax.set_ylabel(f"{metric} rate")
     ax.set_ylim(-0.02, 1.02)
     ax.set_xticks(sorted(curve["depth"].dropna().unique()))

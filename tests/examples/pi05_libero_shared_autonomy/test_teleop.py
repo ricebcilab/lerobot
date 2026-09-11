@@ -167,3 +167,54 @@ def test_teleop_chain_attach_operator_takes_priority():
     op.refresh(np.array([[0.5, 0.0, 0.0, 0, 0, 0, -1.0]]))
     np.testing.assert_allclose(chain.source.translation, [0.5, 0.0, 0.0])
     np.testing.assert_allclose(chain.raw.last_translation, [0.5, 0.0, 0.0])
+
+
+def test_operator_delays_snapshots_holds_continuous_commands_and_resets():
+    op = teleop.PolicyOperator(10, teleop.PolicyOperatorSettings(update_every_steps=20, delay_steps=4))
+    assert [step for step in range(41) if op.should_refresh(step)] == [0, 20, 40]
+    chunk = np.array([[0.25, -0.37, 0.15, 0, 0, 0, 1]])
+    op.refresh(chunk, step=0)
+    chunk[:] = 0  # pending commands retain the earlier observation's intent
+    op.advance(3)
+    np.testing.assert_array_equal(op.translation, 0)
+    assert op.gripper == GRIPPER_OPEN and op.command_age_steps == -1
+    op.advance(4)
+    np.testing.assert_allclose(op.translation, [0.25, -0.37, 0.15])
+    assert op.gripper == GRIPPER_CLOSE and op.command_age_steps == 4
+    op.refresh(np.array([[-0.5, 0, 0, 0, 0, 0, -1]]), step=20)
+    op.advance(23)
+    np.testing.assert_allclose(op.translation, [0.25, -0.37, 0.15])
+    assert op.command_age_steps == 23
+    op.advance(24)
+    np.testing.assert_allclose(op.translation, [-0.5, 0, 0])
+    assert op.command_age_steps == 4 and op.refreshes == 2
+    op.refresh(np.ones((1, 7)), step=40)
+    op.reset()
+    op.advance(100)
+    np.testing.assert_array_equal(op.translation, 0)
+    assert op.command_age_steps == -1 and op.refreshes == 0 and op.gripper == GRIPPER_OPEN
+
+
+def test_operator_delay_longer_than_update_period_preserves_queued_commands():
+    op = teleop.PolicyOperator(10, teleop.PolicyOperatorSettings(update_every_steps=2, delay_steps=5))
+    for step in [0, 2, 4]:
+        op.refresh(np.full((1, 7), (step + 1) / 10), step=step)
+    for step, expected in [(5, 0.1), (6, 0.1), (7, 0.3), (9, 0.5)]:
+        op.advance(step)
+        np.testing.assert_allclose(op.translation, expected)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"update_every_steps": 0},
+        {"update_every_steps": 1.5},
+        {"update_every_steps": True},
+        {"delay_steps": -1},
+        {"delay_steps": 0.5},
+        {"delay_steps": False},
+    ],
+)
+def test_operator_rejects_invalid_step_counts(settings):
+    with pytest.raises(ValueError, match="policy_operator"):
+        teleop.PolicyOperatorSettings(**settings)

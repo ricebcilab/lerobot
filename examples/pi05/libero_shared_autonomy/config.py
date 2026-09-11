@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from teleop import build_corruption
+from teleop import PolicyOperatorSettings, build_corruption
 
 from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, build_reversal_adapter
 
@@ -51,6 +51,7 @@ class SessionSettings:
     port: int = 8765
     output_dir: Path = Path("outputs/pi05_libero_interactive")
     operator: str = "human"
+    policy_operator: PolicyOperatorSettings = field(default_factory=PolicyOperatorSettings)
     control: ControlSettings = field(default_factory=ControlSettings)
 
 
@@ -77,6 +78,7 @@ _CONTROL_SCHEMA = {
     "operator_dims": "operator_dims",
 }
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
+_OPERATOR_SCHEMA = {"update_every_steps": "update_every_steps", "delay_steps": "delay_steps"}
 
 INTERACTIVE_SCHEMA = {
     "policy": _POLICY_SCHEMA,
@@ -96,6 +98,7 @@ EXPERIMENT_SCHEMA = {
     "scene": {"suite": "suite", "task_ids": "task_ids"},
     "prompt": "prompt",
     "operator": "operator",
+    "policy_operator": _OPERATOR_SCHEMA,
     "policy": _POLICY_SCHEMA,
     "control": _CONTROL_SCHEMA,
     "server": {"port": "port"},
@@ -224,12 +227,17 @@ def _session_from_flat(flat: dict, where: str, defaults: SessionSettings) -> Ses
         port=flat.get("port", defaults.port),
         output_dir=Path(flat.get("output_dir", defaults.output_dir)),
         operator=flat.get("operator", defaults.operator),
+        policy_operator=PolicyOperatorSettings(
+            **{key: flat[key] for key in PolicyOperatorSettings.__dataclass_fields__ if key in flat}
+        ),
         control=build_control(flat, where),
     )
     if not isinstance(session.n_action_steps, int) or session.n_action_steps < 1:
         _fail(where, "policy.n_action_steps must be a positive integer")
     if session.operator not in OPERATORS:
         _fail(where, f"operator must be one of {', '.join(OPERATORS)}, got {session.operator!r}")
+    if session.operator != "policy" and session.policy_operator != PolicyOperatorSettings():
+        _fail(where, "policy_operator settings require operator=policy")
     return session
 
 
@@ -304,6 +312,8 @@ def load_experiment_settings(
     )
     if not isinstance(settings.n_trials, int) or settings.n_trials < 1:
         _fail(where, f"experiment.n_trials must be a positive integer, got {settings.n_trials!r}")
+    if type(settings.seed) is not int or settings.seed < 0:
+        _fail(where, "experiment.seed must be a non-negative integer")
     if settings.task_order not in TASK_ORDERS:
         _fail(
             where,
