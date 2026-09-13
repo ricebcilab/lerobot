@@ -1,0 +1,6 @@
+# The policy alone, no operator: the floor of every study (the arm's uninformative
+# prompt) or, with `--set prompt=task`, its ceiling (the scene's own instruction).
+extends: base_rotz20.yaml
+control:
+  mode: policy
+  corruption: null
