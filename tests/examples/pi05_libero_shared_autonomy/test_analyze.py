@@ -168,7 +168,6 @@ def test_best_depth(tmp_path):
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
     best = analyze.best_depth(trials)
     assert len(best) == 1 and best.iloc[0]["method"] == "FRS" and best.iloc[0]["depth"] == 4.0
-    assert best.iloc[0]["authority"] == pytest.approx(0.6)
 
 
 # ---------------------------------------------------------------- paired tests
@@ -364,22 +363,6 @@ def test_success_over_time_and_continuous_summary(tmp_path):
     assert row["ci95_low"] < 2.0 < row["ci95_high"]
 
 
-def test_authority_maps_both_depth_conventions_onto_one_axis():
-    assert analyze.authority("FC", 2) == pytest.approx(0.2)
-    assert analyze.authority("FC", 10) == pytest.approx(1.0)
-    assert analyze.authority("FRS", 1) == pytest.approx(0.9)
-    assert analyze.authority("FRS-RA", 8) == pytest.approx(0.2)
-    assert analyze.authority("FRS", 4, num_steps=8) == pytest.approx(0.5)
-    assert np.isnan(analyze.authority("policy (ceiling)", np.nan))
-
-
-def test_load_run_tags_authority(tmp_path):
-    write_run(tmp_path, "fc8", config("shared_flow_control", n_guided_steps=8), outcomes(True))
-    write_run(tmp_path, "frs2", config(n_reversal_steps=2), outcomes(True))
-    trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
-    assert trials.set_index("run")["authority"].to_dict() == pytest.approx({"fc8": 0.8, "frs2": 0.8})
-
-
 def test_best_vs_best_selects_on_the_data_and_pairs_by_reset(tmp_path):
     for name, cfg, flags in [
         ("fc4", config("shared_flow_control", n_guided_steps=4), (False, False, True)),
@@ -409,14 +392,15 @@ def test_plot_metric_handles_binary_and_continuous_metrics_on_either_axis(tmp_pa
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
 
     fig, ax = plt.subplots()
-    table = analyze.plot_metric(trials, ax)  # success vs authority by default
-    assert list(table.columns) == ["method", "authority", "n", "value", "ci95_low", "ci95_high"]
-    assert table.set_index("method")["authority"].to_dict() == pytest.approx(
-        {"FC": 0.8, "FRS": 0.8, "policy (ceiling)": np.nan}, nan_ok=True
+    measured = trials.assign(user_authority=[np.nan, np.nan, 0.5, 0.7, 0.2, 0.4])  # runs load alphabetically
+    table = analyze.plot_metric(measured, ax)  # success vs measured user authority by default
+    assert list(table.columns[:4]) == ["method", "depth", "n", "value"]
+    assert table.set_index("method")["user_authority"].to_dict() == pytest.approx(
+        {"FC": 0.6, "FRS": 0.3, "policy (ceiling)": np.nan}, nan_ok=True
     )
-    assert ax.get_xlabel() == "Scheduled user authority" and ax.get_ylabel() == "Success rate"
-    assert [t.get_position()[0] for t in ax.get_xticklabels()] == [0.8]  # only the sampled settings
+    assert ax.get_xlabel() == "User authority" and ax.get_ylabel() == "Success rate"
     assert len(ax.lines) >= 3  # two method lines plus the ceiling band
+    assert any(c.has_xerr for c in ax.containers if hasattr(c, "has_xerr"))  # horizontal error bars
     plt.close(fig)
 
     fig, ax = plt.subplots()
@@ -438,16 +422,17 @@ def test_plot_best_vs_best_draws_a_bar_per_method_and_a_bracket_per_pair(tmp_pat
     ]:
         write_run(tmp_path, name, cfg, outcomes(*flags), task_of=lambda i: 0)
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
-    best, comparisons, _ = analyze.best_vs_best(trials)
+    best, comparisons, selected = analyze.best_vs_best(trials)
     fig, ax = plt.subplots()
-    table = analyze.plot_best_vs_best(best, comparisons, ax)
+    table, drawn = analyze.plot_best_vs_best(selected, ax)
     assert list(table["method"]) == ["FC", "FRS", "FRS-RA"]
-    assert len(ax.patches) == 3 and len(comparisons) == 3
+    assert len(ax.patches) == 3 and len(comparisons) == 3 and drawn["p"].tolist() == comparisons["p"].tolist()
     assert [p.get_facecolor()[:3] for p in ax.patches] == [
         matplotlib.colors.to_rgb(analyze.METHOD_COLORS[m]) for m in ("FC", "FRS", "FRS-RA")
     ]
-    assert sum("p = " in t.get_text() for t in ax.texts) == 3  # one bracket label per pair
-    assert [t.get_text() for t in ax.get_xticklabels()][0] == "FC\ndepth 8, authority 0.8"
+    assert sum(t.get_text() in ("n.s.", "*", "**", "***") for t in ax.texts) == 3  # one mark per pair
+    assert analyze.significance_stars(0.03) == "*" and analyze.significance_stars(np.nan) == "n.s."
+    assert [t.get_text() for t in ax.get_xticklabels()][0] == "FC\ndepth 8"
     plt.close(fig)
 
 
@@ -474,6 +459,18 @@ def test_step_authority_is_a_clipped_barycentric_coordinate_and_symmetric():
     assert np.isnan(analyze.step_authority(a[:1], p[:1], p[:1])).all()
 
 
+def test_chunk_authority_pools_a_chunk_and_skips_idle_ones():
+    a = np.array([[0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.3, 0.0, 0.0], [0.9, 0.0, 0.0]])
+    p = np.zeros((4, 3))
+    r = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    pushing = np.array([True, True, False, True])
+    # chunks of two steps: the first pools its two pushing steps (0.5), the second has one (0.9)
+    assert analyze.chunk_authority(a, p, r, pushing, 2).tolist() == pytest.approx([0.5, 0.9])
+    assert np.isnan(analyze.chunk_authority(a, p, r, np.zeros(4, bool), 2)).all()
+    swapped = analyze.chunk_authority(a, r, p, pushing, 2)
+    assert (analyze.chunk_authority(a, p, r, pushing, 2) + swapped).tolist() == pytest.approx([1.0, 1.0])
+
+
 def test_trial_metrics_measure_authority_from_the_policy_plan(tmp_path):
     raw = np.array([[0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32)
     action = np.zeros((3, 7), dtype=np.float32)
@@ -490,8 +487,10 @@ def test_trial_metrics_measure_authority_from_the_policy_plan(tmp_path):
     write_run(tmp_path, "r", config(), [{"success": True, "arrays": arrays}], task_of=lambda i: 0)
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
     out = analyze.trial_metrics(trials).iloc[0]
-    assert out["user_authority"] == pytest.approx((1.0 + 0.25 + 0.0) / 3)
-    assert out["user_authority_pushing"] == pytest.approx((1.0 + 0.25) / 2)
+    # One chunk (n_action_steps = 10 > 3 steps) pooling the two pushing steps:
+    # <(0.45, 0.0625), (0.45, 0.25)> / |(0.45, 0.25)|^2
+    assert out["user_authority"] == pytest.approx((0.45 * 0.45 + 0.0625 * 0.25) / (0.45**2 + 0.25**2))
+    assert out["user_authority_all_steps"] == pytest.approx((1.0 + 0.25 + 0.0) / 3)
     assert out["policy_authority"] == pytest.approx(1 - out["user_authority"])
 
     write_run(tmp_path, "legacy", config(), outcomes(True), task_of=lambda i: 0)  # no policy_translation
@@ -513,5 +512,30 @@ def test_plot_metric_places_cells_at_the_mean_of_a_measured_x(tmp_path):
         trials.assign(user_authority=[0.1, 0.3, 0.8, 1.0]), ax, "success", x="user_authority"
     )
     assert table.set_index("depth")["user_authority"].to_dict() == pytest.approx({4.0: 0.2, 8.0: 0.9})
-    assert ax.get_xlabel() == "Measured user authority"
+    assert ax.get_xlabel() == "User authority"
+    plt.close(fig)
+
+
+def test_paired_test_uses_wilcoxon_for_a_continuous_metric_and_head_to_head_draws_it(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    write_run(
+        tmp_path,
+        "fc8",
+        config("shared_flow_control", n_guided_steps=8),
+        outcomes(*[True] * 6),
+        task_of=lambda i: 0,
+    )
+    write_run(tmp_path, "frs1", config(n_reversal_steps=1), outcomes(*[True] * 6), task_of=lambda i: 0)
+    trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
+    trials["path_length"] = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 0.5, 0.6, 0.7, 0.8, 0.9, np.nan]
+    result = analyze.paired_test(trials, "method", "FC", "FRS", metric="path_length")
+    assert result["paired_trials"] == 5 and result["mean_difference"] == pytest.approx(-0.5)
+    assert 0 < result["wilcoxon_p"] == result["p"] < 0.1
+    fig, ax = plt.subplots()
+    table, comparisons = analyze.plot_best_vs_best(trials, ax, "path_length")
+    assert ax.get_ylabel() == "End-effector path length (m)" and len(ax.patches) == 2
+    assert comparisons.iloc[0]["p"] == pytest.approx(result["p"])
     plt.close(fig)

@@ -445,7 +445,8 @@ environment variables; vary the arm order across participants to spread
 practice and fatigue. Afterwards set `ROOT` in
 [`analyze_human_pilot.ipynb`](notebooks/analyze_human_pilot.ipynb) to that
 `OUT` and Run All: it checks counts and reset pairing, labels incomplete data
-as partial, and exports the figures and CSVs under `<OUT>/figures/`.
+as partial, and exports the figures and CSVs under `<OUT>/figures/`
+(`outcomes_vs_authority`, `best_vs_best`, `success_over_time`).
 
 #### Why task 4 and these depths
 
@@ -491,37 +492,34 @@ What has been run, in order, and what it found (all under `outputs/`):
   profile collapses FC (task 4: 95% → 20%) while shallow reversal keeps about
   half the trials.
 - `human_pilot/p01` — the first pilot on task 4. At their best depths FC d10
-  (90%), FRS d1 and FRS-RA d2 (100%) tie on ten resets; the separation is at
-  low authority (0.2-0.6), where the reversal arms sit at 70-100% and FC at
-  40%.
+  (90%), FRS d1 and FRS-RA d2 (100%) tie on ten resets. The separation is at
+  low measured authority (about 0.3, the shallow settings), where the reversal
+  arms sit at 70-100% and FC at 40%: FC does not get less of the operator's
+  push there, it converts the same push into fewer successes.
 
 ## Analysis
 
 [`notebooks/analyze.py`](notebooks/analyze.py) loads every run directory
 that contains a `trials.jsonl` and tags each trial with the run's method
-(`FC`, `FRS`, `FRS-RA`, `policy (floor)`, `policy (ceiling)`), depth, authority
-and operator:
+(`FC`, `FRS`, `FRS-RA`, `policy (floor)`, `policy (ceiling)`), depth and
+operator:
 
 - `find_runs(root)` / `load_runs(run_dirs)` — the runs under `root` that
   recorded a trial, and their `trials.jsonl` + `config.yaml` as one `DataFrame`
   plus a dict of configs.
-- `authority(method, depth)` — the **scheduled** user authority: the operator's
-  share of the denoising schedule on one 0-1 axis, `n_guided / 10` for FC and
-  `(10 − n_reversal) / 10` for the reversal arms (both methods release their
-  constraint at the same diffusion time `t*`, and this is `1 − t*`). FC's depth
-  counts steps the operator controls and FRS's counts steps the policy denoises
-  freely, so equal depths are not equal authority. It is an a-priori quantity;
-  the measured one is `step_authority`.
 - `summary_table(trials, by, metric)` — per group of columns: `n`, the value
   and a 95% interval — the rate with a Wilson interval for a binary metric, the
   mean with a t interval otherwise. `best_depth` is the per-method view.
-- `paired_test(trials, by, a, b, pair_on=None)` / `paired_comparisons` —
-  McNemar's exact test on matching `pair_id` values and verified identical
-  initial-state hashes; duplicate or unverified pairs fail.
+- `paired_test(trials, by, a, b, pair_on=None, metric)` / `paired_comparisons`
+  — a paired test on matching `pair_id` values with verified identical
+  initial-state hashes (duplicate or unverified pairs fail): McNemar's exact
+  test for a binary metric, the Wilcoxon signed-rank test for a continuous
+  one; both report `p`.
 - `best_vs_best(trials)` — each steering method at its best depth on the given
   trials, the paired tests between them, and those trials (selection and test
-  on the same data: optimistic for every method alike); `plot_best_vs_best`
-  draws it as a bar per method with a McNemar bracket per pair.
+  on the same data: optimistic for every method alike);
+  `plot_best_vs_best(selected, ax, metric)` draws any metric on them as a bar
+  per method with a significance-starred bracket per pair.
 - `task_targets` / `task_goals` — which scene element each task is about (what
   the ceiling anchor's successes move most) and where it ends up.
 - `trial_metrics(trials)` — per-trial metrics from the `.npz` arrays, one read
@@ -531,21 +529,27 @@ and operator:
   efficiency, time to success, task progress against the goal set, and the
   measured authority below. `success_over_time` gives the fraction of trials
   done by step *k*, the censoring-safe view of trial time.
-- `step_authority(action, policy, command)` — **measured user authority** per
-  step: with `a` the executed translation, `p` the policy's own plan
+- `step_authority(action, policy, command)` — **user authority** per step:
+  with `a` the executed translation, `p` the policy's own plan
   (`policy_translation`) and `r` the operator's command, the barycentric
   coordinate of `a` on the segment from `p` to `r`, `⟨a − p, r − p⟩ / ‖r − p‖²`
   clipped to [0, 1]; policy authority is its complement (swapping `p` and `r`
   gives exactly `1 −` it). 0 whenever the operator is idle or the policy runs
-  alone, 1 under teleop or override. `trial_metrics` reports the per-trial
-  mean as `user_authority` (and over pushing steps only as
-  `user_authority_pushing`); `plot_metric(..., x="user_authority")` puts each
-  method/depth cell at its measured value, the check on whether the scheduled
-  axis compares the methods fairly.
-- `plot_metric(trials, ax, metric, x)` — one line per method: any per-trial
-  metric against `x` (`authority` or `depth`); `plot_success_over_time` draws
-  the time curves. Every plot colours a method the same way (`METHOD_COLORS`,
-  a colourblind-safe triple for the steered arms, neutral for the anchors).
+  alone, 1 under teleop or override. `chunk_authority` takes it per action
+  chunk over the steps where the operator pushed, and `trial_metrics` reports
+  the mean over a trial's pushing chunks as `user_authority` — what the
+  channel delivered while in use (`user_authority_all_steps` is the per-step
+  mean over every step, which idle time dilutes). Depth is the knob; this is what it delivered, and
+  it is the x-axis of every comparison — equal depths are not equal authority
+  across methods (FC's counts steps the operator controls, FRS's steps the
+  policy denoises freely).
+- `plot_metric(trials, ax, metric, x="user_authority")` — distinct markers per method:
+  any per-trial metric against the measured authority (each method/depth cell
+  at its mean, with faint 95% intervals on both axes) or against `depth`
+  (connected in depth order). Use `legend=False` for a shared figure legend;
+  `plot_success_over_time` draws the time curves. Every plot colours a method
+  the same way (`METHOD_COLORS`, a colourblind-safe triple for the steered
+  arms, neutral for the anchors) and follows `paper.mplstyle`.
 
 [`analyze_human_pilot.ipynb`](notebooks/analyze_human_pilot.ipynb) uses these
 for the human study; the same calls work on any oracle-sweep directory. Jupyter

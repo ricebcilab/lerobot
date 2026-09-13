@@ -7,9 +7,9 @@ trial a `.npz` of step arrays. Every trial row is tagged with the run's
 FRS-RA = flow reversal with the reversal adapter, or a policy-only anchor:
 floor = the arm's prompt, ceiling = the scene's own instruction), its *depth*
 (the denoising steps the operator controls: `n_guided_steps` for FC,
-`n_reversal_steps` for the reversal arms), its *authority* (the share of the
-denoising steps under the operator's constraint, on one 0-1 axis for both
-conventions) and who the operator was.
+`n_reversal_steps` for the reversal arms) and who the operator was. Authority is
+measured, not scheduled: `step_authority` reads it off the recorded arrays, and
+the plots put every method/depth cell at its measured user authority.
 
 Pairing requires recorded pair IDs and matching initial-state hashes.
 
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, PercentFormatter
 from scipy import stats
 
 from lerobot.policies.pi05.steering import DEADBAND
@@ -40,6 +40,7 @@ METHOD_COLORS = {
     "policy (floor)": "#6b6b6b",
     "policy (ceiling)": "#6b6b6b",
 }
+METHOD_MARKERS = {"FC": "o", "FRS": "s", "FRS-RA": "^"}
 PAPER_STYLE = Path(__file__).with_name("paper.mplstyle")  # plt.style.use(analyze.PAPER_STYLE)
 # Axis labels for the per-trial metrics, as they would read in a figure caption.
 METRIC_LABELS = {
@@ -59,11 +60,11 @@ METRIC_LABELS = {
     "reads_this_trial": "Input reads per trial",
     "cos_raw": "Intent agreement (cosine to raw command)",
     "cos_served": "Intent agreement (cosine to served command)",
-    "user_authority": "Measured user authority",
-    "user_authority_pushing": "Measured user authority while pushing",
-    "policy_authority": "Measured policy authority",
+    "user_authority": "User authority",
+    "user_authority_all_steps": "User authority (idle steps included)",
+    "policy_authority": "Policy authority",
 }
-X_LABELS = {"authority": "Scheduled user authority", "depth": "Method depth (denoising steps)"}
+X_LABELS = {"depth": "Method depth (denoising steps)"}
 NUM_INFERENCE_STEPS = 10  # pi0.5's denoising steps; the depth of every arm counts a subset of them
 PROMPT_FROM_TASK = "task"  # config.PROMPT_FROM_TASK
 
@@ -99,25 +100,6 @@ def depth_of(config: dict) -> float:
     return np.nan
 
 
-def authority(method: str, depth: float, num_steps: int = NUM_INFERENCE_STEPS) -> float:
-    """The operator's authority on a 0-1 axis shared by both depth conventions.
-
-    Both methods end with the policy denoising freely from some point of its
-    `num_steps`-step schedule. FC clamps the command onto the state for the first
-    `n_guided_steps`, so the operator constrains `depth / num_steps` of the schedule.
-    FRS reverses the reference `n_reversal_steps` of the way to noise and the policy
-    denoises those steps back freely, so the operator constrains the remaining
-    `(num_steps - depth) / num_steps`. Authority 1 is the whole schedule under the
-    operator (FC: every step clamped; FRS: the reference executed as is), 0 is the
-    policy alone. NaN for the anchors.
-    """
-    if method == "FC":
-        return depth / num_steps
-    if method in ("FRS", "FRS-RA"):
-        return (num_steps - depth) / num_steps
-    return np.nan
-
-
 def operator_profile(config: dict) -> str:
     """Who drove: "human", or the synthetic operator's resolved timing as a JSON string."""
     if config.get("operator", "human") != "policy":
@@ -131,7 +113,7 @@ def operator_profile(config: dict) -> str:
 
 
 def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
-    """One run's trials (tagged with run, label, method, depth, authority, operator, ...) and its config."""
+    """One run's trials (tagged with run, method, depth, operator, ...) and its config."""
     run_dir = Path(run_dir)
     trials = [
         json.loads(line) for line in (run_dir / "trials.jsonl").read_text().splitlines() if line.strip()
@@ -146,7 +128,7 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
     df["mode"] = config["mode"]
     df["method"] = method
     df["depth"] = depth
-    df["authority"] = authority(method, depth)
+    df["n_action_steps"] = config.get("n_action_steps", 10)
     df["operator"] = config.get("operator", "human")
     df["operator_profile"] = operator_profile(config)
     return df, config
@@ -229,8 +211,8 @@ def summary_table(trials: pd.DataFrame, by: list[str], metric: str = "success") 
 
 
 def best_depth(trials: pd.DataFrame, metric: str = "success") -> pd.DataFrame:
-    """Per steering method: the depth (and authority) with the highest `metric`, pooled over tasks; ties to the lowest depth."""
-    curve = summary_table(trials, ["method", "depth", "authority"], metric)
+    """Per steering method: the depth with the highest `metric`, pooled over tasks; ties to the lowest depth."""
+    curve = summary_table(trials, ["method", "depth"], metric)
     curve = curve[curve["depth"].notna()]
     return curve.loc[curve.groupby("method")["value"].idxmax()].reset_index(drop=True)
 
@@ -260,6 +242,7 @@ def mcnemar(a: np.ndarray, b: np.ndarray) -> dict:
     a, b = np.asarray(a, dtype=bool), np.asarray(b, dtype=bool)
     a_only, b_only = int((a & ~b).sum()), int((~a & b).sum())
     discordant = a_only + b_only
+    p = stats.binomtest(b_only, discordant, 0.5).pvalue if discordant else np.nan
     return {
         "paired_trials": len(a),
         "A_rate": float(a.mean()) if len(a) else np.nan,
@@ -267,7 +250,25 @@ def mcnemar(a: np.ndarray, b: np.ndarray) -> dict:
         "A_only": a_only,
         "B_only": b_only,
         "discordant": discordant,
-        "mcnemar_p": stats.binomtest(b_only, discordant, 0.5).pvalue if discordant else np.nan,
+        "mcnemar_p": p,
+        "p": p,
+    }
+
+
+def wilcoxon(a: np.ndarray, b: np.ndarray) -> dict:
+    """Wilcoxon signed-rank test on paired continuous outcomes; pairs with a NaN on either side drop out."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    keep = np.isfinite(a) & np.isfinite(b)
+    a, b = a[keep], b[keep]
+    differences = b - a
+    p = stats.wilcoxon(a, b).pvalue if len(a) > 1 and np.any(differences != 0) else np.nan
+    return {
+        "paired_trials": int(keep.sum()),
+        "A_mean": float(a.mean()) if len(a) else np.nan,
+        "B_mean": float(b.mean()) if len(b) else np.nan,
+        "mean_difference": float(differences.mean()) if len(a) else np.nan,
+        "wilcoxon_p": p,
+        "p": p,
     }
 
 
@@ -279,11 +280,13 @@ def paired_test(
     pair_on: list[str] | None = None,
     metric: str = "success",
 ) -> dict:
-    """McNemar's exact test on verified matching resets, defaulting to recorded pair IDs.
+    """A paired test on verified matching resets, defaulting to recorded pair IDs.
 
-    `paired_test(trials, "run", a, b)` compares two runs trial by trial;
-    `paired_test(trials[trials.depth == 4], "method", "FRS", "FRS-RA", ["task_id", "trial"])`
-    compares two methods at one depth, paired by scene reset and pooled over tasks.
+    McNemar's exact test for a binary `metric`, the Wilcoxon signed-rank test for a
+    continuous one; both report `p`. `paired_test(trials, "run", a, b)` compares two
+    runs trial by trial; `paired_test(trials[trials.depth == 4], "method", "FRS",
+    "FRS-RA", ["task_id", "trial"])` compares two methods at one depth, paired by scene
+    reset and pooled over tasks.
     """
     required = ["pair_id", "initial_state_hash"]
     selected = trials[trials[by].isin([a, b])]
@@ -301,7 +304,8 @@ def paired_test(
             raise ValueError(
                 f"Unmatched {key}: the requested pairs do not share the same trial setup and state."
             )
-    return {"A": a, "B": b, **mcnemar(pa.loc[both, metric].values, pb.loc[both, metric].values)}
+    test = mcnemar if _is_binary(trials[metric]) else wilcoxon
+    return {"A": a, "B": b, **test(pa.loc[both, metric].values, pb.loc[both, metric].values)}
 
 
 def paired_comparisons(
@@ -392,6 +396,31 @@ def step_authority(action: np.ndarray, policy: np.ndarray, command: np.ndarray) 
     return out
 
 
+def chunk_authority(
+    action: np.ndarray, policy: np.ndarray, command: np.ndarray, pushing: np.ndarray, n_steps: int
+) -> np.ndarray:
+    """User authority per action chunk, over the steps of the chunk where the operator pushed.
+
+    The same barycentric coordinate as `step_authority`, taken on the chunk's stacked
+    step vectors rather than step by step: one value per consumed command, which is
+    the unit at which the flow methods read the operator, and immune to the noise of
+    single steps where plan and command nearly coincide. NaN for chunks with no push.
+    """
+    a, p, r = (np.asarray(x, dtype=np.float64) for x in (action, policy, command))
+    pushing = np.asarray(pushing, dtype=bool)
+    out = []
+    for start in range(0, len(a), n_steps):
+        sel = slice(start, start + n_steps)
+        keep = pushing[sel]
+        if not keep.any():
+            out.append(np.nan)
+            continue
+        d = (r[sel][keep] - p[sel][keep]).ravel()
+        moved = (a[sel][keep] - p[sel][keep]).ravel()
+        out.append(np.clip(moved @ d / (d @ d), 0.0, 1.0) if d @ d > 1e-12 else np.nan)
+    return np.array(out)
+
+
 def _mean_cos(a: np.ndarray, b: np.ndarray) -> float:
     norms = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
     ok = norms > 1e-9
@@ -417,9 +446,11 @@ def trial_metrics(trials: pd.DataFrame) -> pd.DataFrame:
     are 1 - distance / initial distance at the end and at best, clipped to [0, 1];
     NaN when the task has no goal or the trial lacks the element.
 
-    Authority (`step_authority`, needs the `policy_translation` array): `user_authority`
-    is the mean over the trial's steps, `user_authority_pushing` the mean over the steps
-    where the operator commanded beyond the deadband, `policy_authority` its complement.
+    Authority (needs the `policy_translation` array): `user_authority` is the mean of
+    `chunk_authority` over the chunks in which the operator pushed -- what the channel
+    delivered while it was in use -- and `policy_authority` its complement;
+    `user_authority_all_steps` is the per-step mean over every step (`step_authority`),
+    which idle time dilutes.
     """
     goals = task_goals(trials)
 
@@ -455,19 +486,20 @@ def trial_metrics(trials: pd.DataFrame) -> pd.DataFrame:
             "path_efficiency": displacement / path_length if path_length else np.nan,
             "time_to_success": float(row["steps"]) if row["success"] else np.nan,
             "user_authority": np.nan,
-            "user_authority_pushing": np.nan,
+            "user_authority_all_steps": np.nan,
             "policy_authority": np.nan,
             "goal_distance_min": np.nan,
             "progress_final": np.nan,
             "progress_max": np.nan,
         }
         if plan is not None:
-            authority = step_authority(executed, plan, served)
-            if np.isfinite(authority).any():
-                out["user_authority"] = float(np.nanmean(authority))
+            chunks = chunk_authority(executed, plan, served, active, int(row["n_action_steps"]))
+            if np.isfinite(chunks).any():
+                out["user_authority"] = float(np.nanmean(chunks))
                 out["policy_authority"] = 1.0 - out["user_authority"]
-            if np.isfinite(authority[active]).any():
-                out["user_authority_pushing"] = float(np.nanmean(authority[active]))
+            steps = step_authority(executed, plan, served)
+            if np.isfinite(steps).any():
+                out["user_authority_all_steps"] = float(np.nanmean(steps))
         if located is not None:
             _, track = located
             distance = np.linalg.norm(track[:, None, :] - goal["positions"][None, :, :], axis=2).min(axis=1)
@@ -501,30 +533,39 @@ def success_over_time(trials: pd.DataFrame, by: list[str], horizon: int | None =
 
 
 def plot_metric(
-    trials: pd.DataFrame, ax, metric: str = "success", x: str = "authority", title: str | None = None
+    trials: pd.DataFrame,
+    ax,
+    metric: str = "success",
+    x: str = "user_authority",
+    title: str | None = None,
+    *,
+    legend: bool = True,
 ):
-    """One line per steering method: `metric` against `x`.
+    """One marker per method/depth cell: `metric` against `x`.
 
     Any per-trial metric works: a binary one (success, on_target) is drawn as a rate
     with Wilson 95% error bars, a continuous one (path length, progress, ...) as a
     mean with t-based 95% error bars. Pooled over the tasks in `trials`. Methods
-    without a depth (the policy-only anchors) are dashed horizontal bands. `x` is
-    "authority" (default: the scheduled share of the denoising schedule, the same
-    reading for both depth conventions), "depth", or any per-trial metric such as
-    `user_authority`, in which case each method/depth cell sits at that metric's cell
-    mean. Returns the table.
+    without a depth (the policy-only anchors) are dashed horizontal bands. `x` is a
+    per-trial metric (default `user_authority`, needs `trial_metrics`): each
+    method/depth cell sits at the cell's mean of it, with its 95% interval as a
+    horizontal error bar; or "depth", where markers are connected in depth order.
+    Intervals are lighter than the markers, and method identity uses both colour
+    and shape. Set `legend=False` when using a shared figure legend. Returns the table.
     """
     binary = _is_binary(trials[metric])
-    if x in X_LABELS:
-        table = summary_table(trials, ["method", x], metric)
+    if x == "depth":
+        table = summary_table(trials, ["method", "depth"], metric)
     else:  # a measured quantity: one point per method/depth cell, at the cell's mean of x
         table = summary_table(trials, ["method", "depth"], metric)
-        means = trials.groupby(["method", "depth"], dropna=False)[x].mean().rename(x).reset_index()
-        table = table.merge(means, on=["method", "depth"], how="left")
+        xs = summary_table(trials, ["method", "depth"], x).rename(
+            columns={"value": x, "ci95_low": f"{x}_ci95_low", "ci95_high": f"{x}_ci95_high"}
+        )
+        table = table.merge(xs.drop(columns="n"), on=["method", "depth"], how="left")
     for method, group in table.groupby("method", sort=False):
-        group = group.sort_values(x)
+        group = group.sort_values("depth")
         color = METHOD_COLORS.get(method)
-        if group[x].isna().all():
+        if group["depth"].isna().all():
             value = group["value"].iloc[0]
             label = f"{method} ({value:.0%})" if binary else f"{method} ({value:.2f})"
             style = "--" if method == "policy (ceiling)" else ":"
@@ -532,29 +573,54 @@ def plot_metric(
             if group["ci95_low"].notna().all():
                 ax.axhspan(group["ci95_low"].iloc[0], group["ci95_high"].iloc[0], alpha=0.08, color=color)
             continue
-        err = np.vstack([group["value"] - group["ci95_low"], group["ci95_high"] - group["value"]])
+        yerr = np.vstack([group["value"] - group["ci95_low"], group["ci95_high"] - group["value"]])
+        xerr = None
+        if f"{x}_ci95_low" in group:
+            xerr = np.nan_to_num(
+                np.vstack([group[x] - group[f"{x}_ci95_low"], group[f"{x}_ci95_high"] - group[x]])
+            )
         ax.errorbar(
             group[x],
             group["value"],
-            yerr=np.nan_to_num(err),
-            marker="o",
-            capsize=3,
+            yerr=np.nan_to_num(yerr),
+            xerr=xerr,
+            fmt="none",
+            capsize=2,
+            elinewidth=1,
+            capthick=1,
+            alpha=0.3,
+            color=color,
+            zorder=1,
+        )
+        ax.plot(
+            group[x],
+            group["value"],
+            linestyle="-" if x == "depth" else "none",
+            marker=METHOD_MARKERS.get(method, "o"),
+            markersize=7,
+            markeredgecolor="white",
+            markeredgewidth=0.6,
             label=method,
             color=color,
+            zorder=3,
         )
-    if x in X_LABELS:
-        ax.set_xlabel(X_LABELS[x])
-        ax.set_xticks(sorted(table[x].dropna().unique()))  # the sampled settings, nothing in between
+    if x == "depth":
+        ax.set_xlabel(X_LABELS["depth"])
+        ax.set_xticks(sorted(table["depth"].dropna().unique()))  # the sampled settings, nothing in between
     else:
         ax.set_xlabel(METRIC_LABELS.get(x, x.replace("_", " ").capitalize()))
         ax.xaxis.set_major_locator(MaxNLocator(5))
+        if x in ("user_authority", "user_authority_all_steps", "policy_authority"):
+            ax.xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax.set_ylabel(METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()))
     if binary:
         ax.set_ylim(-0.02, 1.02)
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax.yaxis.set_major_locator(MaxNLocator(5))
     if title:
         ax.set_title(title)
-    ax.legend()
+    if legend:
+        ax.legend()
     return table
 
 
@@ -562,7 +628,7 @@ def plot_success_over_time(trials: pd.DataFrame, ax, by: str = "method", title: 
     """Fraction of trials succeeded by step k, one curve per value of `by`. Returns the table."""
     curve = success_over_time(trials, [by])
     for key, group in curve.groupby(by, sort=False):
-        method = next((m for m in METHODS if str(key).startswith(m)), None)  # "FRS d2" -> FRS
+        method = next((m for m in sorted(METHODS, key=len, reverse=True) if str(key).startswith(m)), None)
         ax.step(
             group["step"], group["fraction"], where="post", label=str(key), color=METHOD_COLORS.get(method)
         )
@@ -577,54 +643,56 @@ def plot_success_over_time(trials: pd.DataFrame, ax, by: str = "method", title: 
     return curve
 
 
-def plot_best_vs_best(best: pd.DataFrame, comparisons: pd.DataFrame, ax, title: str | None = None):
-    """Head-to-head at each method's best depth: a bar per method with its Wilson 95% interval,
-    the depth and authority under it, and a bracket per pair giving the McNemar result
-    (discordant pairs won by each side, and p). Takes the tables `best_vs_best` returns.
+def significance_stars(p: float) -> str:
+    """`***` p < 0.001, `**` p < 0.01, `*` p < 0.05, `n.s.` otherwise (or with no test)."""
+    if np.isnan(p):
+        return "n.s."
+    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+
+
+def plot_best_vs_best(selected: pd.DataFrame, ax, metric: str = "success", title: str | None = None):
+    """Head-to-head on the trials `best_vs_best` selected (each method at its best depth):
+    a bar per method with its 95% interval, the depth under it, the value on it, and a
+    bracket per pair marked with the paired test's significance (`significance_stars`:
+    McNemar for a binary metric, Wilcoxon signed-rank otherwise). Returns (table,
+    comparisons), the statistics behind the marks.
     """
-    best = best.reset_index(drop=True)
-    x = np.arange(len(best))
-    colors = [METHOD_COLORS.get(m) for m in best["method"]]
-    err = np.vstack([best["value"] - best["ci95_low"], best["ci95_high"] - best["value"]])
-    ax.bar(x, best["value"], width=0.5, color=colors, yerr=err, capsize=4, ecolor="#444444", linewidth=0)
-    for xi, value, n in zip(x, best["value"], best["n"], strict=True):
+    binary = _is_binary(selected[metric])
+    table = summary_table(selected, ["method", "depth"], metric)
+    comparisons = paired_comparisons(selected, "method", metric=metric)
+    x = np.arange(len(table))
+    colors = [METHOD_COLORS.get(m) for m in table["method"]]
+    err = np.nan_to_num(np.vstack([table["value"] - table["ci95_low"], table["ci95_high"] - table["value"]]))
+    ax.bar(x, table["value"], width=0.5, color=colors, yerr=err, capsize=4, ecolor="#444444", linewidth=0)
+    for xi, value, n in zip(x, table["value"], table["n"], strict=True):
+        if binary:
+            text = f"{value:.0%}\n{int(round(value * n))}/{n}"
+        else:
+            text = f"{value:{'.0f' if abs(value) >= 10 else '.2f'}}\nn={n}"
         ax.text(
-            xi,
-            0.02,
-            f"{value:.0%}\n{int(round(value * n))}/{n}",
-            ha="center",
-            va="bottom",
-            color="white",
+            xi, 0.02 * ax.get_ylim()[1] if not binary else 0.02, text, ha="center", va="bottom", color="white"
         )
     ax.set_xticks(x)
-    ax.set_xticklabels(
-        [
-            f"{m}\ndepth {int(d)}, authority {a:.1f}"
-            for m, d, a in zip(best["method"], best["depth"], best["authority"], strict=True)
-        ]
-    )
-    ax.set_ylabel("Success rate")
+    ax.set_xticklabels([f"{m}\ndepth {int(d)}" for m, d in zip(table["method"], table["depth"], strict=True)])
+    ax.set_ylabel(METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()))
     if title:
         ax.set_title(title)
     # One bracket per comparison, stacked above the bars.
-    pos = {m: i for i, m in enumerate(best["method"])}
-    top = float(np.nanmax(best["ci95_high"])) + 0.06
-    step = 0.11
+    pos = {m: i for i, m in enumerate(table["method"])}
+    peak = float(np.nanmax(np.where(np.isfinite(table["ci95_high"]), table["ci95_high"], table["value"])))
+    scale = 1.0 if binary else max(peak, 1e-9)
+    top = peak + 0.05 * scale
+    step = 0.09 * scale
     for k, row in enumerate(comparisons.itertuples(index=False)):
         a, b = pos[row.A], pos[row.B]
         y = top + k * step
-        ax.plot([a, a, b, b], [y - 0.02, y, y, y - 0.02], color="#444444", linewidth=1)
-        p = "no discordant pairs" if np.isnan(row.mcnemar_p) else f"p = {row.mcnemar_p:.3f}"
-        wins = f"{row.B} {row.B_only} · {row.A} {row.A_only} of {row.paired_trials} pairs"
-        ax.text(
-            (a + b) / 2,
-            y + 0.01,
-            f"{row.B_rate - row.A_rate:+.0%} · {p}\n{wins}",
-            ha="center",
-            va="bottom",
-            fontsize="small",
-        )
-    ax.set_ylim(0, top + len(comparisons) * step + 0.06)
-    ax.set_yticks(np.linspace(0, 1, 6))  # the headroom above 100% only holds the brackets
-    ax.spines["left"].set_bounds(0, 1)
-    return best
+        ax.plot([a, a, b, b], [y - 0.015 * scale, y, y, y - 0.015 * scale], color="#444444", linewidth=1)
+        ax.text((a + b) / 2, y + 0.005 * scale, significance_stars(row.p), ha="center", va="bottom")
+    ax.set_ylim(0, top + len(comparisons) * step + 0.04 * scale)
+    if binary:
+        ax.set_yticks(np.linspace(0, 1, 6))  # the headroom above 100% only holds the brackets
+        ax.spines["left"].set_bounds(0, 1)
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(5))
+        ax.spines["left"].set_bounds(0, peak)
+    return table, comparisons
