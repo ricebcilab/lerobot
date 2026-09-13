@@ -33,7 +33,7 @@ control:
   # The known corruption every arm is studied under: what the robot gets is
   # M @ what the operator commanded (env units). `--set control.corruption=null` for a clean run.
   corruption: {rotation_z_deg: 20}
-  reversal_adapter: null      # reverse integration follows F @ v; the *_adapted arm sets it
+  reversal_adapter: null      # reverse integration follows F @ v; the flow_reversal_ra_* arm (FRS-RA) sets it
 
 server:
   port: 8765

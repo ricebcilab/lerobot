@@ -90,8 +90,8 @@ def test_every_shipped_condition_loads(name):
 
 
 def test_arm_files_resolve():
-    adapted = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20_adapted.yaml", {})
-    c = adapted.session.control
+    frs_ra = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_ra_rotz20.yaml", {})
+    c = frs_ra.session.control
     assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
     np.testing.assert_allclose(c.corruption_matrix, rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))

@@ -1,4 +1,4 @@
-# Arm 3: Flow Reversal Steering with the reversal adapter (our addition). The
+# Arm 3, FRS-RA: Flow Reversal Steering with the reversal adapter (our addition). The
 # adapter reshapes the velocity field during the reversal only: its translation
 # block is the known corruption M; orientation and gripper are left to the
 # policy's own field (identity), so the only change from arm 2 is the rotation.
