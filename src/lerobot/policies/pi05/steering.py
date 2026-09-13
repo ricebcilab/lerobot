@@ -112,8 +112,6 @@ def translation_matrix(spec, where: str = "matrix", literal_key: str = "M") -> n
 
 
 _BLOCK_CHOICES = ("identity", "zero")
-_ORIENTATION = slice(3, 6)
-_GRIPPER = slice(GRIPPER_DIM, GRIPPER_DIM + 1)
 
 
 def build_reversal_adapter(
@@ -150,7 +148,10 @@ def build_reversal_adapter(
         f[:3, :3] = 0.0
     elif translation != "identity":
         f[:3, :3] = translation_matrix(translation, f"{where}.translation")
-    for key, dims in (("orientation", _ORIENTATION), ("gripper", _GRIPPER)):
+    for key, dims in (
+        ("orientation", OPERATOR_DIM_GROUPS["rotation"]),
+        ("gripper", OPERATOR_DIM_GROUPS["gripper"]),
+    ):
         choice = spec.get(key, "identity")
         if choice not in _BLOCK_CHOICES:
             raise ValueError(f"{where}.{key}: expected identity or zero, got {choice!r}")
@@ -159,12 +160,20 @@ def build_reversal_adapter(
     return f
 
 
-class ReversalAdapter:
-    """Mutable holder for the environment-space reversal adapter F (None = off).
+def format_matrix(matrix: np.ndarray) -> str:
+    """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
+    return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
 
-    ``FlowReversalSteeringPolicy`` reads the holder on every chunk, so replacing
-    ``matrix`` takes effect immediately. ``label`` is display-only.
+
+class MatrixHolder:
+    """Mutable holder for an optional square matrix (None = off) with a display label.
+
+    Consumers read the holder on every use, so replacing ``matrix`` takes effect
+    immediately; the setter validates the shape.
     """
+
+    size: int
+    where: str
 
     def __init__(self, matrix=None, label: str | None = None):
         self.matrix = matrix
@@ -176,14 +185,22 @@ class ReversalAdapter:
 
     @matrix.setter
     def matrix(self, value) -> None:
-        self._matrix = None if value is None else validate_matrix(value, N_ACTION_DIMS, "reversal adapter")
+        self._matrix = None if value is None else validate_matrix(value, self.size, self.where)
+
+
+class ReversalAdapter(MatrixHolder):
+    """The environment-space reversal adapter F of ``FlowReversalSteeringPolicy`` (None = off)."""
+
+    size = N_ACTION_DIMS
+    where = "reversal adapter"
 
     def describe(self) -> str:
         if self._matrix is None:
             return "Reversal adapter: off."
         identity = " (identity, a no-op)" if np.allclose(self._matrix, np.eye(N_ACTION_DIMS)) else ""
-        rows = "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in self._matrix)
-        return f"Reversal adapter: environment-space F = {self.label}{identity} = [{rows}]."
+        return (
+            f"Reversal adapter: environment-space F = {self.label}{identity} = {format_matrix(self._matrix)}."
+        )
 
     def normalized_matrix(self, std: np.ndarray) -> np.ndarray | None:
         """Convert an environment-space velocity transform to normalized coordinates: S^-1 F S.
@@ -194,6 +211,40 @@ class ReversalAdapter:
         if self.matrix is None:
             return None
         return self.matrix * std[np.newaxis, :] / std[:, np.newaxis]
+
+
+def _rng_state() -> tuple:
+    """CPU and CUDA generator states, so a second sampling pass can reuse the first one's noise."""
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    return torch.get_rng_state(), cuda
+
+
+def _set_rng_state(state: tuple) -> None:
+    cpu, cuda = state
+    torch.set_rng_state(cpu)
+    if cuda:
+        torch.cuda.set_rng_state_all(cuda)
+
+
+def paired_chunks(policy, batch, steered: bool, **steer_kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    """The steered chunk and the policy's own plan for the same observation and the same noise.
+
+    Returns (steered, plain). When `steered` is False the two are the same tensor: no
+    second pass. Otherwise the generator state is restored between the passes so the
+    plain chunk starts from the Gaussian sample the steered one used, and the state
+    after the steered pass is restored afterwards, so a run's random stream is exactly
+    what it would be without the second pass.
+    """
+    if not steered:
+        chunk = policy.predict_action_chunk(batch)
+        return chunk, chunk
+    before = _rng_state()
+    chunk = policy.predict_action_chunk(batch, **steer_kwargs)
+    after = _rng_state()
+    _set_rng_state(before)
+    plain = policy.predict_action_chunk(batch)
+    _set_rng_state(after)
+    return chunk, plain
 
 
 # ---------------------------------------------------------------- FlowControlPolicy
@@ -231,10 +282,16 @@ class FlowControlPolicy:
         self._queue: deque = deque()
         self.guided_steps = 0  # per-rollout count of guided denoising steps
         self._pending_command: np.ndarray | None = None
+        self._pending_target: torch.Tensor | None = None
+        self._policy_queue: deque = deque()
+        self.last_policy_action: torch.Tensor | None = (
+            None  # the policy's own plan for the step just returned
+        )
 
     def reset(self) -> None:
         self._policy.reset()
         self._queue.clear()
+        self._policy_queue.clear()
         self.guided_steps = 0
         self._pending_command = None
 
@@ -242,13 +299,12 @@ class FlowControlPolicy:
     def _x_t_hook(self, step: int, time_: float, x_t: torch.Tensor) -> torch.Tensor:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
         # the hook uses the current chunk's teleop command and must stay eager.
-        if step >= self.n_guided_steps:
+        if step >= self.n_guided_steps or self._pending_command is None:
             return x_t
-        command = self._pending_command
-        if command is None:
-            return x_t
-        target = (command - self._mean) / self._std
-        x_t[..., :3] = torch.as_tensor(target, dtype=x_t.dtype, device=x_t.device)
+        if self._pending_target is None:
+            target = (self._pending_command - self._mean) / self._std
+            self._pending_target = torch.as_tensor(target, dtype=x_t.dtype, device=x_t.device)
+        x_t[..., :3] = self._pending_target
         self.guided_steps += 1
         return x_t
 
@@ -261,9 +317,15 @@ class FlowControlPolicy:
             self._pending_command = (
                 command if command is not None and np.max(np.abs(command)) >= DEADBAND else None
             )
-            chunk = self._policy.predict_action_chunk(batch, x_t_hook=self._x_t_hook)
-            actions = chunk[:, : self._policy.config.n_action_steps]
-            self._queue.extend(actions.transpose(0, 1))
+            self._pending_target = None  # normalized on the device by the first guided step
+            chunk, plain = paired_chunks(
+                self._policy, batch, self._pending_command is not None, x_t_hook=self._x_t_hook
+            )
+            n = self._policy.config.n_action_steps
+            actions = list(chunk[:, :n].transpose(0, 1))
+            self._queue.extend(actions)
+            self._policy_queue.extend(actions if plain is chunk else plain[:, :n].transpose(0, 1))
+        self.last_policy_action = self._policy_queue.popleft()
         return self._queue.popleft()
 
 
@@ -393,6 +455,11 @@ class FlowReversalSteeringPolicy:
         self.pinned_steps = policy.config.n_action_steps if pinned_steps == -1 else pinned_steps
         self.operator_dims = operator_dims  # the setter builds the delegation mask
         self._pending_command: np.ndarray | None = None
+        self._adapter_cache: tuple | None = None
+        self._policy_queue: deque = deque()
+        self.last_policy_action: torch.Tensor | None = (
+            None  # the policy's own plan for the step just returned
+        )
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
         self._queue: deque = deque()
@@ -439,6 +506,7 @@ class FlowReversalSteeringPolicy:
     def reset(self) -> None:
         self._policy.reset()
         self._queue.clear()
+        self._policy_queue.clear()
         self._gripper_ref = self._normalize_gripper(GRIPPER_OPEN)
         self._last_reference = None
         self.steered_chunks = 0
@@ -455,6 +523,18 @@ class FlowReversalSteeringPolicy:
         ref[..., : len(normalized)] = torch.as_tensor(normalized, dtype=torch.float32)
         return ref
 
+    def _adapter_tensor(self, like: torch.Tensor) -> torch.Tensor | None:
+        """The adapter in normalized coordinates on `like`'s device, rebuilt only when the holder's matrix changes."""
+        matrix = None if self._adapter is None else self._adapter.matrix
+        if matrix is None:
+            self._adapter_cache = None
+            return None
+        key = (id(matrix), like.device, like.dtype)
+        if self._adapter_cache is None or self._adapter_cache[0] != key:
+            normalized = self._adapter.normalized_matrix(self._std)
+            self._adapter_cache = (key, torch.as_tensor(normalized, dtype=like.dtype, device=like.device))
+        return self._adapter_cache[1]
+
     @torch.compiler.disable
     def _noise_fn(self, velocity, noise: torch.Tensor) -> torch.Tensor:
         # compiler.disable: with --compile, sample_actions is dynamo-traced;
@@ -468,12 +548,13 @@ class FlowReversalSteeringPolicy:
         reference = self.reference_chunk(command).to(device=noise.device, dtype=noise.dtype)
         self._last_reference = reference
         self.steered_chunks += 1
-        adapter_matrix = None if self._adapter is None else self._adapter.normalized_matrix(self._std)
-        if adapter_matrix is not None:
-            adapter_matrix = torch.as_tensor(adapter_matrix, dtype=noise.dtype, device=noise.device)
         total = self._policy.config.num_inference_steps
         latent = reverse_flow(
-            reference, velocity, total, adapter=adapter_matrix, n_reversal_steps=self._n_reversal_steps
+            reference,
+            velocity,
+            total,
+            adapter=self._adapter_tensor(noise),
+            n_reversal_steps=self._n_reversal_steps,
         )
         delegated = self._delegated.to(noise.device)
         if not delegated.any():
@@ -496,12 +577,21 @@ class FlowReversalSteeringPolicy:
             steering = np.max(np.abs(command)) >= DEADBAND
             self._pending_command = command if steering else None
             flow_kwargs = self._flow_kwargs() if steering else {}
-            chunk = self._policy.predict_action_chunk(batch, noise_fn=self._noise_fn, **flow_kwargs)
+            if not steering:
+                self._last_reference = None  # no reference to score this chunk against
+            chunk, plain = paired_chunks(
+                self._policy, batch, steering, noise_fn=self._noise_fn, **flow_kwargs
+            )
             actions = chunk[:, : self._policy.config.n_action_steps]
-            self._gripper_ref = float(actions[0, -1, GRIPPER_DIM])
+            executed = actions[0].float().cpu()  # one device sync per chunk
+            self._gripper_ref = float(executed[-1, GRIPPER_DIM])
             if self._last_reference is not None:
-                executed = actions[0, :, :3].float().cpu()
-                target = self._last_reference[0, : actions.shape[1], :3].float().cpu()
-                self.reconstruction_errors.append((executed - target).abs().mean().item())
-            self._queue.extend(actions.transpose(0, 1))
+                target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
+                self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
+            steps = list(actions.transpose(0, 1))
+            self._queue.extend(steps)
+            self._policy_queue.extend(
+                steps if plain is chunk else plain[:, : self._policy.config.n_action_steps].transpose(0, 1)
+            )
+        self.last_policy_action = self._policy_queue.popleft()
         return self._queue.popleft()

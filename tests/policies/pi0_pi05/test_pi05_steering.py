@@ -249,9 +249,10 @@ def test_reverse_flow_steering_passes_schedule_only_while_steering():
     source.translation = np.array([1.0, 0.0, 0.0])
     wrapper.select_action({})
     wrapper.select_action({})  # served from the queue, no new call
-    assert len(policy.calls) == 2
-    assert policy.calls[-1]["flow_start_time"] == pytest.approx(0.4)
-    assert policy.calls[-1]["num_forward_steps"] == 4
+    steered, plain = policy.calls[1:]  # a steered chunk costs a second, plain pass for the policy's own plan
+    assert len(policy.calls) == 3 and plain == {}
+    assert steered["flow_start_time"] == pytest.approx(0.4)
+    assert steered["num_forward_steps"] == 4
     assert wrapper.steered_chunks == 1
     assert len(wrapper.reconstruction_errors) == 1
 
@@ -260,21 +261,27 @@ def test_reverse_flow_steering_full_reversal_has_no_schedule_kwargs():
     policy = FakePolicy()
     wrapper = FlowReversalSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), postprocessor())
     wrapper.select_action({})
-    assert "flow_start_time" not in policy.calls[-1]
+    assert "noise_fn" in policy.calls[0] and "flow_start_time" not in policy.calls[0]
     assert wrapper.n_reversal_steps is None
 
 
 @pytest.mark.parametrize("depth", [1, 2, 4, 8, 10])
 def test_partial_reversal_roundtrip_and_evaluation_budget(depth):
     class IntegratingPolicy(FakePolicy):
+        call_times: list[list[float]] = []
+
         def predict_action_chunk(self, batch, **kwargs):
             self.times = []
+            self.call_times.append(self.times)
 
             def velocity(x, time):
                 self.times.append(time)
                 return torch.ones_like(x)
 
-            x = kwargs["noise_fn"](velocity, torch.zeros(1, CHUNK, MAX_DIM))
+            noise_fn = kwargs.get("noise_fn")
+            x = torch.zeros(1, CHUNK, MAX_DIM)
+            if noise_fn is not None:
+                x = noise_fn(velocity, x)
             start = kwargs.get("flow_start_time", 1.0)
             steps = kwargs.get("num_forward_steps", NUM_STEPS)
             dt = -start / steps
@@ -293,7 +300,10 @@ def test_partial_reversal_roundtrip_and_evaluation_budget(depth):
     torch.testing.assert_close(actual[0, :3], torch.tensor([0.5, 0.0, -0.5]))
     torch.testing.assert_close(actual[0, 3:], torch.full((MAX_DIM - 3,), -1.0))
     assert policy.forward_dt == pytest.approx(-1.0 / NUM_STEPS)
-    assert len(policy.times) == NUM_STEPS + depth
+    steered, plain = policy.call_times[-2:]
+    assert len(steered) == NUM_STEPS + depth  # n reverse, N - n unsteered, n forward
+    assert len(plain) == NUM_STEPS  # the policy's own plan, for the record
+    torch.testing.assert_close(wrapper.last_policy_action, torch.full((1, MAX_DIM), -1.0))
 
 
 def test_wrapper_converts_adapter_before_reversal():
@@ -404,3 +414,43 @@ def test_operator_dims_setter_rebuilds_the_mask():
     assert wrapper._delegated[0, 3].item() is False
     with pytest.raises(ValueError, match="operator_dims"):
         wrapper.operator_dims = ["translation", "wrist"]
+
+
+class NoisyPolicy(FakePolicy):
+    """Draws its noise from torch's generator, like the real sampler; hooks may reshape it."""
+
+    def predict_action_chunk(self, batch, **kwargs):
+        self.calls.append(kwargs)
+        x = torch.randn(1, CHUNK, MAX_DIM)
+        hook = kwargs.get("x_t_hook")
+        if hook is not None:
+            for step in range(NUM_STEPS):
+                x = hook(step, 1.0 - step / NUM_STEPS, x)
+        return x
+
+
+def test_flow_control_records_the_policy_plan_from_the_same_noise_without_disturbing_the_stream():
+    policy = NoisyPolicy()
+    wrapper = FlowControlPolicy(policy, Source((1.0, 0.0, 0.0)), 2, postprocessor())
+    torch.manual_seed(3)
+    steered = wrapper.select_action({})
+    plan = wrapper.last_policy_action
+    after = torch.randn(3)  # whatever the run draws next
+
+    torch.manual_seed(3)
+    expected_plain = NoisyPolicy().predict_action_chunk({})[:, 0]
+    torch.testing.assert_close(plan, expected_plain)  # same Gaussian sample as the steered pass
+    assert not torch.equal(steered[0, :3], plan[0, :3])  # dims 0-2 were steered ...
+    assert torch.equal(steered[0, 3:], plan[0, 3:])  # ... and nothing else
+
+    # A single steered pass (no second one) leaves the generator exactly where the wrapper did.
+    torch.manual_seed(3)
+    alone = FlowControlPolicy(NoisyPolicy(), Source((1.0, 0.0, 0.0)), 2, postprocessor())
+    alone._pending_command = np.array([1.0, 0.0, 0.0])
+    NoisyPolicy().predict_action_chunk({}, x_t_hook=alone._x_t_hook)
+    torch.testing.assert_close(torch.randn(3), after)
+
+    idle = FlowControlPolicy(NoisyPolicy(), Source((0.0, 0.0, 0.0)), 2, postprocessor())
+    action = idle.select_action({})
+    assert idle.last_policy_action is action  # not steering: the plan is the action, no second pass
+    assert len(idle._policy.calls) == 1

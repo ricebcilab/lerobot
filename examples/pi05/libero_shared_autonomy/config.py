@@ -67,18 +67,11 @@ class ExperimentSettings:
     prompt: str = "do something"
 
 
-_CONTROL_SCHEMA = {
-    "mode": "mode",
-    "n_guided_steps": "n_guided_steps",
-    "n_reversal_steps": "n_reversal_steps",
-    "input_noise": "input_noise",
-    "max_steps": "max_steps",
-    "corruption": "corruption",
-    "reversal_adapter": "reversal_adapter",
-    "operator_dims": "operator_dims",
-}
+# YAML key -> flat settings name. The `control:` and `policy_operator:` blocks mirror
+# their dataclasses (the resolved *_matrix fields are not settings).
+_CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if not k.endswith("_matrix")}
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
-_OPERATOR_SCHEMA = {"update_every_steps": "update_every_steps", "delay_steps": "delay_steps"}
+_OPERATOR_SCHEMA = {k: k for k in PolicyOperatorSettings.__dataclass_fields__}
 
 INTERACTIVE_SCHEMA = {
     "policy": _POLICY_SCHEMA,
@@ -187,9 +180,14 @@ def _fail(where: str, message: str):
     raise ValueError(f"{where}: {message}")
 
 
+def _fields_from_flat(cls, flat: dict, exclude: tuple[str, ...] = ()) -> dict:
+    """The flat settings that are fields of dataclass `cls`, as constructor kwargs."""
+    return {k: flat[k] for k in cls.__dataclass_fields__ if k in flat and k not in exclude}
+
+
 def build_control(flat: dict, where: str) -> ControlSettings:
     """ControlSettings from flat settings, with ranges checked and matrix specs resolved."""
-    control = ControlSettings(**{k: flat[k] for k in ControlSettings.__dataclass_fields__ if k in flat})
+    control = ControlSettings(**_fields_from_flat(ControlSettings, flat))
     if control.mode not in MODES:
         _fail(where, f"control.mode must be one of {', '.join(MODES)}, got {control.mode!r}")
     if not isinstance(control.n_guided_steps, int) or control.n_guided_steps < 0:
@@ -217,19 +215,11 @@ def build_control(flat: dict, where: str) -> ControlSettings:
     return control
 
 
-def _session_from_flat(flat: dict, where: str, defaults: SessionSettings) -> SessionSettings:
+def _session_from_flat(flat: dict, where: str) -> SessionSettings:
     session = SessionSettings(
-        policy_path=flat.get("policy_path", defaults.policy_path),
-        n_action_steps=flat.get("n_action_steps", defaults.n_action_steps),
-        compile=flat.get("compile", defaults.compile),
-        suite=flat.get("suite", defaults.suite),
-        task_id=flat.get("task_id", defaults.task_id),
-        port=flat.get("port", defaults.port),
-        output_dir=Path(flat.get("output_dir", defaults.output_dir)),
-        operator=flat.get("operator", defaults.operator),
-        policy_operator=PolicyOperatorSettings(
-            **{key: flat[key] for key in PolicyOperatorSettings.__dataclass_fields__ if key in flat}
-        ),
+        **_fields_from_flat(SessionSettings, flat, exclude=("output_dir", "policy_operator", "control")),
+        output_dir=Path(flat.get("output_dir", SessionSettings.output_dir)),
+        policy_operator=PolicyOperatorSettings(**_fields_from_flat(PolicyOperatorSettings, flat)),
         control=build_control(flat, where),
     )
     if not isinstance(session.n_action_steps, int) or session.n_action_steps < 1:
@@ -246,7 +236,7 @@ def load_interactive_settings(path: str | Path | None, overrides: dict) -> Sessi
     where = str(path) if path is not None else "command line"
     flat = flatten(load_yaml_with_extends(path), INTERACTIVE_SCHEMA, where) if path is not None else {}
     flat.update({k: v for k, v in overrides.items() if v is not None})
-    return _session_from_flat(flat, where, SessionSettings())
+    return _session_from_flat(flat, where)
 
 
 def parse_set(item: str) -> tuple[list[str], object]:
@@ -295,20 +285,11 @@ def load_experiment_settings(
         data = deep_merge(data, sets_to_tree(sets))
     flat = flatten(data, EXPERIMENT_SCHEMA, where)
     flat.update({k: v for k, v in overrides.items() if v is not None})
-    defaults = ExperimentSettings(name=path.stem, session=SessionSettings())
-    session_defaults = SessionSettings(output_dir=defaults.output_dir)
-    session_flat = {
-        k: v for k, v in flat.items() if k not in ("n_trials", "seed", "task_order", "task_ids", "prompt")
-    }
     settings = ExperimentSettings(
         name=path.stem,
-        session=_session_from_flat(session_flat, where, session_defaults),
-        n_trials=flat.get("n_trials", defaults.n_trials),
-        seed=flat.get("seed", defaults.seed),
-        task_order=flat.get("task_order", defaults.task_order),
-        output_dir=Path(flat.get("output_dir", defaults.output_dir)),
-        task_ids=flat.get("task_ids", defaults.task_ids),
-        prompt=flat.get("prompt", defaults.prompt),
+        session=_session_from_flat(flat, where),
+        **_fields_from_flat(ExperimentSettings, flat, exclude=("name", "session", "output_dir")),
+        output_dir=Path(flat.get("output_dir", ExperimentSettings.output_dir)),
     )
     if not isinstance(settings.n_trials, int) or settings.n_trials < 1:
         _fail(where, f"experiment.n_trials must be a positive integer, got {settings.n_trials!r}")

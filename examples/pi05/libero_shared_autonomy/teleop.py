@@ -39,8 +39,9 @@ from lerobot.policies.pi05.steering import (
     GRIPPER_CLOSE,
     GRIPPER_DIM,
     GRIPPER_OPEN,
+    MatrixHolder,
+    format_matrix,
     translation_matrix,
-    validate_matrix,
 )
 
 __all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN"]  # re-exported for readers of this module
@@ -332,9 +333,6 @@ class PolicyOperator:
     def command_age_steps(self) -> int:
         return -1 if self._generated_at is None else self._step - self._generated_at
 
-    def idle(self) -> None:
-        self._translation = np.zeros(3)
-
     @property
     def translation(self) -> np.ndarray:
         return self._translation.copy()
@@ -344,7 +342,7 @@ class PolicyOperator:
         return self._gripper
 
 
-class CommandCorruption:
+class CommandCorruption(MatrixHolder):
     """Deterministically corrupt a teleop source's translation: x -> M @ x.
 
     `matrix` is a 3x3 array-like (rows = output axes, columns = input axes) or
@@ -356,18 +354,12 @@ class CommandCorruption:
     passed through unchanged.
     """
 
+    size = 3
+    where = "corruption matrix"
+
     def __init__(self, source, matrix=None, label: str | None = None):
         self.source = source
-        self.matrix = matrix
-        self.label = label
-
-    @property
-    def matrix(self) -> np.ndarray | None:
-        return self._matrix
-
-    @matrix.setter
-    def matrix(self, value) -> None:
-        self._matrix = None if value is None else validate_matrix(value, 3, "corruption matrix")
+        super().__init__(matrix, label)
 
     @property
     def translation(self) -> np.ndarray:
@@ -383,8 +375,7 @@ class CommandCorruption:
     def describe(self) -> str:
         if self._matrix is None:
             return "Command corruption: off."
-        rows = "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in self._matrix)
-        return f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = [{rows}]."
+        return f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {format_matrix(self._matrix)}."
 
 
 def build_corruption(spec, where: str = "corruption") -> np.ndarray | None:

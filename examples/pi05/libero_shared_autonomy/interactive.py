@@ -168,52 +168,47 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
         print(text)
 
 
+def noise_line(session: Session) -> str:
+    std = session.chain.noisy.input_noise
+    return f"Input noise: std {std:.3f} on x/y/z while you command." if std > 0 else "Input noise: off."
+
+
 def cmd_noise(session: Session, tokens: list[str]) -> None:
-    if len(tokens) == 2:
-        try:
+    try:
+        if len(tokens) > 2:
+            raise ValueError
+        if len(tokens) == 2:
             session.chain.noisy.input_noise = float(tokens[1])
-        except ValueError:
-            print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
-            return
-    elif len(tokens) > 2:
+    except ValueError:
         print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
         return
-    std = session.chain.noisy.input_noise
-    print(f"Input noise: std {std:.3f} on x/y/z while you command." if std > 0 else "Input noise: off.")
+    print(noise_line(session))
+
+
+def _cmd_matrix(session: Session, tokens: list[str], name: str, holder, build) -> None:
+    """`<name> off` clears the holder, `<name> <file.yaml>` loads a spec into it, bare `<name>` shows it."""
+    if len(tokens) == 2 and tokens[1] == "off":
+        holder.matrix = holder.label = None
+    elif len(tokens) == 2:
+        try:
+            holder.matrix, holder.label = build(read_matrix_spec(tokens[1])), Path(tokens[1]).name
+        except (OSError, ValueError) as e:
+            print(f"could not load {name}: {e}")
+            return
+    elif len(tokens) > 2:
+        print(f"usage: {name} [<file.yaml>|off]")
+        return
+    hint = "" if holder.matrix is not None else f" Load one with `{name} <file.yaml>`."
+    print(holder.describe() + hint)
 
 
 def cmd_corruption(session: Session, tokens: list[str]) -> None:
-    if len(tokens) == 2 and tokens[1] == "off":
-        session.set_corruption(None, None)
-    elif len(tokens) == 2:
-        try:
-            session.set_corruption(build_corruption(read_matrix_spec(tokens[1])), Path(tokens[1]).name)
-        except (OSError, ValueError) as e:
-            print(f"could not load corruption: {e}")
-            return
-    elif len(tokens) > 2:
-        print("usage: corruption [<file.yaml>|off]")
-        return
-    hint = "" if session.chain.corruption.matrix is not None else " Load one with `corruption <file.yaml>`."
-    print(session.chain.corruption.describe() + hint)
+    _cmd_matrix(session, tokens, "corruption", session.chain.corruption, build_corruption)
 
 
 def cmd_adapter(session: Session, tokens: list[str]) -> None:
-    if len(tokens) == 2 and tokens[1] == "off":
-        session.set_reversal_adapter(None, None)
-    elif len(tokens) == 2:
-        try:
-            spec = read_matrix_spec(tokens[1])
-            matrix = build_reversal_adapter(spec, session.chain.corruption.matrix)
-            session.set_reversal_adapter(matrix, Path(tokens[1]).name)
-        except (OSError, ValueError) as e:
-            print(f"could not load reversal adapter: {e}")
-            return
-    elif len(tokens) > 2:
-        print("usage: adapter [<file.yaml>|off]")
-        return
-    hint = "" if session.adapter.matrix is not None else " Load one with `adapter <file.yaml>`."
-    print(session.adapter.describe() + hint)
+    build = lambda spec: build_reversal_adapter(spec, session.chain.corruption.matrix)  # noqa: E731
+    _cmd_matrix(session, tokens, "adapter", session.adapter, build)
 
 
 def cmd_tasks(session: Session, tokens: list[str]) -> None:
@@ -281,7 +276,7 @@ def main():
     if session.mode != "policy":
         print(session.announce_mode() + "\n")
     if session.chain.noisy.input_noise > 0:
-        print(f"Input noise: std {session.chain.noisy.input_noise:.3f} on x/y/z while you command.\n")
+        print(noise_line(session) + "\n")
 
     try:
         while True:

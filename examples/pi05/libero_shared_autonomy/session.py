@@ -9,9 +9,7 @@ optional per-step recorder (experiments).
 
 import hashlib
 import logging
-import os
 import time
-import webbrowser
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -20,7 +18,7 @@ from functools import cache
 import numpy as np
 import torch
 from config import MODES, ControlSettings, SessionSettings, spec_label
-from live_view import ACTION_LABELS, LiveView
+from live_view import LiveView
 from reproducibility import TrialSpec
 from teleop import KeyboardReader, PolicyOperator, TeleopChain
 
@@ -35,6 +33,8 @@ from lerobot.envs import (
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.pi05.steering import (
+    GRIPPER_DIM,
+    N_ACTION_DIMS,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     ReversalAdapter,
@@ -66,11 +66,20 @@ class _ZeroPolicy:
         pass
 
     def select_action(self, obs) -> torch.Tensor:
-        return torch.zeros(1, len(ACTION_LABELS))
+        return torch.zeros(1, N_ACTION_DIMS)
 
 
 def _identity(x):
     return x
+
+
+def _frame(observation) -> np.ndarray:
+    """The agentview image of a (vectorised) observation, oriented like LiberoEnv.render().
+
+    Read from the observation rather than render(): the sub-env auto-resets on
+    termination, so after a final step render() would show the next fresh scene.
+    """
+    return observation["pixels"]["image"][0][::-1, ::-1]
 
 
 def _teleop_hook(source, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarray]:
@@ -80,7 +89,7 @@ def _teleop_hook(source, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarr
         action = action.copy()
         action[0, :3] = source.translation
         if paste_gripper:
-            action[0, 6] = source.gripper
+            action[0, GRIPPER_DIM] = source.gripper
         return action
 
     return hook
@@ -110,8 +119,6 @@ class Session:
         if hasattr(self.policy_cfg, "compile_model"):
             self.policy_cfg.compile_model = settings.compile
 
-        self.suite = self.task_id = None
-        self.envs_dict = self.vec_env = None
         self.env_cfg, self.envs_dict, self.vec_env = self._build_env(settings.suite, settings.task_id)
         self.suite, self.task_id = settings.suite, settings.task_id
 
@@ -140,33 +147,18 @@ class Session:
         self._flow_policy: FlowControlPolicy | None = None
         self._frs_policy: FlowReversalSteeringPolicy | None = None
         self.mode = "policy"
-        self.n_guided_steps = control.n_guided_steps
-        self.n_reversal_steps = control.n_reversal_steps
-        self.operator_dims = tuple(control.operator_dims)
         self._scene_names: dict | None = None
         self.apply_control(control)
-
-        # In a graphical session, open the page only if no tab is already
-        # polling us: a tab left open from the previous run (the study scripts
-        # chain several) has had the whole model load to make itself known.
-        graphical = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        if graphical and not self.view.page_seen:
-            webbrowser.open(self.view.url)
-
-    @classmethod
-    def from_settings(cls, settings: SessionSettings) -> "Session":
-        return cls(settings)
+        self.view.open_in_browser()  # after the model load, so a tab left open by the previous run is noticed
 
     # ------------------------------------------------------------ scene
 
     @staticmethod
+    @cache
     def list_tasks(suite: str) -> list[str]:
-        from libero.libero import benchmark
+        from lerobot.envs.libero import _get_suite
 
-        bench = benchmark.get_benchmark_dict()
-        if suite not in bench:
-            raise ValueError(f"Unknown suite '{suite}'. Available: {', '.join(sorted(bench))}")
-        return [t.language for t in bench[suite]().tasks]
+        return [t.language for t in _get_suite(suite).tasks]
 
     @staticmethod
     @cache
@@ -254,7 +246,7 @@ class Session:
             else {"seed": trial_spec.env_seed, "options": {"init_state_id": trial_spec.init_state_id}}
         )
         observation, _ = self.vec_env.reset(**kwargs)
-        self.view.stream.publish(self.vec_env.envs[0].render())
+        self.view.stream.publish(_frame(observation))
         return observation
 
     def initial_state_hash(self) -> str:
@@ -267,27 +259,18 @@ class Session:
 
     # ------------------------------------------------------------ operator perturbations
 
-    def set_corruption(self, matrix, label: str | None) -> None:
-        self.chain.corruption.matrix = matrix
-        self.chain.corruption.label = label
-
-    def set_reversal_adapter(self, matrix, label: str | None) -> None:
-        self.adapter.matrix = matrix
-        self.adapter.label = label
-
     def _status_extra(self) -> dict:
-        corruption, adapter = self.chain.corruption, self.adapter
         return {
             "input_noise": self.chain.noisy.input_noise,
-            "corruption": corruption.label if corruption.matrix is not None else None,
-            "flow_adapter": adapter.label if adapter.matrix is not None else None,
+            "corruption": self.chain.corruption.label,
+            "reversal_adapter": self.adapter.label,
         }
 
     def resolved_matrices(self) -> dict:
         """For run provenance: the matrices in force, as lists (None when off)."""
         m, f = self.chain.corruption.matrix, self.adapter.matrix
         _, std = get_action_mean_std(self.postprocessor)
-        normalized = self.adapter.normalized_matrix(std[:7])
+        normalized = self.adapter.normalized_matrix(std[:N_ACTION_DIMS])
         return {
             "corruption_matrix": None if m is None else m.tolist(),
             "reversal_adapter_matrix": None if f is None else f.tolist(),
@@ -297,19 +280,21 @@ class Session:
 
     # ------------------------------------------------------------ mode
 
+    def _check_depth(self, name: str, value, low: int) -> None:
+        total = self.policy.config.num_inference_steps
+        if not isinstance(value, int) or not low <= value <= total:
+            raise ValueError(f"{name} must be an integer in [{low}, {total}] (denoising steps)")
+
     def set_mode(
         self, mode: str, n_guided_steps: int | None = None, n_reversal_steps: int | None = None
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
-        total = self.policy.config.num_inference_steps
         if n_guided_steps is not None:
-            if not isinstance(n_guided_steps, int) or not 0 <= n_guided_steps <= total:
-                raise ValueError(f"n_guided_steps must be an integer in [0, {total}] (denoising steps)")
+            self._check_depth("n_guided_steps", n_guided_steps, 0)
             self.n_guided_steps = n_guided_steps
         if n_reversal_steps is not None:
-            if not isinstance(n_reversal_steps, int) or not 1 <= n_reversal_steps <= total:
-                raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
+            self._check_depth("n_reversal_steps", n_reversal_steps, 1)
             self.n_reversal_steps = n_reversal_steps
         self.mode = mode
         if mode != "policy" and self.operator is None:
@@ -317,12 +302,13 @@ class Session:
 
     def apply_control(self, control: ControlSettings) -> None:
         """Put the session in the state a `control:` block describes (mode, depths, noise, matrices)."""
-        self.set_corruption(control.corruption_matrix, spec_label(control.corruption))
-        self.set_reversal_adapter(control.reversal_adapter_matrix, spec_label(control.reversal_adapter))
+        self.chain.corruption.matrix = control.corruption_matrix
+        self.chain.corruption.label = spec_label(control.corruption)
+        self.adapter.matrix = control.reversal_adapter_matrix
+        self.adapter.label = spec_label(control.reversal_adapter)
         self.chain.noisy.input_noise = control.input_noise
-        total = self.policy.config.num_inference_steps
-        if control.n_reversal_steps is not None and not 1 <= control.n_reversal_steps <= total:
-            raise ValueError(f"n_reversal_steps must be an integer in [1, {total}]")
+        if control.n_reversal_steps is not None:
+            self._check_depth("n_reversal_steps", control.n_reversal_steps, 1)
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
         self.operator_dims = tuple(control.operator_dims)
         if self._frs_policy is not None:
@@ -370,8 +356,6 @@ class Session:
                     f"inverted {n} of {total} steps (partway to noise, t={n / total:.1f}); pi0.5 then "
                     f"denoises from there in {n} steps (idle input = pure policy)."
                 )
-            if self.adapter.matrix is not None:
-                lines.append(self.adapter.describe())
         return "\n".join(lines)
 
     def _rollout_kwargs(self) -> dict:
@@ -421,16 +405,12 @@ class Session:
     def metrics(self) -> dict:
         """Steering statistics of the last rollout in the current mode."""
         if self.mode == "shared_flow_control" and self._flow_policy is not None:
-            return {
-                "guided_steps": int(self._flow_policy.guided_steps),
-                "steered_chunk_velocity_evaluations": self.policy.config.num_inference_steps,
-            }
+            return {"guided_steps": int(self._flow_policy.guided_steps)}
         if self.mode == "shared_flow_reversal_steering" and self._frs_policy is not None:
             errors = self._frs_policy.reconstruction_errors
-            total = self.policy.config.num_inference_steps
             return {
-                "n_reversal_steps": self._frs_policy.n_reversal_steps or total,
-                "steered_chunk_velocity_evaluations": total + (self._frs_policy.n_reversal_steps or total),
+                "n_reversal_steps": self._frs_policy.n_reversal_steps
+                or self.policy.config.num_inference_steps,
                 "steered_chunks": int(self._frs_policy.steered_chunks),
                 "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
             }
@@ -458,9 +438,9 @@ class Session:
     ) -> RolloutResult:
         """One rollout in the current scene and mode, driven by `prompt`.
 
-        `recorder(step=, observation=, action=, reward=, terminated=, truncated=, info=)`
-        is called once per step with the observation the policy saw and the executed
-        action. `max_steps` overrides the suite's episode length (teleop mode has its
+        `recorder(step=, observation=, action=, policy_action=, reward=, terminated=,
+        truncated=, info=)` is called once per step with the observation the policy saw,
+        the executed action and the policy's own plan for that step. `max_steps` overrides the suite's episode length (teleop mode has its
         own default).
         """
         k = self._rollout_kwargs()
@@ -479,8 +459,7 @@ class Session:
         if trial_spec is not None:
             self.chain.noisy._rng = np.random.default_rng(trial_spec.input_noise_seed)
         max_steps = max_steps or k["max_steps"] or int(vec_env.call("_max_episode_steps")[0])
-        frames = [vec_env.envs[0].render()]
-        stream.publish(frames[-1])
+        frames = [_frame(observation)]  # what show_scene has already published
         stream.set_status(
             prompt=prompt, step=0, max_steps=max_steps, state="running", action=None, mode=self.mode_label()
         )
@@ -504,9 +483,16 @@ class Session:
                 torch.manual_seed((trial_spec.policy_seed + chunk_index) % 2**32)
             with torch.inference_mode(), self.autocast_ctx:
                 action = policy.select_action(obs)
-            action = postprocessor(action)
-            transition = env_postprocessor({ACTION: action})
-            action_numpy = transition[ACTION].to("cpu").numpy()
+            # The policy's own plan for this step: the steering wrappers expose the chunk
+            # they would have produced without the operator; elsewhere it is the action
+            # itself, before any operator hook.
+            plan = getattr(policy, "last_policy_action", None)
+            action_numpy = env_postprocessor({ACTION: postprocessor(action)})[ACTION].to("cpu").numpy()
+            policy_numpy = (
+                action_numpy
+                if plan is None or plan is action
+                else env_postprocessor({ACTION: postprocessor(plan)})[ACTION].to("cpu").numpy()
+            )
             if action_hook is not None:
                 action_numpy = action_hook(action_numpy)
 
@@ -521,6 +507,7 @@ class Session:
                     step=step,
                     observation=previous_observation,
                     action=action_numpy,
+                    policy_action=policy_numpy,
                     reward=reward,
                     terminated=terminated,
                     truncated=truncated,
@@ -535,17 +522,10 @@ class Session:
                 is_success = info["is_success"]
                 success = bool(is_success[0] if hasattr(is_success, "__len__") else is_success)
 
-            if terminated[0] or truncated[0]:
-                # The sub-env auto-resets on termination, so render() would show a
-                # fresh scene; use the final observation's agentview pixels instead
-                # (flipped to match render() orientation).
-                final = observation["pixels"]["image"][0][::-1, ::-1]
-                frames.append(final)
-                stream.publish(final)
-                break
-
-            frames.append(vec_env.envs[0].render())
+            frames.append(_frame(observation))
             stream.publish(frames[-1])
+            if terminated[0] or truncated[0]:
+                break
             print(f"\r  step {step}/{max_steps}", end="", flush=True)
 
             leftover = 1.0 / RATE_HZ - (time.time() - step_start)
@@ -556,14 +536,25 @@ class Session:
         stream.set_status(state="success" if success else "failed")
         return RolloutResult(success=success, steps=step, frames=frames, metrics=self.metrics())
 
-    def _refresh_operator(self, observation, step: int = 0) -> None:
-        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator."""
+    def policy_chunk(self, observation, prompt: str) -> torch.Tensor:
+        """The policy's own action chunk for `observation` under `prompt`, in its normalized space."""
         obs = preprocess_observation(observation)
-        obs["task"] = [self.task_description]
+        obs["task"] = [prompt]
         obs = self.env_preprocessor(obs)
         obs = self.preprocessor(obs)
         with torch.inference_mode(), self.autocast_ctx:
-            chunk = self.policy.predict_action_chunk(obs)
+            return self.policy.predict_action_chunk(obs)
+
+    def env_actions(self, chunk: torch.Tensor) -> np.ndarray:
+        """A normalized chunk (1, T, dim) as the env actions its steps would execute, (T, dim)."""
+        steps = [
+            self.env_postprocessor({ACTION: self.postprocessor(a)})[ACTION] for a in chunk.transpose(0, 1)
+        ]
+        return np.stack([a.to("cpu").numpy()[0] for a in steps])
+
+    def _refresh_operator(self, observation, step: int = 0) -> None:
+        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator."""
+        chunk = self.policy_chunk(observation, self.task_description)
         chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
         self.operator.refresh(chunk * self.operator_std + self.operator_mean, step=step)  # env units
 

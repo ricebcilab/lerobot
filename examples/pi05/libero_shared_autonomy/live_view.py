@@ -12,7 +12,9 @@
 
 import io
 import json
+import os
 import threading
+import webbrowser
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -20,9 +22,11 @@ import numpy as np
 from PIL import Image
 from teleop import KeyboardReader
 
+from lerobot.policies.pi05.steering import ACTION_DIMS
+
 # LIBERO's robosuite OSC_POSE controller: end-effector position deltas,
 # orientation (axis-angle) deltas, then gripper (-1 = open, +1 = close).
-ACTION_LABELS = ["Δx", "Δy", "Δz", "Δroll", "Δpitch", "Δyaw", "gripper"]
+ACTION_LABELS = [d.replace("d", "Δ", 1) if d != "gripper" else d for d in ACTION_DIMS]
 
 PAGE = """<!doctype html>
 <html>
@@ -154,7 +158,7 @@ async function poll() {
     const heldKeys = s.keys.length ? ' <span class="held">held: ' + s.keys.join(" ") + '</span>' : "";
     const noise = s.input_noise > 0 ? ' &middot; <span class="held">input noise &sigma;=' + s.input_noise.toFixed(2) + '</span>' : "";
     const corruption = s.corruption ? ' &middot; <span class="held">corruption: ' + s.corruption + '</span>' : "";
-    const adapter = s.flow_adapter ? ' &middot; <span class="held">flow adapter: ' + s.flow_adapter + '</span>' : "";
+    const adapter = s.reversal_adapter ? ' &middot; <span class="held">reversal adapter: ' + s.reversal_adapter + '</span>' : "";
     document.getElementById("keys").innerHTML =
       'keyboard: <kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&larr;</kbd><kbd>&rarr;</kbd> move &middot; ' +
       '<kbd>PgUp</kbd>/<kbd>PgDn</kbd> or <kbd>W</kbd>/<kbd>S</kbd> up/down &middot; ' +
@@ -232,7 +236,7 @@ class LiveView:
         self._command_cond = threading.Condition()
         self._offered: tuple[str, ...] = ()
         self._chosen: str | None = None
-        self.page_seen = False  # a page has polled /status, e.g. a tab left open from the previous run
+        self._page_seen = False  # a page has polled /status, e.g. a tab left open from the previous run
 
     @property
     def url(self) -> str:
@@ -246,6 +250,15 @@ class LiveView:
         if self._server is not None:
             self._server.shutdown()
             self._server = None
+
+    def open_in_browser(self) -> None:
+        """In a graphical session, open the page unless a tab is already polling this server.
+
+        The study scripts chain several runs on one port; a tab left open by the
+        previous run reconnects by itself, so it must not be opened again.
+        """
+        if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and not self._page_seen:
+            webbrowser.open(self.url)
 
     def wait_command(self, options: tuple[str, ...]) -> str:
         """Show `options` as buttons and block until the operator picks one; returns the pick."""
@@ -278,27 +291,35 @@ class LiveView:
             def log_message(self, *args):  # keep the terminal clean for the REPL
                 pass
 
+            def _send(self, body: bytes, content_type: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _json_body(self) -> dict | None:
+                """The POSTed JSON object, or None after answering 400."""
+                try:
+                    payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                    if not isinstance(payload, dict):
+                        raise TypeError("expected a JSON object")
+                    return payload
+                except (ValueError, TypeError):
+                    self.send_error(400)
+                    return None
+
             def do_GET(self):
                 if self.path == "/":
-                    body = PAGE.encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send(PAGE.encode(), "text/html; charset=utf-8")
                 elif self.path.startswith("/status"):
-                    view.page_seen = True
+                    view._page_seen = True
                     status = stream.get_status()
                     status["keys"] = sorted(keyboard.held)
                     status["keyboard_gripper"] = keyboard.gripper
                     status["controls"] = view.offered_commands()
                     status.update(status_extra())
-                    body = json.dumps(status).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send(json.dumps(status).encode(), "application/json")
                 elif self.path.startswith("/stream"):
                     self.send_response(200)
                     self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -323,37 +344,30 @@ class LiveView:
                     self.send_error(404)
 
             def do_POST(self):
+                if self.path not in ("/control", "/keys"):
+                    self.send_error(404)
+                    return
+                payload = self._json_body()
+                if payload is None:
+                    return
                 if self.path == "/control":
-                    try:
-                        payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                        command = payload["command"]
-                        if not isinstance(command, str):
-                            raise TypeError("command must be a str")
-                    except (ValueError, KeyError, TypeError):
+                    command = payload.get("command")
+                    if not isinstance(command, str):
                         self.send_error(400)
                         return
                     if not view.submit_command(command):
                         self.send_error(409, "command not on offer")
                         return
-                    self.send_response(204)
-                    self.end_headers()
-                    return
-                if self.path != "/keys":
-                    self.send_error(404)
-                    return
-                try:
-                    payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                    held, toggles = payload["held"], payload["toggles"]
+                else:
+                    held, toggles = payload.get("held"), payload.get("toggles")
                     if not (
                         isinstance(held, list)
                         and all(isinstance(k, str) for k in held)
                         and isinstance(toggles, int)
                     ):
-                        raise TypeError("held must be a list of str, toggles an int")
-                except (ValueError, KeyError, TypeError):
-                    self.send_error(400)
-                    return
-                keyboard.update(held, toggles)
+                        self.send_error(400)
+                        return
+                    keyboard.update(held, toggles)
                 self.send_response(204)
                 self.end_headers()
 

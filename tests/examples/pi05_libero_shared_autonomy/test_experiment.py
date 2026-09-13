@@ -77,7 +77,8 @@ def test_run_block_reuses_preview_and_records_matching_identity(tmp_path, monkey
     for block in ("a", "b"):
         directory = tmp_path / block
         directory.mkdir()
-        runs.append(experiment.run_block(FakeSession(), settings, [0, 0], directory))
+        specs = experiment.build_trial_specs(settings, [0, 0])
+        runs.append(experiment.run_block(FakeSession(), settings, specs, directory))
     assert seen[:2] == seen[2:]
     assert [r["pair_id"] for r in runs[0]] == [r["pair_id"] for r in runs[1]]
     with np.load(tmp_path / "a" / "trial_000.npz") as z:
@@ -86,19 +87,20 @@ def test_run_block_reuses_preview_and_records_matching_identity(tmp_path, monkey
 
 
 def test_show_scene_passes_explicit_reset_without_consuming_another_state():
-    calls = []
-    observation = {"initial": True}
+    calls, published = [], []
+    observation = {"pixels": {"image": np.arange(12, dtype=np.uint8).reshape(1, 2, 2, 3)}}
 
     def reset(**kwargs):
         calls.append(kwargs)
         return observation, {}
 
     session = Session.__new__(Session)
-    session.vec_env = SimpleNamespace(reset=reset, envs=[SimpleNamespace(render=lambda: None)])
-    session.view = SimpleNamespace(stream=SimpleNamespace(publish=lambda frame: None))
+    session.vec_env = SimpleNamespace(reset=reset)
+    session.view = SimpleNamespace(stream=SimpleNamespace(publish=published.append))
     spec = trial_specs([0], "libero_goal", seed=7, state_counts={0: 50})[0]
     assert session.show_scene(spec) is observation
     assert calls == [{"seed": spec.env_seed, "options": {"init_state_id": spec.init_state_id}}]
+    np.testing.assert_array_equal(published[0], observation["pixels"]["image"][0][::-1, ::-1])
 
 
 @pytest.mark.parametrize("chunk_steps,update_steps,delay,steps", [(1, None, 0, 2), (10, 20, 4, 31)])
@@ -207,6 +209,7 @@ def test_trial_recorder_rows_and_per_trial_reads(tmp_path):
         step=2,
         observation={},
         action=np.zeros((1, 7)),
+        policy_action=np.full((1, 7), 0.25),
         reward=np.array([1.0]),
         terminated=np.array([True]),
         truncated=np.array([False]),
@@ -215,6 +218,9 @@ def test_trial_recorder_rows_and_per_trial_reads(tmp_path):
     assert recorder.total_reads == 1
     assert [r["user_reads"] for r in recorder.rows] == [1, 0]
     assert np.isnan(recorder.rows[1]["eef_pos"]).all() and recorder.rows[1]["joint_pos"].shape == (7,)
+    # The policy's own plan: given explicitly, else the action itself (nothing steered it).
+    assert recorder.rows[0]["policy_translation"].tolist() == [1.0, 1.0, 1.0]
+    assert recorder.rows[1]["policy_translation"].tolist() == [0.25, 0.25, 0.25]
     recorder.save(tmp_path / "t.npz", success=True, task_id=3)
     z = np.load(tmp_path / "t.npz")
     assert z["action"].shape == (2, 7) and bool(z["success"]) and int(z["task_id"]) == 3

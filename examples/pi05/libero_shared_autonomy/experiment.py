@@ -44,13 +44,13 @@ import numpy as np
 import yaml
 from config import (
     CONFIG_DIR,
-    MODES,
     PROMPT_FROM_TASK,
     ExperimentSettings,
     load_experiment_settings,
     set_label,
+    spec_label,
 )
-from reproducibility import trial_specs
+from reproducibility import TrialSpec, trial_specs
 from session import VIDEO_FPS, Session
 from teleop import TeleopChain
 
@@ -86,8 +86,7 @@ class TrialRecorder:
 
     def __init__(self, chain: TeleopChain):
         self._chain = chain
-        self._reads = chain.served.reads
-        self.reads_at_start = chain.served.reads  # the counter is session-wide, so baseline it
+        self._reads = chain.served.reads  # the counter is session-wide, so baseline it
         self.rows: list[dict] = []
         self.scene_rows: list[dict | None] = []  # object positions / articulations before each step
         self.start = time.time()
@@ -103,9 +102,15 @@ class TrialRecorder:
     @property
     def total_reads(self) -> int:
         """How many times the teleop input was sampled during *this* trial."""
-        return self._chain.served.reads - self.reads_at_start
+        return sum(row["user_reads"] for row in self.rows)
 
-    def __call__(self, step, observation, action, reward, terminated, truncated, info, scene=None):
+    def __call__(
+        self, step, observation, action, reward, terminated, truncated, info, scene=None, policy_action=None
+    ):
+        # `policy_action`: what the policy would have executed on its own; defaults to the action
+        # (true wherever nothing steered it), so the array below is defined on every step.
+        if policy_action is None:
+            policy_action = action
         state = observation.get("robot_state", {}) if isinstance(observation, dict) else {}
         eef = state.get("eef", {})
         gripper = state.get("gripper", {})
@@ -116,6 +121,7 @@ class TrialRecorder:
             {
                 "t": time.time() - self.start,
                 "action": np.asarray(action, dtype=np.float32)[0],
+                "policy_translation": np.asarray(policy_action, dtype=np.float32)[0, :3],
                 "user_translation": np.asarray(self._chain.served.last_translation, dtype=np.float32),
                 "user_translation_raw": np.asarray(self._chain.raw.last_translation, dtype=np.float32),
                 "user_gripper": float(self._chain.served.last_gripper),
@@ -249,7 +255,6 @@ def parse_args() -> tuple[argparse.Namespace, list[Block]]:
         "--n-trials", dest="n_trials", type=int, default=None, help="= --set experiment.n_trials"
     )
     parser.add_argument("--seed", type=int, default=None, help="= --set experiment.seed")
-    parser.add_argument("--mode", default=None, choices=MODES, help="= --set control.mode")
     parser.add_argument("--output-dir", dest="output_dir", default=None, help="= --set experiment.output_dir")
     parser.add_argument("--port", type=int, default=None, help="= --set server.port")
     parser.add_argument(
@@ -271,7 +276,7 @@ def parse_args() -> tuple[argparse.Namespace, list[Block]]:
 
 
 def _load_block(args: argparse.Namespace, block: Block) -> ExperimentSettings:
-    overrides = {k: getattr(args, k) for k in ("n_trials", "seed", "mode", "output_dir", "port")}
+    overrides = {k: getattr(args, k) for k in ("n_trials", "seed", "output_dir", "port")}
     settings = load_experiment_settings(args.config, overrides, sets=block.sets)
     settings.name = block.name
     return settings
@@ -290,7 +295,7 @@ def _resolve_task_ids(settings: ExperimentSettings, where: str) -> list[int]:
 
 
 def _provenance(
-    settings: ExperimentSettings, block: Block, schedule: list[int], session: Session | None
+    settings: ExperimentSettings, block: Block, schedule: list[int], specs, session: Session
 ) -> dict:
     control = settings.session.control
     resolved = {
@@ -298,10 +303,6 @@ def _provenance(
         "overrides": list(block.sets),
         "n_trials": settings.n_trials,
         "seed": settings.seed,
-        "initial_state_sampling": "per_task_seeded_permutation",
-        "implementation_version": 2,
-        "flow_schedule": "symmetric_euler",
-        "command_sampling": "once_per_chunk",
         "task_order": settings.task_order,
         "output_dir": str(settings.output_dir),
         "suite": settings.session.suite,
@@ -322,16 +323,35 @@ def _provenance(
         "reversal_adapter": control.reversal_adapter,
         "port": settings.session.port,
         "schedule": schedule,
-        "trial_specs": [spec.metadata() for spec in build_trial_specs(settings, schedule)],
-        "scene_rows": "before_step",  # per-step scene state is taken before the action is applied
+        "trial_specs": [spec.metadata() for spec in specs],
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+        **session.resolved_matrices(),
     }
-    if session is not None:
-        resolved.update(session.resolved_matrices())
     return resolved
 
 
 _FIXED_PER_PROCESS = ("policy_path", "n_action_steps", "compile", "port", "operator")
+
+
+def _describe_block(settings: ExperimentSettings) -> str:
+    """The settings a block runs under, as printed by the block header and --dry-run."""
+    control = settings.session.control
+    lines = [
+        f'VLA prompt: "{settings.prompt}"'
+        + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else ""),
+        f"mode: {control.mode}   n_guided_steps: {control.n_guided_steps}   "
+        f"n_reversal_steps: {control.n_reversal_steps}",
+        f"operator: {settings.session.operator}   operator commands: {', '.join(control.operator_dims)}",
+    ]
+    if settings.session.operator == "policy":
+        lines.append(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
+    for name, spec, matrix in (
+        ("corruption M", control.corruption, control.corruption_matrix),
+        ("reversal adapter F", control.reversal_adapter, control.reversal_adapter_matrix),
+    ):
+        if matrix is not None:
+            lines.append(f"{name} = {spec_label(spec)} = {np.array2string(matrix, precision=3)}")
+    return "\n".join(lines)
 
 
 def _print_block_header(index: int, total: int, settings: ExperimentSettings, session: Session) -> None:
@@ -339,28 +359,20 @@ def _print_block_header(index: int, total: int, settings: ExperimentSettings, se
     print(
         f"BLOCK {index + 1}/{total}: {settings.name}: {settings.n_trials} trials, mode {session.mode_label()}"
     )
-    print(
-        f'VLA prompt: "{settings.prompt}"'
-        + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else "")
-    )
-    print(
-        f"operator: {settings.session.operator}   "
-        f"operator commands: {', '.join(settings.session.control.operator_dims)}"
-    )
-    if settings.session.operator == "policy":
-        print(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
-    if session.chain.corruption.matrix is not None:
-        print(session.chain.corruption.describe())
-    if session.adapter.matrix is not None:
-        print(session.adapter.describe())
+    print(_describe_block(settings))
     text = session.announce_mode()
     if text:
         print(text)
     print("#" * 78)
 
 
+def _rate_line(results: list[dict]) -> str:
+    wins = sum(r["success"] for r in results)
+    return f"{len(results)} trials, {wins} success ({wins / len(results):.0%})" if results else "no trials"
+
+
 def run_block(
-    session: Session, settings: ExperimentSettings, schedule: list[int], run_dir: Path
+    session: Session, settings: ExperimentSettings, specs: list[TrialSpec], run_dir: Path
 ) -> list[dict]:
     """Run one block's trials in `session`, writing trials.jsonl and per-trial files under run_dir.
 
@@ -372,7 +384,6 @@ def run_block(
     mode = session.mode
     results: list[dict] = []
     trials_path = run_dir / "trials.jsonl"
-    specs = build_trial_specs(settings, schedule)
     for trial, spec in enumerate(specs):
         task_id = spec.task_id
         if (settings.session.suite, task_id) != (session.suite, session.task_id):
@@ -449,10 +460,7 @@ def run_block(
             "video": video_name,
             "steps_file": steps_name,
             "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
-            **result.metrics,
-            "n_reversal_steps": (
-                result.metrics.get("n_reversal_steps") if mode == "shared_flow_reversal_steering" else None
-            ),
+            **result.metrics,  # n_reversal_steps and the steering statistics in the reversal modes
         }
         results.append(record)
         with open(trials_path, "a") as f:
@@ -467,10 +475,8 @@ def run_block(
             print(stats)
         print(f"saved {steps_name} + {video_name}")
     if results:
-        wins = sum(r["success"] for r in results)
         print(
-            f"\n{settings.name}: {len(results)} trials, {wins} success ({wins / len(results):.0%}), "
-            f"mean {np.mean([r['steps'] for r in results]):.0f} steps"
+            f"\n{settings.name}: {_rate_line(results)}, mean {np.mean([r['steps'] for r in results]):.0f} steps"
         )
     print(f"Data: {run_dir}")
     return results
@@ -486,58 +492,46 @@ def main():
             schedule = build_schedule(
                 settings.task_ids, settings.n_trials, settings.task_order, settings.seed
             )
-            plan.append((block, settings, schedule))
+            plan.append((block, settings, schedule, build_trial_specs(settings, schedule)))
     except (OSError, ValueError) as e:
         raise SystemExit(f"--config: {e}") from e
     first = plan[0][1].session
-    for _, settings, _ in plan[1:]:
+    for _, settings, _, _ in plan[1:]:
         for key in _FIXED_PER_PROCESS:
             if getattr(settings.session, key) != getattr(first, key):
                 raise SystemExit(f"--sweep/--set cannot change {key} between blocks (one policy per process)")
 
     if args.dry_run:
-        for _block, settings, schedule in plan:
-            control = settings.session.control
+        for _block, settings, _schedule, specs in plan:
             tasks = Session.list_tasks(settings.session.suite)
             print(
                 f"Config OK ({args.config}). Block {settings.name}: schedule ({settings.task_order}, seed {settings.seed}):"
             )
-            for i, spec in enumerate(build_trial_specs(settings, schedule)):
+            for i, spec in enumerate(specs):
                 print(
                     f"  trial {i:03d}: {spec.suite} task {spec.task_id}, "
                     f"init_state_id={spec.init_state_id}, env_seed={spec.env_seed}: {tasks[spec.task_id]}"
                 )
-            print(
-                f'VLA prompt: "{settings.prompt}"   mode: {control.mode}   '
-                f"n_guided_steps: {control.n_guided_steps}   n_reversal_steps: {control.n_reversal_steps}   "
-                f"operator: {settings.session.operator} ({', '.join(control.operator_dims)})"
-            )
-            if settings.session.operator == "policy":
-                print(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
-            if control.corruption_matrix is not None:
-                print(f"corruption M = {np.array2string(control.corruption_matrix, precision=3)}")
-            if control.reversal_adapter_matrix is not None:
-                print(f"reversal adapter F = {np.array2string(control.reversal_adapter_matrix, precision=3)}")
-            print()
+            print(_describe_block(settings) + "\n")
         return
 
     init_logging()
     first_settings = plan[0][1]
-    first_settings.session.task_id = plan[0][2][0]
+    first_settings.session.task_id = plan[0][3][0].task_id
     session = Session(first_settings.session)
     all_results: dict[str, list[dict]] = {}
     try:
-        for index, (block, settings, schedule) in enumerate(plan):
+        for index, (block, settings, schedule, specs) in enumerate(plan):
             session.apply_control(settings.session.control)
             if session.operator is not None:
                 session.operator.configure(settings.session.policy_operator)
             run_dir = settings.output_dir / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{settings.name}"
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "config.yaml").write_text(
-                yaml.safe_dump(_provenance(settings, block, schedule, session), sort_keys=False)
+                yaml.safe_dump(_provenance(settings, block, schedule, specs, session), sort_keys=False)
             )
             _print_block_header(index, len(plan), settings, session)
-            all_results[settings.name] = run_block(session, settings, schedule, run_dir)
+            all_results[settings.name] = run_block(session, settings, specs, run_dir)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
@@ -546,9 +540,7 @@ def main():
     if len(all_results) > 1:
         print("\nSummary:")
         for name, results in all_results.items():
-            wins = sum(r["success"] for r in results)
-            rate = f"{wins}/{len(results)} = {wins / len(results):.0%}" if results else "no trials"
-            print(f"  {name}: {rate}")
+            print(f"  {name}: {_rate_line(results)}")
 
 
 if __name__ == "__main__":
