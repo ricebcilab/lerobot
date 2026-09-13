@@ -1,0 +1,25 @@
+# Figure style shared by every plot in this folder (analyze.py, the notebooks):
+# `plt.style.use(analyze.PAPER_STYLE)`. Paper conventions: readable type, sparse
+# ticks, no top/right spines, no frame around the legend, no grid.
+font.size:          13
+axes.labelsize:     13
+axes.titlesize:     13
+axes.titleweight:   normal
+xtick.labelsize:    12
+ytick.labelsize:    12
+legend.fontsize:    12
+legend.frameon:     False
+axes.spines.top:    False
+axes.spines.right:  False
+axes.grid:          False
+axes.linewidth:     0.8
+xtick.direction:    out
+ytick.direction:    out
+xtick.major.size:   4
+ytick.major.size:   4
+lines.linewidth:    1.8
+lines.markersize:   6
+errorbar.capsize:   3
+figure.dpi:         100
+savefig.dpi:        220
+savefig.bbox:       tight
