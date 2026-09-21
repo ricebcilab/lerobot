@@ -13,10 +13,11 @@
 # arm as a depth sweep (one block of n_trials per depth) or, for the
 # policy-only anchors, one block:
 #
-#   fc       flow_control_rotz20.yaml      --sweep control.n_guided_steps=<depths>
-#   frs      flow_reversal_rotz20.yaml     --sweep control.n_reversal_steps=<depths>
-#   frs_ra   flow_reversal_ra_rotz20.yaml  --sweep control.n_reversal_steps=<depths>
+#   fc       flow_control_<C>.yaml         --sweep control.n_guided_steps=<depths>
+#   frs      flow_reversal_<C>.yaml        --sweep control.n_reversal_steps=<depths>
+#   frs_ra   flow_reversal_ra_<C>.yaml     --sweep control.n_reversal_steps=<depths>
 #            with the adapter rotated by ADAPTER_DEG when that is set (else the file's F = M)
+#   where <C> is CORRUPTION (default rotz20; `scale` selects the per-axis gain family)
 #   floor    policy_anchor.yaml            the policy alone with the arm's prompt
 #   ceiling  policy_anchor.yaml            the policy alone with the scene's instruction
 #
@@ -24,21 +25,22 @@
 
 ARMS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUN="${ARMS_DIR}/../run.sh"
+CORRUPTION="${CORRUPTION:-rotz20}"
 
 run_arm() {
     local arm=$1 depths=$2
     shift 2
     case "${arm}" in
         fc)
-            "${RUN}" experiment --config flow_control_rotz20.yaml "$@" --sweep "control.n_guided_steps=${depths}"
+            "${RUN}" experiment --config "flow_control_${CORRUPTION}.yaml" "$@" --sweep "control.n_guided_steps=${depths}"
             ;;
         frs)
-            "${RUN}" experiment --config flow_reversal_rotz20.yaml "$@" --sweep "control.n_reversal_steps=${depths}"
+            "${RUN}" experiment --config "flow_reversal_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
         frs_ra)
             local adapter=()
             [ -n "${ADAPTER_DEG:-}" ] && adapter=(--set "control.reversal_adapter={translation: {rotation_z_deg: ${ADAPTER_DEG}}}")
-            "${RUN}" experiment --config flow_reversal_ra_rotz20.yaml "$@" "${adapter[@]}" --sweep "control.n_reversal_steps=${depths}"
+            "${RUN}" experiment --config "flow_reversal_ra_${CORRUPTION}.yaml" "$@" "${adapter[@]}" --sweep "control.n_reversal_steps=${depths}"
             ;;
         floor)
             "${RUN}" experiment --config policy_anchor.yaml "$@"

@@ -234,6 +234,14 @@ files extend it:
   run it at F@40 (`ADAPTER_DEG=40` in the scripts).
 - `policy_anchor.yaml` — the policy alone: with the arm's prompt the **floor**
   of every comparison, with `--set prompt=task` its **ceiling**.
+- `base_scale.yaml` and `flow_control_scale.yaml`, `flow_reversal_scale.yaml`,
+  `flow_reversal_ra_scale.yaml` — the same three arms under a per-axis **gain**
+  instead of a rotation (`corruption: {scale: [2, 1, 1]}`: the operator's x
+  command is twice as sensitive as y and z). A separate family is needed because
+  a `--set` on `control.corruption` merges into the file's mapping, so a scale
+  cannot replace a rotation from the command line; the gain vector itself can be
+  overridden (`--set 'control.corruption={scale: [1, 2, 1]}'`). The study
+  scripts pick this family with `CORRUPTION=scale` (see `experiments/arms.sh`).
 
 The depth of each method is a sweep variable rather than a file. `--set KEY=VALUE`
 overrides any YAML key (dotted path, value parsed as YAML) and `--sweep KEY=V1,V2,...`
