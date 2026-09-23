@@ -191,6 +191,39 @@ def test_get_action_mean_std_reads_first_action_stats():
         get_action_mean_std(SimpleNamespace(steps=[]))
 
 
+def test_get_action_mean_std_follows_the_normalization_mode():
+    q01, q99 = np.full(7, -0.02), np.full(7, 0.06)
+    step = SimpleNamespace(stats={"action": {"mean": np.ones(7), "std": np.ones(7), "q01": q01, "q99": q99}})
+    step.norm_map = {"ACTION": "QUANTILES"}
+    mean, std = get_action_mean_std(SimpleNamespace(steps=[step]))
+    np.testing.assert_allclose(mean, 0.02)  # 2 (x - q01) / (q99 - q01) - 1 == (x - mean) / std
+    np.testing.assert_allclose(std, 0.04)
+    step.norm_map = {"ACTION": "MEAN_STD"}
+    mean, std = get_action_mean_std(SimpleNamespace(steps=[step]))
+    np.testing.assert_allclose(mean, 1.0)
+    step.stats["action"].update(min=np.zeros(7), max=np.full(7, 4.0))
+    step.norm_map = {"ACTION": "MIN_MAX"}
+    mean, std = get_action_mean_std(SimpleNamespace(steps=[step]))
+    np.testing.assert_allclose(mean, 2.0)
+    np.testing.assert_allclose(std, 2.0)
+
+
+def test_wrappers_take_the_deadband_in_the_source_units():
+    source = Source(translation=(0.01, 0.0, 0.0))  # a full push in a 0.01-per-unit action space
+    wrapper = FlowControlPolicy(FakePolicy(), source, 3, postprocessor(), deadband=0.001)
+    wrapper.select_action({})
+    assert wrapper.guided_steps == 3
+    wrapper = FlowControlPolicy(FakePolicy(), source, 3, postprocessor())  # DEADBAND of 0.05: idle
+    wrapper.select_action({})
+    assert wrapper.guided_steps == 0
+    wrapper = FlowReversalSteeringPolicy(FakePolicy(), source, postprocessor(), deadband=0.001)
+    wrapper.select_action({})
+    assert wrapper.steered_chunks == 1
+    wrapper = FlowReversalSteeringPolicy(FakePolicy(), source, postprocessor())
+    wrapper.select_action({})
+    assert wrapper.steered_chunks == 0
+
+
 def test_flow_control_writes_normalized_translation_for_tau_steps():
     policy = FakePolicy()
     source = Source(translation=(0.5, 0.0, -0.5))
@@ -341,6 +374,11 @@ def test_reference_chunk_uses_last_gripper_and_normalization():
     assert ref.shape == (1, CHUNK, MAX_DIM)
     assert ref[0, 0, 0].item() == pytest.approx(0.5)  # (1 - 0) / 2
     assert ref[0, 0, GRIPPER_DIM].item() == pytest.approx((-1.0 - 0.5) / 2.0)  # open at start
+    wrapper = FlowReversalSteeringPolicy(policy, Source(translation=(1.0, 0, 0)), post, gripper_open=0.0)
+    ref = wrapper.reference_chunk(np.array([1.0, 0.0, 0.0]))
+    assert ref[0, 0, GRIPPER_DIM].item() == pytest.approx((0.0 - 0.5) / 2.0)  # a 0/1 gripper's open state
+    wrapper.reset()
+    assert wrapper._gripper_ref == pytest.approx((0.0 - 0.5) / 2.0)
 
 
 # ---------------------------------------------------------------- delegation to the policy

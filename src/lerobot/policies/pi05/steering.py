@@ -55,7 +55,7 @@ OPERATOR_DIM_GROUPS = {
     "gripper": slice(GRIPPER_DIM, GRIPPER_DIM + 1),
 }
 GRIPPER_CLOSE = 1.0
-DEADBAND = 0.05  # below this (env units, full deflection = 1) the operator counts as idle
+DEADBAND = 0.05  # default `deadband` of the wrappers: below this (env units) the operator counts as idle
 
 
 class TeleopSource(Protocol):
@@ -251,13 +251,27 @@ def paired_chunks(policy, batch, steered: bool, **steer_kwargs) -> tuple[torch.T
 
 
 def get_action_mean_std(postprocessor) -> tuple[np.ndarray, np.ndarray]:
-    """Per-dimension action mean/std from the checkpoint's action unnormalizer stats."""
+    """The affine (mean, std) of the checkpoint's action normalization: normalized = (x - mean) / std.
+
+    Read from the unnormalizer step's stats and its normalization mode: mean/std as is,
+    quantiles and min/max as the equivalent affine map onto [-1, 1].
+    """
     for step in postprocessor.steps:
         stats = getattr(step, "stats", None)
-        if stats and "action" in stats:
-            mean = np.asarray(stats["action"]["mean"], dtype=np.float64)
-            std = np.maximum(np.asarray(stats["action"]["std"], dtype=np.float64), 1e-6)
-            return mean, std
+        if not stats or "action" not in stats:
+            continue
+        action = {k: np.asarray(v, dtype=np.float64) for k, v in stats["action"].items()}
+        mode = getattr(getattr(step, "norm_map", None), "get", lambda *_: None)("ACTION")
+        mode = getattr(mode, "value", mode) or "MEAN_STD"
+        if mode == "QUANTILES":
+            lo, hi = action["q01"], action["q99"]
+        elif mode == "QUANTILE10":
+            lo, hi = action["q10"], action["q90"]
+        elif mode == "MIN_MAX":
+            lo, hi = action["min"], action["max"]
+        else:
+            return action["mean"], np.maximum(action["std"], 1e-6)
+        return (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-6)
     raise RuntimeError("No action stats in the postprocessor; the shared flow modes need them.")
 
 
@@ -269,14 +283,17 @@ class FlowControlPolicy:
     space) is written into dims 0-2 of x_t across the whole chunk; the
     remaining steps denoise freely. The executed action is entirely the
     model's output — the operator steers only the early flow. Guidance is
-    skipped while the input is inside DEADBAND, so idle input means pure
+    skipped while the input is inside `deadband`, so idle input means pure
     policy.
     """
 
-    def __init__(self, policy, source: TeleopSource, n_guided_steps: int, postprocessor):
+    def __init__(
+        self, policy, source: TeleopSource, n_guided_steps: int, postprocessor, deadband: float = DEADBAND
+    ):
         self._policy = policy
         self._source = source
         self.n_guided_steps = n_guided_steps
+        self.deadband = deadband
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:3], std[:3]
         self._queue: deque = deque()
@@ -315,7 +332,7 @@ class FlowControlPolicy:
             # matching FRS and the synthetic operator's refresh cadence.
             command = self._source.translation if self.n_guided_steps else None
             self._pending_command = (
-                command if command is not None and np.max(np.abs(command)) >= DEADBAND else None
+                command if command is not None and np.max(np.abs(command)) >= self.deadband else None
             )
             self._pending_target = None  # normalized on the device by the first guided step
             chunk, plain = paired_chunks(
@@ -407,9 +424,10 @@ def delegation_mask(
 class FlowReversalSteeringPolicy:
     """pi0.5 wrapper implementing shared_flow_reversal_steering (Flow Reversal Steering).
 
-    While the teleop input is deflected, a reference chunk that servos in the
-    commanded direction at uniform velocity (rotation zero, gripper held at the
-    model's last executed command) is integrated *backward* through the
+    While the teleop input is deflected (beyond `deadband`), a reference chunk
+    that servos in the commanded direction at uniform velocity (rotation zero,
+    gripper held at the model's last executed command, `gripper_open` before
+    the first chunk) is integrated *backward* through the
     policy's own velocity field for num_inference_steps to find the latent
     noise that maps to it; the normal forward flow then denoises from that
     noise instead of a random one. The executed action is entirely the
@@ -447,10 +465,14 @@ class FlowReversalSteeringPolicy:
         n_reversal_steps: int | None = None,
         operator_dims: tuple[str, ...] = ("translation",),
         pinned_steps: int | None = -1,
+        deadband: float = DEADBAND,
+        gripper_open: float = GRIPPER_OPEN,
     ):
         self._policy = policy
         self._source = source
         self._adapter = adapter
+        self.deadband = deadband
+        self.gripper_open = gripper_open
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
         self.pinned_steps = policy.config.n_action_steps if pinned_steps == -1 else pinned_steps
         self.operator_dims = operator_dims  # the setter builds the delegation mask
@@ -463,7 +485,7 @@ class FlowReversalSteeringPolicy:
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
         self._queue: deque = deque()
-        self._gripper_ref = self._normalize_gripper(GRIPPER_OPEN)
+        self._gripper_ref = self._normalize_gripper(gripper_open)
         self._last_reference: torch.Tensor | None = None
         self.steered_chunks = 0  # per-rollout count of chunks started from inverted noise
         self.reconstruction_errors: list[float] = []  # per steered chunk, in std units
@@ -507,7 +529,7 @@ class FlowReversalSteeringPolicy:
         self._policy.reset()
         self._queue.clear()
         self._policy_queue.clear()
-        self._gripper_ref = self._normalize_gripper(GRIPPER_OPEN)
+        self._gripper_ref = self._normalize_gripper(self.gripper_open)
         self._last_reference = None
         self.steered_chunks = 0
         self.reconstruction_errors = []
@@ -574,7 +596,7 @@ class FlowReversalSteeringPolicy:
             # Sample the operator once per chunk: the forward schedule depends on
             # whether we are steering, so it cannot be decided inside the hook.
             command = self._source.translation
-            steering = np.max(np.abs(command)) >= DEADBAND
+            steering = np.max(np.abs(command)) >= self.deadband
             self._pending_command = command if steering else None
             flow_kwargs = self._flow_kwargs() if steering else {}
             if not steering:
