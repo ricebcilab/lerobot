@@ -74,12 +74,14 @@ def config(mode="shared_flow_reversal_steering", **kw) -> dict:
         "n_reversal_steps": None,
         "prompt": "do something",
         "corruption_matrix": None,
+        "reversal_adapter": None,
         "reversal_adapter_matrix": None,
         **kw,
     }
 
 
 ROT = [[0.94, -0.34, 0.0], [0.34, 0.94, 0.0], [0.0, 0.0, 1.0]]
+ADAPTED = {"translation": "corruption", "orientation": "identity", "gripper": "identity"}
 
 
 def outcomes(*flags):
@@ -109,13 +111,29 @@ def test_operator_profiles_cannot_be_silently_pooled(tmp_path):
 def test_method_and_depth():
     c = config()
     assert (analyze.method_of(c), analyze.depth_of(c)) == ("FRS", 10.0)  # null = full reversal
-    c = config(n_reversal_steps=4, corruption_matrix=ROT, reversal_adapter_matrix=np.eye(7).tolist())
+    c = config(
+        n_reversal_steps=4,
+        corruption_matrix=ROT,
+        reversal_adapter=ADAPTED,
+        reversal_adapter_matrix=np.eye(7).tolist(),
+    )
     assert (analyze.method_of(c), analyze.depth_of(c)) == ("FRS-RA", 4.0)
     c = config("shared_flow_control", n_guided_steps=6)
     assert (analyze.method_of(c), analyze.depth_of(c)) == ("FC", 6.0)
     assert analyze.method_of(config("policy")) == "policy (floor)"
     assert analyze.method_of(config("policy", prompt="task")) == "policy (ceiling)"
     assert np.isnan(analyze.depth_of(config("policy")))
+
+
+def test_a_run_is_the_adapted_arm_by_its_setting_even_without_a_run_level_matrix():
+    # With a random corruption the run-level matrices are None: each trial has its own.
+    per_trial = config(
+        n_reversal_steps=1,
+        corruption={"random": {"rotation_deg": [30, 90], "scale": [1, 4]}},
+        reversal_adapter=ADAPTED,
+    )
+    assert analyze.method_of(per_trial) == "FRS-RA"
+    assert analyze.method_of(config(n_reversal_steps=1, corruption=per_trial["corruption"])) == "FRS"
 
 
 def test_find_and_load_runs(tmp_path):
@@ -180,7 +198,7 @@ def test_paired_test_by_run_and_by_method(tmp_path):
     b = write_run(
         tmp_path,
         "b_adapted",
-        config(n_reversal_steps=4, reversal_adapter_matrix=np.eye(7).tolist()),
+        config(n_reversal_steps=4, reversal_adapter=ADAPTED, reversal_adapter_matrix=np.eye(7).tolist()),
         outcomes(True, True, False),
         task_of=lambda i: 0,
     )
@@ -191,7 +209,7 @@ def test_paired_test_by_run_and_by_method(tmp_path):
     write_run(
         tmp_path,
         "d_adapted_t1",
-        config(n_reversal_steps=4, reversal_adapter_matrix=np.eye(7).tolist()),
+        config(n_reversal_steps=4, reversal_adapter=ADAPTED, reversal_adapter_matrix=np.eye(7).tolist()),
         outcomes(True, True, False),
         task_of=lambda i: 1,
     )
@@ -213,7 +231,12 @@ def test_paired_test_by_run_and_by_method(tmp_path):
 
 def test_paired_test_rejects_missing_mismatched_and_duplicate_pairs(tmp_path):
     write_run(tmp_path, "a", config(), outcomes(True))
-    write_run(tmp_path, "b", config(reversal_adapter_matrix=np.eye(7).tolist()), outcomes(False))
+    write_run(
+        tmp_path,
+        "b",
+        config(reversal_adapter=ADAPTED, reversal_adapter_matrix=np.eye(7).tolist()),
+        outcomes(False),
+    )
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
     with pytest.raises(ValueError, match="Unverified pairing"):
         analyze.paired_test(trials.drop(columns="pair_id"), "method", "FRS", "FRS-RA")
@@ -418,7 +441,11 @@ def test_plot_best_vs_best_draws_a_bar_per_method_and_a_bracket_per_pair(tmp_pat
     for name, cfg, flags in [
         ("fc8", config("shared_flow_control", n_guided_steps=8), (True, False, True)),
         ("frs1", config(n_reversal_steps=1), (True, True, True)),
-        ("ra2", config(n_reversal_steps=2, reversal_adapter_matrix=np.eye(7).tolist()), (False, True, True)),
+        (
+            "ra2",
+            config(n_reversal_steps=2, reversal_adapter=ADAPTED, reversal_adapter_matrix=np.eye(7).tolist()),
+            (False, True, True),
+        ),
     ]:
         write_run(tmp_path, name, cfg, outcomes(*flags), task_of=lambda i: 0)
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))

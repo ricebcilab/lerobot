@@ -10,24 +10,18 @@
 
 """Run a shared-autonomy user study on LIBERO with pi0.5.
 
-Reads an experiment description from YAML (see configs/experiment/), then runs
-`n_trials` trials. Each trial draws a task from the configured scene, shows
-*you* the task to accomplish, and lets you attempt it with the VLA in the
-shared-autonomy mode from the config. The VLA itself only ever receives the
-config's `prompt` (e.g. "do something"), so the language instruction and the
-human intent can be dissociated on purpose.
+Runs `n_trials` trials from a YAML description (configs/experiment/): each trial shows *you*
+the task and lets you attempt it with the VLA in the configured shared-autonomy mode, while
+the VLA only ever sees the config's `prompt`.
 
     ./run.sh experiment --config <condition>.yaml [--set KEY=VALUE ...] [--sweep KEY=V1,V2,...] [--dry-run]
 
-`--config` is looked up as given, then under configs/experiment/, so a bare
-condition name works from anywhere.
+`--config` is looked up as given, then under configs/experiment/. `--set` overrides one YAML
+key (dotted path, YAML value); `--sweep` runs one block per listed value with a single policy
+load. Every block is written to `<output_dir>/<timestamp>_<config stem>[_<key>-<value>...]/`:
 
-`--set` overrides one YAML key (dotted path, YAML value); `--sweep` runs one block of
-`n_trials` per listed value with a single policy load. Every block is written to
-`<output_dir>/<timestamp>_<config stem>[_<key>-<value>...]/`:
-
-    config.yaml     the resolved configuration, schedule and the matrices in force
-    trials.jsonl    one JSON record per completed trial
+    config.yaml     the resolved configuration, schedule and matrices in force (per trial when random)
+    trials.jsonl    one JSON record per completed trial, with that trial's matrices
     trial_XXX.npz   per-step arrays (operator input, executed action, robot state)
     trial_XXX.mp4   the rollout video
 """
@@ -39,21 +33,25 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import yaml
 from config import (
     CONFIG_DIR,
     PROMPT_FROM_TASK,
+    ControlSettings,
     ExperimentSettings,
     load_experiment_settings,
+    matrix_list,
     set_label,
     spec_label,
 )
-from reproducibility import TrialSpec, trial_specs
+from reproducibility import TrialSpec, corruption_rng, trial_specs
 from session import VIDEO_FPS, Session
-from teleop import TeleopChain
+from teleop import CorruptionDraw, TeleopChain
 
+from lerobot.policies.pi05.steering import N_ACTION_DIMS, build_reversal_adapter
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
@@ -64,6 +62,36 @@ def build_trial_specs(settings: ExperimentSettings, schedule: list[int]):
     suite = settings.session.suite
     counts = {task: Session.initial_state_count(suite, task) for task in set(schedule)}
     return trial_specs(schedule, suite, settings.seed, counts)
+
+
+class TrialMatrices(NamedTuple):
+    """The corruption M and the reversal adapter F in force on one trial, and the draw they came from."""
+
+    corruption: np.ndarray | None
+    adapter: np.ndarray | None
+    draw: CorruptionDraw | None  # None for a fixed corruption
+
+    def record(self) -> dict:
+        """The matrices as plain lists, the same shape in trials.jsonl and config.yaml."""
+        return {
+            "corruption_matrix": matrix_list(self.corruption),
+            "reversal_adapter_matrix": matrix_list(self.adapter),
+            "corruption_parameters": None if self.draw is None else self.draw.parameters(),
+        }
+
+    def array(self, name: str) -> np.ndarray:
+        """A matrix for the step file; NaN when off, so the file needs no pickle."""
+        matrix, size = (self.corruption, 3) if name == "corruption" else (self.adapter, N_ACTION_DIMS)
+        return np.full((size, size), np.nan) if matrix is None else np.asarray(matrix, dtype=np.float64)
+
+
+def trial_matrices(control: ControlSettings, spec: TrialSpec) -> TrialMatrices:
+    """What is in force on one trial: a fixed corruption every time, or this trial's draw from the random
+    family (the same for every method, see `corruption_rng`) with the adapter rebuilt from it."""
+    if control.corruption_family is None:
+        return TrialMatrices(control.corruption_matrix, control.reversal_adapter_matrix, None)
+    draw = control.corruption_family.sample(corruption_rng(spec))
+    return TrialMatrices(draw.matrix, build_reversal_adapter(control.reversal_adapter, draw.matrix), draw)
 
 
 def build_schedule(task_ids: list[int], n_trials: int, order: str, seed: int) -> list[int]:
@@ -318,6 +346,8 @@ def _provenance(
         "n_guided_steps": control.n_guided_steps,
         "n_reversal_steps": control.n_reversal_steps,
         "input_noise": control.input_noise,
+        "input_gain": control.input_gain,
+        "resolved_input_gain": control.resolved_input_gain,
         "max_steps": control.max_steps,
         "corruption": control.corruption,
         "reversal_adapter": control.reversal_adapter,
@@ -327,6 +357,9 @@ def _provenance(
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
         **session.resolved_matrices(),
     }
+    if control.corruption_family is not None:
+        # One draw per trial: list them, since the run-level matrices above are None.
+        resolved["trial_corruptions"] = [trial_matrices(control, spec).record() for spec in specs]
     return resolved
 
 
@@ -345,12 +378,24 @@ def _describe_block(settings: ExperimentSettings) -> str:
     ]
     if settings.session.operator == "policy":
         lines.append(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
-    for name, spec, matrix in (
-        ("corruption M", control.corruption, control.corruption_matrix),
-        ("reversal adapter F", control.reversal_adapter, control.reversal_adapter_matrix),
+    if control.resolved_input_gain is not None:
+        lines.append(
+            f"input gain: {control.resolved_input_gain:g} ({control.input_gain}): commands are limited to "
+            "unit length and scaled by it, so the corruption cannot clip"
+        )
+    for name, spec, matrix, per_trial in (
+        ("corruption M", control.corruption, control.corruption_matrix, "a new draw on every trial"),
+        (
+            "reversal adapter F",
+            control.reversal_adapter,
+            control.reversal_adapter_matrix,
+            "rebuilt from each draw",
+        ),
     ):
         if matrix is not None:
             lines.append(f"{name} = {spec_label(spec)} = {np.array2string(matrix, precision=3)}")
+        elif spec is not None:  # a random corruption: no single matrix for the block
+            lines.append(f"{name} = {spec_label(spec)}: {per_trial}")
     return "\n".join(lines)
 
 
@@ -385,6 +430,9 @@ def run_block(
     results: list[dict] = []
     trials_path = run_dir / "trials.jsonl"
     for trial, spec in enumerate(specs):
+        matrices = trial_matrices(control, spec)  # the same on every trial unless the corruption is random
+        session.chain.corruption.matrix = matrices.corruption
+        session.adapter.matrix = matrices.adapter
         task_id = spec.task_id
         if (settings.session.suite, task_id) != (session.suite, session.task_id):
             session.set_scene(settings.session.suite, task_id)  # a new scene needs its own env + processors
@@ -433,6 +481,9 @@ def run_block(
             vla_prompt=vla_prompt,
             success=result.success,
             mode=mode,
+            corruption_matrix=matrices.array("corruption"),
+            reversal_adapter_matrix=matrices.array("adapter"),
+            input_gain=np.nan if control.resolved_input_gain is None else control.resolved_input_gain,
             **identity,
         )
         motion = summarize_scene_motion(recorder.scene_first, recorder.scene_last)
@@ -449,8 +500,10 @@ def run_block(
             "mode": mode,
             "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
             "input_noise": control.input_noise,
+            "input_gain": control.resolved_input_gain,
             "corruption": session.chain.corruption.label,
             "reversal_adapter": session.adapter.label,
+            **matrices.record(),
             "success": bool(result.success),
             "mode_expressed": motion["mode"],
             "moved": {k: round(v, 4) for k, v in motion["moved"].items()},
@@ -512,6 +565,13 @@ def main():
                     f"  trial {i:03d}: {spec.suite} task {spec.task_id}, "
                     f"init_state_id={spec.init_state_id}, env_seed={spec.env_seed}: {tasks[spec.task_id]}"
                 )
+                draw = trial_matrices(settings.session.control, spec).draw
+                if draw is not None:
+                    axis = ", ".join(f"{v:+.2f}" for v in draw.rotation_axis)
+                    gains = ", ".join(f"{v:.2f}" for v in draw.scale)
+                    print(
+                        f"             corruption: {draw.rotation_deg:.0f} deg about [{axis}], gains [{gains}]"
+                    )
             print(_describe_block(settings) + "\n")
         return
 

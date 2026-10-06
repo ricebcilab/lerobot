@@ -11,6 +11,7 @@ from config import (
     SessionSettings,
     deep_merge,
     flatten,
+    largest_gain,
     load_experiment_settings,
     load_interactive_settings,
     load_yaml_with_extends,
@@ -25,6 +26,13 @@ from lerobot.policies.pi05.steering import rotation_about_z
 CONDITIONS = sorted(
     p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if not p.name.startswith("base")
 )
+
+
+def _load(tmp_path, text, **kwargs):
+    """The control settings of an experiment config written from `text`."""
+    path = tmp_path / "c.yaml"
+    path.write_text(text)
+    return load_experiment_settings(path, {}, **kwargs).session.control
 
 
 def test_deep_merge_overlay_wins_and_null_resets():
@@ -71,6 +79,7 @@ def test_shipped_interactive_config_loads():
     assert isinstance(s, SessionSettings)
     assert s.control.mode == "policy" and s.control.corruption_matrix is None
     assert s.output_dir == Path("outputs/pi05_libero_interactive")
+    assert s.control.resolved_input_gain is not None  # the REPL cannot clip either
 
 
 def test_interactive_cli_overrides_win_over_file():
@@ -87,6 +96,10 @@ def test_every_shipped_condition_loads(name):
     assert s.name == Path(name).stem
     assert s.session.control.mode in MODES
     assert s.session.suite == "libero_goal" and s.seed == 0 and s.prompt == "do something"
+    # every shipped condition turns the command down enough that its corruption cannot clip
+    control = s.session.control
+    assert control.resolved_input_gain is not None
+    assert control.resolved_input_gain * largest_gain(control) <= 1.0
 
 
 def test_arm_files_resolve():
@@ -156,26 +169,21 @@ def test_policy_operator_timing_overrides_and_defaults():
 
 
 def test_experiment_validation_errors(tmp_path):
-    def write(text):
-        p = tmp_path / "c.yaml"
-        p.write_text(text)
-        return p
-
     with pytest.raises(ValueError, match="n_trials"):
-        load_experiment_settings(write("experiment: {n_trials: 0}"), {})
+        _load(tmp_path, "experiment: {n_trials: 0}")
     with pytest.raises(ValueError, match="control.mode"):
-        load_experiment_settings(write("control: {mode: nope}"), {})
+        _load(tmp_path, "control: {mode: nope}")
     with pytest.raises(ValueError, match="task_order"):
-        load_experiment_settings(write("experiment: {task_order: backwards}"), {})
+        _load(tmp_path, "experiment: {task_order: backwards}")
     with pytest.raises(ValueError, match="prompt"):
-        load_experiment_settings(write("prompt: ''"), {})
+        _load(tmp_path, "prompt: ''")
     with pytest.raises(ValueError, match="corruption"):
-        load_experiment_settings(write("control: {reversal_adapter: {translation: corruption}}"), {})
+        _load(tmp_path, "control: {reversal_adapter: {translation: corruption}}")
     with pytest.raises(ValueError, match="n_reversal_steps"):
-        load_experiment_settings(write("control: {n_reversal_steps: 0}"), {})
+        _load(tmp_path, "control: {n_reversal_steps: 0}")
     for value in (-1, 0.5, True):
         with pytest.raises(ValueError, match="seed"):
-            load_experiment_settings(write(f"experiment: {{seed: {value}}}"), {})
+            _load(tmp_path, f"experiment: {{seed: {value}}}")
 
 
 def test_experiment_cli_overrides(tmp_path):
@@ -207,3 +215,80 @@ def test_operator_settings():
         load_experiment_settings(path, {}, sets=["control.operator_dims=[wrist]"])
     with pytest.raises(ValueError, match="operator_dims"):
         load_experiment_settings(path, {}, sets=["control.operator_dims=translation"])
+
+
+# ---------------------------------------------------------------- random corruption and input gain
+
+
+def test_random_corruption_spec_becomes_a_family_and_leaves_the_matrices_to_each_trial(tmp_path):
+    from teleop import RandomCorruption
+
+    control = _load(
+        tmp_path,
+        "control: {mode: shared_flow_reversal_steering, reversal_adapter: {translation: corruption},"
+        " corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}}",
+    )
+    assert control.corruption_family == RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+    assert control.corruption_matrix is None and control.reversal_adapter_matrix is None
+    assert spec_label(control.corruption) == "random(rotation_deg=30..90, scale=1..4)"
+    # either part may be left out, and a fixed corruption has no family
+    only_rotation = _load(tmp_path, "control: {corruption: {random: {rotation_deg: [0, 45]}}}")
+    assert only_rotation.corruption_family == RandomCorruption(rotation_deg=(0, 45))
+    assert _load(tmp_path, "control: {corruption: {rotation_z_deg: 20}}").corruption_family is None
+
+
+@pytest.mark.parametrize(
+    "corruption,complaint",
+    [
+        ("{random: {angle_deg: [0, 30]}}", "angle_deg"),  # unknown key, named
+        ("{random: {rotation_deg: [90, 30]}}", "rotation_deg must be"),  # reversed range
+        ("{random: {scale: [0, 2]}}", "scale must be"),  # a zero gain
+        ("{random: {scale: [1, 2]}, rotation_z_deg: 20}", "cannot be combined"),  # mixed with a fixed form
+        ("{random: [1, 2]}", "'random' must be a mapping"),
+    ],
+)
+def test_random_corruption_spec_errors_name_the_setting_and_the_problem(tmp_path, corruption, complaint):
+    with pytest.raises(ValueError, match=f"control.corruption.*{complaint}"):
+        _load(tmp_path, f"control: {{corruption: {corruption}}}")
+
+
+def test_a_random_corruption_needs_trials_so_the_interactive_runner_rejects_it(tmp_path):
+    path = tmp_path / "i.yaml"
+    path.write_text("control: {corruption: {random: {scale: [1, 2]}}}")
+    with pytest.raises(ValueError, match="control.corruption.*one per trial"):
+        load_interactive_settings(path, {})
+
+
+@pytest.mark.parametrize(
+    "corruption,largest_safe_gain",
+    [
+        ("{random: {rotation_deg: [30, 90], scale: [1, 4]}}", 0.25),
+        ("{scale: [4, 1, 1]}", 0.25),
+        ("{rotation_z_deg: 40}", 1.0),
+        ("null", 1.0),
+        ("{scale: [0.5, 0.5, 0.5]}", 1.0),  # a corruption that only shrinks: the gain never exceeds 1
+    ],
+)
+def test_input_gain_auto_is_the_largest_gain_that_cannot_clip(tmp_path, corruption, largest_safe_gain):
+    control = _load(tmp_path, f"control: {{corruption: {corruption}, input_gain: auto}}")
+    assert control.resolved_input_gain == pytest.approx(largest_safe_gain)
+
+
+def test_input_gain_is_off_by_default_and_a_number_is_checked_against_the_corruption(tmp_path):
+    assert _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}}").resolved_input_gain is None
+    control = _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, input_gain: 0.2}")
+    assert control.resolved_input_gain == pytest.approx(0.2)
+    with pytest.raises(ValueError, match=r"control.input_gain.*0\.25"):  # names the largest safe gain
+        _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, input_gain: 0.5}")
+    for bad in ("0", "-1", "1.5", "fast", "true", "[0.5]"):
+        with pytest.raises(ValueError, match="control.input_gain"):
+            _load(tmp_path, f"control: {{input_gain: {bad}}}")
+
+
+@pytest.mark.parametrize("arm", ["flow_control", "flow_reversal", "flow_reversal_ra"])
+def test_the_shipped_random_family_cannot_clip_and_only_the_adapted_arm_has_an_adapter(arm):
+    control = load_experiment_settings(CONFIG_DIR / "experiment" / f"{arm}_random.yaml", {}).session.control
+    assert control.corruption_family is not None
+    # the gain in force times the most the family can lengthen a command stays inside the unit cube
+    assert control.resolved_input_gain * control.corruption_family.max_gain <= 1.0
+    assert (control.reversal_adapter is not None) == (arm == "flow_reversal_ra")

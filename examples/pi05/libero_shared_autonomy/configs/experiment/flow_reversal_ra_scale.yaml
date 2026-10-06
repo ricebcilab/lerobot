@@ -1,8 +1,6 @@
-# Arm 3, FRS-RA: Flow Reversal Steering with the reversal adapter (our addition). The
-# adapter reshapes the velocity field during the reversal only: its translation
-# block is the known corruption M; orientation and gripper are left to the
-# policy's own field (identity), so the only change from arm 2 is the rotation.
-#   sweep the depth:  --sweep control.n_reversal_steps=2,4,6,8,10
+# FRS-RA (ours): FRS with the reversal's velocity field multiplied by F, whose translation
+# block is the known corruption M and whose other blocks are identity.
+#   sweep the depth:  --sweep control.n_reversal_steps=1,2,4,6,8
 extends: base_scale.yaml
 control:
   mode: shared_flow_reversal_steering

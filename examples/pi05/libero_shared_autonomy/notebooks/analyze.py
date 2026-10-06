@@ -3,8 +3,8 @@
 A run directory holds `config.yaml` (resolved settings, schedule and the
 matrices in force), `trials.jsonl` (one record per completed trial) and per
 trial a `.npz` of step arrays. Every trial row is tagged with the run's
-*method* (FC = shared flow control, FRS = native flow reversal steering,
-FRS-RA = flow reversal with the reversal adapter, or a policy-only anchor:
+*method* (FC = shared flow control, FRS = flow reversal steering without the
+adapter, FRS-RA = flow reversal with the reversal adapter, or a policy-only anchor:
 floor = the arm's prompt, ceiling = the scene's own instruction), its *depth*
 (the denoising steps the operator controls: `n_guided_steps` for FC,
 `n_reversal_steps` for the reversal arms) and who the operator was. Authority is
@@ -83,7 +83,7 @@ def method_of(config: dict) -> str:
     if mode == "shared_flow_control":
         return "FC"
     if mode == "shared_flow_reversal_steering":
-        return "FRS-RA" if config.get("reversal_adapter_matrix") is not None else "FRS"
+        return "FRS-RA" if config.get("reversal_adapter") is not None else "FRS"
     if mode == "policy":
         return "policy (ceiling)" if config.get("prompt") == PROMPT_FROM_TASK else "policy (floor)"
     return mode  # shared_override / teleop: not part of the study

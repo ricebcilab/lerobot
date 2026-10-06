@@ -204,6 +204,7 @@ def _cmd_matrix(session: Session, tokens: list[str], name: str, holder, build) -
 
 def cmd_corruption(session: Session, tokens: list[str]) -> None:
     _cmd_matrix(session, tokens, "corruption", session.chain.corruption, build_corruption)
+    print(session.refresh_input_gain())  # an `auto` gain follows the corruption in force
 
 
 def cmd_adapter(session: Session, tokens: list[str]) -> None:

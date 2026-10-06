@@ -1,0 +1,33 @@
+# Shared settings for the arms in this folder; an arm file `extends:` it. `--set KEY=VALUE` overrides
+# any key, `--sweep KEY=V1,V2,...` runs one block per value, and null keeps the built-in default.
+
+experiment:
+  n_trials: 10                # per block
+  seed: 0                     # seeds the task schedule, the resets, the policy, the operator and the noise
+  task_order: random          # random | shuffled | sequential
+  output_dir: outputs/pi05_libero_experiments
+
+scene:
+  suite: libero_goal
+  task_ids: null              # null = every task in the suite, or e.g. [0, 3, 7]
+
+prompt: "do something"        # what the VLA is told; `task` gives it the scene's own instruction
+
+policy:
+  path: lerobot/pi05_libero_finetuned
+  n_action_steps: 10
+  compile: false
+
+control:
+  mode: shared_flow_reversal_steering
+  n_guided_steps: 8           # FC: denoising steps the command is written into
+  n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
+  input_noise: 0.0
+  input_gain: auto            # scale the command so the corruption cannot clip it (null = off)
+  max_steps: null             # null = the suite's own episode length
+  # A fresh draw on every trial, the same one for every arm: a rotation about a random axis times per-axis gains.
+  corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}
+  reversal_adapter: null      # the FRS-RA arm sets F = M
+
+server:
+  port: 8765

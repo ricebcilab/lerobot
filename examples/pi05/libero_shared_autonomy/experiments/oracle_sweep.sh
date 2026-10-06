@@ -8,21 +8,15 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# The shared-autonomy grid with the policy itself as the operator: the
-# task-prompted pi0.5 supplies the translation command, corrupted exactly like a
-# SpaceMouse would be, while the executing policy only ever sees the arm's
-# uninformative prompt. Per task: the arms in ARMS swept over their depths.
+# The study grid with the policy itself as the operator (the task-prompted pi0.5 supplies the
+# command; the executing policy only sees the arm's prompt): per task, the arms in ARMS over their depths.
 #
-#   oracle_sweep.sh                      all 10 LIBERO-Goal tasks, 10 matched trials per block
+#   oracle_sweep.sh                                   all 10 LIBERO-Goal tasks, 10 matched trials per block
 #   TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 oracle_sweep.sh
-#   FC_DEPTHS=8,10 FRS_DEPTHS=2,4,6 SEED=0 oracle_sweep.sh --dry-run
-#   ADAPTER_DEG=40 ARMS="fc frs frs_ra ceiling" oracle_sweep.sh   # F@40 instead of the file's F = M, no floor
-#
-# Extra flags go to every run, e.g. the SpaceMouse-like operator timing:
+#   ARMS="fc frs frs_ra ceiling" oracle_sweep.sh --dry-run
 #   oracle_sweep.sh --set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4
 #
-# Runs are written under $OUT (default outputs/pi05_libero_oracle_sweep_v2);
-# notebooks/analyze.py (load_runs, plot_metric, paired_test) reads them.
+# Extra flags reach every run. Output goes under $OUT; notebooks/analyze.py reads it.
 
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/arms.sh"

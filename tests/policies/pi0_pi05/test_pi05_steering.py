@@ -357,6 +357,27 @@ def test_wrapper_converts_adapter_before_reversal():
     np.testing.assert_allclose(policy.last_latent[0, 0, :3].numpy(), expected, atol=1e-6)
 
 
+def test_a_replaced_adapter_matrix_is_used_even_when_it_reuses_the_old_one_s_memory():
+    """Per-trial adapters: clearing the adapter and setting a new matrix must not serve the old one."""
+    policy = FakePolicy()
+    adapter = ReversalAdapter()
+    wrapper = FlowReversalSteeringPolicy(
+        policy, Source((1.0, 0.0, 0.0)), postprocessor(), adapter=adapter, n_reversal_steps=1
+    )
+    latents = []
+    for gain in (2.0, 3.0, 4.0):
+        adapter.matrix = None  # frees the previous matrix, so the next one can land on its address
+        matrix = np.eye(7)
+        matrix[0, 0] = gain
+        adapter.matrix = matrix
+        del matrix
+        wrapper.reset()
+        wrapper.select_action({})
+        latents.append(float(policy.last_latent[0, 0, 0]))
+    # FakePolicy's velocity is all ones, so one reversal step of 1/10 moves x by 0.1 * gain.
+    np.testing.assert_allclose(latents, [1.2, 1.3, 1.4], atol=1e-6)
+
+
 def test_reverse_flow_steering_validates_n_reversal_steps():
     wrapper = FlowReversalSteeringPolicy(FakePolicy(), Source(), postprocessor())
     for bad in (0, 11, 2.5, "3"):

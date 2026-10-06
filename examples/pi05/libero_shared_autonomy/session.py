@@ -17,7 +17,7 @@ from functools import cache
 
 import numpy as np
 import torch
-from config import MODES, ControlSettings, SessionSettings, spec_label
+from config import MODES, ControlSettings, SessionSettings, gain_that_cannot_clip, matrix_list, spec_label
 from live_view import LiveView
 from reproducibility import TrialSpec
 from teleop import KeyboardReader, PolicyOperator, TeleopChain
@@ -272,10 +272,10 @@ class Session:
         _, std = get_action_mean_std(self.postprocessor)
         normalized = self.adapter.normalized_matrix(std[:N_ACTION_DIMS])
         return {
-            "corruption_matrix": None if m is None else m.tolist(),
-            "reversal_adapter_matrix": None if f is None else f.tolist(),
+            "corruption_matrix": matrix_list(m),
+            "reversal_adapter_matrix": matrix_list(f),
             "reversal_adapter_coordinates": "environment",
-            "reversal_adapter_normalized_matrix": None if normalized is None else normalized.tolist(),
+            "reversal_adapter_normalized_matrix": matrix_list(normalized),
         }
 
     # ------------------------------------------------------------ mode
@@ -301,12 +301,14 @@ class Session:
             self.chain.attach_spacemouse()
 
     def apply_control(self, control: ControlSettings) -> None:
-        """Put the session in the state a `control:` block describes (mode, depths, noise, matrices)."""
+        """Put the session in the state a `control:` block describes (mode, depths, noise, gain, matrices)."""
         self.chain.corruption.matrix = control.corruption_matrix
         self.chain.corruption.label = spec_label(control.corruption)
         self.adapter.matrix = control.reversal_adapter_matrix
         self.adapter.label = spec_label(control.reversal_adapter)
         self.chain.noisy.input_noise = control.input_noise
+        self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
+        self.chain.gain.gain = control.resolved_input_gain
         if control.n_reversal_steps is not None:
             self._check_depth("n_reversal_steps", control.n_reversal_steps, 1)
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
@@ -314,6 +316,17 @@ class Session:
         if self._frs_policy is not None:
             self._frs_policy.operator_dims = self.operator_dims
         self.set_mode(control.mode, control.n_guided_steps)
+
+    def refresh_input_gain(self) -> str:
+        """Re-derive an `auto` gain from the corruption now in force (the REPL swaps M live); returns a status line."""
+        if self.input_gain == "auto":
+            m = self.chain.corruption.matrix
+            self.chain.gain.gain = gain_that_cannot_clip(1.0 if m is None else float(np.linalg.norm(m, 2)))
+        gain = self.chain.gain.gain
+        if gain is None:
+            return "Input gain: off (the corruption can clip the command)."
+        auto = " (auto)" if self.input_gain == "auto" else ""
+        return f"Input gain: {gain:g}{auto}: your command is limited to unit length and scaled by it."
 
     def mode_label(self) -> str:
         """Short label for the terminal and the live view."""

@@ -218,3 +218,135 @@ def test_operator_delay_longer_than_update_period_preserves_queued_commands():
 def test_operator_rejects_invalid_step_counts(settings):
     with pytest.raises(ValueError, match="policy_operator"):
         teleop.PolicyOperatorSettings(**settings)
+
+
+# ---------------------------------------------------------------- random corruption
+
+
+def _rotation_and_gains(matrix):
+    """Split M = R @ diag(gains) back into its parts: the column lengths are the gains."""
+    gains = np.linalg.norm(matrix, axis=0)
+    return matrix / gains, gains
+
+
+def _angle_deg(rotation):
+    """The angle of a rotation matrix, from its trace."""
+    return np.degrees(np.arccos((np.trace(rotation) - 1) / 2))
+
+
+def test_random_corruption_draws_a_rotation_times_per_axis_gains_inside_the_ranges():
+    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+    angles, all_gains, axes = [], [], []
+    for seed in range(200):
+        draw = family.sample(np.random.default_rng(seed))
+        rotation, gains = _rotation_and_gains(draw.matrix)
+        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-9)  # a rotation ...
+        assert np.linalg.det(rotation) == pytest.approx(1.0)  # ... not a reflection
+        angle = _angle_deg(rotation)
+        assert 30 - 1e-6 <= angle <= 90 + 1e-6
+        assert np.all((gains >= 1 - 1e-9) & (gains <= 4 + 1e-9))
+        # the draw reports the parameters the matrix was built from
+        assert draw.rotation_deg == pytest.approx(angle)
+        np.testing.assert_allclose(draw.scale, gains)
+        np.testing.assert_allclose(rotation @ draw.rotation_axis, draw.rotation_axis, atol=1e-9)
+        assert np.linalg.norm(draw.rotation_axis) == pytest.approx(1.0)
+        angles.append(angle)
+        all_gains.append(gains)
+        axes.append(draw.rotation_axis)
+    # the ranges are actually covered, each axis gets its own gain, and the rotation axis is not fixed
+    assert min(angles) < 40 and max(angles) > 80
+    assert np.min(all_gains) < 1.3 and np.max(all_gains) > 3.0
+    assert np.ptp(all_gains, axis=1).mean() > 0.5
+    assert np.linalg.norm(np.mean(axes, axis=0)) < 0.2
+
+
+def test_random_corruption_is_reproducible_from_its_generator():
+    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+    first = family.sample(np.random.default_rng(7)).matrix
+    np.testing.assert_array_equal(first, family.sample(np.random.default_rng(7)).matrix)
+    assert not np.allclose(first, family.sample(np.random.default_rng(8)).matrix)
+
+
+def test_random_corruption_parts_can_be_switched_off():
+    rng = np.random.default_rng(3)
+    np.testing.assert_allclose(teleop.RandomCorruption().sample(rng).matrix, np.eye(3), atol=1e-12)
+    only_gains = teleop.RandomCorruption(scale=(2, 3)).sample(rng).matrix
+    np.testing.assert_allclose(only_gains, np.diag(np.diag(only_gains)), atol=1e-12)
+    assert np.all((np.diag(only_gains) >= 2) & (np.diag(only_gains) <= 3))
+    only_rotation = teleop.RandomCorruption(rotation_deg=(45, 45)).sample(rng).matrix
+    np.testing.assert_allclose(np.linalg.norm(only_rotation, axis=0), 1.0)
+    assert _angle_deg(only_rotation) == pytest.approx(45)
+
+
+def test_random_corruption_never_grows_a_command_by_more_than_max_gain():
+    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+    largest = [
+        np.linalg.svd(family.sample(np.random.default_rng(seed)).matrix, compute_uv=False)[0]
+        for seed in range(200)
+    ]
+    assert max(largest) <= family.max_gain + 1e-9
+    assert max(largest) > 0.9 * family.max_gain  # and the bound is not loose
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        {"rotation_deg": (90, 30)},
+        {"rotation_deg": (-10, 30)},
+        {"rotation_deg": (0, 200)},
+        {"scale": (2, 1)},
+        {"scale": (0, 2)},
+        {"scale": (1, float("inf"))},
+        {"rotation_deg": (30,)},
+        {"scale": "1-4"},
+    ],
+)
+def test_random_corruption_rejects_impossible_ranges(ranges):
+    with pytest.raises(ValueError, match="rotation_deg|scale"):
+        teleop.RandomCorruption(**ranges)
+
+
+# ---------------------------------------------------------------- input gain: no clipping
+
+
+def test_input_gain_keeps_the_direction_and_shortens_the_command():
+    source = Source((1.0, 1.0, 0.0), GRIPPER_CLOSE)
+    limited = teleop.InputGain(source, gain=0.5)
+    # two axes at full deflection: same direction, length 1 before the gain, 0.5 after
+    np.testing.assert_allclose(limited.translation, [0.35355339, 0.35355339, 0.0])
+    assert limited.gripper == GRIPPER_CLOSE
+    source.translation = np.array([0.4, 0.0, 0.0])  # already shorter than 1: only the gain applies
+    np.testing.assert_allclose(limited.translation, [0.2, 0.0, 0.0])
+    limited.gain = None  # off: the command passes through untouched, corner and all
+    source.translation = np.array([1.0, 1.0, 1.0])
+    np.testing.assert_array_equal(limited.translation, [1.0, 1.0, 1.0])
+
+
+@pytest.mark.parametrize("gain", [0, -0.5, 1.5, float("nan"), "auto", True])
+def test_input_gain_rejects_values_outside_zero_to_one(gain):
+    with pytest.raises(ValueError, match="gain"):
+        teleop.InputGain(Source(), gain=gain)
+
+
+def test_chain_with_input_gain_never_clips_a_corruption_from_the_family():
+    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+    stick = Source()
+    chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
+    chain.combined.sources.insert(0, stick)
+    chain.gain.gain = 1 / family.max_gain
+    rng = np.random.default_rng(0)
+    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+    pushes = rng.uniform(-1, 1, size=(200, 3))
+    pushes = pushes[np.linalg.norm(pushes, axis=1) >= 0.5]  # clearly commanding, not idle
+    for seed in range(40):
+        chain.corruption.matrix = family.sample(np.random.default_rng(seed)).matrix
+        for push in np.vstack([corners, np.eye(3), pushes]):
+            stick.translation = push
+            served = chain.source.translation
+            raw = chain.raw.last_translation
+            assert np.max(np.abs(served)) <= 1.0
+            # what the policy is served is exactly M @ what was recorded as the operator's command
+            np.testing.assert_allclose(served, chain.corruption.matrix @ raw, atol=1e-12)
+            # and that recorded command is the push itself, only shorter
+            assert np.linalg.norm(raw) <= 0.25 + 1e-12
+            assert raw @ push == pytest.approx(np.linalg.norm(raw) * np.linalg.norm(push))

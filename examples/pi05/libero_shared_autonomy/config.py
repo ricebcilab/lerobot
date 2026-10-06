@@ -4,7 +4,8 @@ Both entry points read the same nested YAML shape (policy / scene / control /
 server) into dataclasses. A file may say `extends: other.yaml` (relative to
 itself) to overlay on another; a key set to null keeps the built-in default,
 and unknown keys are rejected. Matrix specs under `control` are resolved here
-into arrays (see `lerobot.policies.pi05.steering` for the accepted forms).
+into arrays (see `lerobot.policies.pi05.steering` for the accepted forms); a
+`{random: ...}` corruption becomes a family that each trial draws from instead.
 """
 
 import copy
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from teleop import PolicyOperatorSettings, build_corruption
+from teleop import PolicyOperatorSettings, RandomCorruption, build_corruption, check_input_gain
 
 from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, build_reversal_adapter
 
@@ -33,12 +34,16 @@ class ControlSettings:
     n_guided_steps: int = 5
     n_reversal_steps: int | None = None
     input_noise: float = 0.0
+    input_gain: float | str | None = None  # null = off, `auto`, or a number in (0, 1]
     max_steps: int | None = None
     corruption: dict | list | None = None  # spec as written
     reversal_adapter: dict | None = None  # spec as written
     operator_dims: list[str] = field(default_factory=lambda: ["translation"])  # what the operator commands
+    # Resolved from the specs above, not settings; with a random corruption each trial draws its own matrices.
     corruption_matrix: np.ndarray | None = field(default=None, repr=False)
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
+    corruption_family: RandomCorruption | None = field(default=None, repr=False)
+    resolved_input_gain: float | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -68,8 +73,10 @@ class ExperimentSettings:
 
 
 # YAML key -> flat settings name. The `control:` and `policy_operator:` blocks mirror
-# their dataclasses (the resolved *_matrix fields are not settings).
-_CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if not k.endswith("_matrix")}
+# their dataclasses (the resolved fields are not settings).
+_RESOLVED = ("corruption_matrix", "reversal_adapter_matrix", "corruption_family", "resolved_input_gain")
+_CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if k not in _RESOLVED}
+_RANDOM_SCHEMA = {k: k for k in RandomCorruption.__dataclass_fields__}  # the `random:` block of a corruption
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
 _OPERATOR_SCHEMA = {k: k for k in PolicyOperatorSettings.__dataclass_fields__}
 
@@ -161,10 +168,18 @@ def flatten(data: dict, schema: dict, where: str) -> dict:
     return flat
 
 
+def matrix_list(matrix: np.ndarray | None) -> list | None:
+    """A matrix as nested lists for YAML / JSON provenance, None when off."""
+    return None if matrix is None else np.asarray(matrix).tolist()
+
+
 def spec_label(spec) -> str | None:
     """Short display form of a matrix spec, e.g. 'rotation_z_deg=20' (None for no spec)."""
     if spec is None:
         return None
+    if isinstance(spec, dict) and isinstance(spec.get("random"), dict):
+        ranges = (f"{key}={'..'.join(f'{v:g}' for v in value)}" for key, value in spec["random"].items())
+        return f"random({', '.join(ranges)})"
     if isinstance(spec, dict):
         parts = []
         for key, value in spec.items():
@@ -183,6 +198,55 @@ def _fail(where: str, message: str):
 def _fields_from_flat(cls, flat: dict, exclude: tuple[str, ...] = ()) -> dict:
     """The flat settings that are fields of dataclass `cls`, as constructor kwargs."""
     return {k: flat[k] for k in cls.__dataclass_fields__ if k in flat and k not in exclude}
+
+
+def corruption_family(spec, where: str) -> RandomCorruption | None:
+    """The family a `{random: {...}}` corruption spec describes; None for a fixed corruption."""
+    if not isinstance(spec, dict) or "random" not in spec:
+        return None
+    others = [key for key in spec if key != "random"]
+    if others:
+        _fail(where, f"random cannot be combined with other keys (got {', '.join(others)})")
+    try:
+        return RandomCorruption(**flatten(spec, {"random": _RANDOM_SCHEMA}, where))
+    except ValueError as e:
+        _fail(where, str(e))
+
+
+def gain_that_cannot_clip(largest_gain: float) -> float:
+    """The largest input gain that keeps a corruption of at most `largest_gain` from clipping."""
+    return 1.0 if largest_gain <= 1.0 else 1.0 / largest_gain
+
+
+def largest_gain(control: ControlSettings) -> float:
+    """The most the corruption in force can lengthen a command (1 without a corruption)."""
+    if control.corruption_family is not None:
+        return control.corruption_family.max_gain
+    if control.corruption_matrix is None:
+        return 1.0
+    return float(np.linalg.norm(control.corruption_matrix, 2))
+
+
+def resolve_input_gain(control: ControlSettings, where: str) -> float | None:
+    """`control.input_gain` as a number: `auto` is the largest gain the corruption can never clip."""
+    spec = control.input_gain
+    if spec is None:
+        return None
+    largest = largest_gain(control)
+    safe = gain_that_cannot_clip(largest)
+    if spec == "auto":
+        return safe
+    try:
+        gain = check_input_gain(spec)
+    except (TypeError, ValueError) as e:
+        _fail(where, f"control.input_gain: {e} (or auto)")
+    if gain > safe * (1 + 1e-9):
+        _fail(
+            where,
+            f"control.input_gain {gain:g} can clip: this corruption lengthens a command by up to "
+            f"{largest:.3g}, so the largest gain that never clips is {safe:.3g} (or use auto)",
+        )
+    return gain
 
 
 def build_control(flat: dict, where: str) -> ControlSettings:
@@ -208,10 +272,15 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             where,
             f"control.operator_dims must be a non-empty list drawn from {', '.join(OPERATOR_DIM_GROUPS)}, got {dims!r}",
         )
-    control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
-    control.reversal_adapter_matrix = build_reversal_adapter(
-        control.reversal_adapter, control.corruption_matrix, f"{where}: control.reversal_adapter"
-    )
+    control.corruption_family = corruption_family(control.corruption, f"{where}: control.corruption")
+    if control.corruption_family is None:
+        control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
+        control.reversal_adapter_matrix = build_reversal_adapter(
+            control.reversal_adapter, control.corruption_matrix, f"{where}: control.reversal_adapter"
+        )
+    else:  # each trial draws its corruption, and the adapter with it: only check the adapter spec here
+        build_reversal_adapter(control.reversal_adapter, np.eye(3), f"{where}: control.reversal_adapter")
+    control.resolved_input_gain = resolve_input_gain(control, where)
     return control
 
 
@@ -236,7 +305,13 @@ def load_interactive_settings(path: str | Path | None, overrides: dict) -> Sessi
     where = str(path) if path is not None else "command line"
     flat = flatten(load_yaml_with_extends(path), INTERACTIVE_SCHEMA, where) if path is not None else {}
     flat.update({k: v for k, v in overrides.items() if v is not None})
-    return _session_from_flat(flat, where)
+    session = _session_from_flat(flat, where)
+    if session.control.corruption_family is not None:
+        _fail(
+            where,
+            "control.corruption: a random corruption draws one per trial, so it needs `run.sh experiment`",
+        )
+    return session
 
 
 def parse_set(item: str) -> tuple[list[str], object]:

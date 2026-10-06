@@ -13,9 +13,9 @@
 Where the operator's command comes from and what happens to it on the way to
 the policy:
 
-    SpaceMouse + keyboard -> CombinedReader -> RecordingReader (raw)
-        -> CommandCorruption (M @ x) -> NoisyReader (+ noise)
-        -> RecordingReader (served)
+    SpaceMouse + keyboard -> CombinedReader -> InputGain (optional)
+        -> RecordingReader (raw) -> CommandCorruption (M @ x)
+        -> NoisyReader (+ noise) -> RecordingReader (served)
 
 `TeleopChain` builds that pipeline; the modes consume `chain.source`. Every
 reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
@@ -43,6 +43,7 @@ from lerobot.policies.pi05.steering import (
     format_matrix,
     translation_matrix,
 )
+from lerobot.utils.rotation import Rotation
 
 __all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN"]  # re-exported for readers of this module
 
@@ -167,14 +168,11 @@ KEY_PUSH = {
 
 
 class KeyboardReader:
-    """Translation + gripper state driven by the set of keys held in the browser.
+    """Translation + gripper from the keys held in the browser page.
 
-    `update(held, toggles)` is called by the HTTP server on every key event and
-    heartbeat from the page: `held` is the full set of currently pressed keys
-    (idempotent, so a lost event cannot stick a key) and `toggles` is the
-    page's running count of gripper-toggle presses (Space). If the page stops
-    reporting for `stale_after` seconds, translation falls back to zero; the
-    gripper keeps its last commanded state.
+    `update(held, toggles)` arrives with every key event and heartbeat: `held` is the full
+    set of pressed keys (so a lost event cannot stick a key), `toggles` the page's count of
+    gripper presses. After `stale_after` seconds without a report the translation is zero.
     """
 
     def __init__(
@@ -232,14 +230,8 @@ class KeyboardReader:
 
 
 class CombinedReader:
-    """Merge several teleop sources (SpaceMouse, keyboard, ...) into one.
-
-    Translation comes from the first source in `sources` deflected beyond
-    DEADBAND (so list the SpaceMouse first to give it priority), zero if all
-    are idle. The gripper toggles whenever *any* source toggles: each source's
-    state is the parity of its own presses, so the merged state is closed iff
-    an odd number of sources report closed.
-    """
+    """Merge teleop sources into one: the translation of the first source deflected beyond DEADBAND
+    (list the SpaceMouse first for priority), and a gripper closed iff an odd number of sources say so."""
 
     def __init__(self, sources: Iterable):
         self.sources = list(sources)
@@ -277,15 +269,11 @@ class PolicyOperatorSettings:
 class PolicyOperator:
     """A synthetic operator: the task-prompted policy's own plan, sampled like a SpaceMouse.
 
-    `refresh(chunk, step)` takes an action chunk in env units (steps x 7) and turns it
-    into a continuous translation and a binary gripper command:
-    translation = mean over the first `n_action_steps` steps, clipped to [-1, 1];
-    gripper = close iff that mean gripper command is > 0. The command holds until
-    the next delivery, like a stick held in place. Intent updates and delivery
-    delay are configurable in environment steps; defaults preserve the immediate
-    once-per-chunk oracle. Placed in front of the human
-    sources (`TeleopChain.attach_operator`), so the corruption, the noise and the
-    recorders treat it exactly like a person.
+    `refresh(chunk, step)` turns an action chunk (env units) into a translation (mean over the
+    first `n_action_steps` steps, clipped to [-1, 1]) and a gripper command (close iff the mean
+    is > 0), held until the next delivery. Update period and delay are in environment steps;
+    the defaults are the immediate once-per-chunk oracle. It sits in front of the human sources
+    (`TeleopChain.attach_operator`), so corruption, noise and recorders treat it like a person.
     """
 
     def __init__(self, n_action_steps: int, settings: PolicyOperatorSettings | None = None):
@@ -320,11 +308,7 @@ class PolicyOperator:
         self.advance(step)
 
     def advance(self, step: int) -> None:
-        """Deliver ready commands and hold the latest one between intent updates.
-
-        Before the first delayed command arrives the source is idle. FC and FRS
-        still consume the source only at their action-chunk boundaries.
-        """
+        """Deliver the commands due by `step` and hold the latest; idle until the first one arrives."""
         self._step = step
         while self._pending and self._pending[0][0] <= step:
             _, self._generated_at, self._translation, self._gripper = self._pending.popleft()
@@ -343,15 +327,10 @@ class PolicyOperator:
 
 
 class CommandCorruption(MatrixHolder):
-    """Deterministically corrupt a teleop source's translation: x -> M @ x.
+    """Corrupt a source's translation: x -> clip(M @ x), with `matrix` a 3x3 or None (off).
 
-    `matrix` is a 3x3 array-like (rows = output axes, columns = input axes) or
-    None for identity/off; it can be changed at any time. The product is
-    clipped to the env's [-1, 1] action range. Like `NoisyReader`, the
-    transform is only applied while the source is commanding beyond DEADBAND,
-    so an idle source stays exactly idle whatever M is. `label` is free-form
-    (the file the matrix came from) and only used for display. The gripper is
-    passed through unchanged.
+    The matrix can change at any time and is only applied while the source commands beyond
+    DEADBAND, so an idle source stays idle. `label` is for display.
     """
 
     size = 3
@@ -392,16 +371,106 @@ def read_matrix_spec(path: str | Path):
     return data
 
 
-class NoisyReader:
-    """Add isotropic Gaussian noise to a teleop source's translation.
+@dataclass(frozen=True)
+class CorruptionDraw:
+    """One corruption drawn from a `RandomCorruption`: the matrix and what it was built from."""
 
-    Every read of `translation` draws an independent N(0, std^2) sample for
-    each of x, y and z — consecutive control steps therefore get independent
-    noise — and clips the result to the env's [-1, 1] action range. Noise is
-    only added while the source is actually commanding (deflected beyond
-    DEADBAND): an idle source stays exactly idle, so the shared modes still
-    hand control back to the policy when you let go. `input_noise` can be changed
-    at any time; 0 disables the noise. The gripper is passed through unchanged.
+    matrix: np.ndarray  # 3x3: rotation @ diag(scale)
+    rotation_axis: np.ndarray  # unit vector
+    rotation_deg: float
+    scale: np.ndarray  # the gain of each operator axis
+
+    def parameters(self) -> dict:
+        """The draw as plain numbers, for a trial record."""
+        return {
+            "rotation_axis": self.rotation_axis.tolist(),
+            "rotation_deg": float(self.rotation_deg),
+            "scale": self.scale.tolist(),
+        }
+
+
+def _range(value, name: str, low: float, high: float, low_open: bool = False) -> tuple[float, float]:
+    """`value` as an ordered (lo, hi) pair of finite numbers inside [low, high] (or (low, high])."""
+    try:
+        lo, hi = (float(v) for v in value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name} must be a [low, high] pair of numbers, got {value!r}") from e
+    inside = (low < lo if low_open else low <= lo) and hi <= high
+    if isinstance(value, str) or not (np.isfinite(lo) and np.isfinite(hi) and lo <= hi and inside):
+        bounds = f"{'(' if low_open else '['}{low:g}, {high:g}]"
+        raise ValueError(f"{name} must be a [low, high] pair with low <= high inside {bounds}, got {value!r}")
+    return lo, hi
+
+
+@dataclass(frozen=True)
+class RandomCorruption:
+    """A family to draw one corruption per trial from: M = R @ diag(gains), the gains log-uniform
+    in `scale` and the rotation uniform in `rotation_deg` about a uniformly random axis."""
+
+    rotation_deg: tuple[float, float] = (0.0, 0.0)
+    scale: tuple[float, float] = (1.0, 1.0)
+
+    def __post_init__(self):
+        object.__setattr__(self, "rotation_deg", _range(self.rotation_deg, "rotation_deg", 0.0, 180.0))
+        object.__setattr__(self, "scale", _range(self.scale, "scale", 0.0, np.inf, low_open=True))
+
+    @property
+    def max_gain(self) -> float:
+        """The most any draw can lengthen a command: a rotation keeps lengths, so the largest gain."""
+        return self.scale[1]
+
+    def sample(self, rng: np.random.Generator) -> CorruptionDraw:
+        axis = rng.normal(size=3)
+        axis /= np.linalg.norm(axis)
+        angle = float(rng.uniform(*self.rotation_deg))
+        scale = np.exp(rng.uniform(np.log(self.scale[0]), np.log(self.scale[1]), size=3))
+        rotation = Rotation.from_rotvec(axis * np.radians(angle)).as_matrix()
+        return CorruptionDraw(rotation @ np.diag(scale), axis, angle, scale)
+
+
+def check_input_gain(value) -> float:
+    """`value` as an input gain, a number in (0, 1]; raises ValueError otherwise (bool, str, NaN included)."""
+    if isinstance(value, bool | str) or not 0.0 < float(value) <= 1.0:
+        raise ValueError(f"input gain must be a number in (0, 1] or null, got {value!r}")
+    return float(value)
+
+
+class InputGain:
+    """Limit the operator's command to unit length (keeping its direction) and scale it by `gain`.
+
+    A corruption that lengthens a command by at most 1 / gain then stays inside [-1, 1], so
+    the clip in `CommandCorruption` never acts. `gain = None` passes the command through.
+    """
+
+    def __init__(self, source, gain: float | None = None):
+        self.source = source
+        self.gain = gain
+
+    @property
+    def gain(self) -> float | None:
+        return self._gain
+
+    @gain.setter
+    def gain(self, value: float | None) -> None:
+        self._gain = None if value is None else check_input_gain(value)
+
+    @property
+    def translation(self) -> np.ndarray:
+        command = np.asarray(self.source.translation, dtype=np.float64)
+        if self._gain is None:
+            return command
+        return self._gain * command / max(1.0, float(np.linalg.norm(command)))
+
+    @property
+    def gripper(self) -> float:
+        return self.source.gripper
+
+
+class NoisyReader:
+    """Add N(0, std^2) noise to each of x, y, z on every read, clipped to [-1, 1].
+
+    Noise is only added while the source commands beyond DEADBAND, so an idle source stays
+    idle. `input_noise` can change at any time; 0 is off.
     """
 
     def __init__(self, source, input_noise: float = 0.0, rng: np.random.Generator | None = None):
@@ -433,16 +502,11 @@ class NoisyReader:
 
 
 class RecordingReader:
-    """Pass-through wrapper that remembers the last command it served.
+    """Pass-through that remembers the last command it served.
 
-    Readers are sampled by whoever consumes them (the action hook once per
-    control step, the shared flow policies once per denoising step or chunk),
-    and `NoisyReader` draws fresh noise on every read — so logging a separate
-    read would record a value that was never used. Wrapping the chain instead
-    records exactly what was handed out: `last_translation` / `last_gripper`
-    hold the most recent values and `reads` counts how many times the source
-    has been sampled (log its delta to see when the input was actually
-    consulted).
+    `NoisyReader` draws fresh noise on every read, so a separate read for logging would record
+    a value never used; `last_translation` / `last_gripper` hold what was handed out and
+    `reads` counts the samples.
     """
 
     def __init__(self, source):
@@ -465,17 +529,12 @@ class RecordingReader:
 
 
 class TeleopChain:
-    """The teleop input pipeline shared by the runner and the experiment driver.
+    """The teleop input pipeline shared by the REPL and the experiment runner:
 
-    Sources (SpaceMouse first, then keyboard) are merged, the raw command is
-    recorded, then the deterministic corruption and the Gaussian noise are
-    applied, and the value finally served is recorded too:
+        SpaceMouse + keyboard -> gain -> raw -> M @ x -> + noise -> served
 
-        SpaceMouse + keyboard -> raw -> M @ x -> + noise -> served
-
-    `source` is what the modes consume; `raw` and `served` are the recorders an
-    experiment logs (`raw.last_translation` is the operator's true intent,
-    `served.last_translation` what the policy actually got).
+    `source` is what the modes consume; `raw` (the operator's intent, after the gain) and
+    `served` (what the policy got) are the recorders an experiment logs.
     """
 
     def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
@@ -483,7 +542,8 @@ class TeleopChain:
         self.spacemouse = None
         self.operator = None
         self.combined = CombinedReader([keyboard])
-        self.raw = RecordingReader(self.combined)
+        self.gain = InputGain(self.combined)
+        self.raw = RecordingReader(self.gain)
         self.corruption = CommandCorruption(self.raw)
         self.noisy = NoisyReader(self.corruption, input_noise=input_noise)
         self.served = RecordingReader(self.noisy)

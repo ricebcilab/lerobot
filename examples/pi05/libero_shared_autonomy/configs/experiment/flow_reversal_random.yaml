@@ -1,0 +1,7 @@
+# FRS: the reference chunk built from the command is reversed through the policy's own field.
+# null reverses all the way, the published method; n < 10 is this study's partial reversal.
+#   sweep the depth:  --sweep control.n_reversal_steps=1,2,4,6,8
+extends: base_random.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: null

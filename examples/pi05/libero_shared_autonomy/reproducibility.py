@@ -24,6 +24,13 @@ class TrialSpec:
         return values
 
 
+def corruption_rng(spec: TrialSpec) -> np.random.Generator:
+    """The stream a trial's random corruption is drawn from: a function of the reset alone, so every
+    method draws the same corruption on the same trial; derived from a seed already in the spec so
+    `pair_id` stays comparable with earlier runs."""
+    return np.random.default_rng([spec.input_noise_seed, 0x434F5252])
+
+
 def trial_specs(schedule: list[int], suite: str, seed: int, state_counts: dict[int, int]) -> list[TrialSpec]:
     """Match each task's kth occurrence across methods, depth blocks and task orders.
 

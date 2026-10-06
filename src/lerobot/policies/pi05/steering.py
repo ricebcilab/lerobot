@@ -445,7 +445,10 @@ class FlowReversalSteeringPolicy:
     With delegation, a steered chunk costs N + n velocity evaluations: n reverse,
     N - n to obtain the unsteered state, and n forward. Depth changes how far
     inversion travels before delegation and reconstruction; its effect on
-    intent preservation is empirical. n = N (or None) is the full reversal.
+    intent preservation is empirical. n = N (or None) is the full reversal,
+    the method of Tang et al.; a partial reversal (n < N) is this module's own
+    variant, which the paper does not have, and at small n the executed chunk
+    is mostly the reference itself.
 
     `operator_dims` names the dim groups the operator commands (default: only
     translation) and `pinned_steps` how many leading steps of the chunk the
@@ -551,11 +554,14 @@ class FlowReversalSteeringPolicy:
         if matrix is None:
             self._adapter_cache = None
             return None
-        key = (id(matrix), like.device, like.dtype)
-        if self._adapter_cache is None or self._adapter_cache[0] != key:
+        # The cache keeps the matrix itself, not its id: a matrix that replaces a freed one can
+        # land on the same address, and would then be mistaken for the one it replaced.
+        cached = self._adapter_cache
+        if cached is None or cached[0] is not matrix or cached[1:3] != (like.device, like.dtype):
             normalized = self._adapter.normalized_matrix(self._std)
-            self._adapter_cache = (key, torch.as_tensor(normalized, dtype=like.dtype, device=like.device))
-        return self._adapter_cache[1]
+            tensor = torch.as_tensor(normalized, dtype=like.dtype, device=like.device)
+            self._adapter_cache = (matrix, like.device, like.dtype, tensor)
+        return self._adapter_cache[3]
 
     @torch.compiler.disable
     def _noise_fn(self, velocity, noise: torch.Tensor) -> torch.Tensor:

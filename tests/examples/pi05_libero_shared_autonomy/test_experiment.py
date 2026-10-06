@@ -1,12 +1,67 @@
+import json
 from types import SimpleNamespace
 
+import experiment
 import numpy as np
 import pytest
 import torch
+import yaml
+from config import ExperimentSettings, SessionSettings, load_experiment_settings
 from experiment import TrialRecorder, build_schedule, expand_blocks, prompt_for
 from reproducibility import trial_specs
 from session import RolloutResult, Session
 from teleop import KeyboardReader, PolicyOperator, PolicyOperatorSettings, TeleopChain
+
+from lerobot.policies.pi05.steering import ReversalAdapter
+
+
+class FakeSession:
+    """What run_block needs of a Session: a scene to show, a chain and an adapter to set, and a rollout."""
+
+    suite, task_id = "libero_goal", 0
+    task_description = "open drawer"
+    view = SimpleNamespace(stream=SimpleNamespace(set_status=lambda **kw: None))
+    operator = object()  # a synthetic operator: no Start button to wait for
+
+    def __init__(self, mode="policy", show_scene=lambda spec: {}, rollout=None):
+        self.mode, self.n_guided_steps = mode, 0
+        self.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
+        self.adapter = ReversalAdapter()
+        self._show_scene, self._rollout = show_scene, rollout
+
+    def set_scene(self, suite, task_id):
+        self.suite, self.task_id = suite, task_id
+
+    def show_scene(self, spec):
+        return self._show_scene(spec)
+
+    def initial_state_hash(self):
+        return "verified-state"
+
+    def rollout(self, prompt, **kwargs):
+        if self._rollout is not None:
+            self._rollout(self, **kwargs)
+        return RolloutResult(success=True, steps=1, frames=[], metrics={})
+
+    def mode_label(self):
+        return self.mode
+
+    def stats_line(self):
+        return ""
+
+
+@pytest.fixture
+def run_block(monkeypatch):
+    """run_block without videos or a simulator: `run(session, settings, schedule, directory)` -> records."""
+    monkeypatch.setattr(experiment, "write_video", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Session, "initial_state_count", lambda suite, task: 50)
+
+    def run(session, settings, schedule, directory):
+        directory.mkdir(exist_ok=True)
+        specs = experiment.build_trial_specs(settings, schedule)
+        return experiment.run_block(session, settings, specs, directory)
+
+    return run
 
 
 def test_build_schedule_orders():
@@ -36,49 +91,23 @@ def test_trial_specs_match_across_task_order_and_use_seeded_state_permutations()
     assert len({a[0].env_seed, a[0].policy_seed, a[0].operator_seed, a[0].input_noise_seed}) == 4
 
 
-def test_run_block_reuses_preview_and_records_matching_identity(tmp_path, monkeypatch):
-    import experiment
-    from config import ExperimentSettings, SessionSettings
-
+def test_run_block_reuses_preview_and_records_matching_identity(tmp_path, run_block):
     settings = ExperimentSettings("test", SessionSettings(operator="policy", suite="libero_goal"))
     preview = {"observation": "preview"}
     seen = []
 
-    class FakeSession:
-        suite, task_id = "libero_goal", 0
-        task_description = "open drawer"
-        mode, n_guided_steps = "policy", 0
-        operator = object()
-        chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
-        adapter = SimpleNamespace(label=None)
-        view = SimpleNamespace(stream=SimpleNamespace(set_status=lambda **kw: None))
+    def show_scene(spec):
+        seen.append(spec)
+        return preview
 
-        def show_scene(self, spec):
-            seen.append(spec)
-            return preview
+    def rollout(session, **kwargs):
+        assert kwargs["initial_observation"] is preview
+        assert kwargs["trial_spec"] == seen[-1]
 
-        def initial_state_hash(self):
-            return "verified-state"
-
-        def rollout(self, prompt, **kwargs):
-            assert kwargs["initial_observation"] is preview
-            assert kwargs["trial_spec"] == seen[-1]
-            return RolloutResult(success=True, steps=1, frames=[], metrics={})
-
-        def mode_label(self):
-            return self.mode
-
-        def stats_line(self):
-            return ""
-
-    monkeypatch.setattr(experiment, "write_video", lambda *args, **kwargs: None)
-    monkeypatch.setattr(Session, "initial_state_count", lambda suite, task: 50)
-    runs = []
-    for block in ("a", "b"):
-        directory = tmp_path / block
-        directory.mkdir()
-        specs = experiment.build_trial_specs(settings, [0, 0])
-        runs.append(experiment.run_block(FakeSession(), settings, specs, directory))
+    runs = [
+        run_block(FakeSession(show_scene=show_scene, rollout=rollout), settings, [0, 0], tmp_path / block)
+        for block in ("a", "b")
+    ]
     assert seen[:2] == seen[2:]
     assert [r["pair_id"] for r in runs[0]] == [r["pair_id"] for r in runs[1]]
     with np.load(tmp_path / "a" / "trial_000.npz") as z:
@@ -288,3 +317,156 @@ def test_trial_recorder_keeps_scene_rows_and_saves_them(tmp_path):
     z = np.load(tmp_path / "t.npz")
     assert z["object_pos"].shape == (3, 1, 3) and np.isnan(z["object_pos"][1]).all()
     assert list(z["object_names"]) == ["bowl"] and z["articulation_qpos"].shape == (3, 1)
+
+
+# ---------------------------------------------------------------- per-trial corruption and input gain
+
+RANDOM = "corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}, input_gain: auto"
+ADAPTED = (
+    "mode: shared_flow_reversal_steering, n_reversal_steps: 1, reversal_adapter: {translation: corruption}"
+)
+
+
+def _settings(tmp_path, control: str):
+    path = tmp_path / "condition.yaml"
+    path.write_text(
+        f"scene: {{suite: libero_goal, task_ids: [4]}}\noperator: policy\ncontrol: {{{control}}}\n"
+    )
+    return load_experiment_settings(path, {})
+
+
+def _bare_session(control):
+    """A Session without a policy or simulator, in the state `apply_control` leaves it."""
+    session = Session.__new__(Session)
+    session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
+    session.adapter = ReversalAdapter()
+    session.policy = SimpleNamespace(config=SimpleNamespace(num_inference_steps=10))
+    session._frs_policy = None
+    session.operator = object()  # a synthetic operator, so no SpaceMouse is looked for
+    session.apply_control(control)
+    return session
+
+
+def _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trials=3):
+    """Run a block against the fake session; returns the (M, F) each rollout saw and the saved records."""
+    in_force = []
+    session = FakeSession(
+        mode=settings.session.control.mode,
+        rollout=lambda session, **kwargs: in_force.append(
+            (session.chain.corruption.matrix, session.adapter.matrix)
+        ),
+    )
+    run_block(session, settings, [4] * n_trials, tmp_path)
+    saved = [json.loads(line) for line in (tmp_path / "trials.jsonl").read_text().splitlines()]
+    return in_force, saved
+
+
+def test_every_method_draws_the_same_corruption_on_a_trial_and_the_adapter_follows_it(tmp_path):
+    fc = _settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control
+    adapted = _settings(tmp_path, f"{ADAPTED}, {RANDOM}").session.control
+    specs = trial_specs([4] * 6, "libero_goal", seed=4, state_counts={4: 50})
+    drawn = []
+    for spec in specs:
+        a, b = experiment.trial_matrices(fc, spec), experiment.trial_matrices(adapted, spec)
+        np.testing.assert_array_equal(a.corruption, b.corruption)  # matched across methods
+        assert a.adapter is None
+        np.testing.assert_array_equal(b.adapter[:3, :3], b.corruption)  # F = M
+        np.testing.assert_array_equal(b.adapter[3:, 3:], np.eye(4))
+        assert 30 <= a.draw.rotation_deg <= 90
+        drawn.append(a.corruption)
+    assert len({m.tobytes() for m in drawn}) == len(specs)  # a fresh draw on every trial
+    np.testing.assert_array_equal(experiment.trial_matrices(fc, specs[0]).corruption, drawn[0])
+    other_seed = trial_specs([4], "libero_goal", seed=5, state_counts={4: 50})[0]
+    assert not np.array_equal(experiment.trial_matrices(fc, other_seed).corruption, drawn[0])
+
+
+def test_a_fixed_corruption_is_the_same_on_every_trial(tmp_path):
+    control = _settings(tmp_path, f"{ADAPTED}, corruption: {{rotation_z_deg: 40}}").session.control
+    for spec in trial_specs([4] * 2, "libero_goal", seed=4, state_counts={4: 50}):
+        matrices = experiment.trial_matrices(control, spec)
+        # cos 40 and sin 40 degrees: a push along x comes out turned towards y
+        np.testing.assert_allclose(matrices.corruption @ [1, 0, 0], [0.76604444, 0.64278761, 0])
+        np.testing.assert_array_equal(matrices.adapter[:3, :3], matrices.corruption)
+        assert matrices.draw is None and matrices.record()["corruption_parameters"] is None
+
+
+def test_run_block_puts_each_trial_s_corruption_in_force_and_records_it(tmp_path, run_block):
+    settings = _settings(tmp_path, f"{ADAPTED}, {RANDOM}")
+    in_force, saved = _run_block_recording_what_is_in_force(tmp_path, run_block, settings)
+    assert len(in_force) == len(saved) == 3
+    for trial, ((corruption, adapter), record) in enumerate(zip(in_force, saved, strict=True)):
+        np.testing.assert_array_equal(
+            adapter[:3, :3], corruption
+        )  # the adapter in force followed the corruption
+        # the record and the step file hold what was in force while the trial ran
+        np.testing.assert_allclose(record["corruption_matrix"], corruption)
+        np.testing.assert_allclose(record["reversal_adapter_matrix"], adapter)
+        assert set(record["corruption_parameters"]) == {"rotation_axis", "rotation_deg", "scale"}
+        assert record["input_gain"] == 0.25
+        with np.load(tmp_path / f"trial_{trial:03d}.npz") as z:
+            np.testing.assert_allclose(z["corruption_matrix"], corruption)
+            np.testing.assert_allclose(z["reversal_adapter_matrix"], adapter)
+            assert float(z["input_gain"]) == 0.25
+    assert not np.allclose(in_force[0][0], in_force[1][0])  # and it changed from one trial to the next
+
+
+def test_run_block_records_empty_matrices_when_nothing_is_in_force(tmp_path, run_block):
+    settings = _settings(tmp_path, "mode: shared_flow_control")
+    in_force, saved = _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trials=1)
+    assert in_force == [(None, None)]
+    record = saved[0]
+    assert record["corruption_matrix"] is None and record["reversal_adapter_matrix"] is None
+    assert record["corruption_parameters"] is None and record["input_gain"] is None
+    with np.load(tmp_path / "trial_000.npz") as z:  # loadable without pickle: NaN stands for "off"
+        assert z["corruption_matrix"].shape == (3, 3) and np.isnan(z["corruption_matrix"]).all()
+        assert z["reversal_adapter_matrix"].shape == (7, 7) and np.isnan(z["input_gain"])
+
+
+def test_apply_control_turns_the_input_gain_on_and_off_with_the_block(tmp_path):
+    session = _bare_session(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control)
+    assert session.chain.gain.gain == 0.25
+    assert session.chain.corruption.matrix is None  # nothing is in force until a trial draws it
+    fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
+    session.apply_control(fixed.session.control)
+    assert session.chain.gain.gain is None
+
+
+def test_an_auto_gain_follows_a_live_corruption_change_but_a_number_does_not(tmp_path):
+    session = _bare_session(
+        _settings(tmp_path, "mode: shared_flow_control, input_gain: auto").session.control
+    )
+    assert session.chain.gain.gain == 1.0
+    session.chain.corruption.matrix = np.diag([4.0, 1.0, 1.0])  # what the REPL's `corruption <file>` does
+    assert "0.25" in session.refresh_input_gain() and session.chain.gain.gain == 0.25
+    session.chain.corruption.matrix = None  # `corruption off`
+    session.refresh_input_gain()
+    assert session.chain.gain.gain == 1.0
+    session.apply_control(_settings(tmp_path, "mode: shared_flow_control, input_gain: 0.2").session.control)
+    session.chain.corruption.matrix = np.diag([4.0, 1.0, 1.0])
+    assert "0.2" in session.refresh_input_gain() and session.chain.gain.gain == 0.2
+
+
+def test_a_random_block_s_config_lists_every_trial_s_corruption_in_plain_yaml(tmp_path):
+    settings = _settings(tmp_path, f"mode: shared_flow_control, {RANDOM}")
+    specs = trial_specs([4] * 3, "libero_goal", seed=settings.seed, state_counts={4: 50})
+    session = SimpleNamespace(
+        resolved_matrices=lambda: {"corruption_matrix": None, "reversal_adapter_matrix": None}
+    )
+    resolved = experiment._provenance(settings, experiment.Block("block", []), [4, 4, 4], specs, session)
+    written = yaml.safe_load(yaml.safe_dump(resolved))  # what lands in config.yaml
+    assert written["input_gain"] == "auto" and written["resolved_input_gain"] == 0.25
+    assert len(written["trial_corruptions"]) == 3
+    for spec, entry in zip(specs, written["trial_corruptions"], strict=True):
+        in_trial = experiment.trial_matrices(settings.session.control, spec).corruption
+        np.testing.assert_allclose(entry["corruption_matrix"], in_trial)
+        assert 30 <= entry["corruption_parameters"]["rotation_deg"] <= 90
+    fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
+    assert "trial_corruptions" not in experiment._provenance(
+        fixed, experiment.Block("block", []), [4], specs[:1], session
+    )
+
+
+def test_the_dry_run_description_states_the_family_and_the_gain_in_force(tmp_path):
+    text = experiment._describe_block(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}"))
+    assert "random(rotation_deg=30..90, scale=1..4)" in text
+    assert "input gain: 0.25" in text

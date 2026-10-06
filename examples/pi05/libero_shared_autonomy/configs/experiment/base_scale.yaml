@@ -1,23 +1,17 @@
-# Shared settings for every experiment arm in this folder. An arm file says
-# `extends: base_scale.yaml` and overrides only what it changes; on the command line,
-# `--set KEY=VALUE` overrides any key and `--sweep KEY=V1,V2,...` runs one block
-# per value. Unknown keys are rejected; a key set to null keeps the built-in
-# default.
+# Shared settings for the arms in this folder; an arm file `extends:` it. `--set KEY=VALUE` overrides
+# any key, `--sweep KEY=V1,V2,...` runs one block per value, and null keeps the built-in default.
 
 experiment:
-  n_trials: 10                # trials per block
-  seed: 0                     # task schedule, initial-state permutations, env, policy, operator and input noise
-  task_order: random          # random (uniform, with replacement) | shuffled (permutations) | sequential
+  n_trials: 10                # per block
+  seed: 0                     # seeds the task schedule, the resets, the policy, the operator and the noise
+  task_order: random          # random | shuffled | sequential
   output_dir: outputs/pi05_libero_experiments
 
 scene:
   suite: libero_goal
   task_ids: null              # null = every task in the suite, or e.g. [0, 3, 7]
 
-# Instruction handed to the VLA on every trial. The human is always shown the
-# real task; a generic prompt dissociates the two. The literal string `task`
-# gives the VLA the scene's own instruction instead.
-prompt: "do something"
+prompt: "do something"        # what the VLA is told; `task` gives it the scene's own instruction
 
 policy:
   path: lerobot/pi05_libero_finetuned
@@ -26,14 +20,13 @@ policy:
 
 control:
   mode: shared_flow_reversal_steering
-  n_guided_steps: 8           # shared_flow_control only: denoising steps the operator's command is written into
-  n_reversal_steps: null      # shared_flow_reversal_steering only; null = reverse all the way to noise
+  n_guided_steps: 8           # FC: denoising steps the command is written into
+  n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
   input_noise: 0.0
+  input_gain: auto            # scale the command so the corruption cannot clip it (null = off)
   max_steps: null             # null = the suite's own episode length
-  # The known corruption every arm is studied under: what the robot gets is
-  # M @ what the operator commanded (env units). `--set control.corruption=null` for a clean run.
-  corruption: {scale: [2, 1, 1]}   # per-axis gain: x twice as sensitive as y and z; override the list with --set
-  reversal_adapter: null      # reverse integration follows F @ v; the flow_reversal_ra_* arm (FRS-RA) sets it
+  corruption: {scale: [2, 1, 1]}     # per-axis gain on the command; override the vector with --set
+  reversal_adapter: null      # the FRS-RA arm sets F = M
 
 server:
   port: 8765

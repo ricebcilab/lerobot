@@ -8,20 +8,16 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Sourced by the study scripts: the arms of the shared-autonomy study and how
-# each is launched. `run_arm <arm> <depths> [experiment flags...]` runs one
-# arm as a depth sweep (one block of n_trials per depth) or, for the
-# policy-only anchors, one block:
+# Sourced by the study scripts. `run_arm <arm> <depths> [flags...]` runs one arm as a depth sweep
+# (one block per depth), or one block for the policy-only anchors:
 #
 #   fc       flow_control_<C>.yaml         --sweep control.n_guided_steps=<depths>
 #   frs      flow_reversal_<C>.yaml        --sweep control.n_reversal_steps=<depths>
 #   frs_ra   flow_reversal_ra_<C>.yaml     --sweep control.n_reversal_steps=<depths>
-#            with the adapter rotated by ADAPTER_DEG when that is set (else the file's F = M)
-#   where <C> is CORRUPTION (default rotz20; `scale` selects the per-axis gain family)
-#   floor    policy_anchor.yaml            the policy alone with the arm's prompt
-#   ceiling  policy_anchor.yaml            the policy alone with the scene's instruction
+#   floor    policy_anchor.yaml            the policy alone, with the arm's prompt
+#   ceiling  policy_anchor.yaml            the policy alone, with the scene's instruction
 #
-# ARMS_DIR and RUN are exported for the sourcing script.
+# <C> is CORRUPTION: rotz20 (default), scale, or random (a new corruption on every trial).
 
 ARMS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUN="${ARMS_DIR}/../run.sh"
@@ -38,9 +34,7 @@ run_arm() {
             "${RUN}" experiment --config "flow_reversal_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
         frs_ra)
-            local adapter=()
-            [ -n "${ADAPTER_DEG:-}" ] && adapter=(--set "control.reversal_adapter={translation: {rotation_z_deg: ${ADAPTER_DEG}}}")
-            "${RUN}" experiment --config "flow_reversal_ra_${CORRUPTION}.yaml" "$@" "${adapter[@]}" --sweep "control.n_reversal_steps=${depths}"
+            "${RUN}" experiment --config "flow_reversal_ra_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
         floor)
             "${RUN}" experiment --config policy_anchor.yaml "$@"
