@@ -72,9 +72,27 @@ Smoke-test first with `--seeds 0 --max-demos-per-seed 4 --overwrite`. Other flag
 
 ### 5. Finetune (LoRA on LLM + action expert — the "v1" recipe)
 
-Edit and run `bash examples/pi05/feeding_finetune/train.sh` (canonical config,
-fully commented). Key points, validated at 18/20 matched-seed rollouts vs 3/20
-for the old expert-only finetune:
+`train.sh` is the single training entry point. Defaults reproduce the v1 run; everything is
+an env override, and extra args pass through to `lerobot-train`:
+
+```bash
+bash examples/pi05/feeding_finetune/train.sh                 # fresh LoRA on lerobot/pi05_base
+DRY_RUN=1 bash examples/pi05/feeding_finetune/train.sh       # print the resolved command
+# continue an existing adapter on another dataset (see step 6):
+INIT=$OUT/pi05_feeding_v1_lora/checkpoints/030000/pretrained_model \
+DATASET_ROOT=$RAW_ROOT/lerobot_v1_gp REPO_ID=rice/feeding_pi05_v1_gp \
+OUTPUT_DIR=$OUT/pi05_feeding_v1_lora_gp STEPS=10000 LR=1e-4 bash examples/pi05/feeding_finetune/train.sh
+```
+
+`INIT` is either a base model id (fresh adapter) or an adapter checkpoint directory
+(`adapter_config.json` present): then lerobot loads the base named in that file plus the
+trained adapter with `is_trainable=True` (`--policy.path` + `--policy.use_peft=true`) and starts
+a fresh optimizer/LR schedule. That is a new run, unlike lerobot's `--resume`, which replays the
+same run with its saved optimizer state. Other overrides: `JOB_NAME`, `DECAY_LR` (default
+`LR/10`), `BATCH_SIZE`, `SAVE_FREQ`, `TRAIN_GPU`.
+
+Key points of the recipe, validated at 18/20 matched-seed rollouts vs 3/20 for the old
+expert-only finetune:
 
 - **LoRA r=32/α=64 on the PaliGemma LLM _and_ action-expert attention q/v**
   (`--peft.*` flags; `pip install peft` once). Adapting the LLM fixes language
@@ -89,9 +107,45 @@ for the old expert-only finetune:
   ~40 h / 30k steps on an RTX 6000 Ada). No DDP/FSDP needed.
 - Checkpoints are **adapter-only**: merge with pi-finetune's
   `scripts/merge_lora_checkpoint.py` before rollout/deployment, and select the
-  checkpoint by rollout metrics (`scripts/select_checkpoint.py`), not loss.
+  checkpoint by rollout metrics (`scripts/eval_checkpoints.py`), not loss. The
+  resolved config of every run is in each checkpoint's `train_config.json`.
 - Deployment maps the predicted binary gripper state to open/close commands
   with hysteresis (built into brand-rice's `Pi05Agent`).
+
+### 6. Generic-prompt mix for shared autonomy (relabel + continue)
+
+Every episode above is labelled `"Reach, grasp and bring to mouth the {food}"`. The
+shared-autonomy "free-use" graph instead prompts **`"Reach, grasp and bring to mouth"`**
+(no food named). That string is out of distribution for a model trained only on specific
+prompts, so which object it goes for is arbitrary (measured on v1/030000, 95 matched trials:
+it approached the cued object at chance, 32/95, while grasping _some_ object 86/95). Fix
+without new data: relabel a fraction of episodes with generic paraphrases and continue the
+adapter.
+
+```bash
+# 6a. Relabel 40% of episodes per food (stratified, deterministic) into a COPY of the dataset.
+#     The first prompt is the exact deployment string.
+python examples/pi05/feeding_finetune/relabel_prompts.py \
+    --src-root "$RAW_ROOT/lerobot_v1" --dst-root "$RAW_ROOT/lerobot_v1_gp" \
+    --repo-id rice/feeding_pi05_v1_gp --frac 0.4 --seed 0 \
+    --prompts "Reach, grasp and bring to mouth" \
+              "Reach, grasp and bring an object to mouth" \
+              "Reach, grasp and bring some food to mouth"
+# 6b. Continue the v1 adapter on the copy (lower peak LR, 10k steps) — the INIT form of train.sh above.
+```
+
+- `relabel_prompts.py` is generic: it copies any LeRobotDataset and rewrites only the task
+  files via `lerobot.datasets.dataset_tools.modify_tasks` (same operation as
+  `lerobot-edit-dataset --operation.type modify_tasks`), stratified per original task, with a
+  `relabel_manifest.json` listing every relabelled episode. Keep the fraction ≤ 0.5 so the
+  specific prompts still carry grounding.
+- Rebuilding from raw instead? The converter has the same knob:
+  `--generic-prompt-frac 0.4 [--generic-prompts ...]` (deterministic per seed/demo/copy;
+  defaults to the three paraphrases above).
+- Evaluate with pi-finetune's `scripts/eval_checkpoints.py --task-prompt "Reach, grasp and bring to mouth"`
+  (template; `{cue}` = food name). Watch: specific-prompt success unchanged, generic-prompt
+  _approached-object_ distribution flattening across the objects present, and
+  grasp-given-approach per object.
 
 ---
 

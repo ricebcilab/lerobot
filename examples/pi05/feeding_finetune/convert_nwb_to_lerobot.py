@@ -35,6 +35,15 @@ import sys
 import av
 import numpy as np
 
+# Generic (object-agnostic) paraphrases for --generic-prompt-frac. The FIRST one is the exact
+# string the brand-rice free-use graph sends at deployment (food_categorized.json "text_cue"),
+# so it must be in-distribution for shared autonomy.
+FEEDING_GENERIC_PROMPTS = [
+    "Reach, grasp and bring to mouth",
+    "Reach, grasp and bring an object to mouth",
+    "Reach, grasp and bring some food to mouth",
+]
+
 # Camera obs key (in the mp4 filename) -> short feature name used in the dataset.
 CAMS = {
     "overhead": "external_overhead_cam_rgb",
@@ -58,6 +67,23 @@ def parse_args(argv=None):
         "--task-prompt",
         default="Reach, grasp and bring to mouth the {food}",
         help="Language instruction; '{food}' is filled from the trial's text cue.",
+    )
+    p.add_argument(
+        "--generic-prompt-frac",
+        type=float,
+        default=0.0,
+        help="Probability that an emitted episode (and its mid-approach crop) is labelled with a "
+        "GENERIC prompt from --generic-prompts instead of --task-prompt. Deterministic per "
+        "(seed, demo, copy), so shards agree and oversampled copies can differ. Makes the "
+        "object-agnostic prompt used by the shared-autonomy graph in-distribution; keep <= 0.5 "
+        "so the specific prompts still carry grounding. See relabel_prompts.py to "
+        "relabel an EXISTING dataset instead of rebuilding.",
+    )
+    p.add_argument(
+        "--generic-prompts",
+        nargs="+",
+        default=FEEDING_GENERIC_PROMPTS,
+        help="Generic paraphrases sampled uniformly when --generic-prompt-frac fires.",
     )
     p.add_argument(
         "--fps",
@@ -416,6 +442,8 @@ def main(argv=None):
     )
 
     kept = dropped = crops = balance_skipped = no_close_skipped = 0
+
+    generic = 0
     for nwb_path in nwbs:
         seed = seed_index_of(nwb_path)
         if (want_seeds is not None and seed not in want_seeds) or seed not in vids:
@@ -485,12 +513,18 @@ def main(argv=None):
                         ep2 = None
 
             # Emit the (already-decoded) base episode and its crop n_emit times each.
-            for _ in range(n_emit):
-                save_episode(ds, ep, task)
+            for k in range(n_emit):
+                task_k = task
+                if args.generic_prompt_frac > 0:
+                    g = np.random.default_rng([5, seed, demo, k])
+                    if g.random() < args.generic_prompt_frac:
+                        task_k = args.generic_prompts[int(g.integers(len(args.generic_prompts)))]
+                        generic += 1
+                save_episode(ds, ep, task_k)
                 kept += 1
                 s_kept += 1
                 if ep2 is not None:
-                    save_episode(ds, ep2, task)
+                    save_episode(ds, ep2, task_k)
                     crops += 1
 
         print(f"[seed {seed}] kept {s_kept}/{n_demos} demos")
@@ -498,7 +532,8 @@ def main(argv=None):
     ds.finalize()
     print(
         f"\nDONE: {kept} base episodes + {crops} mid-approach crops kept, {dropped} dropped, "
-        f"{balance_skipped} balance-subsampled out, {no_close_skipped} no-close sim glitches. "
+        f"{balance_skipped} balance-subsampled out, {no_close_skipped} no-close sim glitches, "
+        f"{generic} base episodes given a generic prompt. "
         f"Dataset at {output_root}"
     )
     print("finalize() computed q01/q99 stats -> pi05 QUANTILE normalization is data-driven.")
