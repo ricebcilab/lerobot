@@ -20,13 +20,15 @@ policy:
 
 control:
   mode: shared_flow_reversal_steering
-  n_guided_steps: 8           # FC: denoising steps the command is written into
+  tau: null                   # FC: chunk steps the command is written into (null = the whole chunk)
+  lambda: 1                   # FC: Euler steps at whose start it is written (1 = the initial condition, Kao et al.)
+  ic_gain: action             # FC: the command's scale in the noise prior; `action` = the checkpoint's action units
   n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
   input_noise: 0.0
   input_gain: auto            # scale the command so the corruption cannot clip it (null = off)
   max_steps: null             # null = the suite's own episode length
   corruption: {rotation_z_deg: 20}   # the robot gets M @ the command; --set control.corruption=null for a clean run
-  reversal_adapter: null      # the FRS-RA arm sets F = M
+  reversal_adapter: null      # the MARS arm sets F = M
 
 server:
   port: 8765

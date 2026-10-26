@@ -24,7 +24,7 @@ class FakeSession:
     operator = object()  # a synthetic operator: no Start button to wait for
 
     def __init__(self, mode="policy", show_scene=lambda spec: {}, rollout=None):
-        self.mode, self.n_guided_steps = mode, 0
+        self.mode, self.tau, self.lam, self.ic_gain = mode, None, 1, "action"
         self.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
         self.adapter = ReversalAdapter()
         self._show_scene, self._rollout = show_scene, rollout

@@ -24,8 +24,10 @@ open the printed URL. REPL commands:
     task <suite> <id>   switch scene (e.g. `task libero_spatial 3`)
     mode <name> [n]     policy: pi0.5 only
                         shared_override: your x/y/z replaces pi0.5's translation
-                        shared_flow_control [n_guided_steps]: your x/y/z steers dims 0-2 of x_t
-                        for the first n_guided_steps denoising steps (default 5)
+                        shared_flow_control [tau] [lambda]: Kao et al.'s flow control: your
+                        x/y/z (scaled by ic_gain, `action` = action units) is written into the
+                        first tau chunk steps of x_t at the start of the first lambda denoising
+                        steps (defaults: the whole chunk, 1)
                         shared_flow_reversal_steering [n_reversal_steps]: your x/y/z
                         defines a reference chunk that is integrated backward
                         through the flow to its latent noise; the forward flow
@@ -52,11 +54,11 @@ import re
 import time
 from pathlib import Path
 
-from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings
+from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings, spec_label
 from session import VIDEO_FPS, Session
-from teleop import build_corruption, read_matrix_spec
+from teleop import build_corruption, build_curl, read_matrix_spec
 
-from lerobot.policies.pi05.steering import build_reversal_adapter
+from lerobot.policies.pi05.steering import parse_adapter_spec
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
@@ -86,11 +88,22 @@ def parse_args():
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--mode", default=None, choices=MODES, help="control mode to start in")
     parser.add_argument(
+        "--tau", dest="tau", type=int, default=None, help="shared_flow_control: chunk steps written"
+    )
+    parser.add_argument(
+        "--lambda",
         "--n-guided-steps",
-        dest="n_guided_steps",
+        dest="lam",
         type=int,
         default=None,
-        help="shared_flow_control: steps your input steers",
+        help="shared_flow_control: denoising steps the command is written at (1 = initial condition)",
+    )
+    parser.add_argument(
+        "--ic-gain",
+        dest="ic_gain",
+        type=_ic_gain,
+        default=None,
+        help="shared_flow_control: scale in the noise prior, or `action` for the checkpoint's action units",
     )
     parser.add_argument(
         "--n-reversal-steps",
@@ -146,18 +159,32 @@ def parse_args():
 # ---------------------------------------------------------------- REPL commands
 
 
+def _ic_gain(text: str):
+    return "action" if text == "action" else float(text)
+
+
 def cmd_mode(session: Session, tokens: list[str]) -> None:
-    usage = "usage: mode policy|shared_override|shared_flow_control [n_guided_steps]|shared_flow_reversal_steering [n]|teleop"
+    usage = "usage: mode policy|shared_override|shared_flow_control [tau] [lambda]|shared_flow_reversal_steering [n]|teleop"
     if len(tokens) < 2 or tokens[1] not in MODES:
         print(usage)
         return
-    mode, arg = tokens[1], (tokens[2] if len(tokens) > 2 else None)
+    mode, args = tokens[1], tokens[2:]
     kwargs = {}
-    if arg is not None:
-        if mode not in ("shared_flow_control", "shared_flow_reversal_steering") or not arg.isdigit():
+    if args:
+        if mode not in ("shared_flow_control", "shared_flow_reversal_steering") or not all(
+            a.isdigit() for a in args
+        ):
             print(usage)
             return
-        kwargs["n_guided_steps" if mode == "shared_flow_control" else "n_reversal_steps"] = int(arg)
+        if mode == "shared_flow_control":
+            kwargs["tau"] = int(args[0])
+            if len(args) > 1:
+                kwargs["lam"] = int(args[1])
+        elif len(args) == 1:
+            kwargs["n_reversal_steps"] = int(args[0])
+        else:
+            print(usage)
+            return
     try:
         session.set_mode(mode, **kwargs)
     except ValueError as e:
@@ -203,12 +230,36 @@ def _cmd_matrix(session: Session, tokens: list[str], name: str, holder, build) -
 
 
 def cmd_corruption(session: Session, tokens: list[str]) -> None:
-    _cmd_matrix(session, tokens, "corruption", session.chain.corruption, build_corruption)
+    corruption = session.chain.corruption
+    if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
+        curl = build_curl(read_matrix_spec(tokens[1]))
+        if curl is not None:  # a curl field replaces any matrix
+            corruption.matrix = None
+            corruption.curl = curl
+            corruption.label = spec_label(read_matrix_spec(tokens[1]))
+            print(corruption.describe())
+            print(session.refresh_input_gain())
+            return
+    corruption.curl = None
+    _cmd_matrix(session, tokens, "corruption", corruption, build_corruption)
     print(session.refresh_input_gain())  # an `auto` gain follows the corruption in force
 
 
 def cmd_adapter(session: Session, tokens: list[str]) -> None:
-    build = lambda spec: build_reversal_adapter(spec, session.chain.corruption.matrix)  # noqa: E731
+    corruption = session.chain.corruption
+    basis = corruption.curl.steady_state() if corruption.curl is not None else corruption.matrix
+    if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
+        spec = parse_adapter_spec(read_matrix_spec(tokens[1]), basis)
+        if spec.user_path or spec.task_path:  # learned MARS modules
+            session.adapter.matrix = spec.matrix
+            session.adapter.user_module = session.adapter.task_module = None
+            session.adapter.load_modules(
+                spec.user_path, spec.task_path, device=next(session.policy.parameters()).device
+            )
+            print(session.adapter.describe())
+            return
+    session.adapter.user_module = session.adapter.task_module = None
+    build = lambda spec: parse_adapter_spec(spec, basis).matrix  # noqa: E731
     _cmd_matrix(session, tokens, "adapter", session.adapter, build)
 
 

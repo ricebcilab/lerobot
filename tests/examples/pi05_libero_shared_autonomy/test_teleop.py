@@ -350,3 +350,83 @@ def test_chain_with_input_gain_never_clips_a_corruption_from_the_family():
             # and that recorded command is the push itself, only shorter
             assert np.linalg.norm(raw) <= 0.25 + 1e-12
             assert raw @ push == pytest.approx(np.linalg.norm(raw) * np.linalg.norm(push))
+
+
+# ---------------------------------------------------------------- curl corruption
+
+from teleop import Curl, build_curl  # noqa: E402
+
+
+def test_curl_discretization_converges_to_the_steady_state_map():
+    curl = Curl(curl=20.0, tau=0.1, dt=0.001)
+    decay, drive = curl.discretization()
+    v, u = np.zeros(3), np.array([1.0, 0.0, 0.5])
+    for _ in range(5000):
+        v = decay @ v + drive @ u
+    np.testing.assert_allclose(v, curl.steady_state() @ u, atol=1e-6)
+    # tau * curl = 2: a clockwise turn by atan(2) and a slowdown by 1/sqrt(5) in x-y; z just lags to u
+    np.testing.assert_allclose(v[:2], [0.2, -0.4], atol=1e-6)
+    assert v[2] == pytest.approx(0.5, abs=1e-6)
+    assert "63 deg" in curl.label() and "45%" in curl.label()
+
+
+def test_curl_corruption_integrates_on_the_clock_and_idle_stays_idle():
+    source = Source((1.0, 0.0, 0.0))
+    curl = Curl(curl=20.0, tau=0.1, dt=0.05)
+    corrupted = CommandCorruption(source, curl=curl)
+    decay, drive = curl.discretization()
+    assert "curl field" in corrupted.describe()
+    np.testing.assert_allclose(corrupted.translation, np.zeros(3))  # no clock yet: still at rest
+    corrupted.advance(0)
+    first = corrupted.translation
+    np.testing.assert_allclose(first, drive @ source.translation)
+    np.testing.assert_allclose(
+        corrupted.translation, first
+    )  # a second read at the same clock: no re-integration
+    corrupted.advance(9)  # a chunk later: nine more steps with the push held
+    v = first.copy()
+    for _ in range(9):
+        v = decay @ v + drive @ source.translation
+    np.testing.assert_allclose(corrupted.translation, np.clip(v, -1, 1))
+    source.translation = np.array(
+        [DEADBAND / 2, 0.0, 0.0]
+    )  # idle push: served as is, the field keeps evolving
+    corrupted.advance(10)
+    np.testing.assert_allclose(corrupted.translation, [DEADBAND / 2, 0.0, 0.0])
+    corrupted.reset()
+    corrupted.advance(0)
+    source.translation = np.array([1.0, 0.0, 0.0])
+    np.testing.assert_allclose(corrupted.translation, first)  # from rest again
+    with pytest.raises(ValueError, match="not both"):
+        CommandCorruption(source, matrix=np.eye(3), curl=curl)
+    corrupted.curl = None
+    np.testing.assert_allclose(corrupted.translation, [1.0, 0.0, 0.0])
+
+
+def test_build_curl_spec():
+    curl = build_curl({"curl": 20, "tau": 0.1})
+    assert curl == Curl(20.0, 0.1) and curl.dt == teleop.CONTROL_DT
+    assert build_curl({"curl": 5, "tau": 0.2, "dt": 0.02}).dt == 0.02
+    assert build_curl({"rotation_z_deg": 20}) is None and build_curl(None) is None
+    for bad in (
+        {"curl": 20},
+        {"curl": 20, "tau": 0.1, "axis": "z"},
+        {"curl": 20, "tau": 0},
+        {"curl": "x", "tau": 0.1},
+    ):
+        with pytest.raises(ValueError):
+            build_curl(bad)
+
+
+def test_teleop_chain_advances_and_resets_the_curl():
+    kb = KeyboardReader(clock=lambda: 0.0)
+    kb.update({"ArrowRight"}, toggles=0)
+    chain = TeleopChain(kb, input_noise=0.0)
+    chain.corruption.curl = Curl(curl=20.0, tau=0.1, dt=0.05)
+    chain.advance(0)
+    served = chain.source.translation
+    raw = chain.raw.last_translation
+    _, drive = chain.corruption.curl.discretization()
+    np.testing.assert_allclose(served, drive @ raw)
+    chain.reset()
+    np.testing.assert_allclose(chain.source.translation, np.zeros(3))  # at rest until the clock advances

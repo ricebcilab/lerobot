@@ -263,3 +263,42 @@ def test_sample_actions_partial_schedule_lands_on_zero():
 
     with pytest.raises(ValueError, match="num_forward_steps"), torch.inference_mode():
         policy.predict_action_chunk(batch, flow_start_time=0.5, num_forward_steps=0)
+
+
+@require_cuda
+@require_hf_token
+def test_velocity_field_is_the_field_the_sampler_integrates():
+    policy, batch = _small_policy()
+    cfg = policy.config
+    noise = torch.randn(1, cfg.chunk_size, cfg.max_action_dim, device=cfg.device)
+    with torch.inference_mode():
+        velocity = policy.velocity_field(batch)
+        x_t, h = noise.clone(), 1.0 / cfg.num_inference_steps
+        for step in range(cfg.num_inference_steps):  # the sampler's own Euler scheme, by hand
+            x_t = x_t - h * velocity(x_t, 1.0 - step * h)
+        manual = x_t[:, :, : cfg.output_features["action"].shape[0]]
+        chunk = policy.predict_action_chunk(batch, noise_fn=lambda v, n: noise.clone())
+        # a (batch,) time tensor is accepted too
+        per_sample = velocity(noise, torch.full((1,), 0.5, device=cfg.device))
+    torch.testing.assert_close(manual, chunk, atol=1e-4, rtol=1e-4)
+    assert per_sample.shape == noise.shape
+
+
+@require_cuda
+@require_hf_token
+def test_velocity_hook_adapts_the_forward_field():
+    policy, batch = _small_policy()
+    cfg = policy.config
+    noise = torch.randn(1, cfg.chunk_size, cfg.max_action_dim, device=cfg.device)
+    calls = []
+
+    def velocity_hook(step, time, x_t, v):
+        calls.append((step, round(time, 6)))
+        return torch.zeros_like(v)  # a zero field: the chunk stays at the starting noise
+
+    with torch.inference_mode():
+        chunk = policy.predict_action_chunk(
+            batch, noise_fn=lambda v, n: noise.clone(), velocity_hook=velocity_hook
+        )
+    assert [s for s, _ in calls] == list(range(cfg.num_inference_steps))
+    torch.testing.assert_close(chunk, noise[:, :, : cfg.output_features["action"].shape[0]])

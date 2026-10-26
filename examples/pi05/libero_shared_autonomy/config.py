@@ -15,9 +15,16 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from teleop import PolicyOperatorSettings, RandomCorruption, build_corruption, check_input_gain
+from teleop import (
+    Curl,
+    PolicyOperatorSettings,
+    RandomCorruption,
+    build_corruption,
+    build_curl,
+    check_input_gain,
+)
 
-from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, build_reversal_adapter
+from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, parse_adapter_spec
 
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")
@@ -31,7 +38,11 @@ DEFAULT_INTERACTIVE_CONFIG = CONFIG_DIR / "interactive.yaml"
 @dataclass
 class ControlSettings:
     mode: str = "policy"
-    n_guided_steps: int = 5
+    tau: int | None = None  # FC: chunk steps the command is written into; None = the whole chunk
+    lam: int = 1  # FC: Euler steps at whose start it is written (YAML `lambda`; the old `n_guided_steps`)
+    ic_gain: float | str = (
+        "action"  # FC: the command's scale in the noise prior; "action" = the checkpoint's action units
+    )
     n_reversal_steps: int | None = None
     input_noise: float = 0.0
     input_gain: float | str | None = None  # null = off, `auto`, or a number in (0, 1]
@@ -43,6 +54,9 @@ class ControlSettings:
     corruption_matrix: np.ndarray | None = field(default=None, repr=False)
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
     corruption_family: RandomCorruption | None = field(default=None, repr=False)
+    corruption_curl: Curl | None = field(default=None, repr=False)
+    reversal_adapter_user_path: str | None = field(default=None, repr=False)  # learned MARS user module
+    reversal_adapter_task_path: str | None = field(default=None, repr=False)  # learned MARS task module
     resolved_input_gain: float | None = field(default=None, repr=False)
 
 
@@ -74,8 +88,18 @@ class ExperimentSettings:
 
 # YAML key -> flat settings name. The `control:` and `policy_operator:` blocks mirror
 # their dataclasses (the resolved fields are not settings).
-_RESOLVED = ("corruption_matrix", "reversal_adapter_matrix", "corruption_family", "resolved_input_gain")
-_CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if k not in _RESOLVED}
+_RESOLVED = (
+    "corruption_matrix",
+    "reversal_adapter_matrix",
+    "corruption_family",
+    "corruption_curl",
+    "reversal_adapter_user_path",
+    "reversal_adapter_task_path",
+    "resolved_input_gain",
+)
+# `lambda` is the YAML key of the `lam` field (a Python keyword); `n_guided_steps` is its old name.
+_CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if k not in _RESOLVED and k != "lam"}
+_CONTROL_SCHEMA.update({"lambda": "lam", "n_guided_steps": "lam"})
 _RANDOM_SCHEMA = {k: k for k in RandomCorruption.__dataclass_fields__}  # the `random:` block of a corruption
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
 _OPERATOR_SCHEMA = {k: k for k in PolicyOperatorSettings.__dataclass_fields__}
@@ -219,7 +243,10 @@ def gain_that_cannot_clip(largest_gain: float) -> float:
 
 
 def largest_gain(control: ControlSettings) -> float:
-    """The most the corruption in force can lengthen a command (1 without a corruption)."""
+    """The most the corruption in force can lengthen a command (1 without a corruption; a curl field
+    never lengthens a push)."""
+    if control.corruption_curl is not None:
+        return 1.0
     if control.corruption_family is not None:
         return control.corruption_family.max_gain
     if control.corruption_matrix is None:
@@ -254,8 +281,25 @@ def build_control(flat: dict, where: str) -> ControlSettings:
     control = ControlSettings(**_fields_from_flat(ControlSettings, flat))
     if control.mode not in MODES:
         _fail(where, f"control.mode must be one of {', '.join(MODES)}, got {control.mode!r}")
-    if not isinstance(control.n_guided_steps, int) or control.n_guided_steps < 0:
-        _fail(where, "control.n_guided_steps must be a non-negative integer")
+    if control.tau is not None and (type(control.tau) is not int or control.tau < 1):
+        _fail(
+            where,
+            "control.tau must be a positive integer (chunk steps the command is written into) or null (the whole chunk)",
+        )
+    if type(control.lam) is not int or control.lam < 0:
+        _fail(
+            where,
+            "control.lambda must be a non-negative integer (Euler steps the command is written at; 1 = the initial condition)",
+        )
+    if control.ic_gain != "action" and (
+        isinstance(control.ic_gain, bool)
+        or not isinstance(control.ic_gain, int | float)
+        or not control.ic_gain > 0
+    ):
+        _fail(
+            where,
+            "control.ic_gain must be a positive number (noise-prior units) or 'action' (the checkpoint's action units)",
+        )
     if control.n_reversal_steps is not None and (
         not isinstance(control.n_reversal_steps, int) or control.n_reversal_steps < 1
     ):
@@ -272,14 +316,24 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             where,
             f"control.operator_dims must be a non-empty list drawn from {', '.join(OPERATOR_DIM_GROUPS)}, got {dims!r}",
         )
-    control.corruption_family = corruption_family(control.corruption, f"{where}: control.corruption")
-    if control.corruption_family is None:
-        control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
-        control.reversal_adapter_matrix = build_reversal_adapter(
-            control.reversal_adapter, control.corruption_matrix, f"{where}: control.reversal_adapter"
-        )
-    else:  # each trial draws its corruption, and the adapter with it: only check the adapter spec here
-        build_reversal_adapter(control.reversal_adapter, np.eye(3), f"{where}: control.reversal_adapter")
+    control.corruption_curl = build_curl(control.corruption, f"{where}: control.corruption")
+    if control.corruption_curl is not None:  # a curl field: no matrix; its steady-state map stands in for M
+        basis = control.corruption_curl.steady_state()
+    else:
+        control.corruption_family = corruption_family(control.corruption, f"{where}: control.corruption")
+        if control.corruption_family is None:
+            control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
+            basis = control.corruption_matrix
+        else:  # each trial draws its corruption, and the fixed adapter with it: only check the spec here
+            basis = np.eye(3)
+    adapter = parse_adapter_spec(control.reversal_adapter, basis, f"{where}: control.reversal_adapter")
+    control.reversal_adapter_matrix = None if control.corruption_family is not None else adapter.matrix
+    # Module checkpoints are loaded (and their existence checked) by the session, so a condition file
+    # can be inspected (--dry-run, tests) before its modules are trained.
+    control.reversal_adapter_user_path, control.reversal_adapter_task_path = (
+        adapter.user_path,
+        adapter.task_path,
+    )
     control.resolved_input_gain = resolve_input_gain(control, where)
     return control
 
@@ -319,14 +373,12 @@ def parse_set(item: str) -> tuple[list[str], object]:
     key, sep, raw = item.partition("=")
     key = key.strip()
     if not sep or not key or not all(part.isidentifier() for part in key.split(".")):
-        raise ValueError(
-            f"--set expects KEY=VALUE with a dotted key such as control.n_guided_steps=4, got {item!r}"
-        )
+        raise ValueError(f"--set expects KEY=VALUE with a dotted key such as control.tau=25, got {item!r}")
     return key.split("."), yaml.safe_load(raw) if raw.strip() else None
 
 
 def sets_to_tree(items: list[str]) -> dict:
-    """Nested mapping from `--set` items, later items winning: ['control.n_guided_steps=4'] -> {'control': {...}}."""
+    """Nested mapping from `--set` items, later items winning: ["control.tau=25"] -> {"control": {...}}."""
     tree: dict = {}
     for item in items:
         parts, value = parse_set(item)
@@ -340,7 +392,7 @@ def sets_to_tree(items: list[str]) -> dict:
 
 
 def set_label(items: list[str]) -> str:
-    """Filesystem-safe suffix describing `--set` items: control.n_guided_steps=4 -> n_guided_steps-4."""
+    """Filesystem-safe suffix describing `--set` items: control.tau=25 -> tau-25."""
     parts = []
     for item in items:
         keys, value = parse_set(item)

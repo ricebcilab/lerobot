@@ -326,23 +326,136 @@ class PolicyOperator:
         return self._gripper
 
 
+CONTROL_DT = 0.05  # one LIBERO control step (20 steps/s): the curl field's integration step
+
+
+@dataclass(frozen=True)
+class Curl:
+    """A curl field on the command, the cursor channel's dynamic corruption: the served translation
+    is a velocity driven by the push with time constant `tau` (s) and turned by `curl` (1/s, + =
+    clockwise in the x-y plane; z is a plain lag): dv/dt = (u - v) / tau + curl * R v, stepped
+    every `dt` s with the push held. At steady state a held push comes out turned clockwise by
+    atan(tau * curl) and slowed by 1 / sqrt(1 + (tau * curl)^2)."""
+
+    curl: float
+    tau: float
+    dt: float = CONTROL_DT
+
+    def __post_init__(self):
+        if not (np.isfinite(self.curl) and self.tau > 0 and self.dt > 0):
+            raise ValueError(f"curl must be finite and tau, dt positive, got {self}")
+
+    @staticmethod
+    def _rot() -> np.ndarray:
+        return np.array([[0.0, 1.0], [-1.0, 0.0]])
+
+    def discretization(self) -> tuple[np.ndarray, np.ndarray]:
+        """(decay, drive): the exact one-step update v <- decay v + drive u for a push u held over `dt`."""
+        eye2, rot = np.eye(2), self._rot()
+        decay2 = np.exp(-self.dt / self.tau) * (
+            np.cos(self.curl * self.dt) * eye2 + np.sin(self.curl * self.dt) * rot
+        )
+        m_inv = (-eye2 / self.tau - self.curl * rot) / (1 / self.tau**2 + self.curl**2)
+        drive2 = m_inv @ (decay2 - eye2) / self.tau
+        lag = np.exp(-self.dt / self.tau)
+        decay, drive = np.eye(3), np.eye(3)
+        decay[:2, :2], decay[2, 2] = decay2, lag
+        drive[:2, :2], drive[2, 2] = drive2, 1.0 - lag
+        return decay, drive
+
+    def steady_state(self) -> np.ndarray:
+        """3x3 map from a held push to the steady-state served velocity (z unchanged)."""
+        k = self.tau * self.curl
+        s = np.eye(3)
+        s[:2, :2] = (np.eye(2) + k * self._rot()) / (1 + k**2)
+        return s
+
+    def label(self) -> str:
+        k = self.tau * self.curl
+        return (
+            f"curl={self.curl:g}, tau={self.tau:g} (steady state: turned {np.degrees(np.arctan(k)):.0f} deg "
+            f"clockwise, slowed to {100 / np.sqrt(1 + k**2):.0f}%)"
+        )
+
+
+def build_curl(spec, where: str = "corruption") -> Curl | None:
+    """The `Curl` a `{curl: b, tau: s[, dt: d]}` spec describes; None for any other (matrix) spec."""
+    if not isinstance(spec, dict) or "curl" not in spec:
+        return None
+    unknown = set(spec) - {"curl", "tau", "dt"}
+    if unknown or "tau" not in spec:
+        raise ValueError(
+            f"{where}: a curl corruption takes curl and tau (and optionally dt), got {sorted(spec)}"
+        )
+    try:
+        return Curl(float(spec["curl"]), float(spec["tau"]), float(spec.get("dt", CONTROL_DT)))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{where}: {e}") from e
+
+
 class CommandCorruption(MatrixHolder):
-    """Corrupt a source's translation: x -> clip(M @ x), with `matrix` a 3x3 or None (off).
+    """Corrupt a source's translation: x -> clip(M @ x), with `matrix` a 3x3 or None (off), or a curl
+    field (`curl`, a `Curl`): a velocity driven by the push, stepped once per control step.
 
     The matrix can change at any time and is only applied while the source commands beyond
-    DEADBAND, so an idle source stays idle. `label` is for display.
+    DEADBAND, so an idle source stays idle. With a curl the field keeps evolving while the push is
+    idle (the cursor channel's rule), but an idle push is still served as is. The curl's clock is
+    `advance(step)`, called once per environment step by the rollout; a read integrates the steps
+    elapsed since the last read with the push held, so once-per-chunk reads (FC, FRS) and
+    once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest.
+    `label` is for display.
     """
 
     size = 3
     where = "corruption matrix"
 
-    def __init__(self, source, matrix=None, label: str | None = None):
+    def __init__(self, source, matrix=None, label: str | None = None, curl: Curl | None = None):
         self.source = source
+        self._curl: Curl | None = None
+        self._vel = np.zeros(3)
+        self._clock = 0
+        self._integrated = 0
+        self._discretization: tuple | None = None
         super().__init__(matrix, label)
+        self.curl = curl
+
+    @property
+    def curl(self) -> Curl | None:
+        return self._curl
+
+    @curl.setter
+    def curl(self, value: Curl | None) -> None:
+        if value is not None and not isinstance(value, Curl):
+            raise ValueError(f"curl must be a Curl or None, got {value!r}")
+        if value is not None and self._matrix is not None:
+            raise ValueError("a corruption is a matrix or a curl field, not both")
+        self._curl = value
+        self._discretization = None if value is None else value.discretization()
+        self.reset()
+
+    def reset(self) -> None:
+        """A new trial: the curl's velocity starts from rest and the clock from step 0."""
+        self._vel = np.zeros(3)
+        self._clock = 0
+        self._integrated = 0
+
+    def advance(self, step: int) -> None:
+        """The environment step about to be served (0-based); the next read integrates up to it."""
+        self._clock = int(step) + 1
 
     @property
     def translation(self) -> np.ndarray:
         clean = np.asarray(self.source.translation, dtype=np.float64)
+        if self._curl is not None:
+            if self._matrix is not None:
+                raise ValueError("a corruption is a matrix or a curl field, not both")
+            decay, drive = self._discretization
+            for _ in range(self._clock - self._integrated):
+                self._vel = decay @ self._vel + drive @ clean
+            self._integrated = max(self._integrated, self._clock)
+            if np.max(np.abs(clean)) < DEADBAND:
+                return clean
+            return np.clip(self._vel, -1.0, 1.0)
         if self._matrix is None or np.max(np.abs(clean)) < DEADBAND:
             return clean
         return np.clip(self._matrix @ clean, -1.0, 1.0)
@@ -352,6 +465,8 @@ class CommandCorruption(MatrixHolder):
         return self.source.gripper
 
     def describe(self) -> str:
+        if self._curl is not None:
+            return f"Command corruption: curl field on x/y/z, {self._curl.label()}."
         if self._matrix is None:
             return "Command corruption: off."
         return f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {format_matrix(self._matrix)}."
@@ -551,6 +666,14 @@ class TeleopChain:
     @property
     def source(self) -> RecordingReader:
         return self.served
+
+    def reset(self) -> None:
+        """A new trial: a curl corruption starts from rest."""
+        self.corruption.reset()
+
+    def advance(self, step: int) -> None:
+        """Once per environment step, before the modes read the source: the curl's clock."""
+        self.corruption.advance(step)
 
     def attach_operator(self, operator) -> None:
         """Put a synthetic operator (e.g. `PolicyOperator`) in front of every human source."""

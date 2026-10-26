@@ -51,7 +51,7 @@ from reproducibility import TrialSpec, corruption_rng, trial_specs
 from session import VIDEO_FPS, Session
 from teleop import CorruptionDraw, TeleopChain
 
-from lerobot.policies.pi05.steering import N_ACTION_DIMS, build_reversal_adapter
+from lerobot.policies.pi05.steering import N_ACTION_DIMS, parse_adapter_spec
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
@@ -91,7 +91,7 @@ def trial_matrices(control: ControlSettings, spec: TrialSpec) -> TrialMatrices:
     if control.corruption_family is None:
         return TrialMatrices(control.corruption_matrix, control.reversal_adapter_matrix, None)
     draw = control.corruption_family.sample(corruption_rng(spec))
-    return TrialMatrices(draw.matrix, build_reversal_adapter(control.reversal_adapter, draw.matrix), draw)
+    return TrialMatrices(draw.matrix, parse_adapter_spec(control.reversal_adapter, draw.matrix).matrix, draw)
 
 
 def build_schedule(task_ids: list[int], n_trials: int, order: str, seed: int) -> list[int]:
@@ -248,7 +248,7 @@ def expand_blocks(stem: str, sets: list[str], sweep: str | None) -> list[Block]:
     key, sep, values = sweep.partition("=")
     values = [v.strip() for v in values.split(",") if v.strip()]
     if not sep or not key.strip() or not values:
-        raise ValueError(f"--sweep expects KEY=v1,v2,... such as control.n_guided_steps=2,4,8, got {sweep!r}")
+        raise ValueError(f"--sweep expects KEY=v1,v2,... such as control.tau=5,10,25, got {sweep!r}")
     blocks = []
     for value in values:
         block_sets = [*sets, f"{key.strip()}={value}"]
@@ -270,7 +270,7 @@ def parse_args() -> tuple[argparse.Namespace, list[Block]]:
         default=[],
         metavar="KEY=VALUE",
         help="override one YAML key by dotted path, value parsed as YAML (repeatable), "
-        "e.g. --set control.n_guided_steps=4 --set control.corruption=null",
+        "e.g. --set control.tau=25 --set control.corruption=null",
     )
     parser.add_argument(
         "--sweep",
@@ -343,8 +343,14 @@ def _provenance(
         "n_action_steps": settings.session.n_action_steps,
         "compile": settings.session.compile,
         "mode": control.mode,
-        "n_guided_steps": control.n_guided_steps,
+        "tau": control.tau,
+        "lambda": control.lam,
+        "ic_gain": control.ic_gain,
         "n_reversal_steps": control.n_reversal_steps,
+        "reversal_adapter_modules": {
+            "user": control.reversal_adapter_user_path,
+            "task": control.reversal_adapter_task_path,
+        },
         "input_noise": control.input_noise,
         "input_gain": control.input_gain,
         "resolved_input_gain": control.resolved_input_gain,
@@ -372,7 +378,7 @@ def _describe_block(settings: ExperimentSettings) -> str:
     lines = [
         f'VLA prompt: "{settings.prompt}"'
         + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else ""),
-        f"mode: {control.mode}   n_guided_steps: {control.n_guided_steps}   "
+        f"mode: {control.mode}   tau: {control.tau}   lambda: {control.lam}   ic_gain: {control.ic_gain}   "
         f"n_reversal_steps: {control.n_reversal_steps}",
         f"operator: {settings.session.operator}   operator commands: {', '.join(control.operator_dims)}",
     ]
@@ -498,7 +504,9 @@ def run_block(
             "policy_operator": asdict(settings.session.policy_operator),
             "operator_dims": list(control.operator_dims),
             "mode": mode,
-            "n_guided_steps": session.n_guided_steps if mode == "shared_flow_control" else None,
+            "tau": session.tau if mode == "shared_flow_control" else None,
+            "lambda": session.lam if mode == "shared_flow_control" else None,
+            "ic_gain": session.ic_gain if mode == "shared_flow_control" else None,
             "input_noise": control.input_noise,
             "input_gain": control.resolved_input_gain,
             "corruption": session.chain.corruption.label,

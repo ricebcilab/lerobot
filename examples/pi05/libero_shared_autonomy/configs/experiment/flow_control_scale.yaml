@@ -1,6 +1,11 @@
-# FC: the command is written into the first n_guided_steps denoising steps of every chunk.
-#   sweep the depth:  --sweep control.n_guided_steps=2,4,6,8,10
+# FC (Kao et al. 2026): the command, scaled by ic_gain into the noise prior's units, is written into the
+# first tau chunk steps of x_t at the start of each of the first lambda denoising steps; the flow runs
+# unmodified. tau null = the whole chunk, lambda 1 = the initial condition only, ic_gain `action` = the
+# checkpoint's action units (the recorded study's arm). Sweep the depth:  --sweep control.tau=5,10,25,50
+# (chunk steps of 50); or the gain once per condition:  --sweep control.ic_gain=1,2,3,5
 extends: base_scale.yaml
 control:
   mode: shared_flow_control
-  n_guided_steps: 8
+  tau: null
+  lambda: 1
+  ic_gain: action

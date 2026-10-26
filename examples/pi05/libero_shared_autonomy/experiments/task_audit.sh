@@ -8,7 +8,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Which LIBERO-Goal task separates FRS-RA from FC at their best depths? oracle_sweep.sh with the
+# Which LIBERO-Goal task separates MARS from FC at their best depths? oracle_sweep.sh with the
 # SpaceMouse-like operator (new intent every 20 steps, delivered 4 late) on tasks 4-8; tasks 0/2/3/9
 # score ~0 for every method and are left out.
 #
@@ -17,7 +17,7 @@
 
 export OUT="${OUT:-outputs/pi05_libero_task_audit_u20d4}"
 export TASKS="${TASKS:-4 5 6 7 8}"
-export ARMS="${ARMS:-fc frs frs_ra ceiling}"
+export ARMS="${ARMS:-fc frs mars ceiling}"
 export FC_DEPTHS="${FC_DEPTHS:-4,6,8,10}"
 export FRS_DEPTHS="${FRS_DEPTHS:-1,2,4}"
 export FRS_RA_DEPTHS="${FRS_RA_DEPTHS:-1,2,4,6}"

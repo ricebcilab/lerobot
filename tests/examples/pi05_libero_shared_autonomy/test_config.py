@@ -103,8 +103,8 @@ def test_every_shipped_condition_loads(name):
 
 
 def test_arm_files_resolve():
-    frs_ra = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_ra_rotz20.yaml", {})
-    c = frs_ra.session.control
+    mars = load_experiment_settings(CONFIG_DIR / "experiment" / "mars_rotz20.yaml", {})
+    c = mars.session.control
     assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
     np.testing.assert_allclose(c.corruption_matrix, rotation_about_z(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))
@@ -116,7 +116,86 @@ def test_arm_files_resolve():
     assert native.session.control.reversal_adapter_matrix is None
     np.testing.assert_allclose(native.session.control.corruption_matrix, rotation_about_z(20))
     fc = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml", {})
-    assert fc.session.control.mode == "shared_flow_control" and fc.session.control.n_guided_steps == 8
+    assert fc.session.control.mode == "shared_flow_control"
+    assert (fc.session.control.tau, fc.session.control.lam, fc.session.control.ic_gain) == (None, 1, "action")
+    learned = load_experiment_settings(
+        CONFIG_DIR / "experiment" / "mars_learned_rotz20.yaml", {}
+    ).session.control
+    assert learned.reversal_adapter_user_path.endswith("user.pt") and learned.reversal_adapter_matrix is None
+
+
+def _write(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text)
+    return path
+
+
+def test_flow_control_knobs_and_the_old_name(tmp_path):
+    arm = _write(
+        tmp_path, "fc.yaml", "control:\n  mode: shared_flow_control\n  tau: 25\n  lambda: 2\n  ic_gain: 2.0\n"
+    )
+    c = load_experiment_settings(arm, {}).session.control
+    assert (c.tau, c.lam, c.ic_gain) == (25, 2, 2.0)
+    old = _write(tmp_path, "old.yaml", "control:\n  mode: shared_flow_control\n  n_guided_steps: 3\n")
+    assert load_experiment_settings(old, {}).session.control.lam == 3  # the old key is lambda
+    assert load_experiment_settings(arm, {}, sets=["control.lambda=0"]).session.control.lam == 0
+    for bad, match in (
+        ("  tau: 0\n", "control.tau"),
+        ("  tau: 2.5\n", "control.tau"),
+        ("  lambda: -1\n", "control.lambda"),
+        ("  ic_gain: 0\n", "control.ic_gain"),
+        ("  ic_gain: noise\n", "control.ic_gain"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            load_experiment_settings(
+                _write(tmp_path, "bad.yaml", "control:\n  mode: shared_flow_control\n" + bad), {}
+            )
+
+
+def test_learned_and_composed_adapter_specs(tmp_path):
+    from lerobot.policies.pi05.steering import LearnedTaskModule, LearnedUserModule, save_adapter_module
+
+    user = save_adapter_module(LearnedUserModule(horizon=4, d=8, tdim=4), tmp_path / "user.pt", kind="user")
+    task = save_adapter_module(LearnedTaskModule(horizon=4, d=8, tdim=4), tmp_path / "task.pt", kind="task")
+    base = "control:\n  mode: shared_flow_reversal_steering\n  corruption: {rotation_z_deg: 20}\n"
+    c = load_experiment_settings(
+        _write(tmp_path, "a.yaml", base + f"  reversal_adapter: {{learned: {user}}}\n"), {}
+    ).session.control
+    assert c.reversal_adapter_user_path == str(user) and c.reversal_adapter_task_path is None
+    assert c.reversal_adapter_matrix is None
+    spec = f"  reversal_adapter: {{user: {{translation: corruption}}, task: {task}}}\n"
+    c = load_experiment_settings(_write(tmp_path, "b.yaml", base + spec), {}).session.control
+    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], rotation_about_z(20))
+    assert c.reversal_adapter_task_path == str(task) and c.reversal_adapter_user_path is None
+    spec = f"  reversal_adapter: {{user: {{learned: {user}}}, task: {task}}}\n"
+    c = load_experiment_settings(_write(tmp_path, "c.yaml", base + spec), {}).session.control
+    assert (c.reversal_adapter_user_path, c.reversal_adapter_task_path) == (str(user), str(task))
+    for bad in ("  reversal_adapter: {learned: 1}\n", "  reversal_adapter: {user: {learned: u.pt}, F: []}\n"):
+        with pytest.raises(ValueError):
+            load_experiment_settings(_write(tmp_path, "d.yaml", base + bad), {})
+
+
+def test_curl_corruption_resolves():
+    from teleop import Curl
+
+    text = (
+        "control:\n  mode: shared_flow_reversal_steering\n  input_gain: auto\n"
+        "  corruption: {curl: 20, tau: 0.1}\n  reversal_adapter: {translation: corruption_inverse}\n"
+    )
+    path = CONFIG_DIR.parent / "_curl_test.yaml"
+    path.write_text(text)
+    try:
+        c = load_experiment_settings(path, {}).session.control
+    finally:
+        path.unlink()
+    assert (
+        c.corruption_curl == Curl(20.0, 0.1) and c.corruption_matrix is None and c.corruption_family is None
+    )
+    assert c.resolved_input_gain == 1.0  # a curl never lengthens a push
+    np.testing.assert_allclose(
+        c.reversal_adapter_matrix[:3, :3], np.linalg.inv(Curl(20.0, 0.1).steady_state())
+    )
+    assert "curl=20" in spec_label(c.corruption)
 
 
 def test_parse_set_and_tree():
@@ -142,7 +221,7 @@ def test_parse_set_and_tree():
 def test_sets_override_the_file_and_are_validated():
     path = CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml"
     s = load_experiment_settings(path, {}, sets=["control.n_guided_steps=4", "control.corruption=null"])
-    assert s.session.control.n_guided_steps == 4 and s.session.control.corruption_matrix is None
+    assert s.session.control.lam == 4 and s.session.control.corruption_matrix is None  # the old key is lambda
     s = load_experiment_settings(
         path, {}, sets=["control.mode=shared_flow_reversal_steering", "control.n_reversal_steps=5"]
     )
@@ -285,10 +364,10 @@ def test_input_gain_is_off_by_default_and_a_number_is_checked_against_the_corrup
             _load(tmp_path, f"control: {{input_gain: {bad}}}")
 
 
-@pytest.mark.parametrize("arm", ["flow_control", "flow_reversal", "flow_reversal_ra"])
+@pytest.mark.parametrize("arm", ["flow_control", "flow_reversal", "mars"])
 def test_the_shipped_random_family_cannot_clip_and_only_the_adapted_arm_has_an_adapter(arm):
     control = load_experiment_settings(CONFIG_DIR / "experiment" / f"{arm}_random.yaml", {}).session.control
     assert control.corruption_family is not None
     # the gain in force times the most the family can lengthen a command stays inside the unit cube
     assert control.resolved_input_gain * control.corruption_family.max_gain <= 1.0
-    assert (control.reversal_adapter is not None) == (arm == "flow_reversal_ra")
+    assert (control.reversal_adapter is not None) == (arm == "mars")

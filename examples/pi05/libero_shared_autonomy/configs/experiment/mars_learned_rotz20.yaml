@@ -1,0 +1,9 @@
+# MARS with a LEARNED user module (train_user_module.py) in the reversal's velocity field, in place of the
+# fixed F = M of mars_rotz20.yaml. A task module can be added: {user: {learned: ...}, task: <path>}.
+#   train it:         ./run.sh python train_user_module.py --config configs/experiment/mars_learned_rotz20.yaml --out outputs/user_modules/rotz20
+#   sweep the depth:  --sweep control.n_reversal_steps=1,2,4,6,8
+extends: base_rotz20.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: null
+  reversal_adapter: {learned: outputs/user_modules/rotz20/user.pt}

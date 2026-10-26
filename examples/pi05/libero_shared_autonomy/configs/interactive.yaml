@@ -12,12 +12,14 @@ scene:
 
 control:
   mode: policy                # policy | teleop | shared_override | shared_flow_control | shared_flow_reversal_steering
-  n_guided_steps: 5           # FC: denoising steps your command is written into
+  tau: null                   # FC: chunk steps your command is written into (null = the whole chunk)
+  lambda: 1                   # FC: denoising steps at whose start it is written (1 = the initial condition)
+  ic_gain: action             # FC: scale in the noise prior, or `action` = the checkpoint's action units
   n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
   input_noise: 0.0            # std of the noise added to your command (0 = off)
   input_gain: auto            # scale your command so the corruption cannot clip it (null = off)
   corruption: null            # the robot gets M @ your command, e.g. {rotation_z_deg: 20}
-  reversal_adapter: null      # FRS-RA, e.g. {translation: corruption, orientation: zero, gripper: zero}
+  reversal_adapter: null      # MARS, e.g. {translation: corruption, ...} (fixed F) or {learned: path/to/user.pt}
 
 server:
   port: 8765

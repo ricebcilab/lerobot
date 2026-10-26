@@ -116,11 +116,18 @@ shared-autonomy modes differ in where your command enters that schedule.
 - `mode teleop` — you drive x/y/z and the gripper; the model is not involved.
 - `mode shared_override` — pi0.5 drives, but your x/y/z replaces the model's
   translation in the executed action.
-- `mode shared_flow_control [n_guided_steps]` (**FC**) — while you are
-  pushing, your translation (normalized to the model's action space) is written
-  into dims 0-2 of `x_t` for the first `n_guided_steps` of the 10 denoising
-  steps of each chunk; the remaining steps denoise freely. The executed action
-  is entirely the model's output, steered through the early flow.
+- `mode shared_flow_control [tau] [lambda]` (**FC**, shared flow control, Kao
+  et al. 2026) — while you are pushing, your translation, scaled by `ic_gain`
+  into the noise prior's units (a full push writes `ic_gain` sigma; `action`
+  writes it in the checkpoint's action units instead), is written into the
+  translation dims of the first `tau` of the chunk's 50 steps of `x_t` at the
+  start of each of the first `lambda` of the 10 denoising steps; the flow itself
+  runs unmodified. `lambda` 1 (the default) writes the initial condition only,
+  Kao et al.'s method; 0 is the policy alone; more re-writes as the flow
+  proceeds, which is what this example's earlier FC did with its `n_guided_steps`
+  (that name is still accepted for `lambda`). `tau` null writes the whole chunk;
+  with `lambda` 1 and `ic_gain: action` that is the arm the human pilot ran. The
+  executed action is entirely the model's output.
 - `mode shared_flow_reversal_steering [n]` (**FRS**, Flow Reversal Steering,
   [Tang et al. 2026](https://arxiv.org/abs/2606.13675)) — while you are
   pushing, a reference chunk that servos in your direction at uniform velocity
@@ -167,7 +174,8 @@ what is left of it undistorted:
   teleop/override); `0` (the default) is off.
 - **Command corruption** — `control.corruption` in a config (or
   `--corruption FILE` / `corruption FILE` in the REPL) left-multiplies your
-  Δx/Δy/Δz by a fixed 3×3 matrix `M` before it reaches the policy:
+  Δx/Δy/Δz by a fixed 3×3 matrix `M` before it reaches the policy, or runs it
+  through a curl field:
 
   ```yaml
   corruption: null                      # off
@@ -175,7 +183,16 @@ what is left of it undistorted:
   corruption: {scale: [1, 1, 1]}        # per-axis gain
   corruption: {M: [[..3 rows..]]}       # literal (bare rows work too)
   corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}   # experiments only: a new M on every trial
+  corruption: {curl: 20, tau: 0.1}      # a curl field (1/s, + = clockwise in x-y) on a command with inertia tau (s)
   ```
+
+  The curl field is the cursor project's dynamic corruption: the served command
+  is a velocity driven by your push, `dv/dt = (u − v)/tau + curl·R·v`, stepped
+  once per control step (`dt`, default 0.05 s) from rest at every trial. A held
+  push comes out turned clockwise by `atan(tau·curl)` and slowed by
+  `1/sqrt(1 + (tau·curl)^2)`; the field keeps evolving while you are idle, but an
+  idle push is served as is. A curl never lengthens a command, so `input_gain:
+auto` is 1.
 
   The `random` form draws `M = R · diag(gains)` afresh for every trial: each
   operator axis gets its own gain, log-uniform in `scale`, and the result is
@@ -186,28 +203,39 @@ what is left of it undistorted:
   `F = M` trial by trial. The participant is not shown the draw; `--dry-run`
   lists it per trial.
 
-- **Reversal adapter** — `control.reversal_adapter` (or `--reversal-adapter FILE`
-  / `adapter FILE` in the REPL) only affects `shared_flow_reversal_steering`:
-  it left-multiplies the velocity field used by the reverse integration with a
-  fixed 7×7 **environment-space** matrix `F` (`x_t += h · F · v`), so only the
-  latent the forward flow starts from changes — the executed action still comes
-  from the policy's own field. Nothing is inverted: `F` is not `M⁻¹`, and a
-  rotation adapter rotates the reversal field in the stated sense.
+- **Reversal adapter (MARS)** — `control.reversal_adapter` (or
+  `--reversal-adapter FILE` / `adapter FILE` in the REPL) only affects
+  `shared_flow_reversal_steering`; FRS with an adapter is **MARS** (Modular
+  Adapters for Reversal Steering, the method this example used to call FRS-RA).
+  An adapter has up to two modules: a **user module**, which multiplies the
+  velocity field of the reverse integration only (`x_t += h · U · v`), so only
+  the latent the forward flow starts from changes, and a **task module**, an
+  affine map of the velocity in both directions, which reshapes every chunk the
+  policy produces. The user module is a fixed 7×7 **environment-space** matrix
+  `F` or a learned `U(x_t, t)` (see [Training a MARS user module](#training-a-mars-user-module)).
+  Nothing is inverted by default: `F` is not `M⁻¹`, and a rotation adapter
+  rotates the reversal field in the stated sense; `corruption_inverse` is there
+  for the curl field, whose steady-state map stands in for `M`.
 
   ```yaml
-  reversal_adapter: null
-  reversal_adapter:
-    translation: corruption             # copy M from control.corruption (error if that is null)
-    orientation: zero                   # identity | zero (missing blocks are identity)
+  reversal_adapter: null                              # plain FRS
+  reversal_adapter:                                   # MARS-U, fixed F
+    translation: corruption                           # copy M from control.corruption (error if that is null)
+    orientation: zero                                 # identity | zero (missing blocks are identity)
     gripper: zero
+  reversal_adapter: {translation: corruption_inverse} # M^-1 (a curl's steady-state map inverted)
   reversal_adapter:
-    translation: {rotation_z_deg: 40}   # or {scale: [...]}, or a 3x3 literal
-  reversal_adapter: {F: [[..7 rows..]]} # literal
+    translation: {rotation_z_deg: 40}                 # or {scale: [...]}, or a 3x3 literal
+  reversal_adapter: {F: [[..7 rows..]]}               # literal
+  reversal_adapter: {learned: outputs/user_modules/rotz20/user.pt}      # MARS-U, learned
+  reversal_adapter: {user: {learned: u.pt}, task: t.pt}                 # MARS: user + task module
+  reversal_adapter: {user: {translation: corruption}, task: t.pt}       # a fixed F with a task module
   ```
 
   Before applying `F` to normalized velocities the wrapper converts it to
   `S⁻¹ F S`, where `S` is the diagonal matrix of action standard deviations
-  (velocities have no mean offset). Both matrices are saved in the run config.
+  (velocities have no mean offset); learned modules work in the normalized space
+  directly. The matrices and the module paths are saved in the run config.
 
 - **Input gain** — `control.input_gain` turns the operator's command down so
   that the corruption can never push it into the env's `[-1, 1]` clip. The
@@ -257,19 +285,22 @@ including the known corruption (`corruption: {rotation_z_deg: 20}`: the
 operator's command is rotated 20° about z before the policy sees it). The arm
 files extend it:
 
-- `flow_control_rotz20.yaml` — **FC**, shared flow control.
-- `flow_reversal_rotz20.yaml` — **FRS**, Flow Reversal Steering without the
+- `flow_control_rotz20.yaml` — **FC**, shared flow control (Kao et al.): `tau`
+  null, `lambda` 1, `ic_gain: action`. Its depth is `tau`, in chunk steps.
+- `flow_reversal_rotz20.yaml` — **FRS**, Flow Reversal Steering without an
   adapter. Swept over `n_reversal_steps`: only `n = 10` is the published method,
   every `n < 10` cell is a partial reversal (see [Interactive prompting](#interactive-prompting)).
-- `flow_reversal_ra_rotz20.yaml` — **FRS-RA**, Flow Reversal Steering with the
-  reversal adapter, our addition. In the file `F`'s translation block is the
-  known corruption `M` and its other blocks are identity, so the only difference
-  from FRS is `M` applied to the reversal's translation. The study scripts always
-  run it at `F = M`.
+- `mars_rotz20.yaml` — **MARS** with a fixed user module (MARS-U, formerly
+  FRS-RA): `F`'s translation block is the known corruption `M` and its other
+  blocks are identity, so the only difference from FRS is `M` applied to the
+  reversal's translation. The study scripts always run it at `F = M`.
+- `mars_learned_rotz20.yaml` — **MARS** with a learned user module
+  (`{learned: outputs/user_modules/rotz20/user.pt}`, trained as below); the
+  file is a template until that checkpoint exists.
 - `policy_anchor.yaml` — the policy alone: with the arm's prompt the **floor**
   of every comparison, with `--set prompt=task` its **ceiling**.
 - `base_scale.yaml` and `flow_control_scale.yaml`, `flow_reversal_scale.yaml`,
-  `flow_reversal_ra_scale.yaml` — the same three arms under a per-axis **gain**
+  `mars_scale.yaml` — the same three arms under a per-axis **gain**
   instead of a rotation (`corruption: {scale: [2, 1, 1]}`: the operator's x
   command is twice as sensitive as y and z). A separate family is needed because
   a `--set` on `control.corruption` merges into the file's mapping, so a scale
@@ -277,24 +308,26 @@ files extend it:
   overridden (`--set 'control.corruption={scale: [1, 2, 1]}'`). The study
   scripts pick this family with `CORRUPTION=scale` (see `experiments/arms.sh`).
 - `base_random.yaml` and `flow_control_random.yaml`, `flow_reversal_random.yaml`,
-  `flow_reversal_ra_random.yaml` — the same three arms under a corruption drawn
+  `mars_random.yaml` — the same three arms under a corruption drawn
   **per trial** (`corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}`)
   so nothing is ever clipped. `CORRUPTION=random` selects it; the ranges can be overridden
   (`--set 'control.corruption={random: {scale: [1, 2]}}'`).
 
-The depth of each method is a sweep variable rather than a file. `--set KEY=VALUE`
+The depth of each method (FC's `tau`, the reversal arms' `n_reversal_steps`) is a sweep variable rather than a file. `--set KEY=VALUE`
 overrides any YAML key (dotted path, value parsed as YAML) and `--sweep KEY=V1,V2,...`
 runs one block of `n_trials` per value with a single policy load:
 
 ```bash
-$R experiment --config flow_control_rotz20.yaml           --sweep control.n_guided_steps=2,4,6,8,10
+$R experiment --config flow_control_rotz20.yaml           --sweep control.tau=5,10,25,50
+$R experiment --config flow_control_rotz20.yaml           --sweep control.ic_gain=1,2,3,5    # Kao's gain, once per condition
 $R experiment --config flow_reversal_rotz20.yaml          --sweep control.n_reversal_steps=1,2,4,6,8
-$R experiment --config flow_reversal_ra_rotz20.yaml       --sweep control.n_reversal_steps=1,2,4,6,8
+$R experiment --config mars_rotz20.yaml                   --sweep control.n_reversal_steps=1,2,4,6,8
 $R experiment --config flow_control_rotz20.yaml --set control.corruption=null      # a clean run
 ```
 
 `experiments/arms.sh` packages exactly these launches as
-`run_arm fc|frs|frs_ra|floor|ceiling <depths> [flags]`, so the study scripts
+`run_arm fc|frs|mars|mars_learned|floor|ceiling <depths> [flags]` (`frs_ra` is
+still accepted for `mars`), so the study scripts
 share one arm → config → sweep-key mapping. Each block gets its own run
 directory named after the file and the overrides in force, e.g.
 `20260903_101500_flow_reversal_rotz20_n_reversal_steps-4/`, and its
@@ -309,31 +342,33 @@ rejected and a key set to `null` keeps the built-in default, so a typo fails
 immediately instead of silently doing nothing. The run's name is the config
 file's stem plus any `--set`/`--sweep` values.
 
-| Key                                  | Default                                  | Meaning                                                                                                                                                                  |
-| ------------------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `experiment.n_trials`                | `10`                                     | Number of trials                                                                                                                                                         |
-| `experiment.seed`                    | `0`                                      | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and input-noise streams                                  |
-| `experiment.task_order`              | `random`                                 | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                               |
-| `experiment.output_dir`              | `outputs/pi05_libero_experiments`        | Parent of the run directory                                                                                                                                              |
-| `scene.suite`                        | `libero_goal`                            | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                  |
-| `scene.task_ids`                     | `null`                                   | Task pool to draw from; `null` = every task in the suite                                                                                                                 |
-| `prompt`                             | `"do something"`                         | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                       |
-| `policy.path`                        | `lerobot/pi05_libero_finetuned`          | Hub id or local checkpoint directory                                                                                                                                     |
-| `policy.n_action_steps`              | `10`                                     | Actions executed per predicted chunk                                                                                                                                     |
-| `policy.compile`                     | `false`                                  | `torch.compile` the model (slow first trial, faster after)                                                                                                               |
-| `control.mode`                       | `shared_flow_reversal_steering`          | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see [Interactive prompting](#interactive-prompting)                       |
-| `control.n_guided_steps`             | `8` in `base_rotz20.yaml` (built-in `5`) | `shared_flow_control` only                                                                                                                                               |
-| `control.n_reversal_steps`           | `null`                                   | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                   |
-| `control.input_noise`                | `0.0`                                    | Std of the Gaussian noise added to the x/y/z command                                                                                                                     |
-| `control.input_gain`                 | `null`                                   | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator) |
-| `control.max_steps`                  | `null`                                   | Rollout length; `null` = the suite's own episode length                                                                                                                  |
-| `control.corruption`                 | `null`                                   | Matrix spec applied to the operator's command, or `{random: ...}` for a new one per trial — see [Perturbing the operator](#perturbing-the-operator)                      |
-| `control.reversal_adapter`           | `null`                                   | Adapter spec for `shared_flow_reversal_steering`'s reverse integration — see [Perturbing the operator](#perturbing-the-operator)                                          |
-| `control.operator_dims`              | `[translation]`                          | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                             |
-| `operator`                           | `human`                                  | `human` (SpaceMouse / keyboard) or `policy` — see [Synthetic operator](#synthetic-operator)                                                                               |
-| `policy_operator.update_every_steps` | `null`                                   | Environment steps between synthetic intent queries; `null` uses `policy.n_action_steps`. Requires `operator: policy`                                                     |
-| `policy_operator.delay_steps`        | `0`                                      | Environment steps from observing the scene to delivering that synthetic command                                                                                          |
-| `server.port`                        | `8765`                                   | Live view port                                                                                                                                                           |
+| Key                                  | Default                           | Meaning                                                                                                                                                                                      |
+| ------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `experiment.n_trials`                | `10`                              | Number of trials                                                                                                                                                                             |
+| `experiment.seed`                    | `0`                               | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and input-noise streams                                                       |
+| `experiment.task_order`              | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                                                  |
+| `experiment.output_dir`              | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                                                  |
+| `scene.suite`                        | `libero_goal`                     | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                                      |
+| `scene.task_ids`                     | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                                                                     |
+| `prompt`                             | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                                           |
+| `policy.path`                        | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                                                                         |
+| `policy.n_action_steps`              | `10`                              | Actions executed per predicted chunk                                                                                                                                                         |
+| `policy.compile`                     | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                                                   |
+| `control.mode`                       | `shared_flow_reversal_steering`   | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see [Interactive prompting](#interactive-prompting)                                          |
+| `control.tau`                        | `null`                            | `shared_flow_control`: chunk steps (of 50) the command is written into; `null` = the whole chunk                                                                                             |
+| `control.lambda`                     | `1`                               | `shared_flow_control`: denoising steps at whose start it is written (1 = the initial condition, Kao et al.; 0 = policy alone). `n_guided_steps` is accepted as the old name                  |
+| `control.ic_gain`                    | `action`                          | `shared_flow_control`: the command's scale in the noise prior (a full push writes `ic_gain` sigma), or `action` for the checkpoint's action units                                            |
+| `control.n_reversal_steps`           | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                                       |
+| `control.input_noise`                | `0.0`                             | Std of the Gaussian noise added to the x/y/z command                                                                                                                                         |
+| `control.input_gain`                 | `null`                            | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)            |
+| `control.max_steps`                  | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                                      |
+| `control.corruption`                 | `null`                            | Matrix spec applied to the operator's command, `{curl: b, tau: s}` for a curl field, or `{random: ...}` for a new matrix per trial — see [Perturbing the operator](#perturbing-the-operator) |
+| `control.reversal_adapter`           | `null`                            | MARS adapter spec for `shared_flow_reversal_steering`: a fixed `F`, `{learned: path}` or `{user: ..., task: ...}` — see [Perturbing the operator](#perturbing-the-operator)                  |
+| `control.operator_dims`              | `[translation]`                   | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                                                 |
+| `operator`                           | `human`                           | `human` (SpaceMouse / keyboard) or `policy` — see [Synthetic operator](#synthetic-operator)                                                                                                  |
+| `policy_operator.update_every_steps` | `null`                            | Environment steps between synthetic intent queries; `null` uses `policy.n_action_steps`. Requires `operator: policy`                                                                         |
+| `policy_operator.delay_steps`        | `0`                               | Environment steps from observing the scene to delivering that synthetic command                                                                                                              |
+| `server.port`                        | `8765`                            | Live view port                                                                                                                                                                               |
 
 `--n-trials`, `--seed`, `--output-dir` and `--port` are aliases for the
 corresponding `--set`.
@@ -360,16 +395,16 @@ ends on success, on the episode limit, or at `control.max_steps`.
 
 Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<config stem>/` containing:
 
-| File            | Contents                                                                                                                                                                  |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| File            | Contents                                                                                                                                                                                                                                             |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config.yaml`   | The resolved configuration, the trial schedule and seeds, and the corruption / adapter **matrices themselves** (with a random corruption: `trial_corruptions`, the draw of every trial) — the run is self-describing even if you later edit the YAML |
-| `trials.jsonl`  | One JSON object per trial, appended as it finishes                                                                                                                        |
-| `trial_XXX.npz` | Per-step arrays for trial `XXX`                                                                                                                                           |
-| `trial_XXX.mp4` | The rollout video (30 fps)                                                                                                                                                |
+| `trials.jsonl`  | One JSON object per trial, appended as it finishes                                                                                                                                                                                                   |
+| `trial_XXX.npz` | Per-step arrays for trial `XXX`                                                                                                                                                                                                                      |
+| `trial_XXX.mp4` | The rollout video (30 fps)                                                                                                                                                                                                                           |
 
 `trials.jsonl` fields: `trial`, `suite`, `task_id`, `task_description`,
 `vla_prompt`, `operator`, `policy_operator`, `operator_dims`, `mode`,
-`n_guided_steps`, `input_noise`, `input_gain` (the gain in force, `null` when
+`tau`, `lambda`, `ic_gain` (older runs: `n_guided_steps`), `input_noise`, `input_gain` (the gain in force, `null` when
 off), `corruption`, `reversal_adapter` (a short label
 of the spec, e.g. `rotation_z_deg=20`, or the loaded file's name; `null` when
 off), `corruption_matrix` and `reversal_adapter_matrix` (the 3×3 `M` and 7×7 `F`
@@ -389,25 +424,25 @@ steering statistics (`guided_steps`, or `n_reversal_steps`, `steered_chunks` and
 
 `trial_XXX.npz` arrays, one row per control step:
 
-| Array                                                          | Shape               | Contents                                                                                                                        |
-| -------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `t`                                                            | `(T,)`              | Seconds since the rollout started                                                                                               |
-| `action`                                                       | `(T, 7)`            | The env action actually executed: `Δx Δy Δz Δroll Δpitch Δyaw gripper`                                                          |
-| `user_translation`                                             | `(T, 3)`            | The operator command **as consumed** — after the corruption matrix and the input noise                                          |
-| `user_translation_raw`                                         | `(T, 3)`            | The same command **before** corruption and noise, i.e. the operator's true intent                                               |
-| `user_gripper`                                                 | `(T,)`              | Operator gripper command (−1 open, +1 close)                                                                                    |
-| `user_reads`                                                   | `(T,)`              | How many times the input was sampled during that step; `0` = the policy did not consult it (the flow modes read once per chunk) |
-| `policy_translation`                                           | `(T, 3)`            | What the policy would have executed on its own: for a steered chunk, the chunk it produced from the same observation and noise without the operator; otherwise the executed action |
-| `oracle_translation`, `operator_translation`                   | `(T, 3)`            | Synthetic operator only: its latest computed command, and the one currently delivered (NaN for a human)                          |
-| `operator_command_age_steps`, `operator_query_count`           | `(T,)`              | Synthetic operator only: age of the delivered command (−1 before the first delivery) and cumulative queries                      |
-| `eef_pos`, `eef_quat`                                          | `(T, 3)`, `(T, 4)`  | End-effector pose the policy saw at that step                                                                                   |
-| `gripper_qpos`                                                 | `(T, 2)`            | Gripper joint positions                                                                                                         |
-| `joint_pos`                                                    | `(T, 7)`            | Arm joint positions                                                                                                             |
-| `reward`, `terminated`, `truncated`                            | `(T,)`              | Environment response                                                                                                            |
-| `object_names`, `object_pos`                                   | `(K,)`, `(T, K, 3)` | Every scene object / fixture and its position before each step (the state the action was applied to)                           |
-| `articulation_names`, `articulation_qpos`                      | `(J,)`, `(T, J)`    | Every non-robot slide / hinge joint (drawers, knobs, doors) and its value before each step                                      |
-| `corruption_matrix`, `reversal_adapter_matrix`, `input_gain`   | `(3, 3)`, `(7, 7)`, scalar | The `M`, `F` and input gain in force on this trial; NaN when off                                                    |
-| `task_description`, `vla_prompt`, `mode`, `task_id`, `success` and the reset identity | scalars | Trial identity, so a single `.npz` stands alone                                                                       |
+| Array                                                                                 | Shape                      | Contents                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `t`                                                                                   | `(T,)`                     | Seconds since the rollout started                                                                                                                                                  |
+| `action`                                                                              | `(T, 7)`                   | The env action actually executed: `Δx Δy Δz Δroll Δpitch Δyaw gripper`                                                                                                             |
+| `user_translation`                                                                    | `(T, 3)`                   | The operator command **as consumed** — after the corruption matrix and the input noise                                                                                             |
+| `user_translation_raw`                                                                | `(T, 3)`                   | The same command **before** corruption and noise, i.e. the operator's true intent                                                                                                  |
+| `user_gripper`                                                                        | `(T,)`                     | Operator gripper command (−1 open, +1 close)                                                                                                                                       |
+| `user_reads`                                                                          | `(T,)`                     | How many times the input was sampled during that step; `0` = the policy did not consult it (the flow modes read once per chunk)                                                    |
+| `policy_translation`                                                                  | `(T, 3)`                   | What the policy would have executed on its own: for a steered chunk, the chunk it produced from the same observation and noise without the operator; otherwise the executed action |
+| `oracle_translation`, `operator_translation`                                          | `(T, 3)`                   | Synthetic operator only: its latest computed command, and the one currently delivered (NaN for a human)                                                                            |
+| `operator_command_age_steps`, `operator_query_count`                                  | `(T,)`                     | Synthetic operator only: age of the delivered command (−1 before the first delivery) and cumulative queries                                                                        |
+| `eef_pos`, `eef_quat`                                                                 | `(T, 3)`, `(T, 4)`         | End-effector pose the policy saw at that step                                                                                                                                      |
+| `gripper_qpos`                                                                        | `(T, 2)`                   | Gripper joint positions                                                                                                                                                            |
+| `joint_pos`                                                                           | `(T, 7)`                   | Arm joint positions                                                                                                                                                                |
+| `reward`, `terminated`, `truncated`                                                   | `(T,)`                     | Environment response                                                                                                                                                               |
+| `object_names`, `object_pos`                                                          | `(K,)`, `(T, K, 3)`        | Every scene object / fixture and its position before each step (the state the action was applied to)                                                                               |
+| `articulation_names`, `articulation_qpos`                                             | `(J,)`, `(T, J)`           | Every non-robot slide / hinge joint (drawers, knobs, doors) and its value before each step                                                                                         |
+| `corruption_matrix`, `reversal_adapter_matrix`, `input_gain`                          | `(3, 3)`, `(7, 7)`, scalar | The `M`, `F` and input gain in force on this trial; NaN when off                                                                                                                   |
+| `task_description`, `vla_prompt`, `mode`, `task_id`, `success` and the reset identity | scalars                    | Trial identity, so a single `.npz` stands alone                                                                                                                                    |
 
 Missing robot-state fields are recorded as `NaN` rather than aborting a trial.
 Loading a trial is just:
@@ -432,15 +467,15 @@ without waiting for the button and the 20 Hz pacing is dropped, so a block
 runs unattended.
 
 By default the operator is queried at every chunk boundary and delivers
-immediately — the *immediate oracle*: task-aware, precise, no reaction delay.
+immediately — the _immediate oracle_: task-aware, precise, no reaction delay.
 `policy_operator` slows it down to something closer to a person on a
 SpaceMouse:
 
 ```yaml
 operator: policy
 policy_operator:
-  update_every_steps: 20   # new intent once per second at 20 steps/s
-  delay_steps: 4           # delivered 0.2 s after observing the scene
+  update_every_steps: 20 # new intent once per second at 20 steps/s
+  delay_steps: 4 # delivered 0.2 s after observing the scene
 ```
 
 It holds the preceding command until delivery, starts idle with the gripper
@@ -480,7 +515,7 @@ sets all three), `SEED` the reset assignment, `OUT` the output root (default
 
 `experiments/human_pilot.sh` runs one task for a person on the SpaceMouse: ten
 matched trials per method and depth, FC at depths 2/4/6/8/10 and the reversal
-arms at 1/2/4/6/8 — 150 trials, +20° corruption, FRS-RA at `F = M`, a 300-step
+arms at 1/2/4/6/8 — 150 trials, +20° corruption, MARS (then called MARS) at `F = M`, a 300-step
 cap (LIBERO-Goal's own episode length), no synthetic delay:
 
 ```bash
@@ -512,21 +547,21 @@ Task 1 ("put the bowl on the stove") saturated in a first human session: FC
 reached 100% by depth 6, leaving nothing to separate. `experiments/task_audit.sh`
 picked the replacement by running `oracle_sweep.sh` with the SpaceMouse-like
 operator (`update_every_steps: 20, delay_steps: 4`) on tasks 4-8, 20 matched
-trials per cell, seed 0, FC over depths 4-10, FRS over 1-4, FRS-RA
+trials per cell, seed 0, FC over depths 4-10, FRS over 1-4, MARS
 (F@40) over 1-6, plus the ceiling. Tasks 0/2/3/9 were left out: the oracle
 sweep scores them ~0 for every method (the translation-only channel cannot
 express them). Success at each method's best depth:
 
-| Task                           | Ceiling | FC      | FRS        | FRS-RA | FRS-RA − FC (McNemar, 20 pairs) |
-| ------------------------------ | ------: | ------- | ---------- | ------ | ------------------------------- |
-| **4** bowl on top of cabinet   |     100 | d4: 20  | d1: 45     | d2: 60 | **+40, p = 0.021**              |
-| 5 push plate to front of stove |      95 | d8: 30  | d4: 25     | d2: 25 | −4, p = 1.0                     |
-| 6 cream cheese in bowl         |     100 | d8: 15  | d2: 25     | d1: 25 | +10, p = 0.69                   |
-| 7 turn on stove                |     100 | d10: 85 | d1: 85     | d1: 85 | 0, p = 1.0                      |
-| 8 bowl on plate                |     100 | d6: 55  | d4: 80     | d4: 65 | +9, p = 0.69                    |
+| Task                           | Ceiling | FC      | FRS    | MARS   | MARS − FC (McNemar, 20 pairs) |
+| ------------------------------ | ------: | ------- | ------ | ------ | ----------------------------- |
+| **4** bowl on top of cabinet   |     100 | d4: 20  | d1: 45 | d2: 60 | **+40, p = 0.021**            |
+| 5 push plate to front of stove |      95 | d8: 30  | d4: 25 | d2: 25 | −4, p = 1.0                   |
+| 6 cream cheese in bowl         |     100 | d8: 15  | d2: 25 | d1: 25 | +10, p = 0.69                 |
+| 7 turn on stove                |     100 | d10: 85 | d1: 85 | d1: 85 | 0, p = 1.0                    |
+| 8 bowl on plate                |     100 | d6: 55  | d4: 80 | d4: 65 | +9, p = 0.69                  |
 
-Task 4 is the only one where FRS-RA beats FC at both methods' best depths,
-with a 100% ceiling and FC far from it (FRS-RA vs. FRS is +15 points
+Task 4 is the only one where MARS beats FC at both methods' best depths,
+with a 100% ceiling and FC far from it (MARS vs. FRS is +15 points
 but not significant at 20 pairs, p = 0.55). The timing profile is what opens
 the gap: under the immediate oracle the same task gives FC d10 95% and FRS d1
 100%. FC gains from depth while the reversal arms fall off by depth 4 on most
@@ -537,7 +572,7 @@ behaves like (20, 4).
 #### Study record
 
 What has been run, in order, and what it found (all under `outputs/`). The
-task audit above and `human_pilot/p01` ran FRS-RA with a fixed 40° rotation
+task audit above and `human_pilot/p01` ran MARS with a fixed 40° rotation
 adapter (F@40) through a script override that has since been removed, and the
 v2 sweeps compared several adapter angles; the scripts now always run `F = M`.
 To repeat an F@40 cell, add
@@ -556,16 +591,49 @@ To repeat an F@40 cell, add
   profile collapses FC (task 4: 95% → 20%) while shallow reversal keeps about
   half the trials.
 - `human_pilot/p01` — the first pilot on task 4. At their best depths FC d10
-  (90%), FRS d1 and FRS-RA d2 (100%) tie on ten resets. The separation is at
+  (90%), FRS d1 and MARS d2 (100%) tie on ten resets. The separation is at
   low measured authority (about 0.3, the shallow settings), where the reversal
   arms sit at 70-100% and FC at 40%: FC does not get less of the operator's
   push there, it converts the same push into fewer successes.
+
+### Training a MARS user module
+
+`train_user_module.py` calibrates a learned user module for one operator channel,
+the cursor project's recipe ported to pi0.5. It rolls out the task-prompted
+policy (the synthetic operator) to collect states at chunk boundaries, labels
+each with the operator's chunk `L` under the real task, the push that chunk
+implies (the `PolicyOperator` rule) through the arm's channel (its corruption or
+curl, then input noise of std `sigma ~ U(sigma_min, sigma_max)`), the reference
+chunk `a_bci` FRS builds from that served command, and `z_L`, `L` reversed through
+the goal-free field (the arm's prompt). The module `U(x_t, t)` then minimizes the
+field regression `U(x_t, t) P(x_t, t) = z_L − a_bci` along `x_t = (1 − t) a_bci +
+t z_L`, so that a full reversal of what the channel delivered lands on the latent
+of what the operator meant. The log reports, on held-out states, the heading
+cosine between the regenerated chunk and `L` with and without the module.
+
+```bash
+python examples/pi05/libero_shared_autonomy/train_user_module.py \
+    --config configs/experiment/mars_learned_rotz20.yaml \
+    --out outputs/user_modules/rotz20 --episodes 20 --steps 3000      # ~1-2 h on one GPU
+$R experiment --config mars_learned_rotz20.yaml --sweep control.n_reversal_steps=2,4,6,8,10
+```
+
+The checkpoint carries its kind (`user`), config and meta (corruption, policy,
+prompt). Task modules (`kind: task`, `LearnedTaskModule`) have the slot, the
+hooks and the loader, but no LIBERO trainer yet: the cursor project's task
+module reads obstacle tokens the scene provides, which LIBERO does not.
+
+**A note on partial reversals.** With `n_reversal_steps` < 10 this example runs
+the forward flow from `t = n/10` in `n` steps of the policy's own step size
+(since commit `b199239a`); the cursor project still runs it in `10 − n` steps,
+which its notes flag as the reason `n = 9` fails there. Tuned depths do not
+transfer between the two schedules.
 
 ## Analysis
 
 [`notebooks/analyze.py`](notebooks/analyze.py) loads every run directory
 that contains a `trials.jsonl` and tags each trial with the run's method
-(`FC`, `FRS`, `FRS-RA`, `policy (floor)`, `policy (ceiling)`), depth and
+(`FC`, `FRS`, `MARS`, `policy (floor)`, `policy (ceiling)`), depth and
 operator:
 
 - `find_runs(root)` / `load_runs(run_dirs)` — the runs under `root` that
@@ -592,7 +660,7 @@ operator:
   executed translation and the raw vs. the corrupted command), path length and
   efficiency, time to success, task progress against the goal set, and the
   measured authority below. `success_over_time` gives the fraction of trials
-  done by step *k*, the censoring-safe view of trial time.
+  done by step _k_, the censoring-safe view of trial time.
 - `step_authority(action, policy, command)` — **user authority** per step:
   with `a` the executed translation, `p` the policy's own plan
   (`policy_translation`) and `r` the operator's command, the barycentric

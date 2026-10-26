@@ -82,6 +82,11 @@ class ActionSelectKwargs(TypedDict, total=False):
     # to that chunk's time so the remaining integration is consistent.
     flow_start_time: float | None
     num_forward_steps: int | None
+    # Optional hook on the velocity field during the forward flow:
+    # (step_index, time, x_t, v_t) -> v_t, applied before each Euler update.
+    # Lets a caller adapt the field that produces the executed chunk (e.g. a
+    # MARS task module, which reshapes the policy's chunk distribution).
+    velocity_hook: Callable[[int, float, Tensor, Tensor], Tensor] | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -807,6 +812,46 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
+    def _encode_prefix(self, images, img_masks, tokens, masks):
+        """Encode the observation prefix once: (prefix_pad_masks, past_key_values) for the action expert."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, past_key_values
+
+    def velocity_field(self, images, img_masks, tokens, masks):
+        """Encode the observation prefix once and return ``velocity(x_t, time)``, the learned flow field
+        for this batch on padded normalized chunks; ``time`` is a float or a (batch,) tensor. This is
+        what ``sample_actions`` integrates, exposed for callers that invert chunks or train adapters on
+        the field (e.g. MARS user modules) without sampling."""
+        bsize, device = tokens.shape[0], tokens.device
+        prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
+
+        def velocity(x_t, time):
+            if torch.is_tensor(time) and time.ndim > 0:
+                time_tensor = time.to(device=device, dtype=torch.float32)
+            else:
+                time_tensor = torch.tensor(float(time), dtype=torch.float32, device=device).expand(bsize)
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time_tensor,
+            )
+
+        return velocity
+
     def sample_actions(
         self,
         images,
@@ -833,23 +878,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
 
         x_t_hook = kwargs.get("x_t_hook")
         noise_fn = kwargs.get("noise_fn")
+        velocity_hook = kwargs.get("velocity_hook")
         if noise_fn is not None:
 
             def velocity(x_t, time):
@@ -905,6 +938,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else:
                 v_t = denoise_step_partial_call(x_t)
 
+            if velocity_hook is not None:
+                v_t = velocity_hook(step, time, x_t, v_t)
             x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
@@ -1277,6 +1312,15 @@ class PI05Policy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
+
+    @torch.no_grad()
+    def velocity_field(self, batch: dict[str, Tensor]):
+        """The flow field for a preprocessed batch: ``velocity(x_t, time)`` on padded normalized chunks
+        of shape (batch, chunk_size, max_action_dim); see ``PI05Pytorch.velocity_field``."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        return self.model.velocity_field(images, img_masks, tokens, masks)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:

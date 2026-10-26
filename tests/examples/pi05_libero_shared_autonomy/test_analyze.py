@@ -117,8 +117,10 @@ def test_method_and_depth():
         reversal_adapter=ADAPTED,
         reversal_adapter_matrix=np.eye(7).tolist(),
     )
-    assert (analyze.method_of(c), analyze.depth_of(c)) == ("FRS-RA", 4.0)
-    c = config("shared_flow_control", n_guided_steps=6)
+    assert (analyze.method_of(c), analyze.depth_of(c)) == ("MARS", 4.0)
+    assert analyze.depth_of(config("shared_flow_control", tau=25)) == 25.0  # Kao et al.'s knobs: chunk steps
+    assert analyze.depth_of(config("shared_flow_control", tau=None)) == float(analyze.CHUNK_SIZE)
+    c = config("shared_flow_control", n_guided_steps=6)  # an older run: denoising steps
     assert (analyze.method_of(c), analyze.depth_of(c)) == ("FC", 6.0)
     assert analyze.method_of(config("policy")) == "policy (floor)"
     assert analyze.method_of(config("policy", prompt="task")) == "policy (ceiling)"
@@ -132,7 +134,7 @@ def test_a_run_is_the_adapted_arm_by_its_setting_even_without_a_run_level_matrix
         corruption={"random": {"rotation_deg": [30, 90], "scale": [1, 4]}},
         reversal_adapter=ADAPTED,
     )
-    assert analyze.method_of(per_trial) == "FRS-RA"
+    assert analyze.method_of(per_trial) == "MARS"
     assert analyze.method_of(config(n_reversal_steps=1, corruption=per_trial["corruption"])) == "FRS"
 
 
@@ -220,7 +222,11 @@ def test_paired_test_by_run_and_by_method(tmp_path):
     assert 0 < by_run["mcnemar_p"] <= 1
     assert len(analyze.paired_comparisons(trials[trials["run"].isin([a.name, b.name])])) == 1
 
-    by_method = analyze.paired_test(trials, "method", "FRS", "FRS-RA", ["task_id", "trial"])
+    by_method = analyze.paired_test(trials, "method", "FRS", "MARS", ["task_id", "trial"])
+    legacy = analyze.paired_test(
+        trials, "method", "FRS", "FRS-RA", ["task_id", "trial"]
+    )  # the old name still works
+    assert legacy["p"] == by_method["p"]
     assert by_method["paired_trials"] == 6 and by_method["B_only"] == 2 and by_method["A_only"] == 0
     assert by_method["A_rate"] == pytest.approx(2 / 6) and by_method["B_rate"] == pytest.approx(4 / 6)
     assert by_method["mcnemar_p"] == pytest.approx(0.5)  # 2 discordant pairs, both in B's favour
@@ -239,13 +245,13 @@ def test_paired_test_rejects_missing_mismatched_and_duplicate_pairs(tmp_path):
     )
     trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
     with pytest.raises(ValueError, match="Unverified pairing"):
-        analyze.paired_test(trials.drop(columns="pair_id"), "method", "FRS", "FRS-RA")
+        analyze.paired_test(trials.drop(columns="pair_id"), "method", "FRS", "MARS")
     bad = trials.copy()
-    bad.loc[bad["method"] == "FRS-RA", "initial_state_hash"] = "different"
+    bad.loc[bad["method"] == "MARS", "initial_state_hash"] = "different"
     with pytest.raises(ValueError, match="Unmatched initial_state_hash"):
-        analyze.paired_test(bad, "method", "FRS", "FRS-RA")
+        analyze.paired_test(bad, "method", "FRS", "MARS")
     with pytest.raises(ValueError, match="Duplicate pairing"):
-        analyze.paired_test(analyze.pd.concat([trials, trials]), "method", "FRS", "FRS-RA")
+        analyze.paired_test(analyze.pd.concat([trials, trials]), "method", "FRS", "MARS")
 
 
 def test_task_targets_prefer_the_ceiling_anchor(tmp_path):
@@ -452,10 +458,10 @@ def test_plot_best_vs_best_draws_a_bar_per_method_and_a_bracket_per_pair(tmp_pat
     best, comparisons, selected = analyze.best_vs_best(trials)
     fig, ax = plt.subplots()
     table, drawn = analyze.plot_best_vs_best(selected, ax)
-    assert list(table["method"]) == ["FC", "FRS", "FRS-RA"]
+    assert list(table["method"]) == ["FC", "FRS", "MARS"]
     assert len(ax.patches) == 3 and len(comparisons) == 3 and drawn["p"].tolist() == comparisons["p"].tolist()
     assert [p.get_facecolor()[:3] for p in ax.patches] == [
-        matplotlib.colors.to_rgb(analyze.METHOD_COLORS[m]) for m in ("FC", "FRS", "FRS-RA")
+        matplotlib.colors.to_rgb(analyze.METHOD_COLORS[m]) for m in ("FC", "FRS", "MARS")
     ]
     assert sum(t.get_text() in ("n.s.", "*", "**", "***") for t in ax.texts) == 3  # one mark per pair
     assert analyze.significance_stars(0.03) == "*" and analyze.significance_stars(np.nan) == "n.s."

@@ -3,11 +3,14 @@
 A run directory holds `config.yaml` (resolved settings, schedule and the
 matrices in force), `trials.jsonl` (one record per completed trial) and per
 trial a `.npz` of step arrays. Every trial row is tagged with the run's
-*method* (FC = shared flow control, FRS = flow reversal steering without the
-adapter, FRS-RA = flow reversal with the reversal adapter, or a policy-only anchor:
-floor = the arm's prompt, ceiling = the scene's own instruction), its *depth*
-(the denoising steps the operator controls: `n_guided_steps` for FC,
-`n_reversal_steps` for the reversal arms) and who the operator was. Authority is
+*method* (FC = shared flow control, FRS = flow reversal steering without an
+adapter, MARS = flow reversal with a reversal adapter, the method formerly
+called FRS-RA (old notebooks may still say so; `LEGACY_METHODS` maps it), or a
+policy-only anchor: floor = the arm's prompt, ceiling = the scene's own
+instruction), its *depth* (`tau`, the chunk steps the command is written into,
+for FC runs recorded with Kao et al.'s knobs, `n_guided_steps` for older FC runs,
+where it counted denoising steps; `n_reversal_steps` for the reversal arms) and
+who the operator was. Authority is
 measured, not scheduled: `step_authority` reads it off the recorded arrays, and
 the plots put every method/depth cell at its measured user authority.
 
@@ -28,19 +31,21 @@ from scipy import stats
 
 from lerobot.policies.pi05.steering import DEADBAND
 
-METHODS = ("FC", "FRS", "FRS-RA", "policy (floor)", "policy (ceiling)")
-STEERED = ("FC", "FRS", "FRS-RA")
+METHODS = ("FC", "FRS", "MARS", "policy (floor)", "policy (ceiling)")
+STEERED = ("FC", "FRS", "MARS")
+LEGACY_METHODS = {"FRS-RA": "MARS"}  # the adapted arm's old name, accepted wherever a method is named
+CHUNK_SIZE = 50  # pi0.5's action chunk: FC's `tau: null` writes the whole chunk
 # One fixed colour per method in every figure (identity is never cycled). The three
 # steered hues are colourblind-safe as a set (worst adjacent CVD dE 9.2); the anchors
 # are reference lines, so they take a neutral.
 METHOD_COLORS = {
     "FC": "#2a78d6",
     "FRS": "#eb6834",
-    "FRS-RA": "#1baf7a",
+    "MARS": "#1baf7a",
     "policy (floor)": "#6b6b6b",
     "policy (ceiling)": "#6b6b6b",
 }
-METHOD_MARKERS = {"FC": "o", "FRS": "s", "FRS-RA": "^"}
+METHOD_MARKERS = {"FC": "o", "FRS": "s", "MARS": "^"}
 PAPER_STYLE = Path(__file__).with_name("paper.mplstyle")  # plt.style.use(analyze.PAPER_STYLE)
 # Axis labels for the per-trial metrics, as they would read in a figure caption.
 METRIC_LABELS = {
@@ -83,7 +88,7 @@ def method_of(config: dict) -> str:
     if mode == "shared_flow_control":
         return "FC"
     if mode == "shared_flow_reversal_steering":
-        return "FRS-RA" if config.get("reversal_adapter") is not None else "FRS"
+        return "MARS" if config.get("reversal_adapter") is not None else "FRS"
     if mode == "policy":
         return "policy (ceiling)" if config.get("prompt") == PROMPT_FROM_TASK else "policy (floor)"
     return mode  # shared_override / teleop: not part of the study
@@ -93,7 +98,9 @@ def depth_of(config: dict) -> float:
     """Denoising steps the operator controls; NaN for modes without a depth."""
     mode = config["mode"]
     if mode == "shared_flow_control":
-        return float(config["n_guided_steps"])
+        if "tau" in config:  # Kao et al.'s knobs: chunk steps (null = the whole chunk)
+            return float(CHUNK_SIZE if config["tau"] is None else config["tau"])
+        return float(config["n_guided_steps"])  # older runs: denoising steps
     if mode == "shared_flow_reversal_steering":
         depth = config.get("n_reversal_steps")
         return float(NUM_INFERENCE_STEPS if depth is None else depth)  # None = full reversal
@@ -285,9 +292,11 @@ def paired_test(
     McNemar's exact test for a binary `metric`, the Wilcoxon signed-rank test for a
     continuous one; both report `p`. `paired_test(trials, "run", a, b)` compares two
     runs trial by trial; `paired_test(trials[trials.depth == 4], "method", "FRS",
-    "FRS-RA", ["task_id", "trial"])` compares two methods at one depth, paired by scene
-    reset and pooled over tasks.
+    "MARS", ["task_id", "trial"])` compares two methods at one depth, paired by scene
+    reset and pooled over tasks. Method names may use the old "FRS-RA".
     """
+    if by == "method":
+        a, b = LEGACY_METHODS.get(a, a), LEGACY_METHODS.get(b, b)
     required = ["pair_id", "initial_state_hash"]
     selected = trials[trials[by].isin([a, b])]
     if any(k not in selected for k in required) or selected[required].isna().any().any():
@@ -296,7 +305,7 @@ def paired_test(
     arms = [selected[selected[by] == arm] for arm in (a, b)]
     if any(arm.duplicated(pair_on).any() for arm in arms):
         raise ValueError("Duplicate pairing keys: select one condition per arm or use pair_on=['pair_id'].")
-    pa, pb = [arm.set_index(pair_on) for arm in arms]
+    pa, pb = (arm.set_index(pair_on) for arm in arms)
     both = pa.index.intersection(pb.index)
     for key in required:
         va, vb = pa.loc[both].reset_index()[key], pb.loc[both].reset_index()[key]

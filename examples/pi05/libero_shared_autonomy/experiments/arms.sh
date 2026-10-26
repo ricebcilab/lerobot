@@ -28,13 +28,16 @@ run_arm() {
     shift 2
     case "${arm}" in
         fc)
-            "${RUN}" experiment --config "flow_control_${CORRUPTION}.yaml" "$@" --sweep "control.n_guided_steps=${depths}"
+            "${RUN}" experiment --config "flow_control_${CORRUPTION}.yaml" "$@" --sweep "control.tau=${depths}"
             ;;
         frs)
             "${RUN}" experiment --config "flow_reversal_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
-        frs_ra)
-            "${RUN}" experiment --config "flow_reversal_ra_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
+        mars | frs_ra)
+            "${RUN}" experiment --config "mars_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
+            ;;
+        mars_learned)
+            "${RUN}" experiment --config "mars_learned_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
         floor)
             "${RUN}" experiment --config policy_anchor.yaml "$@"
@@ -43,7 +46,7 @@ run_arm() {
             "${RUN}" experiment --config policy_anchor.yaml "$@" --set prompt=task
             ;;
         *)
-            echo "Unknown arm: ${arm}; use fc, frs, frs_ra, floor, ceiling" >&2
+            echo "Unknown arm: ${arm}; use fc, frs, mars, mars_learned, floor, ceiling" >&2
             return 2
             ;;
     esac

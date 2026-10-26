@@ -13,7 +13,7 @@
 #
 #   oracle_sweep.sh                                   all 10 LIBERO-Goal tasks, 10 matched trials per block
 #   TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 oracle_sweep.sh
-#   ARMS="fc frs frs_ra ceiling" oracle_sweep.sh --dry-run
+#   ARMS="fc frs mars ceiling" oracle_sweep.sh --dry-run
 #   oracle_sweep.sh --set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4
 #
 # Extra flags reach every run. Output goes under $OUT; notebooks/analyze.py reads it.
@@ -23,7 +23,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/arms.sh"
 
 OUT="${OUT:-outputs/pi05_libero_oracle_sweep_v2}"
 TASKS="${TASKS:-0 1 2 3 4 5 6 7 8 9}"
-ARMS="${ARMS:-fc frs frs_ra floor ceiling}"
+ARMS="${ARMS:-fc frs mars floor ceiling}"
 FC_DEPTHS="${FC_DEPTHS:-${DEPTHS:-2,4,6,8,10}}"
 FRS_DEPTHS="${FRS_DEPTHS:-${DEPTHS:-2,4,6,8,10}}"
 FRS_RA_DEPTHS="${FRS_RA_DEPTHS:-${FRS_DEPTHS}}"

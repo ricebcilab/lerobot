@@ -1,0 +1,9 @@
+# MARS (ours; the method formerly called FRS-RA): FRS with a user module in the reversal's velocity
+# field. Here the module is the fixed matrix F whose translation block is the known corruption M and
+# whose other blocks are identity (MARS-U with F = M); `translation: corruption_inverse` gives M^-1.
+#   sweep the depth:  --sweep control.n_reversal_steps=1,2,4,6,8
+extends: base_random.yaml
+control:
+  mode: shared_flow_reversal_steering
+  n_reversal_steps: null
+  reversal_adapter: {translation: corruption, orientation: identity, gripper: identity}

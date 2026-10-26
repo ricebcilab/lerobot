@@ -36,6 +36,7 @@ class FakePolicy:
         self.calls: list[dict] = []
         self.resets = 0
         self.last_latent: torch.Tensor | None = None
+        self.last_chunk: torch.Tensor | None = None
 
     def reset(self):
         self.resets += 1
@@ -51,6 +52,7 @@ class FakePolicy:
         if hook is not None:
             for step in range(NUM_STEPS):
                 x = hook(step, 1.0 - step / NUM_STEPS, x)
+            self.last_chunk = x.clone()  # the steered chunk; the paired plain pass has no hook
         return x
 
 
@@ -101,6 +103,8 @@ def test_build_reversal_adapter_blocks():
     np.testing.assert_allclose(f[3:, :], 0)
     np.testing.assert_allclose(f[:3, 3:], 0)
 
+    f = build_reversal_adapter({"translation": "corruption_inverse"}, m)
+    np.testing.assert_allclose(f[:3, :3], np.linalg.inv(m))
     f = build_reversal_adapter({"translation": {"scale": [2, 2, 2]}})
     np.testing.assert_allclose(f[:3, :3], 2 * np.eye(3))
     np.testing.assert_allclose(f[3:, 3:], np.eye(4))
@@ -210,10 +214,10 @@ def test_get_action_mean_std_follows_the_normalization_mode():
 
 def test_wrappers_take_the_deadband_in_the_source_units():
     source = Source(translation=(0.01, 0.0, 0.0))  # a full push in a 0.01-per-unit action space
-    wrapper = FlowControlPolicy(FakePolicy(), source, 3, postprocessor(), deadband=0.001)
+    wrapper = FlowControlPolicy(FakePolicy(), source, postprocessor(), lam=3, deadband=0.001)
     wrapper.select_action({})
     assert wrapper.guided_steps == 3
-    wrapper = FlowControlPolicy(FakePolicy(), source, 3, postprocessor())  # DEADBAND of 0.05: idle
+    wrapper = FlowControlPolicy(FakePolicy(), source, postprocessor(), lam=3)  # DEADBAND of 0.05: idle
     wrapper.select_action({})
     assert wrapper.guided_steps == 0
     wrapper = FlowReversalSteeringPolicy(FakePolicy(), source, postprocessor(), deadband=0.001)
@@ -224,22 +228,69 @@ def test_wrappers_take_the_deadband_in_the_source_units():
     assert wrapper.steered_chunks == 0
 
 
-def test_flow_control_writes_normalized_translation_for_tau_steps():
+def test_flow_control_kao_writes_the_scaled_command_into_tau_chunk_steps_at_lambda_euler_steps():
+    # Kao et al.: ic_gain * command (noise-prior units, no mean/std) into the first `tau` chunk
+    # steps of x_t at the start of each of the first `lam` Euler steps; the rest of the chunk and
+    # the other dims are untouched.
     policy = FakePolicy()
     source = Source(translation=(0.5, 0.0, -0.5))
-    wrapper = FlowControlPolicy(policy, source, 3, postprocessor(mean=[0.1] * 7, std=[0.5] * 7))
+    wrapper = FlowControlPolicy(
+        policy, source, postprocessor(mean=[0.1] * 7, std=[0.5] * 7), tau=2, lam=3, ic_gain=2.0
+    )
     wrapper.reset()
     action = wrapper.select_action({})
     assert action.shape == (1, MAX_DIM)
-    assert wrapper.guided_steps == 3
-    expected = (np.array([0.5, 0.0, -0.5]) - 0.1) / 0.5
-    np.testing.assert_allclose(action[0, :3].numpy(), expected, atol=1e-6)
+    assert wrapper.guided_steps == 3  # one write per Euler step, lam of them
+    written = policy.last_chunk  # the chunk as the hooks left it
+    np.testing.assert_allclose(written[0, :2, :3].numpy(), np.array([[1.0, 0.0, -1.0]] * 2), atol=1e-6)
+    torch.testing.assert_close(written[0, 2:, :], torch.zeros(CHUNK - 2, MAX_DIM))
+    torch.testing.assert_close(written[0, :2, 3:], torch.zeros(2, MAX_DIM - 3))
     assert policy.resets == 1
+
+
+def test_flow_control_action_units_write_the_whole_chunk_once_like_the_recorded_study():
+    # The lab's recorded arm = Kao's method with tau = the whole chunk, lam 1 and the command in
+    # action units ((c - mean) / std), the default knobs.
+    policy = FakePolicy()
+    wrapper = FlowControlPolicy(
+        policy, Source(translation=(0.5, 0.0, -0.5)), postprocessor(mean=[0.1] * 7, std=[0.5] * 7)
+    )
+    assert wrapper.tau == CHUNK and wrapper.lam == 1 and wrapper.ic_gain == "action"
+    wrapper.select_action({})
+    assert wrapper.guided_steps == 1
+    expected = (np.array([0.5, 0.0, -0.5]) - 0.1) / 0.5
+    np.testing.assert_allclose(policy.last_chunk[0, :, :3].numpy(), np.tile(expected, (CHUNK, 1)), atol=1e-6)
+
+
+def test_flow_control_lambda_zero_is_the_policy_alone():
+    policy = FakePolicy()
+    wrapper = FlowControlPolicy(policy, Source(translation=(1.0, 0.0, 0.0)), postprocessor(), lam=0)
+    wrapper.select_action({})
+    assert wrapper.guided_steps == 0
+    assert len(policy.calls) == 1 and "x_t_hook" not in policy.calls[0]  # no steering, no paired pass
+    assert wrapper.n_guided_steps == 0  # the old name reads the same knob
+
+
+def test_flow_control_validates_its_knobs():
+    policy, src, post = FakePolicy(), Source(translation=(1.0, 0.0, 0.0)), postprocessor()
+    with pytest.raises(ValueError, match="tau"):
+        FlowControlPolicy(policy, src, post, tau=CHUNK + 1)
+    with pytest.raises(ValueError, match="tau"):
+        FlowControlPolicy(policy, src, post, tau=0)
+    with pytest.raises(ValueError, match="lam"):
+        FlowControlPolicy(policy, src, post, lam=NUM_STEPS + 1)
+    with pytest.raises(ValueError, match="ic_gain"):
+        FlowControlPolicy(policy, src, post, ic_gain=0.0)
+    with pytest.raises(ValueError, match="ic_gain"):
+        FlowControlPolicy(policy, src, post, ic_gain="noise")
+    wrapper = FlowControlPolicy(policy, src, post)
+    wrapper.n_guided_steps = 4  # the alias sets lam
+    assert wrapper.lam == 4
 
 
 def test_flow_control_skips_idle_input_and_queues_actions():
     policy = FakePolicy()
-    wrapper = FlowControlPolicy(policy, Source(translation=(DEADBAND / 2, 0, 0)), 5, postprocessor())
+    wrapper = FlowControlPolicy(policy, Source(translation=(DEADBAND / 2, 0, 0)), postprocessor(), lam=5)
     first = wrapper.select_action({})
     second = wrapper.select_action({})
     assert wrapper.guided_steps == 0
@@ -258,7 +309,7 @@ def test_flow_control_consumes_one_noisy_command_per_chunk():
             return np.array([self.reads / 10, 0.0, 0.0])
 
     source = ChangingSource()
-    wrapper = FlowControlPolicy(FakePolicy(), source, NUM_STEPS, postprocessor())
+    wrapper = FlowControlPolicy(FakePolicy(), source, postprocessor(), lam=NUM_STEPS)
     first = wrapper.select_action({})
     second = wrapper.select_action({})
     assert source.reads == 1
@@ -485,12 +536,13 @@ class NoisyPolicy(FakePolicy):
         if hook is not None:
             for step in range(NUM_STEPS):
                 x = hook(step, 1.0 - step / NUM_STEPS, x)
+            self.last_chunk = x.clone()  # the steered chunk; the paired plain pass has no hook
         return x
 
 
 def test_flow_control_records_the_policy_plan_from_the_same_noise_without_disturbing_the_stream():
     policy = NoisyPolicy()
-    wrapper = FlowControlPolicy(policy, Source((1.0, 0.0, 0.0)), 2, postprocessor())
+    wrapper = FlowControlPolicy(policy, Source((1.0, 0.0, 0.0)), postprocessor(), lam=2)
     torch.manual_seed(3)
     steered = wrapper.select_action({})
     plan = wrapper.last_policy_action
@@ -504,12 +556,157 @@ def test_flow_control_records_the_policy_plan_from_the_same_noise_without_distur
 
     # A single steered pass (no second one) leaves the generator exactly where the wrapper did.
     torch.manual_seed(3)
-    alone = FlowControlPolicy(NoisyPolicy(), Source((1.0, 0.0, 0.0)), 2, postprocessor())
+    alone = FlowControlPolicy(NoisyPolicy(), Source((1.0, 0.0, 0.0)), postprocessor(), lam=2)
     alone._pending_command = np.array([1.0, 0.0, 0.0])
     NoisyPolicy().predict_action_chunk({}, x_t_hook=alone._x_t_hook)
     torch.testing.assert_close(torch.randn(3), after)
 
-    idle = FlowControlPolicy(NoisyPolicy(), Source((0.0, 0.0, 0.0)), 2, postprocessor())
+    idle = FlowControlPolicy(NoisyPolicy(), Source((0.0, 0.0, 0.0)), postprocessor(), lam=2)
     action = idle.select_action({})
     assert idle.last_policy_action is action  # not steering: the plan is the action, no second pass
     assert len(idle._policy.calls) == 1
+
+
+# ---------------------------------------------------------------- MARS: modular reversal adapters
+
+from lerobot.policies.pi05.steering import (  # noqa: E402
+    AdapterSpec,
+    LearnedTaskModule,
+    LearnedUserModule,
+    forward_flow,
+    load_adapter_module,
+    parse_adapter_spec,
+    save_adapter_module,
+)
+
+
+def _constant_field(value=1.0):
+    return lambda x_t, t: torch.full_like(x_t, value)
+
+
+def test_learned_user_module_starts_as_the_identity_and_acts_backward_only():
+    module = LearnedUserModule(horizon=CHUNK, n_dims=N_ACTION_DIMS)
+    x = torch.randn(2, CHUNK, MAX_DIM)
+    u = module(x, 0.3)
+    assert u.shape == (2, CHUNK, N_ACTION_DIMS, N_ACTION_DIMS)
+    torch.testing.assert_close(u, torch.eye(N_ACTION_DIMS).expand(2, CHUNK, -1, -1))
+    with torch.no_grad():
+        module.net[-1].bias.fill_(0.1)  # no longer the identity
+    adapter = ReversalAdapter(user_module=module)
+    x0 = torch.zeros(1, CHUNK, MAX_DIM)
+    with_user = reverse_flow(x0, _constant_field(), NUM_STEPS, adapter=adapter)
+    without = reverse_flow(x0, _constant_field(), NUM_STEPS)
+    assert not torch.allclose(with_user[..., :N_ACTION_DIMS], without[..., :N_ACTION_DIMS])
+    torch.testing.assert_close(
+        with_user[..., N_ACTION_DIMS:], without[..., N_ACTION_DIMS:]
+    )  # padding dims untouched
+    # the user module does not act on the forward flow
+    torch.testing.assert_close(
+        forward_flow(x0, _constant_field(), NUM_STEPS, adapter=adapter),
+        forward_flow(x0, _constant_field(), NUM_STEPS),
+    )
+
+
+def test_task_slot_acts_in_both_directions_and_composes_before_the_user_module():
+    n = N_ACTION_DIMS
+    eye = torch.eye(n)
+    task = lambda x_t, t, v: (2.0 * eye.expand(v.shape[0], v.shape[1], n, n), torch.zeros_like(v))  # noqa: E731
+    user = lambda x_t, t: 3.0 * eye.expand(x_t.shape[0], x_t.shape[1], n, n)  # noqa: E731
+    adapter = ReversalAdapter(user_module=user, task_module=task)
+    assert adapter.kind == "composed"
+    x0 = torch.zeros(1, CHUNK, MAX_DIM)
+    back = reverse_flow(x0, _constant_field(), NUM_STEPS, adapter=adapter)  # backward: user(task(v)) = 6 v
+    torch.testing.assert_close(back[..., :n], torch.full((1, CHUNK, n), 6.0))
+    torch.testing.assert_close(back[..., n:], torch.full((1, CHUNK, MAX_DIM - n), 1.0))
+    fwd = forward_flow(x0, _constant_field(), NUM_STEPS, adapter=adapter)  # forward: task(v) = 2 v
+    torch.testing.assert_close(fwd[..., :n], torch.full((1, CHUNK, n), -2.0))
+    torch.testing.assert_close(fwd[..., n:], torch.full((1, CHUNK, MAX_DIM - n), -1.0))
+
+
+def test_learned_task_module_starts_as_the_identity():
+    module = LearnedTaskModule(horizon=CHUNK, n_dims=N_ACTION_DIMS)
+    x, v = torch.randn(3, CHUNK, MAX_DIM), torch.randn(3, CHUNK, N_ACTION_DIMS)
+    a, b = module(x, torch.full((3,), 0.5), v)
+    torch.testing.assert_close(a, torch.eye(N_ACTION_DIMS).expand(3, CHUNK, -1, -1))
+    torch.testing.assert_close(b, torch.zeros(3, CHUNK, N_ACTION_DIMS))
+
+
+def test_adapter_module_checkpoint_roundtrip(tmp_path):
+    user = LearnedUserModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=32, tdim=8)
+    with torch.no_grad():
+        user.net[-1].bias.normal_()
+    path = tmp_path / "user.pt"
+    save_adapter_module(user, path, kind="user", meta={"corruption": {"rotation_z_deg": 20}})
+    loaded, kind, meta = load_adapter_module(path)
+    assert kind == "user" and meta["corruption"] == {"rotation_z_deg": 20}
+    assert isinstance(loaded, LearnedUserModule) and loaded.config == user.config
+    x = torch.randn(1, CHUNK, MAX_DIM)
+    torch.testing.assert_close(loaded(x, 0.2), user(x, 0.2))
+    task = LearnedTaskModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=16, tdim=8)
+    save_adapter_module(task, tmp_path / "task.pt", kind="task")
+    loaded_task, kind, _ = load_adapter_module(tmp_path / "task.pt")
+    assert kind == "task" and isinstance(loaded_task, LearnedTaskModule)
+    with pytest.raises(ValueError, match="kind"):
+        save_adapter_module(user, tmp_path / "bad.pt", kind="policy")
+    adapter = ReversalAdapter()
+    adapter.load_modules(user_path=path, task_path=tmp_path / "task.pt")
+    assert adapter.kind == "composed" and "MARS" in adapter.describe()
+
+
+def test_parse_adapter_spec_forms():
+    m = rotation_about_z(20)
+    assert parse_adapter_spec(None, m) == AdapterSpec()
+    fixed = parse_adapter_spec({"translation": "corruption", "gripper": "zero"}, m)
+    np.testing.assert_allclose(fixed.matrix[:3, :3], m)
+    assert fixed.user_path is None and fixed.task_path is None
+    assert parse_adapter_spec({"learned": "u.pt"}, m) == AdapterSpec(user_path="u.pt")
+    composed = parse_adapter_spec({"user": {"translation": "corruption"}, "task": "t.pt"}, m)
+    np.testing.assert_allclose(composed.matrix[:3, :3], m)
+    assert composed.task_path == "t.pt" and composed.user_path is None
+    assert parse_adapter_spec({"user": {"learned": "u.pt"}, "task": None}, m) == AdapterSpec(user_path="u.pt")
+    assert parse_adapter_spec({"user": None, "task": "t.pt"}, m) == AdapterSpec(task_path="t.pt")
+    np.testing.assert_allclose(parse_adapter_spec({"F": np.eye(7).tolist()}, m).matrix, np.eye(7))
+    for bad in (
+        {"user": {"learned": "u"}, "F": np.eye(7).tolist()},
+        {"learned": 1},
+        {"task": 3},
+        {"model": "x"},
+        {"user": {"learned": "u", "translation": "corruption"}},
+    ):
+        with pytest.raises(ValueError):
+            parse_adapter_spec(bad, m)
+
+
+def test_reversal_adapter_kind_and_description():
+    adapter = ReversalAdapter()
+    assert adapter.kind == "none" and "off" in adapter.describe()
+    adapter.matrix, adapter.label = np.eye(7), "identity"
+    assert adapter.kind == "user" and "MARS-U" in adapter.describe()
+    adapter.task_module = lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))
+    assert adapter.kind == "composed" and "MARS" in adapter.describe()
+    adapter.matrix = None
+    assert adapter.kind == "task" and "MARS-T" in adapter.describe()
+
+
+def test_wrapper_passes_a_velocity_hook_only_with_a_task_module():
+    policy = FakePolicy()
+    adapter = ReversalAdapter(
+        task_module=lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))
+    )
+    wrapper = FlowReversalSteeringPolicy(
+        policy, Source(translation=(0.0, 0.0, 0.0)), postprocessor(), adapter=adapter
+    )
+    wrapper.select_action({})  # idle: the task module still shapes the policy's own chunk
+    assert "velocity_hook" in policy.calls[0] and "noise_fn" not in policy.calls[0]
+    wrapper = FlowReversalSteeringPolicy(
+        policy, Source(translation=(1.0, 0.0, 0.0)), postprocessor(), adapter=adapter
+    )
+    wrapper.select_action({})  # steering: both passes carry the hook, only the first the reversal
+    steered, plain = policy.calls[1:]
+    assert "velocity_hook" in steered and "noise_fn" in steered
+    assert "velocity_hook" in plain and "noise_fn" not in plain
+    wrapper = FlowReversalSteeringPolicy(
+        policy, Source(translation=(1.0, 0.0, 0.0)), postprocessor(), adapter=ReversalAdapter()
+    )
+    wrapper.select_action({})
+    assert "velocity_hook" not in policy.calls[-2] and "velocity_hook" not in policy.calls[-1]

@@ -99,6 +99,7 @@ class Session:
     def __init__(self, settings: SessionSettings):
         self.settings = settings
         control = settings.control
+        self.tau, self.lam, self.ic_gain = control.tau, control.lam, control.ic_gain  # FC knobs
 
         self.keyboard = KeyboardReader()
         self.chain = TeleopChain(self.keyboard, input_noise=control.input_noise)
@@ -271,11 +272,15 @@ class Session:
         m, f = self.chain.corruption.matrix, self.adapter.matrix
         _, std = get_action_mean_std(self.postprocessor)
         normalized = self.adapter.normalized_matrix(std[:N_ACTION_DIMS])
+        curl = self.chain.corruption.curl
         return {
             "corruption_matrix": matrix_list(m),
+            "corruption_curl": None if curl is None else {"curl": curl.curl, "tau": curl.tau, "dt": curl.dt},
             "reversal_adapter_matrix": matrix_list(f),
             "reversal_adapter_coordinates": "environment",
             "reversal_adapter_normalized_matrix": matrix_list(normalized),
+            "reversal_adapter_modules": {"user": self.adapter.user_label, "task": self.adapter.task_label},
+            "reversal_adapter_kind": self.adapter.kind,
         }
 
     # ------------------------------------------------------------ mode
@@ -286,13 +291,28 @@ class Session:
             raise ValueError(f"{name} must be an integer in [{low}, {total}] (denoising steps)")
 
     def set_mode(
-        self, mode: str, n_guided_steps: int | None = None, n_reversal_steps: int | None = None
+        self,
+        mode: str,
+        lam: int | None = None,
+        n_reversal_steps: int | None = None,
+        tau: int | None = None,
+        ic_gain: float | str | None = None,
+        n_guided_steps: int | None = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
-        if n_guided_steps is not None:
-            self._check_depth("n_guided_steps", n_guided_steps, 0)
-            self.n_guided_steps = n_guided_steps
+        if n_guided_steps is not None:  # the old name of lambda
+            lam = n_guided_steps
+        if lam is not None:
+            self._check_depth("lambda", lam, 0)
+            self.lam = lam
+        if tau is not None:
+            chunk = self.policy.config.chunk_size
+            if not isinstance(tau, int) or not 1 <= tau <= chunk:
+                raise ValueError(f"tau must be an integer in [1, {chunk}] (chunk steps)")
+            self.tau = tau
+        if ic_gain is not None:
+            self.ic_gain = ic_gain  # validated by the wrapper
         if n_reversal_steps is not None:
             self._check_depth("n_reversal_steps", n_reversal_steps, 1)
             self.n_reversal_steps = n_reversal_steps
@@ -302,10 +322,21 @@ class Session:
 
     def apply_control(self, control: ControlSettings) -> None:
         """Put the session in the state a `control:` block describes (mode, depths, noise, gain, matrices)."""
+        self.chain.corruption.curl = None
         self.chain.corruption.matrix = control.corruption_matrix
+        self.chain.corruption.curl = control.corruption_curl
         self.chain.corruption.label = spec_label(control.corruption)
         self.adapter.matrix = control.reversal_adapter_matrix
         self.adapter.label = spec_label(control.reversal_adapter)
+        self.adapter.user_module = self.adapter.task_module = None
+        self.adapter.user_label = self.adapter.task_label = None
+        if control.reversal_adapter_user_path or control.reversal_adapter_task_path:
+            self.adapter.load_modules(
+                control.reversal_adapter_user_path,
+                control.reversal_adapter_task_path,
+                device=next(self.policy.parameters()).device,
+            )
+        self.tau, self.lam, self.ic_gain = control.tau, control.lam, control.ic_gain
         self.chain.noisy.input_noise = control.input_noise
         self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
         self.chain.gain.gain = control.resolved_input_gain
@@ -315,7 +346,7 @@ class Session:
         self.operator_dims = tuple(control.operator_dims)
         if self._frs_policy is not None:
             self._frs_policy.operator_dims = self.operator_dims
-        self.set_mode(control.mode, control.n_guided_steps)
+        self.set_mode(control.mode)
 
     def refresh_input_gain(self) -> str:
         """Re-derive an `auto` gain from the corruption now in force (the REPL swaps M live); returns a status line."""
@@ -331,7 +362,8 @@ class Session:
     def mode_label(self) -> str:
         """Short label for the terminal and the live view."""
         if self.mode == "shared_flow_control":
-            return f"{self.mode} n_guided_steps={self.n_guided_steps}"
+            tau = self.tau or self.policy.config.chunk_size
+            return f"{self.mode} tau={tau} lambda={self.lam} ic_gain={self.ic_gain}"
         if self.mode == "shared_flow_reversal_steering":
             return f"{self.mode} n={self.n_reversal_steps or self.policy.config.num_inference_steps}"
         return self.mode
@@ -351,9 +383,17 @@ class Session:
         elif self.mode == "shared_override":
             lines.append("Shared override: pi0.5 drives, your x/y/z replaces its translation.")
         elif self.mode == "shared_flow_control":
+            chunk = self.policy.config.chunk_size
+            tau = self.tau or chunk
+            units = (
+                "the checkpoint's action units"
+                if self.ic_gain == "action"
+                else f"{self.ic_gain} sigma per full push"
+            )
             lines.append(
-                f"Shared flow control: your x/y/z steers the first n_guided_steps={self.n_guided_steps} of "
-                f"{total} denoising steps (idle input = pure policy)."
+                f"Shared flow control (Kao et al.): your x/y/z, in {units}, is written into the first tau={tau} of "
+                f"{chunk} chunk steps of x_t at the start of the first lambda={self.lam} of {total} denoising steps "
+                "(idle input = pure policy)."
             )
         elif self.mode == "shared_flow_reversal_steering":
             n = total if self.n_reversal_steps is None else self.n_reversal_steps
@@ -397,9 +437,11 @@ class Session:
         elif self.mode == "shared_flow_control":
             if self._flow_policy is None:
                 self._flow_policy = FlowControlPolicy(
-                    self.policy, source, self.n_guided_steps, self.postprocessor
+                    self.policy, source, self.postprocessor, tau=self.tau, lam=self.lam, ic_gain=self.ic_gain
                 )
-            self._flow_policy.n_guided_steps = self.n_guided_steps
+            self._flow_policy.tau = self.tau
+            self._flow_policy.lam = self.lam
+            self._flow_policy.ic_gain = self.ic_gain
             kwargs["policy"] = self._flow_policy
         elif self.mode == "shared_flow_reversal_steering":
             if self._frs_policy is None:
@@ -418,7 +460,12 @@ class Session:
     def metrics(self) -> dict:
         """Steering statistics of the last rollout in the current mode."""
         if self.mode == "shared_flow_control" and self._flow_policy is not None:
-            return {"guided_steps": int(self._flow_policy.guided_steps)}
+            return {
+                "guided_steps": int(self._flow_policy.guided_steps),
+                "tau": self._flow_policy.tau,
+                "lambda": self._flow_policy.lam,
+                "ic_gain": self._flow_policy.ic_gain,
+            }
         if self.mode == "shared_flow_reversal_steering" and self._frs_policy is not None:
             errors = self._frs_policy.reconstruction_errors
             return {
@@ -466,6 +513,7 @@ class Session:
         policy.reset()
         if self.operator is not None:
             self.operator.reset()
+        self.chain.reset()  # a curl corruption starts from rest
         observation = initial_observation
         if observation is None:
             observation = self.show_scene(trial_spec)
@@ -481,6 +529,7 @@ class Session:
         step = 0
         while step < max_steps:
             step_start = time.time()
+            self.chain.advance(step)  # the curl corruption's clock, before anything reads the source
             chunk_index = step // self.settings.n_action_steps
             if self.operator is not None:
                 if self.operator.should_refresh(step):
@@ -549,12 +598,16 @@ class Session:
         stream.set_status(state="success" if success else "failed")
         return RolloutResult(success=success, steps=step, frames=frames, metrics=self.metrics())
 
-    def policy_chunk(self, observation, prompt: str) -> torch.Tensor:
-        """The policy's own action chunk for `observation` under `prompt`, in its normalized space."""
+    def policy_batch(self, observation, prompt: str) -> dict:
+        """`observation` under `prompt` as the preprocessed batch the policy consumes (batch size 1)."""
         obs = preprocess_observation(observation)
         obs["task"] = [prompt]
         obs = self.env_preprocessor(obs)
-        obs = self.preprocessor(obs)
+        return self.preprocessor(obs)
+
+    def policy_chunk(self, observation, prompt: str) -> torch.Tensor:
+        """The policy's own action chunk for `observation` under `prompt`, in its normalized space."""
+        obs = self.policy_batch(observation, prompt)
         with torch.inference_mode(), self.autocast_ctx:
             return self.policy.predict_action_chunk(obs)
 
