@@ -284,6 +284,11 @@ def save_adapter_module(module: nn.Module, path, kind: str, meta: dict | None = 
 def load_adapter_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
     """Load a MARS module checkpoint: (module in eval mode, kind, meta)."""
     ckpt = torch.load(Path(path), map_location=device, weights_only=True)  # tensors, numbers, strings only
+    if ckpt.get("format") == "learned_frs_v1":
+        from .learned_frs import LearnedReversalAdapter
+
+        module, meta = LearnedReversalAdapter.load(path, device=device)
+        return module.requires_grad_(False), "user", meta
     kind = ckpt.get("kind")
     if kind not in _MODULE_KINDS:
         raise ValueError(f"{path}: unknown adapter module kind {kind!r}")
@@ -435,19 +440,26 @@ class AdaptedField:
         self.matrix, self.user_module, self.task_module = matrix, user_module, task_module
 
     def adapt(self, x_t: torch.Tensor, t: float, v: torch.Tensor, backward: bool) -> torch.Tensor:
-        n = N_ACTION_DIMS
-        if self.matrix is not None:
-            n = self.matrix.shape[0]
-        head = v[..., :n]
+        result = v
         if self.task_module is not None:
+            n = getattr(self.task_module, "n_dims", N_ACTION_DIMS)
+            head = result[..., :n]
             a, b = self.task_module(x_t, t, head)
             head = torch.einsum("bhij,bhj->bhi", a.to(head.dtype), head) + b.to(head.dtype)
+            result = torch.cat([head, result[..., n:]], dim=-1)
         if backward:
             if self.matrix is not None:
-                head = head @ self.matrix.transpose(-1, -2)
+                n = self.matrix.shape[0]
+                result = torch.cat([result[..., :n] @ self.matrix.transpose(-1, -2), result[..., n:]], dim=-1)
             if self.user_module is not None:
-                head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
-        return torch.cat([head, v[..., n:]], dim=-1)
+                n = getattr(self.user_module, "n_dims", N_ACTION_DIMS)
+                head = result[..., :n]
+                if hasattr(self.user_module, "apply_velocity"):
+                    head = self.user_module.apply_velocity(x_t, t, head)
+                else:
+                    head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
+                result = torch.cat([head, result[..., n:]], dim=-1)
+        return result
 
 
 def _adapt_velocity(adapter, x_t, t, v, backward: bool):
