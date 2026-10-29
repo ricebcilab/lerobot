@@ -226,19 +226,41 @@ class LearnedUserModule(nn.Module):
     """MARS user module U(x_t, t): one n x n matrix per chunk step, applied to the policy's velocity
     in the BACKWARD pass of the reversal; it undoes one user's command corruption. Works in the
     policy's normalized action space on the first ``n_dims`` dims of ``x_t``. Zero-initialized:
-    a fresh module is the identity (plain FRS)."""
+    a fresh module is the identity (plain FRS). ``time_embedding`` is ``"mars"``
+    (``sinusoidal_time_embedding``) or ``"pi05"`` (pi0.5's own flow-time embedding, periods 0.004-4)."""
 
-    def __init__(self, horizon: int, n_dims: int = N_ACTION_DIMS, d: int = 256, tdim: int = 64):
+    def __init__(
+        self,
+        horizon: int,
+        n_dims: int = N_ACTION_DIMS,
+        d: int = 256,
+        tdim: int = 64,
+        time_embedding: str = "mars",
+    ):
         super().__init__()
-        self.config = {"horizon": horizon, "n_dims": n_dims, "d": d, "tdim": tdim}
-        self.horizon, self.n_dims, self.tdim = horizon, n_dims, tdim
+        if time_embedding not in ("mars", "pi05"):
+            raise ValueError(f"time_embedding must be 'mars' or 'pi05', got {time_embedding!r}")
+        self.config = {
+            "horizon": horizon,
+            "n_dims": n_dims,
+            "d": d,
+            "tdim": tdim,
+            "time_embedding": time_embedding,
+        }
+        self.horizon, self.n_dims, self.tdim, self.time_embedding = horizon, n_dims, tdim, time_embedding
         self.net = _mlp(horizon * n_dims + tdim, d, horizon * n_dims * n_dims)
 
     def forward(self, x_t: torch.Tensor, t) -> torch.Tensor:
         """x_t (B, H, >= n_dims), t a float or (B,) -> (B, H, n, n)."""
         b, h, n = x_t.shape[0], self.horizon, self.n_dims
         x = x_t[:, :h, :n].reshape(b, h * n).to(torch.float32)
-        emb = sinusoidal_time_embedding(t, self.tdim, device=x.device).expand(b, -1)
+        if self.time_embedding == "pi05":
+            from .modeling_pi05 import create_sinusoidal_pos_embedding
+
+            t = torch.as_tensor(t, dtype=torch.float32, device=x.device).reshape(-1)
+            emb = create_sinusoidal_pos_embedding(t, self.tdim, 0.004, 4.0, x.device).float().expand(b, -1)
+        else:
+            emb = sinusoidal_time_embedding(t, self.tdim, device=x.device).expand(b, -1)
         delta = self.net(torch.cat([x, emb], dim=-1)).view(b, h, n, n)
         return torch.eye(n, device=x.device, dtype=x.dtype) + delta
 
@@ -284,14 +306,9 @@ def save_adapter_module(module: nn.Module, path, kind: str, meta: dict | None = 
 def load_adapter_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
     """Load a MARS module checkpoint: (module in eval mode, kind, meta)."""
     ckpt = torch.load(Path(path), map_location=device, weights_only=True)  # tensors, numbers, strings only
-    if ckpt.get("format") == "learned_frs_v1":
-        from .learned_frs import LearnedReversalAdapter
-
-        module, meta = LearnedReversalAdapter.load(path, device=device)
-        return module.requires_grad_(False), "user", meta
     kind = ckpt.get("kind")
     if kind not in _MODULE_KINDS:
-        raise ValueError(f"{path}: unknown adapter module kind {kind!r}")
+        raise ValueError(f"{path}: unknown adapter module kind {kind!r} (format {ckpt.get('format')!r})")
     module = _MODULE_KINDS[kind](**ckpt["config"])
     module.load_state_dict(ckpt["state_dict"])
     return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
@@ -454,10 +471,7 @@ class AdaptedField:
             if self.user_module is not None:
                 n = getattr(self.user_module, "n_dims", N_ACTION_DIMS)
                 head = result[..., :n]
-                if hasattr(self.user_module, "apply_velocity"):
-                    head = self.user_module.apply_velocity(x_t, t, head)
-                else:
-                    head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
+                head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
                 result = torch.cat([head, result[..., n:]], dim=-1)
         return result
 

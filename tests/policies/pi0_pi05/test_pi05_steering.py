@@ -577,6 +577,7 @@ from lerobot.policies.pi05.steering import (  # noqa: E402
     load_adapter_module,
     parse_adapter_spec,
     save_adapter_module,
+    sinusoidal_time_embedding,
 )
 
 
@@ -651,6 +652,31 @@ def test_adapter_module_checkpoint_roundtrip(tmp_path):
     adapter = ReversalAdapter()
     adapter.load_modules(user_path=path, task_path=tmp_path / "task.pt")
     assert adapter.kind == "composed" and "MARS" in adapter.describe()
+
+
+@pytest.mark.parametrize("name", ["mars", "pi05"])
+def test_learned_user_module_time_embedding(tmp_path, name):
+    from lerobot.policies.pi05.modeling_pi05 import create_sinusoidal_pos_embedding
+
+    module = LearnedUserModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=16, tdim=8, time_embedding=name)
+    seen = []
+    module.net[0].register_forward_hook(lambda layer, args, out: seen.append(args[0][:, -8:]))
+    t = torch.tensor([0.1, 0.7])
+    module(torch.randn(2, CHUNK, MAX_DIM), t)
+    if name == "mars":
+        expected = sinusoidal_time_embedding(t, 8)
+    else:
+        expected = create_sinusoidal_pos_embedding(t, 8, 0.004, 4.0, t.device).float()
+    torch.testing.assert_close(seen[0], expected)
+    path = save_adapter_module(module, tmp_path / "user.pt", kind="user")
+    assert load_adapter_module(path)[0].config["time_embedding"] == name
+    # checkpoints saved before the option existed keep the MARS embedding
+    ckpt = torch.load(path, weights_only=True)
+    del ckpt["config"]["time_embedding"]
+    torch.save(ckpt, tmp_path / "old.pt")
+    assert load_adapter_module(tmp_path / "old.pt")[0].time_embedding == "mars"
+    with pytest.raises(ValueError, match="time_embedding"):
+        LearnedUserModule(horizon=CHUNK, time_embedding="rope")
 
 
 def test_parse_adapter_spec_forms():
