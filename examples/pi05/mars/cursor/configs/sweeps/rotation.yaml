@@ -1,0 +1,20 @@
+# Tuned sweep over a rotation of the command x input noise: corruption {rotation_deg: d}.
+#   python run_sweep.py --sweep rotation
+name: rotation
+agent: expert
+arm: base.yaml
+methods:
+  teleop: {mode: teleop}
+  flow_control: {mode: flow_control}
+  frs: {mode: frs}
+  mars_fixed: {mode: frs, reversal_adapter: family}
+depths:
+  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
+  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # steps reversed (of 10)
+grid:
+  family: rotation
+  levels: [10, 20, 45, 90]
+  noises: [0.25, 0.75, 1.25, 1.75]
+trials: {tune: 200, test: 500}
+focus: mars_fixed
+seed: 100

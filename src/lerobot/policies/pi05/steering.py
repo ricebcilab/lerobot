@@ -45,9 +45,28 @@ selects which of translation / rotation / gripper they do), the padding dims and
 the steps beyond ``pinned_steps`` are *delegated* to the policy: after the
 reversal their latent is replaced by the unsteered one (fresh Gaussian noise for
 a full reversal), the noise-space in-painting of Tang et al., App. D.
+
+Under the pi0.5 wrappers sits a task-generic core that takes any velocity field
+``velocity(x, t)`` and any number of action dims: ``integrate`` (one Euler
+integrator for either flow-time convention; the sign of ``h`` sets the
+direction of flow time, ``backward`` whether the user part of the adapter acts):
+
+- pi0.5 (t=1 noise, t=0 action): the reversal (action toward noise) runs
+  ``t0=0, h=+1/N``, the forward pass (noise toward action) ``t0=1, h=-1/N``;
+- the cursor (t=0 noise, t=1 action): the reversal runs ``t0=1, h=-1/N``, the
+  forward pass from the reversal's landing point ``t0=1-n/N`` with ``h>0``
+  (``t0=0, h=+1/N`` for a whole chunk from noise).
+
+Also ``AdaptedField`` (fixed or per-trial matrices, user and task modules), the
+module classes (``LearnedUserModule``, ``LearnedTaskModule``, the
+obstacle-reading ``ObstacleTaskModule``) and their checkpoints, and, in the
+cursor convention, the chunk functions ``flow_control_chunk``, ``frs_chunk`` and
+``steered_chunk`` and the module training losses ``user_field_loss`` and
+``task_field_loss``.
 """
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -288,30 +307,181 @@ class LearnedTaskModule(nn.Module):
         return a, out[..., n * n :]
 
 
+def _gelu_mlp(d_in: int, d: int) -> nn.Sequential:
+    """Linear, GELU, Linear: the cursor policy's ``mlp`` (the obstacle tokens' encoder)."""
+    return nn.Sequential(nn.Linear(d_in, d), nn.GELU(), nn.Linear(d, d))
+
+
+class _BoundTaskModule:
+    """An ``ObstacleTaskModule`` with its observation fixed: the ``(x_t, t, v) -> (A, b)`` callable
+    that ``AdaptedField`` takes as a task module."""
+
+    def __init__(self, module: "ObstacleTaskModule", obs: dict):
+        self.module, self.obs, self.n_dims = module, obs, module.n_dims
+
+    def __call__(self, x_t: torch.Tensor, t, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.module(self.obs, x_t, t, v)
+
+
+class ObstacleTaskModule(nn.Module):
+    """MARS task module that reads obstacles (the cursor example's ``TaskModule``): A(x_t, t, v, obstacles) v + b,
+    one affine map of the policy's velocity per chunk step, in both directions of the flow, from the
+    obstacles as seen from the cursor. The chunk's steps attend (masked cross-attention) to one token per
+    obstacle (position relative to the cursor, radius, distance, in units of ``scale``) and a learned null
+    token, so a trial without obstacles has something to attend to. The head is zero-initialized: a fresh
+    module is the identity. ``obs`` holds ``pos`` (B, 2) and optionally ``obstacles`` (B, K, 3: center,
+    radius) and ``obstacle_mask`` (B, K, True for real obstacles)."""
+
+    def __init__(
+        self,
+        horizon: int = 16,
+        d: int = 128,
+        tdim: int = 64,
+        heads: int = 4,
+        layers: int = 2,
+        scale: float = 0.2,
+        n_dims: int = 2,
+    ):
+        super().__init__()
+        self.config = {
+            "horizon": horizon,
+            "d": d,
+            "tdim": tdim,
+            "heads": heads,
+            "layers": layers,
+            "scale": scale,
+            "n_dims": n_dims,
+        }
+        self.horizon, self.tdim, self.scale, self.n_dims = horizon, tdim, scale, n_dims
+        self.token_in = _gelu_mlp(4, d)
+        self.null = nn.Parameter(torch.zeros(1, 1, d))
+        self.query_in = nn.Linear(n_dims + n_dims + tdim + 2, d)
+        self.step_emb = nn.Parameter(0.02 * torch.randn(horizon, d))
+        self.attn = nn.ModuleList([nn.MultiheadAttention(d, heads, batch_first=True) for _ in range(layers)])
+        self.norm_q = nn.ModuleList([nn.LayerNorm(d) for _ in range(layers)])
+        self.norm_k = nn.ModuleList([nn.LayerNorm(d) for _ in range(layers)])
+        self.ff = nn.ModuleList(
+            [
+                nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+                for _ in range(layers)
+            ]
+        )
+        self.out = nn.Linear(d, n_dims * n_dims + n_dims)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def tokens(self, obs: dict, b: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The obstacle tokens (B, 1 + K, d) with the null token first, and their padding mask."""
+        null = self.null.expand(b, 1, -1)
+        obstacles = obs.get("obstacles")
+        if obstacles is None or obstacles.shape[1] == 0:
+            return null, None
+        rel = (obstacles[..., :2] - obs["pos"][:, None]) / self.scale
+        feats = torch.cat([rel, obstacles[..., 2:3] / self.scale, rel.norm(dim=-1, keepdim=True)], -1)
+        tokens = torch.cat([null, self.token_in(feats)], 1)
+        mask = obs.get("obstacle_mask")
+        if mask is None:
+            return tokens, None
+        return tokens, torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=tokens.device), ~mask], 1)
+
+    def forward(self, obs: dict, x_t: torch.Tensor, t, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x_t (B, H, >= n), v (B, H, >= n), t a float or (B,) -> (A (B, H, n, n), b (B, H, n))."""
+        b, h, n = x_t.shape[0], x_t.shape[1], self.n_dims
+        tokens, pad = self.tokens(obs, b)
+        temb = (
+            sinusoidal_time_embedding(t, self.tdim, device=x_t.device)
+            .expand(b, -1)[:, None]
+            .expand(-1, h, -1)
+        )
+        pos = (2 * obs["pos"] - 1)[:, None].expand(-1, h, -1)
+        q = self.query_in(torch.cat([x_t[..., :n], v[..., :n], temb, pos], -1)) + self.step_emb
+        for attn, norm_q, norm_k, ff in zip(self.attn, self.norm_q, self.norm_k, self.ff, strict=True):
+            k = norm_k(tokens)
+            q = q + attn(norm_q(q), k, k, key_padding_mask=pad, need_weights=False)[0]
+            q = q + ff(q)
+        out = self.out(q)
+        a = torch.eye(n, device=x_t.device) + out[..., : n * n].view(b, h, n, n)
+        return a, out[..., n * n :]
+
+    def bind(self, obs: dict) -> _BoundTaskModule:
+        """This module with ``obs`` fixed: a ``(x_t, t, v) -> (A, b)`` callable carrying ``n_dims``."""
+        return _BoundTaskModule(self, obs)
+
+
 _MODULE_KINDS = {"user": LearnedUserModule, "task": LearnedTaskModule}
+_TASK_ARCHS = {"mlp": LearnedTaskModule, "obstacle": ObstacleTaskModule}  # checkpoint "arch" of a task module
 
 
-def save_adapter_module(module: nn.Module, path, kind: str, meta: dict | None = None) -> Path:
-    """Save a MARS module checkpoint: ``kind`` (user | task), its config, weights and free-form meta."""
-    if kind not in _MODULE_KINDS or not isinstance(module, _MODULE_KINDS[kind]):
+def save_adapter_module(
+    module: nn.Module, path, kind: str, meta: dict | None = None, arch: str | None = None
+) -> Path:
+    """Save a MARS module checkpoint: ``kind`` (user | task), its config, weights and free-form meta.
+    A task module also records its ``arch`` (``"mlp"``: ``LearnedTaskModule``, ``"obstacle"``:
+    ``ObstacleTaskModule``), taken from the module; ``arch``, when given, must match it."""
+    if kind == "user":
+        if not isinstance(module, LearnedUserModule) or arch is not None:
+            raise ValueError("kind 'user' takes a LearnedUserModule and no arch")
+    elif kind == "task":
+        found = next((name for name, cls in _TASK_ARCHS.items() if type(module) is cls), None)
+        if found is None or (arch is not None and arch != found):
+            raise ValueError(
+                f"kind 'task' with arch {arch!r} does not match the module {type(module).__name__}"
+            )
+        arch = found
+    else:
         raise ValueError(f"kind must be one of {sorted(_MODULE_KINDS)} and match the module, got {kind!r}")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"kind": kind, "config": module.config, "state_dict": module.state_dict(), "meta": meta or {}}, path
-    )
+    ckpt = {"kind": kind, "config": module.config, "state_dict": module.state_dict(), "meta": meta or {}}
+    if arch is not None:
+        ckpt["arch"] = arch
+    torch.save(ckpt, path)
     return path
 
 
 def load_adapter_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
-    """Load a MARS module checkpoint: (module in eval mode, kind, meta)."""
+    """Load a MARS module checkpoint: (module in eval mode, kind, meta). A task checkpoint without
+    ``arch`` (the first LIBERO files) is an ``"mlp"`` one."""
     ckpt = torch.load(Path(path), map_location=device, weights_only=True)  # tensors, numbers, strings only
     kind = ckpt.get("kind")
     if kind not in _MODULE_KINDS:
         raise ValueError(f"{path}: unknown adapter module kind {kind!r} (format {ckpt.get('format')!r})")
-    module = _MODULE_KINDS[kind](**ckpt["config"])
+    if kind == "task":
+        arch = ckpt.get("arch", "mlp")
+        if arch not in _TASK_ARCHS:
+            raise ValueError(
+                f"{path}: unknown task module arch {arch!r}; expected one of {sorted(_TASK_ARCHS)}"
+            )
+        cls = _TASK_ARCHS[arch]
+    else:
+        cls = _MODULE_KINDS[kind]
+    module = cls(**ckpt["config"])
     module.load_state_dict(ckpt["state_dict"])
     return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
+
+
+def convert_cursor_module(ckpt: dict) -> dict:
+    """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
+    adapters, saved without ``kind``, are user modules) in the ``save_adapter_module`` format. A user
+    module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
+    embedding computes the same frequencies, so outputs agree to float rounding), a task module an
+    ``ObstacleTaskModule`` (``arch="obstacle"``). ``args`` and ``obstacle`` go into ``meta``."""
+    kind = ckpt.get("kind", "user")
+    config = dict(ckpt["config"])
+    meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
+    if kind == "user":
+        config = {"horizon": config["horizon"], "n_dims": 2, "d": config["d"], "tdim": config["tdim"]}
+        return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
+    if kind == "task":
+        config["n_dims"] = 2
+        return {
+            "kind": "task",
+            "arch": "obstacle",
+            "config": config,
+            "state_dict": ckpt["state_dict"],
+            "meta": meta,
+        }
+    raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
 
 
 @dataclass(frozen=True)
@@ -451,25 +621,35 @@ class ReversalAdapter(MatrixHolder):
 
 class AdaptedField:
     """Applies MARS modules to a velocity: task (both directions), then user (backward only).
-    Only the first n action dims are touched; the padding dims pass through."""
+    Only the first n action dims are touched; the padding dims pass through. ``matrix`` is a fixed
+    (n, n) F or one per trial, (B, n, n). A module acts on its ``n_dims`` attribute's dims
+    (``N_ACTION_DIMS`` when it has none) unless ``n_dims`` is given, which overrides both."""
 
-    def __init__(self, matrix: torch.Tensor | None, user_module=None, task_module=None):
+    def __init__(
+        self, matrix: torch.Tensor | None, user_module=None, task_module=None, n_dims: int | None = None
+    ):
         self.matrix, self.user_module, self.task_module = matrix, user_module, task_module
+        self.n_dims = n_dims
 
-    def adapt(self, x_t: torch.Tensor, t: float, v: torch.Tensor, backward: bool) -> torch.Tensor:
+    def _dims(self, module) -> int:
+        return self.n_dims if self.n_dims is not None else getattr(module, "n_dims", N_ACTION_DIMS)
+
+    def adapt(
+        self, x_t: torch.Tensor, t: float | torch.Tensor, v: torch.Tensor, backward: bool
+    ) -> torch.Tensor:
         result = v
         if self.task_module is not None:
-            n = getattr(self.task_module, "n_dims", N_ACTION_DIMS)
+            n = self._dims(self.task_module)
             head = result[..., :n]
             a, b = self.task_module(x_t, t, head)
             head = torch.einsum("bhij,bhj->bhi", a.to(head.dtype), head) + b.to(head.dtype)
             result = torch.cat([head, result[..., n:]], dim=-1)
         if backward:
             if self.matrix is not None:
-                n = self.matrix.shape[0]
+                n = self.matrix.shape[-1]
                 result = torch.cat([result[..., :n] @ self.matrix.transpose(-1, -2), result[..., n:]], dim=-1)
             if self.user_module is not None:
-                n = getattr(self.user_module, "n_dims", N_ACTION_DIMS)
+                n = self._dims(self.user_module)
                 head = result[..., :n]
                 head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
                 result = torch.cat([head, result[..., n:]], dim=-1)
@@ -477,14 +657,14 @@ class AdaptedField:
 
 
 def _adapt_velocity(adapter, x_t, t, v, backward: bool):
-    """`adapter` is None, a normalized (n, n) matrix (the legacy fixed-F form), an AdaptedField, or a
-    ReversalAdapter holder used directly (its matrix is then taken as already normalized)."""
+    """`adapter` is None, a normalized (n, n) or per-trial (B, n, n) matrix (the legacy fixed-F form), an
+    AdaptedField, or a ReversalAdapter holder used directly (its matrix is then taken as already normalized)."""
     if adapter is None:
         return v
     if isinstance(adapter, torch.Tensor):
         if not backward:
             return v
-        n = adapter.shape[0]
+        n = adapter.shape[-1]
         return torch.cat([v[..., :n] @ adapter.transpose(-1, -2), v[..., n:]], dim=-1)
     if isinstance(adapter, ReversalAdapter):
         if adapter.kind == "none":
@@ -496,6 +676,193 @@ def _adapt_velocity(adapter, x_t, t, v, backward: bool):
         )
         adapter = AdaptedField(matrix, adapter.user_module, adapter.task_module)
     return adapter.adapt(x_t, t, v, backward)
+
+
+def integrate(
+    x: torch.Tensor,
+    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
+    t0: float,
+    h: float,
+    n: int,
+    adapter=None,
+    backward: bool = False,
+    grad: bool = False,
+    batch_time: bool = False,
+) -> torch.Tensor:
+    """``n`` Euler steps ``x <- x + h * adapt(v(x, t))`` at flow times ``t = t0 + i * h``, through any
+    velocity field, in either time convention: the sign of ``h`` picks the direction of flow time,
+    ``backward`` whether the adapter's user part (the fixed matrix F and/or the user module) acts
+    (the reversal toward noise); a task module acts in both directions. ``adapter`` is
+    anything ``_adapt_velocity`` takes. ``t`` is passed to ``velocity`` and the adapter as the float
+    ``t0 + i * h``, or with ``batch_time`` as a (B,) float32 tensor of it on ``x``'s device (the
+    cursor policy's form). With ``grad`` False the loop runs under ``torch.no_grad()``; with it True
+    the caller's grad mode holds (differentiable when grad is enabled, for training)."""
+    with torch.enable_grad() if grad and torch.is_grad_enabled() else torch.no_grad():
+        for i in range(n):
+            t = t0 + i * h
+            if batch_time:
+                t = torch.full((len(x),), t, device=x.device)
+            x = x + h * _adapt_velocity(adapter, x, t, velocity(x, t), backward=backward)
+    return x
+
+
+# ---------------------------------------------------------------- chunks and losses, t = 0 noise convention
+#
+# Everything in this section is in the cursor's flow-time convention: t = 0 is noise, t = 1 the action,
+# and flow times reach `velocity` and the adapter as (B,) float32 tensors (``integrate``'s ``batch_time``).
+
+STEERED_CHUNK_MODES = ("policy", "flow_control", "frs")
+
+
+@torch.no_grad()
+def flow_control_chunk(
+    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    z: torch.Tensor,
+    written: torch.Tensor,
+    steer: torch.Tensor,
+    tau: int,
+    lam: int,
+    steps: int,
+    adapter=None,
+) -> torch.Tensor:
+    """Flow control (Kao et al. 2026) in the t = 0 noise convention: the normalized chunk from noise ``z``
+    (B, H, n). ``written`` (B, H, n) is the reference already scaled into the noise prior's units; its first
+    ``tau`` chunk steps are written into the rows where ``steer`` (B, 1, 1, bool) holds at the start of each
+    of the first ``lam`` (lambda) of the ``steps`` Euler steps (t = 0 to 1). The rest of the chunk keeps its
+    noise and the flow runs unmodified (the adapter's task module in its field, as in every forward pass).
+    lambda 1: the initial condition only, Kao et al.'s method; lambda 0: nothing written, the policy alone;
+    lambda > 1: the lab's variant."""
+    written = written[:, :tau]
+    x, h = z.clone(), 1.0 / steps
+    for i in range(steps):
+        if i < lam:
+            x[:, :tau] = torch.where(steer, written, x[:, :tau])
+        x = integrate(x, velocity, i * h, h, 1, adapter, backward=False, batch_time=True)
+    return x
+
+
+@torch.no_grad()
+def frs_chunk(
+    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    z: torch.Tensor,
+    ref: torch.Tensor,
+    steer: torch.Tensor,
+    n_reverse_steps: int | None,
+    steps: int,
+    adapter=None,
+) -> torch.Tensor:
+    """Flow Reversal Steering (MARS with an adapter) in the t = 0 noise convention: the normalized chunk.
+    The reference ``ref`` (B, H, n, normalized) is reversed n of the N = ``steps`` steps (t = 1 toward
+    1 - n/N, the adapter's user part acting), then run forward in N - n steps, so a partial reversal costs
+    the same N evaluations as a plain chunk; a full reversal (n = N, ``n_reverse_steps`` None) runs forward
+    in N steps. Rows where ``steer`` (B, 1, 1, bool) is False get the plain chunk from ``z``."""
+    n = steps if n_reverse_steps is None else n_reverse_steps
+    if not 1 <= n <= steps:
+        raise ValueError(f"n_reverse_steps must be in [1, {steps}], got {n}")
+    latent = integrate(ref.clone(), velocity, 1.0, -1.0 / steps, n, adapter, backward=True, batch_time=True)
+    t0, m = 1.0 - n / steps, steps if n == steps else steps - n
+    steered = integrate(latent, velocity, t0, (1.0 - t0) / m, m, adapter, batch_time=True)
+    plain = (
+        steered if steer.all() else integrate(z, velocity, 0.0, 1.0 / steps, steps, adapter, batch_time=True)
+    )
+    return torch.where(steer, steered, plain)
+
+
+@torch.no_grad()
+def steered_chunk(
+    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    command: torch.Tensor,
+    mode: str,
+    *,
+    horizon: int,
+    to_reference: Callable[[torch.Tensor], torch.Tensor],
+    tau: int = 5,
+    n_reverse_steps: int | None = None,
+    steps: int = 10,
+    adapter=None,
+    reference: torch.Tensor | None = None,
+    ic_gain: float = 1.0,
+    lam: int = 1,
+    deadband: float = DEADBAND,
+) -> torch.Tensor:
+    """One normalized action chunk (B, ``horizon``, n) for commands (B, n), in the t = 0 noise convention.
+
+    The reference the shared modes steer toward is the command held constant over the chunk, or
+    ``reference`` (B, H, n, a command per step) when given: ``"flow_control"`` writes it, scaled by
+    ``ic_gain``, into x_t (``flow_control_chunk``); ``"frs"`` converts it with the caller's
+    ``to_reference`` (command units to the policy's normalized actions) and reverses it (``frs_chunk``).
+    ``"policy"`` is the plain forward flow. Rows whose command (or whole reference) is inside ``deadband``
+    (max |component| below it) get the plain chunk, from the same noise they would have had in mode
+    ``"policy"``: the noise ``z`` is drawn first, so random streams line up across modes."""
+    b, n = len(command), command.shape[-1]
+    z = torch.randn(b, horizon, n, device=command.device)
+    src = torch.as_tensor(command if reference is None else reference)
+    active = src.abs().amax(-1) >= deadband
+    steer = (active if reference is None else active.any(-1)).to(command.device)[:, None, None]
+    if mode == "policy" or not steer.any():
+        return integrate(z, velocity, 0.0, 1.0 / steps, steps, adapter, batch_time=True)
+    deflection = command[:, None].expand(-1, horizon, -1) if reference is None else reference
+    if mode == "flow_control":
+        if not 0 <= tau <= horizon:
+            raise ValueError(f"tau must be in [0, {horizon}] chunk steps for flow_control, got {tau}")
+        if not 0 <= lam <= steps:
+            raise ValueError(f"lambda must be in [0, {steps}] Euler steps for flow_control, got {lam}")
+        return flow_control_chunk(velocity, z, ic_gain * deflection, steer, tau, lam, steps, adapter)
+    if mode == "frs":
+        return frs_chunk(velocity, z, to_reference(deflection), steer, n_reverse_steps, steps, adapter)
+    raise ValueError(f"unknown mode {mode!r}; expected one of {STEERED_CHUNK_MODES}")
+
+
+def user_field_loss(
+    user: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    latent: torch.Tensor,
+    target: torch.Tensor,
+    t: torch.Tensor,
+    task: Callable | None = None,
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The user module's field regression, in the t = 0 noise convention: along the straight path
+    x_t = (1 - t) latent + t target (t (B,), one flow time per sample),
+
+        U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad),
+
+    T the bound task module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity. A full
+    reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach whichever
+    module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
+    x = (1 - t[:, None, None]) * latent + t[:, None, None] * target
+    with torch.no_grad():
+        v = velocity(x, t)
+    if task is not None:
+        a, b = task(x, t, v)
+        v = torch.einsum("bsij,bsj->bsi", a, v) + b
+    err = ((torch.einsum("bsij,bsj->bsi", user(x, t), v) - (target - latent)) ** 2).mean((1, 2))
+    return err.mean() if weight is None else (err * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def task_field_loss(
+    task: Callable,
+    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    chunk: torch.Tensor,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    lambda_id: float,
+    n_dims: int,
+) -> tuple[torch.Tensor, dict]:
+    """The task module's flow matching through the adapted field, in the t = 0 noise convention: on the
+    policy's interpolation x_t = (1 - t) z + t a (``chunk`` a, normalized (B, H, n); t (B,)),
+
+        L = || A v + b - (a - z) ||^2 + lambda_id (||A - I||^2 + ||b||^2),   v = velocity(x_t, t) (no grad),
+
+    ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. Returns the loss and its
+    two parts (``fm``, ``identity``) as floats."""
+    x = (1 - t[:, None, None]) * z + t[:, None, None] * chunk
+    with torch.no_grad():
+        v = velocity(x, t)
+    mat, b = task(x, t, v)
+    fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
+    identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
+    return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
 
 
 def _rng_state() -> tuple:
@@ -728,14 +1095,8 @@ def reverse_flow(
     leaving the padding dims alone; F = I is an exact no-op) or an ``AdaptedField``
     (MARS: task module, then user module, since this is the backward pass).
     """
-    h = 1.0 / num_steps
     steps = num_steps if n_reversal_steps is None else n_reversal_steps
-    x_t = x
-    for step in range(steps):
-        t = step * h
-        v = _adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=True)
-        x_t = x_t + h * v
-    return x_t
+    return integrate(x, velocity, 0.0, 1.0 / num_steps, steps, adapter, backward=True, grad=True)
 
 
 def forward_flow(
@@ -750,13 +1111,8 @@ def forward_flow(
     ``adapter`` (an ``AdaptedField``) applies its task module only: the user module
     acts on the reversal alone.
     """
-    h = 1.0 / num_steps
     steps = num_steps if stop_at is None else num_steps - stop_at
-    x_t = x
-    for step in range(steps):
-        t = 1.0 - step * h
-        x_t = x_t - h * _adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=False)
-    return x_t
+    return integrate(x, velocity, 1.0, -(1.0 / num_steps), steps, adapter, grad=True)
 
 
 def uniform_reference(

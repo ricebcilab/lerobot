@@ -1,0 +1,8 @@
+# MARS: Flow Reversal Steering with the reversal adapter, under the gain
+# corruption. The reversal follows F @ v with F = the known corruption M; the
+# forward flow, which produces the executed action, is unchanged.
+extends: condition_gain05y.yaml
+control:
+  mode: frs
+  n_reverse_steps: null
+  reversal_adapter: {translation: corruption}

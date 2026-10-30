@@ -74,7 +74,8 @@ repos:
         args: [--prose-wrap=preserve]
         # Jinja2 model-card templates use a .md extension but contain {% ... %} /
         # {{ ... }} tags that prettier's Markdown formatter mangles (e.g. table loops).
-        exclude: ^src/lerobot/templates/.*\.md$
+        # The MARS cursor example's README keeps the original cursor project's layout (as ruff excludes it).
+        exclude: ^(src/lerobot/templates/.*|examples/pi05/mars/cursor/README)\.md$
 
   ##### Security #####
   - repo: https://github.com/gitleaks/gitleaks

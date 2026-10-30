@@ -103,6 +103,7 @@ from lerobot.teleoperators import (  # noqa: F401
     reachy2_teleoperator,
     rebot_102_leader,
     so_leader,
+    spacemouse,
     unitree_g1,
 )
 from lerobot.utils.import_utils import register_third_party_plugins

@@ -1,0 +1,13 @@
+# The known corruption shared by the *_rot90 arms: your command is rotated by
+# 90 degrees (counterclockwise) and gets Gaussian noise on top. Both apply only
+# while you push. Change them here and every *_rot90 arm follows.
+#
+# Chosen by sweep_steering.py --corruption rotation (results/steering_sweep_rotation/):
+# with a simulated user that pushes straight at the goal and never compensates
+# for the rotation, at these values and each method's tuned depth (set in the
+# arms), test success is teleop 1%, flow control 30%, FRS 6%, MARS 92%.
+# At 45 degrees or less, teleop wins instead.
+extends: base.yaml
+control:
+  corruption: {rotation_deg: 90}
+  input_noise: 0.25

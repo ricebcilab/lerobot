@@ -45,6 +45,7 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
+from .cursor_flow.configuration_cursor_flow import CursorFlowConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
@@ -91,7 +92,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
             "multi_task_dit", "vqbet", "pi0", "pi05", "gaussian_actor", "smolvla", "wall_x",
-            "molmoact2".
+            "molmoact2", "cursor_flow".
     Returns:
         The policy class corresponding to the given name.
 
@@ -110,6 +111,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "cursor_flow":
+        from .cursor_flow.modeling_cursor_flow import CursorFlowPolicy
+
+        return CursorFlowPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -179,7 +184,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
                      "multi_task_dit", "diffusion", "act", "vqbet", "pi0", "pi05", "gaussian_actor",
-                     "smolvla", "wall_x", "molmoact2".
+                     "smolvla", "wall_x", "molmoact2", "cursor_flow".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -194,6 +199,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "cursor_flow":
+        return CursorFlowConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":

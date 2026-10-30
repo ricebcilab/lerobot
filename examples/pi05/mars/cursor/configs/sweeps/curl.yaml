@@ -1,0 +1,23 @@
+# Tuned sweep over a clockwise curl force field on the cursor (inertia 0.1 s) x input noise.
+# The field acts on the cursor itself, so it bends the policy's chunks too; mars_fixed's adapter is
+# the inverse of the curl's steady-state map (with the map itself it failed at every depth).
+#   python run_sweep.py --sweep curl
+name: curl
+agent: expert
+arm: base.yaml
+methods:
+  teleop: {mode: teleop}
+  flow_control: {mode: flow_control}
+  frs: {mode: frs}
+  mars_fixed: {mode: frs, reversal_adapter: family}
+depths:
+  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
+  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # steps reversed (of 10)
+grid:
+  family: curl
+  levels: [0, 5, 10, 20, 40]
+  noises: [0.0, 0.3, 0.75]
+trials: {tune: 200, test: 500}
+focus: mars_fixed
+seed: 100
+traces: {levels: [0, 10, 20, 40], noise: 0.0}     # center-out reaches of every method at its tuned depth

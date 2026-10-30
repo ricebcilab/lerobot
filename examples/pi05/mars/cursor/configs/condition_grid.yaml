@@ -1,0 +1,14 @@
+# The compositional-adapter grid's base: the study geometry (4 targets, reach 0.35-0.5) at input noise
+# 1.0, 8 s per trial (the ring detours take longer), no corruption and no obstacle; a grid cell sets its
+# user (a corruption) and its task (an obstacle, and T1 the study's 5 s limit) on top of it
+# (configs/sweeps/grid*.yaml). The cursor runs at the study's half speed by slower time, not smaller
+# steps: the policy then sees the motion it was trained on, which following a route around an obstacle
+# needs (README, the grid's checks); the open-field study keeps its controller.
+extends: base.yaml
+control:
+  input_noise: 1.0
+  gain_mode: time
+task:
+  targets: [4, 4]
+  reach: [0.35, 0.5]
+  time_limit_s: 8.0

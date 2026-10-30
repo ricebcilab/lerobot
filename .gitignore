@@ -176,3 +176,13 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# MARS cursor example: large local artifacts
+examples/pi05/mars/results/
+examples/pi05/mars/checkpoints/
+# Reports and figures stay local (participant data, large PDFs, stats.json with session numbers);
+# only their build scripts are tracked
+examples/pi05/mars/cursor/reports/*
+!examples/pi05/mars/cursor/reports/*.py
+examples/pi05/mars/figures/*
+!examples/pi05/mars/figures/*.py

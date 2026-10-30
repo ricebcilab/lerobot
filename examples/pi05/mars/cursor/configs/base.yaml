@@ -1,0 +1,39 @@
+# The default arm: one control condition for run_experiment.py.
+#
+# Every arm parameter lives here. An arm file says `extends: base.yaml` (or
+# another arm) and overrides only what it changes; a command-line flag of
+# run_experiment.py still wins over both (free play), e.g. --speed-gain 0.3.
+# Unknown or missing keys are errors. Who plays (a person, the expert) and how
+# many trials are the protocol's business (configs/study.yaml).
+
+policy:
+  model: flow_goaldrop        # policy under checkpoints/policies/ (trained with goal dropout; never told the goal)
+  flow_steps: 10              # Euler steps per chunk
+  execute: 2                  # chunk steps executed before replanning and re-reading the input
+
+control:
+  mode: flow_control          # policy | teleop | flow_control | frs
+  tau: 8                      # flow_control: chunk steps, of 16, the command is written into (Kao et al.'s default)
+  ic_gain: 2.0                # flow_control: the command's scale in the noise prior (a full push writes ic_gain sigma); chosen
+                              #   once on the study condition (sweeps/flow_control_gain.yaml), as Kao et al. chose their gain
+  lambda: 1                   # flow_control: Euler steps at whose start the command is written: 1 = the initial condition
+                              #   only (Kao et al.), 0 = nothing (the policy alone), > 1 = re-written as the flow proceeds
+  n_reverse_steps: null       # frs: steps to reverse (null = all the way to noise); frs + reversal_adapter = mars
+  speed_gain: 0.5             # scales the cursor's speed in every mode (1 = the demos' speed)
+  gain_mode: step             # how: step scales every executed step (the study); time plays each planned step over
+                              #   1/gain control steps, the motion the policy was trained on (the obstacle grid)
+  input_noise: 0.0            # std of Gaussian noise added to the x/y command while pushing
+  corruption: null            # what the controller gets = M @ what was pushed, e.g. {scale: [1.0, 0.5]}
+  reversal_adapter: null      # mars: the reversal follows F @ v, e.g. {translation: corruption} or {learned: <name>}
+
+task:
+  targets: [2, 8]             # min and max targets per trial
+  target_radius: 0.05         # screen units (the screen is [0, 1]^2)
+  min_target_sep: 0.12        # center-to-center distance between targets, at least
+  reach: [0.2, null]          # min and max distance from the cursor start to the goal (null: no maximum)
+  dwell_s: 0.3                # holding the cursor on a target this long selects it
+  time_limit_s: 5.0           # a trial with nothing selected by then is a timeout
+  obstacle: null              # discs placed relative to the reach; touching one ends the trial (outcome collision), e.g.
+                              #   {kind: disc, radius: 0.04, along: 0.5, offset: 0.05} or {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14}
+  velocity_tau: 0.0           # s; > 0 gives the cursor inertia (its velocity follows the command)
+  curl: 0.0                   # 1/s; clockwise curl force field on the cursor (needs velocity_tau > 0)

@@ -1,0 +1,8 @@
+# Study arm: MARS at its tuned depth (adapter trained by
+#   python train/train_adapter.py --corruption '{scale: [1.0, 0.25]}' --data free --name gain025y_free
+# with the trainer as it was at git commit 5c2167cd).
+extends: condition_study.yaml
+control:
+  mode: frs
+  n_reverse_steps: 8
+  reversal_adapter: {learned: gain025y_free}

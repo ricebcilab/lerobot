@@ -1,0 +1,6 @@
+# Flow Reversal Steering (FRS): your command's constant-velocity chunk is run
+# backward through the policy's flow to noise, then forward again.
+extends: base.yaml
+control:
+  mode: frs
+  n_reverse_steps: null

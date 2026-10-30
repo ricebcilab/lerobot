@@ -1,0 +1,5 @@
+# Shared flow control under the gain corruption.
+extends: condition_gain05y.yaml
+control:
+  mode: flow_control
+  tau: 8                      # Kao et al.'s default; re-tune with the gain sweep

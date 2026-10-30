@@ -1,0 +1,68 @@
+# The compositional reversal adapter's grid: 4 users x 5 tasks at input noise 1.0 (condition_grid.yaml).
+# T1, the open field, is the study's task with its 5 s per trial; the obstacle tasks get 8 s (the ring
+# detours take longer). The disc sits 15-30% of its radius off the reach and the rings' gaps turn 15-30
+# degrees, each to a random side, so the side to pass is part of the scene; test.json keeps every trial with
+# the side it passed on.
+# User modules are calibrated open loop on T1 with expert labels (the expert's next chunk; the command its
+# push through the user's channel), the task module the identity. Each obstacle task's module is then trained
+# with ONE user's frozen module in the loop: T2 with U1, T3 with U2, T4 with U3, T5 with U4. Those 4 pairs and
+# the T1 column are the cells trained on; the other 12 combine a user and a task module that never met.
+# Data: a user module from 100 open-field demonstrations (500 steps, one noise draw per demonstration step:
+# --n-demos 100 --steps 500 --frozen-noise), a task module from 300 of its task's demonstrations (20 000 steps,
+# --n-demos 300 --frozen-noise); until Oct 27 both had 20 000 (results/old/sim/sweeps/grid_20000demos/).
+# Each module alone is an ablation of the composed adapter (on T1, with no task module, mars_task is FRS).
+# The retrained policy, retrained_mars_user: for each obstacle task a policy with an obstacle head (obstacle
+# tokens) trained from scratch on 20 000 of that task's demonstrations (flow_goaldrop_<task>), needs no task
+# module; its user modules are calibrated on it exactly as the others are on the frozen policy
+# (user_<user>_expert_n100_s0_on_<task>), since a user module is fitted to one policy's field. T1 has nothing to retrain
+# for: there it is the frozen policy and the user module, mars_user.
+#   python run_sweep.py --sweep grid --cells U1xT1 --out grid_part_U1xT1   # a part per cell in parallel (~2 h;
+#   python run_sweep.py --sweep grid --merge grid_part_U1xT1 ... --out grid_s0   # the cells add up to ~24 h), then merged
+# The modules are training seed 0 (_s0 after the demonstration count); seeds 1-4 carry _s1.._s4 in its place, side by
+# side in checkpoints/adapters/ (results/sim/sweeps/grid_s<k>/).
+name: grid
+agent: expert
+arm: condition_grid.yaml
+methods:
+  teleop: {mode: teleop}
+  flow_control: {mode: flow_control}
+  frs: {mode: frs}
+  mars_user: {mode: frs, reversal_adapter: {user: cell}}                 # the user module alone (no task module)
+  mars_task: {mode: frs, reversal_adapter: {task: cell}}                 # the task module alone (no user module)
+  mars: {mode: frs, reversal_adapter: {user: cell, task: cell}}
+  retrained_mars_user:                                                   # the task's retrained policy, a user module on it
+    mode: frs
+    model: {T1: flow_goaldrop, T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap, T4: flow_goaldrop_ring_goal,
+            T5: flow_goaldrop_ring_start}
+    reversal_adapter:
+      user:
+        T1: cell
+        T2: {U1: user_gain025y_expert_n100_s0_on_disc_large, U2: user_gain025x_expert_n100_s0_on_disc_large,
+             U3: user_rot60_expert_n100_s0_on_disc_large, U4: user_curl20_expert_n100_s0_on_disc_large}
+        T3: {U1: user_gain025y_expert_n100_s0_on_wall_gap, U2: user_gain025x_expert_n100_s0_on_wall_gap,
+             U3: user_rot60_expert_n100_s0_on_wall_gap, U4: user_curl20_expert_n100_s0_on_wall_gap}
+        T4: {U1: user_gain025y_expert_n100_s0_on_ring_goal, U2: user_gain025x_expert_n100_s0_on_ring_goal,
+             U3: user_rot60_expert_n100_s0_on_ring_goal, U4: user_curl20_expert_n100_s0_on_ring_goal}
+        T5: {U1: user_gain025y_expert_n100_s0_on_ring_start, U2: user_gain025x_expert_n100_s0_on_ring_start,
+             U3: user_rot60_expert_n100_s0_on_ring_start, U4: user_curl20_expert_n100_s0_on_ring_start}
+depths:
+  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
+  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]          # steps reversed (of 10)
+grid:
+  users:
+    U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}
+    U2: {corruption: {scale: [0.25, 1.0]}, adapter: user_gain025x_expert_n100_s0}
+    U3: {corruption: {rotation_deg: 60}, adapter: user_rot60_expert_n100_s0}
+    U4: {corruption: {curl: 20, tau: 0.1}, adapter: user_curl20_expert_n100_s0}
+  tasks:
+    T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: task_disc_large_n300_s0_with_gain025y}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: task_wall_gap_n300_s0_with_gain025x}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: task_ring_goal_n300_s0_with_rot60}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: task_ring_start_n300_s0_with_curl20}
+  noises: [1.0]
+  train: [[U1, T1], [U2, T1], [U3, T1], [U4, T1], [U1, T2], [U2, T3], [U3, T4], [U4, T5]]
+trials: {tune: 200, test: 500}
+focus: mars
+against: [teleop, flow_control, frs]
+seed: 800

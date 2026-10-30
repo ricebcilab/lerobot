@@ -1,0 +1,21 @@
+# Tuned sweep over a gain on the vertical axis of the command x input noise:
+# corruption {scale: [1, g]}, the expert agent pushing straight at the goal.
+#   python run_sweep.py --sweep gain
+name: gain
+agent: expert
+arm: base.yaml
+methods:
+  teleop: {mode: teleop}
+  flow_control: {mode: flow_control}
+  frs: {mode: frs}
+  mars_fixed: {mode: frs, reversal_adapter: family}     # F = the known corruption M
+depths:
+  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
+  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # steps reversed (of 10)
+grid:
+  family: gain
+  levels: [1.0, 0.75, 0.5, 0.25, 0.1]
+  noises: [0.75, 1.0, 1.5, 2.0, 2.5]
+trials: {tune: 200, test: 500}
+focus: mars_fixed
+seed: 100

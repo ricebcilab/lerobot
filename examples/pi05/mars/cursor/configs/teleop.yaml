@@ -1,0 +1,4 @@
+# You drive the cursor directly; the policy is not involved.
+extends: base.yaml
+control:
+  mode: teleop

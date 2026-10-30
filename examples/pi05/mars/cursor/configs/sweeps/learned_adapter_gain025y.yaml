@@ -1,0 +1,28 @@
+# The learned adapter under a gain of 0.25 on the vertical axis, with the expert_chunk agent: the operator means
+# the goal-given policy's chunk and the channel corrupts every step of it (the BCI-chunk model the
+# adapter was trained on). oracle executes the uncorrupted chunk (channel off); user executes the
+# corrupted one. Depth 10 is the full reversal.
+#   python run_sweep.py --sweep learned_adapter_gain025y
+name: learned_adapter_gain025y
+agent: expert_chunk
+arm: base.yaml
+methods:
+  oracle: {mode: teleop, channel: off}
+  user: {mode: teleop}
+  policy: {mode: policy}
+  flow_control: {mode: flow_control}
+  frs: {mode: frs}
+  mars_fixed: {mode: frs, reversal_adapter: family}
+  mars_goal: {mode: frs, reversal_adapter: {learned: gain025y_goal}}
+  mars_free: {mode: frs, reversal_adapter: {learned: gain025y_free}}
+depths:
+  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
+  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # steps reversed (of 10)
+grid:
+  family: gain
+  levels: [0.25]
+  noises: [0.0, 0.5, 1.0]
+trials: {tune: 300, test: 300}
+focus: mars_free
+against: [user, policy, flow_control, frs, mars_fixed]
+seed: 2000

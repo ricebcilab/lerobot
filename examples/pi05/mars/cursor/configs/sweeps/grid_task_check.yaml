@@ -1,0 +1,33 @@
+# The task modules' go/no-go, before the grid: for each obstacle task, the goal-given policy's own
+# chunks executed as they are (oracle: the expert_chunk agent in teleop, channel off) against the same
+# through the task module (oracle_task), and the goal-hidden policy alone with and without it; beside them the
+# policy retrained for each task with an obstacle head (the grid's retrained_mars_user), alone, goal given and
+# hidden.
+# Go: oracle_task collides far less than oracle and hits >= 80%.
+#   python run_sweep.py --sweep grid_task_check          # ~2 min
+name: grid_task_check
+agent: expert_chunk
+arm: condition_grid.yaml
+methods:
+  oracle: {mode: teleop, channel: off}
+  oracle_task: {mode: teleop, channel: off, reversal_adapter: {task: cell}}
+  policy: {mode: policy}
+  policy_task: {mode: policy, reversal_adapter: {task: cell}}
+  oracle_retrained: {mode: teleop, channel: off, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
+                                                         T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}
+  policy_retrained: {mode: policy, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
+                                           T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}
+depths: [10]
+grid:
+  users:
+    U0: {corruption: null, adapter: null}
+  tasks:
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: task_disc_large_n300_s0_with_gain025y}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: task_wall_gap_n300_s0_with_gain025x}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: task_ring_goal_n300_s0_with_rot60}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: task_ring_start_n300_s0_with_curl20}
+  noises: [0.0]
+trials: {tune: 20, test: 500}
+focus: oracle_task
+against: [oracle]
+seed: 820

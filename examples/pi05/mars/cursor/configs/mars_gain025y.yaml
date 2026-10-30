@@ -1,0 +1,9 @@
+# MARS under gain [1, 0.25] + noise 1.0, full reversal: the reversal
+# follows H(x_t, t) P(x_t, t) with the adapter trained by
+#   python train/train_adapter.py --corruption '{scale: [1.0, 0.25]}' --data free --name gain025y_free
+# (the trainer as it was at git commit 5c2167cd)
+extends: condition_gain025y_noise1.yaml
+control:
+  mode: frs
+  n_reverse_steps: null
+  reversal_adapter: {learned: gain025y_free}

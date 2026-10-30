@@ -1,0 +1,6 @@
+# Shared flow control: your command is written into x_t for the first tau Euler
+# steps of each chunk, then the policy denoises freely.
+extends: base.yaml
+control:
+  mode: flow_control
+  tau: 8                      # Kao et al.'s default: the command in the first 8 of 16 chunk steps

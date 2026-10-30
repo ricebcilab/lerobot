@@ -1,0 +1,24 @@
+# The grid's first gate: the simulated expert alone (teleop, clean channel, no noise) must solve every task
+# (>= 99% hits), so a miss in the grid is the controller's, not the user's; beside it the frozen policy
+# alone, which never saw an obstacle.
+#   python run_sweep.py --sweep grid_expert_check          # ~9 min
+name: grid_expert_check
+agent: expert
+arm: condition_grid.yaml
+methods:
+  policy: {mode: policy}
+  teleop: {mode: teleop}
+grid:
+  users:
+    U0: {corruption: null}
+  tasks:
+    T1: {obstacle: null, time_limit_s: 5.0}          # the study's limit, as in the grid
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}}
+  noises: [0.0]
+trials: {tune: 10, test: 1000}
+focus: teleop
+against: [policy]
+seed: 810

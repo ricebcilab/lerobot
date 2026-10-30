@@ -1,0 +1,5 @@
+# Shared flow control under the 90-degree rotation, at its tuned depth.
+extends: condition_rot90.yaml
+control:
+  mode: flow_control
+  tau: 8                      # Kao et al.'s default; re-tune with the rotation sweep

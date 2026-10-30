@@ -1,0 +1,5 @@
+# Native Flow Reversal Steering under the gain corruption, no adapter.
+extends: condition_gain05y.yaml
+control:
+  mode: frs
+  n_reverse_steps: null

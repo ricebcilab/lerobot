@@ -1,0 +1,30 @@
+# The user-study protocol: what a participant plays and how.
+#
+#   python run_experiment.py --protocol study.yaml --participant p1
+#   python run_experiment.py --protocol study.yaml --participant sim      # the expert agent, same protocol
+#
+# Every arm is an arm config (configs/<file>); all four extend condition_study.yaml
+# (gain diag(1, 0.25) on the command, input noise 1.0, 4 targets, reach 0.35-0.5), each at its tuned depth.
+# Within a visit every arm sees the same target layouts, in a different order per
+# block; the block order is a balanced Latin square row chosen by the participant
+# number and advanced by one row per visit (p1, p2, ...; sim takes row 0). The condition is hidden from the
+# participant (display.blind).
+
+name: study
+arms:
+  teleop: study_teleop.yaml
+  flow_control: study_flow_control.yaml
+  frs: study_frs.yaml
+  mars: study_mars.yaml
+blocks:
+  trials: 40                  # logged trials per block
+  practice: 5                 # practice trials before them (logged with practice: true)
+  order: latin_square         # latin_square | listed (the order above)
+trial:
+  ready_hold_s: 0.3           # the stick must be idle this long before a trial starts
+  feedback_s: 0.6             # hit / wrong target / timeout shown this long
+expert:                       # the simulated participant (--participant sim)
+  lag: 0                      # steps of delay
+  slow_radius: 0.15           # the push tapers inside this distance of the goal
+display:
+  blind: true                 # hide the arm name and settings from the participant

@@ -63,6 +63,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .gamepad.teleop_gamepad import GamepadTeleop
 
         return GamepadTeleop(config)
+    elif config.type == "spacemouse":
+        from .spacemouse.teleop_spacemouse import SpaceMouseTeleop
+
+        return SpaceMouseTeleop(config)
     elif config.type == "keyboard_ee":
         from .keyboard.teleop_keyboard import KeyboardEndEffectorTeleop
 

@@ -1,0 +1,6 @@
+# Study arm: Flow Reversal Steering (no adapter) at its tuned depth (the full reversal; FRS is
+# within noise of that at every depth but 9 in this condition).
+extends: condition_study.yaml
+control:
+  mode: frs
+  n_reverse_steps: null
