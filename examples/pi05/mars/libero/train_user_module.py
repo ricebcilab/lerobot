@@ -25,7 +25,9 @@ Usage (from the example directory, in the LIBERO environment):
     python train_user_module.py --config configs/experiment/mars_learned_rotz20.yaml \
         --out outputs/user_modules/rotz20 --episodes 20 --steps 3000
 Writes <out>/user.pt (load it with `reversal_adapter: {learned: <out>/user.pt}`), train_log.json and
-states.pt (the collected states and labels; `--states <out>/states.pt` reuses them).
+states.pt (the collected states and labels; `--states <out>/states.pt` reuses them). `--step-rank`,
+`--cross-step-rank` and `--cross-step-dims` (e.g. dx,dy,dz) set the module's flexibility (see the README's
+user-module section); they are saved in user.pt's config, which steering reads back.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lerobot.policies.pi05.steering import (  # noqa: E402
+    ACTION_DIMS,
     DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_DIM,
@@ -52,6 +55,7 @@ from lerobot.policies.pi05.steering import (  # noqa: E402
     N_ACTION_DIMS,
     LearnedUserModule,
     ReversalAdapter,
+    apply_user_module,
     forward_flow,
     reverse_flow,
     save_adapter_module,
@@ -68,6 +72,27 @@ def operator_command(chunk_env: np.ndarray, n_action_steps: int) -> tuple[np.nda
     translation = np.clip(prefix[:, :3].mean(axis=0), -1.0, 1.0)
     gripper = GRIPPER_CLOSE if prefix[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
     return translation, gripper
+
+
+def parse_cross_step_dims(value) -> list[int] | None:
+    """The user module's `cross_step_dims` from a config or the command line: None (all dims), a list, or a string
+    ('dx,dy,dz', '[dx, dy, dz]', '0,1,2'), each entry a name from ACTION_DIMS or an index into them."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [v.strip() for v in value.strip().strip("[]").split(",") if v.strip()]
+    out = []
+    for v in value:
+        if isinstance(v, str) and v in ACTION_DIMS:
+            out.append(ACTION_DIMS.index(v))
+        elif (isinstance(v, int) and not isinstance(v, bool)) or (isinstance(v, str) and v.lstrip("-").isdigit()):
+            out.append(int(v))
+        else:
+            raise ValueError(f"cross_step_dims: {v!r} is neither one of {list(ACTION_DIMS)} nor an index")
+    # checked here, before collect_states, so a bad value fails in seconds rather than after state collection
+    if not out or len(set(out)) != len(out) or not all(0 <= i < N_ACTION_DIMS for i in out):
+        raise ValueError(f"cross_step_dims: {value!r} must be unique, non-empty indices in [0, {N_ACTION_DIMS})")
+    return out
 
 
 def channel_core(command: np.ndarray, matrix=None, curl=None, n_steps: int = 10) -> np.ndarray:
@@ -102,13 +127,14 @@ def field_loss(
     user: LearnedUserModule, velocity, z_l: torch.Tensor, a_bci: torch.Tensor, t: torch.Tensor, weight=None
 ):
     """The regression along the straight path from a_bci (t = 0) to z_L (t = 1): U(x_t, t) P(x_t, t) = z_L - a_bci
-    on the first n action dims; per-sample errors averaged with `weight` (B,) when given."""
+    on the first n action dims (the module's `velocity`, cross-step coupling included); per-sample errors averaged
+    with `weight` (B,) when given."""
     tt = t[:, None, None]
     x_t = (1 - tt) * a_bci + tt * z_l
     with torch.no_grad():
         v = velocity(x_t, t).float()
     n = user.n_dims
-    pred = torch.einsum("bhij,bhj->bhi", user(x_t.float(), t), v[..., :n])
+    pred = apply_user_module(user, x_t.float(), t, v[..., :n])
     err = ((pred - (z_l - a_bci)[..., :n].float()) ** 2).mean((1, 2))
     if weight is None:
         return err.mean()
@@ -264,7 +290,15 @@ def train(args) -> None:
     perm = rng.permutation(len(states))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
 
-    user = LearnedUserModule(cfg.chunk_size, N_ACTION_DIMS, d=args.d, tdim=args.tdim).to(device)
+    user = LearnedUserModule(
+        cfg.chunk_size,
+        N_ACTION_DIMS,
+        d=args.d,
+        tdim=args.tdim,
+        step_rank=args.step_rank,
+        cross_step_rank=args.cross_step_rank,
+        cross_step_dims=args.cross_step_dims,
+    ).to(device)
     opt = torch.optim.AdamW(user.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / args.steps)))
 
@@ -363,10 +397,31 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--d", type=int, default=256)
     p.add_argument("--tdim", type=int, default=64)
+    p.add_argument(
+        "--step-rank",
+        type=int,
+        default=None,
+        help="matrices shared by the chunk's steps (default: every step's matrix free)",
+    )
+    p.add_argument(
+        "--cross-step-rank", type=int, default=0, help="rank of the coupling between the chunk's steps"
+    )
+    p.add_argument(
+        "--cross-step-dims",
+        default=None,
+        help="dims the coupling covers: names from ACTION_DIMS or indices, e.g. dx,dy,dz (default: all 7)",
+    )
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    try:
+        args.cross_step_dims = parse_cross_step_dims(args.cross_step_dims)
+    except ValueError as err:
+        p.error(str(err))
+    if args.cross_step_dims is not None and not args.cross_step_rank:
+        p.error("--cross-step-dims needs --cross-step-rank")
+    return args
 
 
 if __name__ == "__main__":

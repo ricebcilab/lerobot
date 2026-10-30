@@ -412,6 +412,7 @@ ignore = [
 "src/lerobot/envs/cursor.py" = ["N806", "E731", "B905"]
 # Copied verbatim from the MARS cursor project (examples/pi05/mars/cursor keeps its style); behaviour-changing
 # fixes (B905 strict=) and restyling are left out on purpose. Each entry lists only the rules its file hits.
+"tests/examples/pi05_mars_cursor/_reference_ranks.py" = ["B905", "C408", "I001", "N803", "N806"]
 "tests/examples/pi05_mars_cursor/_reference_steering.py" = ["B905", "C408", "I001", "N803", "N806"]
 "tests/examples/pi05_mars_cursor/test_adapter.py" = ["C408", "I001", "N803", "N806"]
 "tests/examples/pi05_mars_cursor/test_cursor_flow.py" = ["C408", "E731", "I001", "N803", "N806"]
@@ -434,6 +435,7 @@ convention = "google"
 # The MARS cursor tests copied verbatim from the cursor project keep its layout (see the per-file-ignores above).
 exclude = [
     "tests/examples/pi05_mars_cursor/_reference_devices.py",
+    "tests/examples/pi05_mars_cursor/_reference_ranks.py",
     "tests/examples/pi05_mars_cursor/_reference_steering.py",
     "tests/examples/pi05_mars_cursor/test_adapter.py",
     "tests/examples/pi05_mars_cursor/test_cursor_flow.py",

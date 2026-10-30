@@ -57,8 +57,9 @@ direction of flow time, ``backward`` whether the user part of the adapter acts):
   forward pass from the reversal's landing point ``t0=1-n/N`` with ``h>0``
   (``t0=0, h=+1/N`` for a whole chunk from noise).
 
-Also ``AdaptedField`` (fixed or per-trial matrices, user and task modules), the
-module classes (``LearnedUserModule``, ``LearnedTaskModule``, the
+Also ``AdaptedField`` (fixed or per-trial matrices, user and task modules; a user
+module acts through ``apply_user_module``, i.e. its ``velocity``), the
+module classes (``LearnedUserModule`` with its rank knobs, ``LearnedTaskModule``, the
 obstacle-reading ``ObstacleTaskModule``) and their checkpoints, and, in the
 cursor convention, the chunk functions ``flow_control_chunk``, ``frs_chunk`` and
 ``steered_chunk`` and the module training losses ``user_field_loss`` and
@@ -246,7 +247,31 @@ class LearnedUserModule(nn.Module):
     in the BACKWARD pass of the reversal; it undoes one user's command corruption. Works in the
     policy's normalized action space on the first ``n_dims`` dims of ``x_t``. Zero-initialized:
     a fresh module is the identity (plain FRS). ``time_embedding`` is ``"mars"``
-    (``sinusoidal_time_embedding``) or ``"pi05"`` (pi0.5's own flow-time embedding, periods 0.004-4)."""
+    (``sinusoidal_time_embedding``) or ``"pi05"`` (pi0.5's own flow-time embedding, periods 0.004-4).
+
+    Two knobs set its flexibility (n = ``n_dims``, H = ``horizon``); their defaults are the module
+    as it always was, bit for bit, and a fresh module is the identity under every setting:
+
+    - ``step_rank`` r (default None: every step's matrix free): each step's correction mixes r
+      n x n matrices shared by the chunk, A_s = I + sum_k c_sk B_k, the coefficients c (per step)
+      and the matrices B from (x_t, t). The coefficients start at zero, the matrices do not (else
+      neither would get a gradient). r = n * n spans every matrix, as the default does.
+    - ``cross_step_rank`` q (default 0: none): a rank-q coupling between the chunk's steps on top
+      of the per-step matrices, U V^T on the stacked chunk: out[s, a] += sum_r U[s, a, r] m_r with
+      m_r = sum_{s', a'} V[s', a', r] v[s', a'], U and V (H, n_c, q) from (x_t, t) through an extra
+      head (``cross``) on the hidden layer. U starts at zero.
+    - ``cross_step_dims`` (default None: all n dims): indices into the module's dims that the
+      coupling reads and writes (unique, in range, non-empty); the other dims get no cross-step
+      term. Only with ``cross_step_rank`` > 0. Names (e.g. LIBERO's ``ACTION_DIMS``) are mapped to
+      indices where configs are parsed.
+
+    The cross head has 2 * H * n_c * q outputs (n_c the coupled dims), so (d + 1) * 2 * H * n_c * q
+    parameters: for LIBERO's H = 50 and n = 7, 700 * q outputs (179 900 * q parameters at d = 256).
+
+    ``velocity(x_t, t, v)`` applies the whole correction (call it, not ``forward``, to apply the
+    module: ``apply_user_module`` does); ``forward(x_t, t)`` gives the per-step matrices alone,
+    (B, H, n, n), which is all of it when ``cross_step_rank`` is 0. The knobs enter ``config`` only
+    when they differ from their defaults, so checkpoints without them load and save as before."""
 
     def __init__(
         self,
@@ -255,22 +280,64 @@ class LearnedUserModule(nn.Module):
         d: int = 256,
         tdim: int = 64,
         time_embedding: str = "mars",
+        step_rank: int | None = None,
+        cross_step_rank: int = 0,
+        cross_step_dims: list[int] | None = None,
     ):
         super().__init__()
         if time_embedding not in ("mars", "pi05"):
             raise ValueError(f"time_embedding must be 'mars' or 'pi05', got {time_embedding!r}")
-        self.config = {
+        if step_rank is not None and step_rank < 1:
+            raise ValueError(f"step_rank must be None or >= 1, got {step_rank}")
+        if cross_step_rank < 0:
+            raise ValueError(f"cross_step_rank must be >= 0, got {cross_step_rank}")
+        if cross_step_dims is not None:
+            cross_step_dims = [int(i) for i in cross_step_dims]
+            if not cross_step_rank:
+                raise ValueError("cross_step_dims needs cross_step_rank > 0")
+            if not cross_step_dims:
+                raise ValueError("cross_step_dims must be None or a non-empty list of dim indices")
+            if len(set(cross_step_dims)) != len(cross_step_dims):
+                raise ValueError(f"cross_step_dims must be unique, got {cross_step_dims}")
+            if not all(0 <= i < n_dims for i in cross_step_dims):
+                raise ValueError(f"cross_step_dims must lie in [0, {n_dims}), got {cross_step_dims}")
+        self.config: dict = {
             "horizon": horizon,
             "n_dims": n_dims,
             "d": d,
             "tdim": tdim,
             "time_embedding": time_embedding,
         }
+        if step_rank is not None:
+            self.config["step_rank"] = step_rank
+        if cross_step_rank:
+            self.config["cross_step_rank"] = cross_step_rank
+        if cross_step_dims is not None:
+            self.config["cross_step_dims"] = list(cross_step_dims)
         self.horizon, self.n_dims, self.tdim, self.time_embedding = horizon, n_dims, tdim, time_embedding
-        self.net = _mlp(horizon * n_dims + tdim, d, horizon * n_dims * n_dims)
+        self.step_rank, self.cross_step_rank, self.cross_step_dims = (
+            step_rank,
+            cross_step_rank,
+            cross_step_dims,
+        )
+        n = n_dims
+        out = horizon * n * n if step_rank is None else n * n * step_rank + horizon * step_rank
+        self.net = nn.Sequential(
+            nn.Linear(horizon * n + tdim, d), nn.SiLU(), nn.Linear(d, d), nn.SiLU(), nn.Linear(d, out)
+        )
+        head = self.net[-1]
+        first = 0 if step_rank is None else n * n * step_rank  # the coefficients start at zero, the basis not
+        nn.init.zeros_(head.weight[first:])
+        nn.init.zeros_(head.bias[first:])
+        self.n_coupled = 0
+        if cross_step_rank:
+            self.n_coupled = n if cross_step_dims is None else len(cross_step_dims)
+            n_u = horizon * self.n_coupled * cross_step_rank
+            self.cross = nn.Linear(d, 2 * n_u)  # U then V
+            nn.init.zeros_(self.cross.weight[:n_u])
+            nn.init.zeros_(self.cross.bias[:n_u])
 
-    def forward(self, x_t: torch.Tensor, t) -> torch.Tensor:
-        """x_t (B, H, >= n_dims), t a float or (B,) -> (B, H, n, n)."""
+    def _hidden(self, x_t: torch.Tensor, t) -> torch.Tensor:
         b, h, n = x_t.shape[0], self.horizon, self.n_dims
         x = x_t[:, :h, :n].reshape(b, h * n).to(torch.float32)
         if self.time_embedding == "pi05":
@@ -280,8 +347,48 @@ class LearnedUserModule(nn.Module):
             emb = create_sinusoidal_pos_embedding(t, self.tdim, 0.004, 4.0, x.device).float().expand(b, -1)
         else:
             emb = sinusoidal_time_embedding(t, self.tdim, device=x.device).expand(b, -1)
-        delta = self.net(torch.cat([x, emb], dim=-1)).view(b, h, n, n)
-        return torch.eye(n, device=x.device, dtype=x.dtype) + delta
+        return self.net[:-1](torch.cat([x, emb], dim=-1))
+
+    def _matrices(self, hidden: torch.Tensor) -> torch.Tensor:
+        b, h, n = hidden.shape[0], self.horizon, self.n_dims
+        out = self.net[-1](hidden)
+        eye = torch.eye(n, device=hidden.device, dtype=hidden.dtype)
+        if self.step_rank is None:
+            return eye + out.view(b, h, n, n)
+        r = self.step_rank
+        basis, coef = out[:, : n * n * r].view(b, r, n, n), out[:, n * n * r :].view(b, h, r)
+        return eye + torch.einsum("bsk,bkij->bsij", coef, basis)
+
+    def forward(self, x_t: torch.Tensor, t) -> torch.Tensor:
+        """x_t (B, H, >= n_dims), t a float or (B,) -> the per-step matrices (B, H, n, n)."""
+        return self._matrices(self._hidden(x_t, t))
+
+    def velocity(self, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tensor:
+        """The corrected velocity: x_t (B, H, >= n_dims), t a float or (B,), v (B, H, n) -> (B, H, n) in
+        v's dtype; the per-step matrices, plus the cross-step coupling when ``cross_step_rank`` > 0."""
+        hidden = self._hidden(x_t, t)
+        out = torch.einsum("bhij,bhj->bhi", self._matrices(hidden).to(v.dtype), v)
+        if self.cross_step_rank:
+            b, h, q = hidden.shape[0], self.horizon, self.cross_step_rank
+            uv = self.cross(hidden).view(b, 2, h, self.n_coupled, q)
+            dims = self.cross_step_dims
+            coupled = (v if dims is None else v[..., dims]).to(uv.dtype)
+            m = torch.einsum("bsar,bsa->br", uv[:, 1], coupled)
+            term = torch.einsum("bsar,br->bsa", uv[:, 0], m).to(v.dtype)
+            if dims is None:
+                out = out + term
+            else:
+                out = out.index_add(-1, torch.as_tensor(dims, device=out.device), term)
+        return out
+
+
+def apply_user_module(user, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tensor:
+    """A user module's correction of the velocity ``v`` (B, H, n): its own ``velocity`` when it has one (a
+    ``LearnedUserModule``, with any cross-step coupling), else its per-step matrices, ``user(x_t, t)``
+    (B, H, n, n) applied step by step (a fixed matrix holder or any such callable). In ``v``'s dtype."""
+    if hasattr(user, "velocity"):
+        return user.velocity(x_t, t, v)
+    return torch.einsum("bhij,bhj->bhi", user(x_t, t).to(v.dtype), v)
 
 
 class LearnedTaskModule(nn.Module):
@@ -464,13 +571,22 @@ def convert_cursor_module(ckpt: dict) -> dict:
     """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
     adapters, saved without ``kind``, are user modules) in the ``save_adapter_module`` format. A user
     module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
-    embedding computes the same frequencies, so outputs agree to float rounding), a task module an
+    embedding computes the same frequencies, so outputs agree to float rounding; its ``step_rank`` and
+    ``cross_step_rank``, when set, carry over, and ``cross_step_dims``, which the cursor never had, stays
+    None: the coupling covers both dims), a task module an
     ``ObstacleTaskModule`` (``arch="obstacle"``). ``args`` and ``obstacle`` go into ``meta``."""
     kind = ckpt.get("kind", "user")
     config = dict(ckpt["config"])
     meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
     if kind == "user":
-        config = {"horizon": config["horizon"], "n_dims": 2, "d": config["d"], "tdim": config["tdim"]}
+        ranks = {k: config[k] for k in ("step_rank", "cross_step_rank") if config.get(k)}  # only when set
+        config = {
+            "horizon": config["horizon"],
+            "n_dims": 2,
+            "d": config["d"],
+            "tdim": config["tdim"],
+            **ranks,
+        }
         return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
     if kind == "task":
         config["n_dims"] = 2
@@ -620,7 +736,8 @@ class ReversalAdapter(MatrixHolder):
 
 
 class AdaptedField:
-    """Applies MARS modules to a velocity: task (both directions), then user (backward only).
+    """Applies MARS modules to a velocity: task (both directions), then user (backward only, through
+    ``apply_user_module``: a learned module's ``velocity``, any other callable's per-step matrices).
     Only the first n action dims are touched; the padding dims pass through. ``matrix`` is a fixed
     (n, n) F or one per trial, (B, n, n). A module acts on its ``n_dims`` attribute's dims
     (``N_ACTION_DIMS`` when it has none) unless ``n_dims`` is given, which overrides both."""
@@ -651,7 +768,7 @@ class AdaptedField:
             if self.user_module is not None:
                 n = self._dims(self.user_module)
                 head = result[..., :n]
-                head = torch.einsum("bhij,bhj->bhi", self.user_module(x_t, t).to(head.dtype), head)
+                head = apply_user_module(self.user_module, x_t, t, head)
                 result = torch.cat([head, result[..., n:]], dim=-1)
         return result
 
@@ -827,7 +944,8 @@ def user_field_loss(
 
         U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad),
 
-    T the bound task module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity. A full
+    T the bound task module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity; U(x_t, t) T(v)
+    is ``apply_user_module`` (a ``LearnedUserModule``'s ``velocity``, cross-step coupling included). A full
     reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach whichever
     module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
     x = (1 - t[:, None, None]) * latent + t[:, None, None] * target
@@ -836,7 +954,7 @@ def user_field_loss(
     if task is not None:
         a, b = task(x, t, v)
         v = torch.einsum("bsij,bsj->bsi", a, v) + b
-    err = ((torch.einsum("bsij,bsj->bsi", user(x, t), v) - (target - latent)) ** 2).mean((1, 2))
+    err = ((apply_user_module(user, x, t, v) - (target - latent)) ** 2).mean((1, 2))
     return err.mean() if weight is None else (err * weight).sum() / weight.sum().clamp_min(1.0)
 
 

@@ -618,6 +618,27 @@ python examples/pi05/mars/libero/train_user_module.py \
 $R experiment --config mars_learned_rotz20.yaml --sweep control.n_reversal_steps=2,4,6,8,10
 ```
 
+**The module's ranks.** Three options set how flexible `U` is; their defaults
+are the module as it was, and a fresh module is the identity under every setting:
+
+- `--step-rank r` (default: unset, every chunk step's 7×7 matrix free): every
+  step's matrix is `I + Σ_k c_{s,k} B_k` over `r` 7×7 matrices shared by the
+  chunk, the coefficients per step (`r = 49` spans every matrix).
+- `--cross-step-rank q` (default 0: none): a rank-`q` coupling between the
+  chunk's steps on top of the per-step matrices, `ṽ_s = A_s v_s + U_s Σ_s′ V_s′ᵀ
+  v_s′`, `U` zero-initialized. Its head on the module's hidden layer has
+  `2 · H · n_c · q` outputs (`n_c` the coupled dims): at pi0.5's `H = 50` with all
+  7 dims, **700 · q** outputs, i.e. 700 · q · (256 + 1) weights at the default
+  width (180 k at q = 1).
+- `--cross-step-dims` (default: all 7): the dims the coupling covers, names from
+  `ACTION_DIMS` or indices, e.g. `dx,dy,dz` or `0,1,2` (`n_c = 3`: 300 · q
+  outputs); the other dims get no cross-step term. Only with `--cross-step-rank`.
+
+The options are saved in `user.pt`'s config (only when they differ from the
+defaults), and every place that loads a user module for steering
+(`reversal_adapter: {learned: ...}` or `{user: ...}`, `load_adapter_module`)
+rebuilds it from that config: there is nothing to set at run time.
+
 The checkpoint carries its kind (`user`), config and meta (corruption, policy,
 prompt). Task modules (`kind: task`, `LearnedTaskModule`) have the slot, the
 hooks and the loader, but no LIBERO trainer yet: the cursor project's task

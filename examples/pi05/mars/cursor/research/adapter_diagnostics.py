@@ -30,7 +30,7 @@ from cursor_sa.env import TaskConfig, sample_layouts  # noqa: E402
 from cursor_sa.paths import RESULTS, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
 from cursor_sa.records import logged  # noqa: E402
-from cursor_sa.steering import ReversalAdapter, bci_chunk, hide_goal, observation, reverse_flow  # noqa: E402
+from cursor_sa.steering import ReversalAdapter, bci_chunk, hide_goal, observation, reverse_flow, user_velocity  # noqa: E402
 
 OUT = RESULTS / "research" / "adapter_diagnostics"
 
@@ -52,7 +52,7 @@ def reverse_norm(policy, obs, x, adapter, steps=10):
     for i in range(steps):
         t = torch.full((len(x),), 1.0 - i * h, device=x.device)
         v = policy(obs, x, t)
-        a = torch.einsum("bsij,bsj->bsi", adapter(x, t), v)
+        a = user_velocity(adapter, x, t, v)
         x = x - h * a * (v.norm(dim=-1, keepdim=True) / a.norm(dim=-1, keepdim=True).clamp_min(1e-9))
     return x
 

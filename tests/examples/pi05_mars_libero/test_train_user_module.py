@@ -112,3 +112,43 @@ def test_state_cache_round_trips_with_a_safe_load(tmp_path):
     np.testing.assert_array_equal(back["observation"]["img"], state["observation"]["img"])
     assert isinstance(back["raw"], np.ndarray) and isinstance(back["observation"]["state"], np.ndarray)
     assert torch.is_tensor(back["label"]) and torch.is_tensor(back["latent"])
+
+
+def test_cross_step_dims_take_action_dim_names_or_indices():
+    assert tum.parse_cross_step_dims(None) is None
+    assert tum.parse_cross_step_dims("dx,dy,dz") == [0, 1, 2]
+    assert tum.parse_cross_step_dims("[dx, dy, dz]") == [0, 1, 2]
+    assert tum.parse_cross_step_dims(["dyaw", 6]) == [5, 6]
+    assert tum.parse_cross_step_dims("0,2") == [0, 2]
+    # caught at parse time, before collect_states
+    for bad in ("dx,yaw", "9", "-1", "dx,dx", "0,0", "", [True]):
+        with pytest.raises(ValueError, match="cross_step_dims"):
+            tum.parse_cross_step_dims(bad)
+    args = tum.parse_args(
+        ["--config", "c.yaml", "--out", "o", "--cross-step-rank", "2", "--cross-step-dims", "dx,dy,dz"]
+    )
+    assert (args.step_rank, args.cross_step_rank, args.cross_step_dims) == (None, 2, [0, 1, 2])
+    defaults = tum.parse_args(["--config", "c.yaml", "--out", "o"])
+    assert (defaults.step_rank, defaults.cross_step_rank, defaults.cross_step_dims) == (None, 0, None)
+    with pytest.raises(SystemExit):
+        tum.parse_args(
+            ["--config", "c.yaml", "--out", "o", "--cross-step-dims", "dx"]
+        )  # no coupling to restrict
+
+
+def test_field_loss_applies_the_cross_step_coupling():
+    user = LearnedUserModule(
+        horizon=CHUNK, n_dims=7, d=16, tdim=8, cross_step_rank=2, cross_step_dims=[0, 1, 2]
+    )
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for p in user.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+    a_bci, z_l, t = torch.randn(2, CHUNK, MAX_DIM), torch.randn(2, CHUNK, MAX_DIM), torch.rand(2)
+    field = lambda x_t, tt: 0.5 * x_t  # noqa: E731
+    x_t = (1 - t[:, None, None]) * a_bci + t[:, None, None] * z_l
+    pred = user.velocity(x_t, t, field(x_t, t)[..., :7])
+    expected = ((pred - (z_l - a_bci)[..., :7]) ** 2).mean((1, 2)).mean()
+    torch.testing.assert_close(tum.field_loss(user, field, z_l, a_bci, t), expected)
+    per_step = torch.einsum("bhij,bhj->bhi", user(x_t, t), field(x_t, t)[..., :7])
+    assert not torch.allclose(pred, per_step)  # the coupling is in the loss

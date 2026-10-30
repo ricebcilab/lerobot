@@ -51,7 +51,7 @@ import torch
 import torch.nn as nn
 
 from lerobot.policies.pi05.steering import (AdaptedField, LearnedTaskModule, LearnedUserModule, ObstacleTaskModule,
-                                             convert_cursor_module, integrate)
+                                             apply_user_module, convert_cursor_module, integrate)
 from lerobot.policies.pi05.steering import steered_chunk as core_steered_chunk
 
 from .channel import DEADBAND, corrupt_chunk, is_active
@@ -130,12 +130,30 @@ class FixedAdapter:
 
 
 class UserModule(LearnedUserModule):
-    """U(x_t, t): one 2x2 matrix per chunk step, applied to the policy's velocity in the
-    backward pass; it undoes one user's command corruption. Initialized to the identity.
-    The core's `LearnedUserModule` with the cursor's two dims and defaults."""
+    """U(x_t, t): one 2x2 matrix per chunk step, applied to the policy's velocity in the backward pass; it undoes
+    one user's command corruption. Initialized to the identity. The core's `LearnedUserModule` with the cursor's
+    two dims and defaults. Two knobs set its flexibility:
 
-    def __init__(self, horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars"):
-        super().__init__(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding)
+    step_rank r (default None: every step's matrix free): each step's correction mixes r matrices shared by the
+        chunk, A_s = I + sum_k c_sk B_k, with the coefficients c and the matrices B from (x_t, t); r = 4 spans
+        every 2x2 matrix, as the default does.
+    cross_step_rank q (default 0: none): a rank-q coupling between the chunk's steps on top of the per-step
+        matrices, U V^T on the stacked chunk: step s adds U_s m with m = sum_s' V_s'^T v_s' (U, V [H, 2, q] from
+        (x_t, t)); U starts at zero, so a fresh module is still the identity. `cross_step_dims` (indices, default
+        both dims) restricts the coupling to those dims.
+
+    `velocity(x, t, v)` applies the whole correction (`user_velocity` and the core's `AdaptedField` call it);
+    `forward(x, t)` gives the per-step matrices alone [B, H, 2, 2] (all of it when cross_step_rank is 0)."""
+
+    def __init__(self, horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step_rank=None, cross_step_rank=0,
+                 cross_step_dims=None):
+        super().__init__(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding, step_rank=step_rank,
+                         cross_step_rank=cross_step_rank, cross_step_dims=cross_step_dims)
+
+
+# A user module's correction of the velocity v: its own `velocity` (a UserModule, with any cross-step coupling), else
+# its per-step matrices (a FixedAdapter or any (x, t) -> [B, H, 2, 2] callable). The core's `apply_user_module`.
+user_velocity = apply_user_module
 
 
 # A(x_t, t, v, obstacles) v + b(...): the core's obstacle-reading task module (two dims by default)
@@ -145,8 +163,8 @@ TaskModule = ObstacleTaskModule
 class ReversalAdapter(nn.Module):
     """The reversal adapter: a user module (any (x, t) -> [B, H, 2, 2] callable: a UserModule or a
     FixedAdapter) and/or a task module, composed at test time. `adapt` applies the task module in
-    both directions and the user module in the backward pass: forward task(v), backward
-    user(task(v)). `field(obs)` is the same as the core's `AdaptedField`, which `adapt` and the
+    both directions and the user module in the backward pass (its `velocity` when it has one, see
+    `user_velocity`): forward task(v), backward user(task(v)). `field(obs)` is the same as the core's `AdaptedField`, which `adapt` and the
     flows use. A checkpoint holds one module (`kind` user or task; the first adapters, saved
     without a kind, are user modules); `load` reads the cursor's and the converted lerobot format."""
 

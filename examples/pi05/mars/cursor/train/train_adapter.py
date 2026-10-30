@@ -14,7 +14,10 @@ through the policy's flow), along the straight path from z_L to a_bci:
 
     U(x_t, t) P(x_t, t) = a_bci - z_L,   x_t = (1 - t) z_L + t a_bci
 
-so a full reversal of a_bci lands on z_L, which regenerates L.
+so a full reversal of a_bci lands on z_L, which regenerates L. Two knobs set the module's flexibility (UserModule):
+`--step-rank r` builds every step's matrix from r matrices shared by the chunk, and `--cross-step-rank q` adds a
+rank-q coupling between the chunk's steps (`--cross-step-dims 0` or `0,1` picks the dims it couples; default both);
+the defaults (every step's matrix free, no coupling) are the grid's. They are saved in the module's config.
 
 CLOSED-LOOP RECALIBRATION (ReFIT-style, `--closed-loop <initial module>`): expert demonstrations always head
 for the goal, so the calibration above never shows the off-course states closed loop produces (and the module
@@ -370,7 +373,8 @@ def train_user(args, policy, model, device, rng):
     corruption, curl = corruption_spec(args.corruption)
     data = expert_splits(args, None, policy, device, rng, corruption, curl)
     closed = closed_loop_splits(args, policy, model, device, np.random.default_rng(args.seed + 1)) if args.closed_loop else None
-    user = UserModule(policy.horizon).to(device)
+    user = UserModule(policy.horizon, step_rank=args.step_rank, cross_step_rank=args.cross_step_rank,
+                      cross_step_dims=args.cross_step_dims).to(device)
     opt = torch.optim.AdamW(user.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / args.steps)))
     log, running, skipped, tic = [], 0.0, 0, time.time()
@@ -443,6 +447,14 @@ def train(args):
     train_task(args, policy, device, rng) if args.kind == "task" else train_user(args, policy, model, device, rng)
 
 
+def dim_indices(text):
+    """A comma list of dim indices ('0,1') as a list of ints."""
+    try:
+        return [int(i) for i in text.split(",") if i.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a comma list of dim indices, got {text!r}") from None
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kind", choices=["user", "task"], default="user")
@@ -470,6 +482,10 @@ def parse_args(argv=None):
     p.add_argument("--layers", type=int, default=2, help="task: cross-attention layers")
     p.add_argument("--targets", type=int, nargs=2, default=[4, 4], help="min and max targets per layout")
     p.add_argument("--reach", type=yaml.safe_load, nargs=2, default=[0.35, 0.5], help="min and max reach (null: none)")
+    p.add_argument("--step-rank", type=int, help="user: matrices shared by the chunk's steps (default: every step's free)")
+    p.add_argument("--cross-step-rank", type=int, default=0, help="user: rank of the coupling between the chunk's steps")
+    p.add_argument("--cross-step-dims", type=dim_indices, help="user: the dims the coupling covers, a comma list of "
+                   "indices (e.g. 0 or 0,1; default: all)")
     p.add_argument("--n-demos", type=int, default=20000, help="training demonstrations (one reach each)")
     p.add_argument("--frozen-noise", action="store_true", help="draw the channel's noise once per demonstration step "
                    "(as a recorded calibration has it) instead of anew in every batch")
@@ -485,6 +501,8 @@ def parse_args(argv=None):
         p.error("--kind task needs the task's --obstacle and the user's --user-module")
     if args.frozen_noise and args.closed_loop:
         p.error("--frozen-noise is for calibration on the demonstrations: not with --closed-loop")
+    if args.cross_step_dims is not None and not args.cross_step_rank:
+        p.error("--cross-step-dims needs --cross-step-rank")
     if args.kind == "user" and args.obstacle is not None:
         p.error("a user module calibrates on the open field: no --obstacle")
     args.obstacle = obstacle_spec(args.obstacle)

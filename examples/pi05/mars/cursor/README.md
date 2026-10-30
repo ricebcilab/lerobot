@@ -80,7 +80,7 @@ run_sweep.py          tune-then-test sweeps of the steering methods with a simul
 analyze_results.py    per-participant and pooled analysis of any runs
 train/                train_policy.py, train_adapter.py
 research/             policy validation and diagnostics, not experiments: evaluate_policy_goal_given.py,
-                      evaluate_policy_goal_hidden.py, design_checks.py, adapter_diagnostics.py,
+                      evaluate_policy_goal_hidden.py, design_checks.py, adapter_diagnostics.py, adapter_ranks_*.py,
                       steering_states.py (why steering fails through a retrained policy); each writes
                       results/research/<name>/ with its own log.txt
 reports/              the PDFs and the scripts that build them; build_study_report.py --participants p<N> ... writes
@@ -993,6 +993,23 @@ seeds side by side.
   the demonstrations above 100 and for every 20 000-step task module; not run: T3 at 10 and 30 with 20 000
   steps, and user modules trained 20 000 steps beyond U1. Checkpoints `data_efficiency/*`, results
   `results/sim/sweeps/data_efficiency/`, configs, scripts and logs `results/research/data_efficiency/`.
+- **The user module's ranks** (Oct 29; `train_adapter.py --step-rank r --cross-step-rank q`). Step rank r writes
+  every step's matrix as I + Σ_k c_{s,k} B_k over r shared 2×2 bases (the default, unset, frees every step's
+  matrix, which spans what r = 4 does); cross-step rank q adds a low-rank coupling across the chunk,
+  ṽ_s = A_s v_s + U_s Σ_s′ V_s′ᵀ v_s′, with U zero-initialised so the module starts at the identity. On the grid's
+  seed-0 trials and task modules, MARS against the grid's own (step rank 4, cross-step rank 0, 100 demonstrations;
+  T1 56.2, obstacle cells 71.8, U4's obstacle cells 66.8%): cross-step rank 2 / 8 / 32 gains +4.2 / +3.5 / +3.4
+  points on T1, +2.7 / +2.9 / +2.4 on the obstacle cells and +5.0 / +5.7 / +4.7 on U4's (every CI above 0;
+  U3 × T5 35 → 60%), though a few T2 and T4 cells lose 1–7 points; step rank 1 or 2 at 100 demonstrations is within
+  a point on the obstacle cells, and at 10 demonstrations every step rank loses (obstacle cells −0.5 to −1.2,
+  U4's −3.6 to −4.9, T1 −1.4 at step rank 4 and −5.5 to −5.8 at 1 and 2). One training seed; not yet run over
+  the grid's five. `research/adapter_ranks_sched.py`, `research/adapter_ranks_analysis.py`; checkpoints
+  `user_<user>_expert_<variant>_s0` (e.g. `user_curl20_expert_cr2_n100_s0`; variants `sr1_n10`, `sr2_n10`, `sr4_n10`,
+  `sr1_n100`, `sr2_n100`, `cr2_n100`, `cr8_n100`, `cr32_n100`; local only, not on the Hub), results
+  `results/sim/sweeps/adapter_ranks/`, logs and stats `results/research/adapter_ranks/`. `--cross-step-dims 0`
+  (a comma list of indices; default both dims) restricts the coupling to those dims; not run here. The knobs are the
+  core's `LearnedUserModule` options (`step_rank`, `cross_step_rank`, `cross_step_dims`), saved in the module's config
+  only when set, so every checkpoint without them loads as before.
 
 ## Next steps
 
