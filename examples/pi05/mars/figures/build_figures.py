@@ -7,22 +7,22 @@ the human study, and the simulated user x task grid.
 
 Writes figures/fig1_method.{pdf,png}, fig2_study.{pdf,png}, fig3_grid.{pdf,png} (7.0 in wide, 300 dpi, Type 42
 fonts) and figures/stats.json, the numbers the captions quote (one entry per figure, so --only keeps the rest).
-Fig 1's stats.json values reproduce with --device cpu, the device they were built on: CUDA draws different policy
-noise (torch.randn after the same seed), so on the default cuda the plain policy's chunk differs.
 
 Names: MARS is MARS with both modules (user and task), MARS-U the user module alone, MARS-T the task module alone.
 
 Reads (results/ is git-ignored, so these are local):
-    fig1  checkpoints (the study arm, study_mars.yaml): the state and chunks are computed here
+    fig1  nothing (its reaches come from the channel's rule, its densities are made up)
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
     fig3  the grid's five training seeds: results/sim/sweeps/grid_s0/test.json (seed 0, the grid of record) and
           results/sim/sweeps/grid_s<k>/combined/test.json (seeds 1-4), and each seed's checkpoints for one cell's rollouts
 
-Figures 1a and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
+Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
 """
 
 import argparse
 import json
+import shutil
+import subprocess  # nosec B404
 import sys
 import zlib
 from pathlib import Path
@@ -37,18 +37,17 @@ import torch
 import yaml
 from matplotlib.colors import to_rgb
 from matplotlib.legend_handler import HandlerTuple
-from matplotlib.patches import FancyArrowPatch, Polygon, Rectangle
+from matplotlib.patches import Circle, Ellipse, FancyArrowPatch, Polygon, Rectangle
 from scipy import stats as sps
 
 from analyze_results import find_runs, load_trials
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import GRID, INK, INK_2, aligned_path, cumulative_hits, draw_scene, paired_lead
-from cursor_sa.env import CursorEnv, Layouts, TaskConfig, sample_layouts
+from cursor_sa.env import Layouts, TaskConfig, sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import load_run
-from cursor_sa.session import arm_adapter, arm_task, channel_for, load_checkpoints, run_trials
-from cursor_sa.steering import SharedController, forward_flow, reverse_flow, to_action
+from cursor_sa.session import arm_task, channel_for, load_checkpoints, run_trials
 from run_sweep import method_arm, with_depth
 
 FIG_DIR = Path(__file__).resolve().parent
@@ -162,16 +161,12 @@ def row_major(handles, labels, ncol):
     return [handles[i] for i in seq], [labels[i] for i in seq]
 
 
-def chunk_path(pos, chunk):
-    return pos + np.cumsum(np.vstack([np.zeros((1, 2)), chunk]), 0)
-
-
 def arrow(ax, pos, cmd, color, ls="-", scale=0.14):
     ax.annotate("", xy=pos + scale * cmd, xytext=pos, zorder=5,
                 arrowprops=dict(arrowstyle="-|>", color=color, lw=0.9, ls=ls, shrinkA=0, shrinkB=0, mutation_scale=6))
 
 
-# ================================================================ The method schematic (Figures 1a and 3a)
+# ================================================================ The method schematic (Figures 1b and 3a)
 
 
 SCHEMATIC_X = np.linspace(-3.2, 3.2, 800)  # the schematic's axis: actions, or noise, in made-up units
@@ -181,6 +176,7 @@ BAND_HATCH, BAND_FILL = "#a5a49e", "#efeee9"  # the actions that hit the obstacl
 OBSTACLE_STYLE = dict(facecolor="#8f8d86", edgecolor="#5f5e5a", lw=0.6)  # the scenes' obstacles: darker than the other targets
 SCHEMATIC_TITLES = {"readout": "user readout  $a_{\\mathrm{readout}}$", "noise": "noise  $z \\sim \\mathcal{N}(0, I)$",
                     "policy": "policy actions  $a_{\\mathrm{policy}}$"}
+INTENT_DASH = (0, (2.5, 1.5))  # the user's intent density
 EMPHASIS = dict(color=ARM_COLOR[MARS_KEY], fontweight="bold")
 FLOW_NAME = dict(color=INK_2, fontstyle="italic")
 
@@ -247,12 +243,15 @@ def obstacle_band(ax, lo, hi, above=False):
     ax.add_patch(Rectangle((lo, 0), hi - lo, top, facecolor="none", edgecolor=BAND_HATCH, lw=0, hatch="//////", zorder=4 if above else 1))
 
 
-def intent_and_command(ax, pol, readout, u, uh):
-    """The user readout's panel: the policy's density for reference, the readout's commands, the intent u on the axis (it need not be in
-    the policy's distribution) and the command u-hat it is corrupted into, joined by C."""
+def intent_and_command(ax, pol, readout, u, uh, intent=None):
+    """The user readout's panel: the policy's density for reference, the readout's commands, the intent u (on the user's intent
+    density, dashed, when given, else on the axis; it need not be in the policy's distribution) and the command u-hat it is
+    corrupted into, joined by C."""
     density(ax, pol, DENSITY_FILL)
+    if intent is not None:
+        density(ax, intent, None, edge=INK, lw=0.9, ls=INTENT_DASH, support_only=True)
     density(ax, readout, READOUT_FILL, edge=SERVED, support_only=True)
-    yu = on_density(ax, u, np.zeros_like(readout), "v", INK, hollow=True)
+    yu = on_density(ax, u, np.zeros_like(readout) if intent is None else intent, "v", INK, hollow=True)
     yh = on_density(ax, uh, readout, "v", SERVED)
     ax.annotate("", xy=(uh, yh), xytext=(u, yu), arrowprops=dict(arrowstyle="-|>", color=INK_2, lw=0.7, mutation_scale=5, shrinkA=4, shrinkB=4))
     ax.text((u + uh) / 2 - 0.08, (yu + yh) / 2 + 0.03, "$C$", fontsize=FS_TEXT, color=INK_2, ha="right", va="bottom")
@@ -311,11 +310,13 @@ def schematic(fig, x0, y0, spec):
 
 
 def fig1_schematic():
-    """Figure 1a: the policy's two modes (two targets), the user readout's commands off their support; MARS's reversal (through A_U)
-    lands in the bulk of the noise and the flow brings it to a mode, FRS's (A_U = I) lands far in the tail and comes back
-    near the command."""
+    """Figure 1b: the policy's two modes (two targets); the user's intent near the right one, partly off its support; the
+    readout's commands, the intent corrupted, off the policy's support. MARS's reversal (through A_U) lands in the bulk of the
+    noise and the flow brings it to the mode the user means, FRS's (A_U = I) lands far in the tail and comes back near the
+    command."""
     X, mars, frs = SCHEMATIC_X, ARM_COLOR[MARS_KEY], ARM_COLOR["frs"]
     pol = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, -0.35, 0.34)
+    intent = 0.42 * sps.norm.pdf(X, 0.45, 0.32)
     readout = 0.42 * sps.norm.pdf(X, 2.1, 0.3)
 
     def policy_panel(ax):
@@ -325,7 +326,7 @@ def fig1_schematic():
         ax.text(-0.15, h, "$\\hat a$", fontsize=FS_TEXT, color=mars, ha="left", va="center")
 
     return dict(
-        draw={"readout": lambda ax: intent_and_command(ax, pol, readout, 0.9, 2.1), "noise": lambda ax: noise_panel(ax, 0.62, 2.75, frs),
+        draw={"readout": lambda ax: intent_and_command(ax, pol, readout, 0.45, 2.1, intent), "noise": lambda ax: noise_panel(ax, 0.62, 2.75, frs),
               "policy": policy_panel},
         top={"readout": 0.84, "noise": 0.46, "policy": 0.8},
         callouts={"readout": READOUT_CALLOUT,
@@ -343,10 +344,11 @@ def fig3_schematic():
     lo, hi = -0.85, 0.05
     pol = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, -0.4, 0.34)
     task = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, 0.75, 0.3)
+    intent = 0.36 * sps.norm.pdf(X, 0.75, 0.3)
     readout = 0.36 * sps.norm.pdf(X, 2.4, 0.22)
 
     def readout_panel(ax):
-        intent_and_command(ax, pol, readout, 1.45, 2.4)
+        intent_and_command(ax, pol, readout, 0.75, 2.4, intent)
         obstacle_band(ax, lo, hi, above=True)
 
     def policy_panel(ax):
@@ -376,9 +378,10 @@ def method_legend(entries):
     """Legend handles and labels for the schematic's and the scenes' marks, by name, in the given order."""
     hatch = Rectangle((0, 0), 1, 1, facecolor=BAND_FILL, edgecolor=BAND_HATCH, lw=0, hatch="//////")
     disc = lambda face, edge, mew=0.8: plt.Line2D([], [], ls="none", marker="o", ms=6.5, mfc=face, mec=edge, mew=mew)
-    marks = {"intent": (plt.Line2D([], [], color=INK, lw=0.9, marker="v", mfc="white", ms=4.2), "intent $u$"),
-             "command": (plt.Line2D([], [], color=SERVED, lw=0.9, marker="v", ms=4.2), "command $\\hat u$"),
+    marks = {"intent": (plt.Line2D([], [], color=INK, lw=0.9), "intent $u$"),
+             "command": (plt.Line2D([], [], color=SERVED, lw=0.9), "command $\\hat u$"),
              "policy": (Rectangle((0, 0), 1, 1, facecolor=DENSITY_FILL, edgecolor=INK, lw=0.7), "policy density"),
+             "intent_density": (Rectangle((0, 0), 1, 1, facecolor="none", edgecolor=INK, lw=0.8, ls=INTENT_DASH), "intent density"),
              "readout": (Rectangle((0, 0), 1, 1, facecolor=READOUT_FILL, edgecolor=SERVED, lw=0.7), "readout density"),
              "frs": (plt.Line2D([], [], color=ARM_COLOR["frs"], lw=1.2, marker="o", mfc="white", ms=4.2), "FRS"),
              "mars": (plt.Line2D([], [], color=ARM_COLOR[MARS_KEY], lw=1.2, marker="o", ms=4.2), MARS),
@@ -393,148 +396,107 @@ def method_legend(entries):
 # ================================================================ Figure 1: the method
 
 
-FIG1_SEEDS = dict(layout=3, channel=5, torch=0)
-FIG1_STEPS = 28  # control steps into the reach before the state shown
+TARGET_STYLE = dict(facecolor="#fbe3a1", edgecolor=INK, lw=0.8)  # the scenes' target, as Figures 2 and 3 draw it
+TILE_W, TILE_H = 1.6, 1.0  # a tile's data extent: the pictogram on the left half, a reach on the right
+START, GOAL = np.array([0.98, 0.2]), np.array([1.42, 0.78])
 
 
-def fig1_instance(device, seeds=FIG1_SEEDS, n_steps=FIG1_STEPS):
-    """MARS at one mid-reach state of the study condition: the expert's push, the served command (the corruption; the
-    figure leaves the channel's noise out, stats.json also gives a noise draw of median size), and from the served
-    command's reference chunk the chunk plain FRS regenerates and the chunk MARS regenerates (the user module in the
-    reversal), at the study's depth and the full reversal."""
-    arm = config.load_arm("study_mars.yaml")
-    policies, adapters = load_checkpoints({arm["name"]: arm}, device)
-    policy, adapter, task = policies[arm["model"]], arm_adapter(arm, adapters), arm_task(arm)
-    layouts = sample_layouts(np.random.default_rng(seeds["layout"]), 1, tuple(arm["targets"]), task)
-    env = CursorEnv(layouts, task)
-    ctl = SharedController(policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"], arm["execute"],
-                           task.dt, speed_gain=arm["speed_gain"], adapter=adapter, device=device, gain_mode=arm["gain_mode"],
-                           ic_gain=arm["ic_gain"])
-    agent = ExpertAgent()
-    agent.reset(1, channel_for(arm, np.random.default_rng(seeds["channel"])))
-    torch.manual_seed(seeds["torch"])
-    path = [env.pos[0].copy()]
-    for _ in range(n_steps):
-        raw, served, reference = agent.step(env.pos, layouts, ctl)
-        prev = env.pos.copy()
-        env.step(ctl.act(served, reference))
-        ctl.record(env.pos - prev)
-        path.append(env.pos[0].copy())
-    pos = env.pos[0].copy()
-    push = agent.command(env.pos, layouts)                     # [1, 2], what the expert means
-    clean = channel_for(arm, input_noise=0.0)
-    clean.reset(1)
-    clean_cmd = clean(push)[0]                                 # the corruption alone
-    draws = []
-    for s in range(32):                                        # the channel's noise: the draw of median size
-        ch = channel_for(arm, np.random.default_rng(1000 + s))
-        ch.reset(1)
-        draws.append(ch(push)[0])
-    noisy = draws[int(np.argsort([np.linalg.norm(d - clean_cmd) for d in draws])[len(draws) // 2])]
-    served = clean_cmd
-    goal_dir = unit(layouts.goal_pos[0] - pos)
-    obs = ctl.observation()
-    H, N = policy.horizon, arm["flow_steps"]
-    n_study = arm["n_reverse_steps"] or N
-    scale = float(policy.action_scale)
-    as_ref = lambda cmd: to_action(torch.as_tensor(cmd, dtype=torch.float32, device=device)[None, None].expand(1, H, 2).clone(), policy, task.dt)
-    ref = as_ref(served)
-    chunks, latents = {}, {}
-    with torch.no_grad():
-        torch.manual_seed(seeds["torch"] + 1)
-        chunks["policy"] = forward_flow(policy, obs, torch.randn(1, H, 2, device=device), 0.0, 1.0, N)
-        for depth in sorted({N, n_study}):
-            fwd = lambda lat: forward_flow(policy, obs, lat, 1.0 - depth / N, 1.0, N if depth == N else N - depth, adapter)
-            latents[f"frs_{depth}"] = reverse_flow(policy, obs, ref.clone(), depth, N)
-            latents[f"mars_{depth}"] = reverse_flow(policy, obs, ref.clone(), depth, N, adapter)
-            chunks[f"frs_{depth}"] = fwd(latents[f"frs_{depth}"])
-            chunks[f"mars_{depth}"] = fwd(latents[f"mars_{depth}"])
-            if depth == N:  # the same from the noisy draw, for the record
-                chunks["frs_noisy"] = fwd(reverse_flow(policy, obs, as_ref(noisy), depth, N))
-                chunks["mars_noisy"] = fwd(reverse_flow(policy, obs, as_ref(noisy), depth, N, adapter))
-    screen = {k: v[0].cpu().numpy() * scale for k, v in chunks.items()}   # displacement per step
-    screen["reference"] = ref[0].cpu().numpy() * scale
-    screen["intent"] = as_ref(push[0])[0].cpu().numpy() * scale
-    latents = {k: v[0].cpu().numpy() for k, v in latents.items()}
-    direction = {k: bearing(v.sum(0), goal_dir) for k, v in screen.items()}
-    cosine = {k: float(unit(v.sum(0)) @ goal_dir) for k, v in screen.items()}
-    targets = layouts.targets[0, layouts.mask[0]]
-    bearings = [bearing(t - pos, goal_dir) for t in targets]
-    return dict(arm=arm, task=task, layouts=layouts, path=np.array(path), pos=pos, goal_dir=goal_dir, push=push[0], clean=clean_cmd,
-                served=served, chunks=screen, latents=latents, direction=direction,
-                cosine=cosine, bearings=bearings, goal_index=int(np.flatnonzero(layouts.mask[0]).tolist().index(layouts.goal[0])),
-                depth_full=N, depth_study=n_study, execute=arm["execute"], action_scale=scale,
-                stats=dict(seeds=seeds, steps=n_steps, pos=pos.round(4).tolist(), push=push[0].round(3).tolist(),
-                           served=served.round(3).tolist(), noisy_draw=noisy.round(3).tolist(),
-                           push_direction_deg=bearing(push[0], goal_dir), served_direction_deg=bearing(served, goal_dir),
-                           noisy_direction_deg=bearing(noisy, goal_dir),
-                           chunk_direction_deg={k: round(v, 1) for k, v in direction.items()},
-                           chunk_cosine={k: round(v, 3) for k, v in cosine.items()},
-                           latent_rms={k: round(float(np.sqrt((v ** 2).mean())), 3) for k, v in latents.items()},
-                           target_bearings_deg=[round(b, 1) for b in bearings], depth_full=N, depth_study=n_study))
+ASSETS = FIG_DIR / "assets"  # Figure 1a's pictograms: hand-drawn SVGs, each rendered beside it as a PNG (rsvg-convert -w 480)
 
 
-def scene_window(inst, depth, pad=1.12):
-    """A square view around the state that holds the cursor, the goal, the command arrows and the chunks."""
-    pos, lay = inst["pos"], inst["layouts"]
-    goal = lay.goal_pos[0]
-    pts = [pos, goal + 0.06, goal - 0.06, pos + 0.14 * inst["push"], pos + 0.14 * inst["served"]]
-    for key in ("reference", f"frs_{depth}", f"mars_{depth}"):
-        pts.append(pos + inst["chunks"][key].sum(0))
-    pts = np.array(pts)
-    lo, hi = pts.min(0), pts.max(0)
-    span = pad * (hi - lo).max()
-    c = (lo + hi) / 2
-    return (c[0] - span / 2, c[0] + span / 2), (c[1] - span / 2, c[1] + span / 2)
+def icon(ax, name):
+    """Place the pictogram assets/<name>.png on the tile's left half (its SVG's 80 x 100 aspect), re-rendering it first
+    when its SVG is newer and rsvg-convert is there."""
+    svg, png = ASSETS / f"{name}.svg", ASSETS / f"{name}.png"
+    if (not png.exists() or svg.stat().st_mtime > png.stat().st_mtime) and shutil.which("rsvg-convert"):
+        subprocess.run(["rsvg-convert", "-w", "480", str(svg), "-o", str(png)], check=True)  # nosec B603 B607
+    h = 0.9
+    ax.imshow(plt.imread(png), extent=(0.4 - 0.4 * h, 0.4 + 0.4 * h, 0.5 - h / 2, 0.5 + h / 2), interpolation="antialiased", zorder=2)
 
 
-def draw_instance(ax, inst, depth):
-    """Figure 1c's cursor instance: the push, the served command and the regenerated chunks of FRS and MARS."""
-    lay, task, pos = inst["layouts"], inst["task"], inst["pos"]
-    draw_scene(ax, lay, task)
-    ax.plot(inst["path"][:, 0], inst["path"][:, 1], color=INK_2, lw=0.7, alpha=0.6, zorder=3)
-    arrow(ax, pos, inst["push"], INK)
-    arrow(ax, pos, inst["served"], SERVED)
-    for key, color in ((f"frs_{depth}", ARM_COLOR["frs"]), (f"mars_{depth}", ARM_COLOR[MARS_KEY])):
-        pts = chunk_path(pos, inst["chunks"][key])
-        ax.plot(pts[:, 0], pts[:, 1], color=color, lw=0.9, zorder=4)
-        e = inst["execute"]
-        ax.plot(pts[:e + 1, 0], pts[:e + 1, 1], color=color, lw=2.2, zorder=4)
-    ax.plot(*pos, "o", color=INK, ms=3, zorder=6)
-    xl, yl = scene_window(inst, depth)
-    ax.set(xlim=xl, ylim=yl)
+PLANE = [(0.8, 0.08), (1.5, 0.08), (1.58, 0.48), (0.9, 0.48)]  # the plane a two-axis device moves in, in perspective
+SHADOW = np.array([GOAL[0], 0.36])  # the target's projection onto it
+GHOST = GOAL + [-0.26, -0.04]  # where the user believes the target is
 
 
-def build_fig1(out, device):
+def served_path(kind):
+    """The reach the served commands give, from START, for the user's straight push to GOAL."""
+    d = GOAL - START
+    if kind == "rotate":
+        c, s = np.cos(np.radians(45)), np.sin(np.radians(45))
+        return np.array([START, START + 0.9 * np.array([[c, -s], [s, c]]) @ d])
+    if kind == "project":  # the height above the plane is lost
+        return np.array([START, SHADOW])
+    if kind == "misjudge":  # straight at the believed target, corrected toward the real one only after a reaction time
+        t = np.linspace(0, 1, 30)[:, None]
+        turn = START + 0.8 * (GHOST - START)
+        bend = START + 0.97 * (GHOST - START)
+        return (1 - t) ** 2 * turn + 2 * t * (1 - t) * bend + t ** 2 * (GOAL - [0.05, 0.05])
+    steps = [START]  # quantized: one axis at a time
+    for k in range(6):
+        steps.append(steps[-1] + (np.array([d[0], 0]) if k % 2 == 0 else np.array([0, d[1]])) / 3)
+    return np.array(steps)
+
+
+def reach(ax, kind):
+    """The tile's reach: the target, the straight push the user means (ink) and where the served commands go (the served colour)."""
+    if kind == "project":  # the target floats above the device's plane
+        ax.add_patch(Polygon(PLANE, closed=True, facecolor=CALLOUT_FILL, edgecolor=PANEL_EDGE, lw=0.6, zorder=1))
+        ax.plot(*np.c_[GOAL - [0, 0.07], SHADOW], color=INK_2, lw=0.6, ls=(0, (2, 1.5)), zorder=1.5)
+        ax.add_patch(Ellipse(SHADOW, 0.1, 0.04, facecolor=PANEL_EDGE, lw=0, zorder=1.5))
+    if kind == "misjudge":
+        ax.add_patch(Circle(GHOST, 0.07, facecolor="none", edgecolor=INK_2, lw=0.7, ls=(0, (2, 1.5)), zorder=2))
+    ax.add_patch(Circle(GOAL, 0.07, zorder=2, **TARGET_STYLE))
+    ax.annotate("", xy=GOAL - 0.08 * unit(GOAL - START), xytext=START, zorder=3,
+                arrowprops=dict(arrowstyle="-|>", color=INK, lw=0.8, mutation_scale=5, shrinkA=0, shrinkB=0))
+    p = served_path(kind)
+    if kind == "misjudge":
+        p = np.r_[[START], p]
+    ax.plot(*p[:-1].T if len(p) > 2 else p[:1].T, color=SERVED, lw=1.0, zorder=4)
+    ax.annotate("", xy=p[-1], xytext=p[-2], zorder=4,
+                arrowprops=dict(arrowstyle="-|>", color=SERVED, lw=1.0, mutation_scale=5, shrinkA=0, shrinkB=0))
+    ax.plot(*START, "o", color=INK, ms=2.6, zorder=5)
+
+
+# the corrupted inputs: (label, pictogram, how the commands go wrong); sources of input corruption in assistive
+# teleoperation, BCI and EMG work: decoder misalignment and drift (Sadtler et al. 2014, Jarosiewicz et al. 2015; for EMG,
+# electrode shift, sweat and fatigue), low-DOF interfaces for high-DOF robots (Herlant et al. 2016, Losey et al. 2020),
+# the user's misperception and reaction time, and discrete interfaces (sip-and-puff, switches, motor-imagery classes)
+FIG1_INPUTS = (("decoding error", "decoding", "rotate"), ("low-DOF control", "low_dof", "project"),
+               ("misperception & delay", "misperception", "misjudge"), ("discrete input", "discrete", "quantize"))
+
+
+def inputs_panel(fig, x0, top, tile_w=1.0, gap_x=0.1, row_h=0.78):
+    """Figure 1a: one tile per source of corrupted input, two to a row (a last odd one centred), (x0, top) inches the
+    panel's top left."""
+    tile_h = tile_w * TILE_H / TILE_W
+    for i, (label, name, kind) in enumerate(FIG1_INPUTS):
+        lone = i == len(FIG1_INPUTS) - 1 and i % 2 == 0
+        x, y = x0 + (0.5 if lone else i % 2) * (tile_w + gap_x), top - (i // 2) * row_h - tile_h
+        ax = fig.add_axes([*inches(fig, x, y), *inches(fig, tile_w, tile_h)])
+        icon(ax, name)
+        reach(ax, kind)
+        ax.set(xlim=(0, TILE_W), ylim=(0, TILE_H), xticks=[], yticks=[], aspect="auto")
+        frame(ax)
+        fig.text(*inches(fig, x + tile_w / 2, y - 0.03), label, fontsize=FS_TEXT, color=INK, ha="center", va="top")
+
+
+def build_fig1(out):
     paper_style()
-    inst = fig1_instance(device)
-    depth = inst["depth_full"]
-    H = 2.62
-    fig = plt.figure(figsize=(FULL_W, H))
-    # a: the method, a schematic with made-up densities
-    schematic(fig, 0.05, 0.2, fig1_schematic())
+    fig = plt.figure(figsize=(FULL_W, 2.62))
+    # a: where corrupted inputs come from
+    inputs_panel(fig, 0.1, 2.08)
     panel_label(fig, 0.005, 0.995, "a")
-    # b: the embodiments: the cursor at the study's state (FRS and MARS from the same command), the robot (a photo to come)
-    side, xb, yb = 1.04, 4.72, 1.12
-    ax_cur = fig.add_axes([*inches(fig, xb, yb), *inches(fig, side, side)])
-    draw_instance(ax_cur, inst, depth)
-    ax_cur.set_title("Cursor control", fontsize=FS_TITLE, pad=3)
-    ax_rob = fig.add_axes([*inches(fig, xb + side + 0.14, yb), *inches(fig, side, side)])
-    ax_rob.set(xticks=[], yticks=[], xlim=(0, 1), ylim=(0, 1), aspect="equal")
-    frame(ax_rob)
-    for sp in ax_rob.spines.values():
-        sp.set_linestyle((0, (3, 2)))
-    ax_rob.text(0.5, 0.5, "photo", ha="center", va="center", fontsize=FS_TEXT, color=INK_2, transform=ax_rob.transAxes)
-    ax_rob.set_title("Robot manipulation", fontsize=FS_TITLE, pad=3)
-    panel_label(fig, (xb - 0.2) / FULL_W, 0.995, "b")
-    handles, labels = row_major(*method_legend(["intent", "command", "policy", "readout", "frs", "mars", "cursor", "target"]), 2)
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=inches(fig, xb + side + 0.07, yb - 0.12), ncol=2, fontsize=FS_LEGEND,
-               handlelength=1.7, columnspacing=1.1, handletextpad=0.5, borderaxespad=0, labelspacing=0.55)
+    # b: the method, a schematic with made-up densities
+    x0 = 2.36
+    schematic(fig, x0, 0.2, fig1_schematic())
+    panel_label(fig, (x0 + 0.02) / FULL_W, 0.995, "b")
+    handles, labels = method_legend(["policy", "intent_density", "readout"])
+    fig.legend(handles, labels, loc="center", bbox_to_anchor=inches(fig, 5.68, 0.42), ncol=len(handles), fontsize=FS_LEGEND,
+               handlelength=1.1, columnspacing=0.6, handletextpad=0.35, borderaxespad=0)
     png = save(fig, out, "fig1_method")
-    write_stats(out, "fig1", dict(inst["stats"], depth_shown=depth, executed_steps=inst["execute"],
-                                  schematic="panel a's densities are made up; panel b is the study state",
-                                  condition=dict(corruption=inst["arm"]["corruption"], input_noise=inst["arm"]["input_noise"],
-                                                 adapter=inst["arm"]["learned_adapter"], n_reverse_steps=inst["arm"]["n_reverse_steps"])))
+    write_stats(out, "fig1", dict(inputs=[label for label, _, _ in FIG1_INPUTS],
+                                  schematic="panel a's reaches are illustrations; panel b's densities are made up"))
     return png
 
 
@@ -1031,13 +993,13 @@ def build_fig3(out, results, device):
     roll = rollouts(D, device)
     fig = plt.figure(figsize=(FULL_W, FIG3_H))
     y = lambda inch: inch / FIG3_H
-    # a: the method with the task module, a schematic with made-up densities (as Figure 1a)
+    # a: the method with the task module, a schematic with made-up densities (as Figure 1b)
     schematic(fig, 0.05, 6.05, fig3_schematic())
     # b: the tasks, two to a row, beside it
     shown = task_rollouts(D, device)
     draw_tasks(fig, D, shown, (5.12 / FULL_W, y(5.9), 1.85 / FULL_W, y(2.35)))
     # the marks of a and b, one legend as Figure 1's
-    handles, labels = method_legend(["intent", "command", "policy", "readout", "obstacle", "start", "target", "other"])
+    handles, labels = method_legend(["policy", "intent_density", "readout", "obstacle", "start", "target", "other"])
     fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(5.62)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
                handletextpad=0.5, borderaxespad=0, labelspacing=0.4, handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)})
     # c: how the modules were trained, and who wins where
@@ -1134,7 +1096,7 @@ def main(argv=None):
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args(argv)
     out, results = Path(args.out), Path(args.results)
-    builders = {"fig1": lambda: build_fig1(out, args.device), "fig2": lambda: build_fig2(out, results),
+    builders = {"fig1": lambda: build_fig1(out), "fig2": lambda: build_fig2(out, results),
                 "fig3": lambda: build_fig3(out, results, args.device)}
     for name in args.only:
         print(f"{name} -> {builders[name]()}", flush=True)
