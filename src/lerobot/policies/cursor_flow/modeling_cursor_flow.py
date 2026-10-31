@@ -186,11 +186,7 @@ class FlowPolicy(nn.Module):
         """Euler-integrate the flow on normalized chunks x from time t0 to t1.
         0 -> 1 turns noise into a chunk (mu_theta in the steering README);
         1 -> 0 runs it backward, mapping a chunk to its latent noise."""
-        dt = (t1 - t0) / steps
-        for i in range(steps):
-            t = torch.full((len(x),), t0 + i * dt, device=x.device)
-            x = x + dt * self(obs, x, t)
-        return x
+        return integrate(x, lambda x_t, t: self(obs, x_t, t), t0, (t1 - t0) / steps, steps, batch_time=True)
 
     @torch.no_grad()
     def sample(self, obs, steps=10, z=None):
@@ -245,16 +241,8 @@ class CursorFlowPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
         """An action chunk (B, horizon, 2) in screen units per step. Flow mode: noise drawn as the cursor
         example draws it, Euler-integrated from t=0 (noise) to t=1 (action) in ``FLOW_STEPS`` steps
-        (``steering.integrate``), the cursor example's plain policy chunk. Regress mode: the predicted chunk."""
-        model = self.model
-        if model.mode == "regress":
-            return model(batch) * model.action_scale
-        pos = batch["pos"]
-        z = torch.randn(len(pos), model.horizon, 2, device=pos.device)
-        chunk = integrate(
-            z, lambda x, t: model(batch, x, t), 0.0, 1.0 / FLOW_STEPS, FLOW_STEPS, batch_time=True
-        )
-        return chunk * model.action_scale
+        (``FlowPolicy.sample``), the cursor example's plain policy chunk. Regress mode: the predicted chunk."""
+        return self.model.sample(batch, steps=FLOW_STEPS)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:

@@ -38,6 +38,7 @@ from lerobot.policies.pi05.steering import (
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     ReversalAdapter,
+    check_steps,
     get_action_mean_std,
 )
 from lerobot.utils.constants import ACTION
@@ -285,11 +286,6 @@ class Session:
 
     # ------------------------------------------------------------ mode
 
-    def _check_depth(self, name: str, value, low: int) -> None:
-        total = self.policy.config.num_inference_steps
-        if not isinstance(value, int) or not low <= value <= total:
-            raise ValueError(f"{name} must be an integer in [{low}, {total}] (denoising steps)")
-
     def set_mode(
         self,
         mode: str,
@@ -297,24 +293,20 @@ class Session:
         n_reversal_steps: int | None = None,
         tau: int | None = None,
         ic_gain: float | str | None = None,
-        n_guided_steps: int | None = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
-        if n_guided_steps is not None:  # the old name of lambda
-            lam = n_guided_steps
         if lam is not None:
-            self._check_depth("lambda", lam, 0)
+            check_steps("lambda", lam, 0, self.policy.config.num_inference_steps, "Euler steps")
             self.lam = lam
         if tau is not None:
-            chunk = self.policy.config.chunk_size
-            if not isinstance(tau, int) or not 1 <= tau <= chunk:
-                raise ValueError(f"tau must be an integer in [1, {chunk}] (chunk steps)")
+            check_steps("tau", tau, 1, self.policy.config.chunk_size, "chunk steps")
             self.tau = tau
         if ic_gain is not None:
             self.ic_gain = ic_gain  # validated by the wrapper
         if n_reversal_steps is not None:
-            self._check_depth("n_reversal_steps", n_reversal_steps, 1)
+            total = self.policy.config.num_inference_steps
+            check_steps("n_reversal_steps", n_reversal_steps, 1, total, "Euler steps")
             self.n_reversal_steps = n_reversal_steps
         self.mode = mode
         if mode != "policy" and self.operator is None:
@@ -340,8 +332,14 @@ class Session:
         self.chain.noisy.input_noise = control.input_noise
         self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
         self.chain.gain.gain = control.resolved_input_gain
-        if control.n_reversal_steps is not None:
-            self._check_depth("n_reversal_steps", control.n_reversal_steps, 1)
+        check_steps(
+            "n_reversal_steps",
+            control.n_reversal_steps,
+            1,
+            self.policy.config.num_inference_steps,
+            "Euler steps",
+            optional=True,
+        )
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
         self.operator_dims = tuple(control.operator_dims)
         if self._frs_policy is not None:

@@ -268,7 +268,6 @@ def test_flow_control_lambda_zero_is_the_policy_alone():
     wrapper.select_action({})
     assert wrapper.guided_steps == 0
     assert len(policy.calls) == 1 and "x_t_hook" not in policy.calls[0]  # no steering, no paired pass
-    assert wrapper.n_guided_steps == 0  # the old name reads the same knob
 
 
 def test_flow_control_validates_its_knobs():
@@ -283,9 +282,6 @@ def test_flow_control_validates_its_knobs():
         FlowControlPolicy(policy, src, post, ic_gain=0.0)
     with pytest.raises(ValueError, match="ic_gain"):
         FlowControlPolicy(policy, src, post, ic_gain="noise")
-    wrapper = FlowControlPolicy(policy, src, post)
-    wrapper.n_guided_steps = 4  # the alias sets lam
-    assert wrapper.lam == 4
 
 
 def test_flow_control_skips_idle_input_and_queues_actions():

@@ -108,6 +108,16 @@ class TeleopSource(Protocol):
         ...
 
 
+def check_steps(name: str, value, low: int, high: int, unit: str, optional: bool = False) -> None:
+    """Raise unless ``value`` is an integer (not a bool) in [``low``, ``high``] ``unit``, or None when
+    ``optional``: the one check of the step knobs (tau, lambda, n_reversal_steps, pinned_steps)."""
+    if optional and value is None:
+        return
+    if not (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high):
+        none = "None or " if optional else ""
+        raise ValueError(f"{name} must be {none}an integer in [{low}, {high}] ({unit}), got {value!r}")
+
+
 # ---------------------------------------------------------------- matrices
 
 
@@ -741,7 +751,8 @@ class AdaptedField:
 
 def _adapt_velocity(adapter, x_t, t, v, backward: bool):
     """`adapter` is None, a normalized (n, n) or per-trial (B, n, n) matrix (the legacy fixed-F form), an
-    AdaptedField, or a ReversalAdapter holder used directly (its matrix is then taken as already normalized)."""
+    AdaptedField, or a ReversalAdapter holder without a fixed matrix used directly (a holder's matrix is in
+    environment units: convert the holder with ``field(std, like)`` first)."""
     if adapter is None:
         return v
     if isinstance(adapter, torch.Tensor):
@@ -750,14 +761,13 @@ def _adapt_velocity(adapter, x_t, t, v, backward: bool):
         n = adapter.shape[-1]
         return torch.cat([v[..., :n] @ adapter.transpose(-1, -2), v[..., n:]], dim=-1)
     if isinstance(adapter, ReversalAdapter):
+        if adapter.matrix is not None:
+            raise ValueError(
+                "a ReversalAdapter's fixed matrix is in environment units; pass its field(std, like) instead"
+            )
         if adapter.kind == "none":
             return v
-        matrix = (
-            None
-            if adapter.matrix is None
-            else torch.as_tensor(adapter.matrix, dtype=v.dtype, device=v.device)
-        )
-        adapter = AdaptedField(matrix, adapter.user_module, adapter.task_module)
+        adapter = AdaptedField(None, adapter.user_module, adapter.task_module)
     return adapter.adapt(x_t, t, v, backward)
 
 
@@ -847,8 +857,7 @@ def frs_chunk(
     et al.'s noise-space in-painting (App. D: a 5-step reference in a 15-step chunk, the rest set to
     N(0, I)). None steers the whole chunk."""
     n = steps if n_reverse_steps is None else n_reverse_steps
-    if not 1 <= n <= steps:
-        raise ValueError(f"n_reverse_steps must be in [1, {steps}], got {n}")
+    check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
     latent = integrate(ref.clone(), velocity, 1.0, -1.0 / steps, n, adapter, backward=True, batch_time=True)
     t0, m = 1.0 - n / steps, steps if n == steps else steps - n
     if pinned_steps is not None and pinned_steps < latent.shape[1]:
@@ -900,16 +909,11 @@ def steered_chunk(
         return integrate(z, velocity, 0.0, 1.0 / steps, steps, adapter, batch_time=True)
     deflection = command[:, None].expand(-1, horizon, -1) if reference is None else reference
     if mode == "flow_control":
-        if not 0 <= tau <= horizon:
-            raise ValueError(f"tau must be in [0, {horizon}] chunk steps for flow_control, got {tau}")
-        if not 0 <= lam <= steps:
-            raise ValueError(f"lambda must be in [0, {steps}] Euler steps for flow_control, got {lam}")
+        check_steps("tau", tau, 0, horizon, "chunk steps")
+        check_steps("lambda", lam, 0, steps, "Euler steps")
         return flow_control_chunk(velocity, z, ic_gain * deflection, steer, tau, lam, steps, adapter)
     if mode == "frs":
-        if pinned_steps is not None and not 1 <= pinned_steps <= horizon:
-            raise ValueError(
-                f"pinned_steps must be None or in [1, {horizon}] chunk steps for frs, got {pinned_steps}"
-            )
+        check_steps("pinned_steps", pinned_steps, 1, horizon, "chunk steps", optional=True)
         return frs_chunk(
             velocity, z, to_reference(deflection), steer, n_reverse_steps, steps, adapter, pinned_steps
         )
@@ -925,23 +929,30 @@ def user_field_loss(
     task: Callable | None = None,
     weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The user module's field regression, in the t = 0 noise convention: along the straight path
-    x_t = (1 - t) latent + t target (t (B,), one flow time per sample),
+    """The user module's field regression: along the straight path x_t = (1 - t) latent + t target
+    (t (B,), one flow time per sample),
 
-        U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad),
+        U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad, in float32),
 
-    T the bound task module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity; U(x_t, t) T(v)
-    is ``apply_user_module`` (a ``LearnedUserModule``'s ``velocity``, cross-step coupling included). A full
-    reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach whichever
-    module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
+    on the module's first ``n_dims`` dims (all of ``v``'s for a callable without them), T the bound task
+    module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity; U(x_t, t) T(v) is
+    ``apply_user_module`` (a ``LearnedUserModule``'s ``velocity``, cross-step coupling included). In the
+    t = 0 noise convention ``latent`` is the noise and ``target`` the action; in pi0.5's (t = 1 noise) they
+    swap. A full reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach
+    whichever module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
     x = (1 - t[:, None, None]) * latent + t[:, None, None] * target
     with torch.no_grad():
-        v = velocity(x, t)
+        v = velocity(x, t).float()
     if task is not None:
         a, b = task(x, t, v)
         v = torch.einsum("bsij,bsj->bsi", a, v) + b
-    err = ((apply_user_module(user, x, t, v) - (target - latent)) ** 2).mean((1, 2))
-    return err.mean() if weight is None else (err * weight).sum() / weight.sum().clamp_min(1.0)
+    n = getattr(user, "n_dims", v.shape[-1])
+    pred = apply_user_module(user, x.float(), t, v[..., :n])
+    err = ((pred - (target - latent)[..., :n].float()) ** 2).mean((1, 2))
+    if weight is None:
+        return err.mean()
+    weight = weight.float()
+    return (err * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 def task_field_loss(
@@ -1035,7 +1046,46 @@ def get_action_mean_std(postprocessor) -> tuple[np.ndarray, np.ndarray]:
     raise RuntimeError("No action stats in the postprocessor; the shared flow modes need them.")
 
 
-class FlowControlPolicy:
+class _ChunkSteering:
+    """What both pi0.5 wrappers share with ``PI05Policy.select_action``'s queue: once per chunk the
+    operator's command is read and held (inside ``deadband`` it counts as idle), ``_sample_chunk(batch)``
+    returns the chunk and the policy's own plan for the same noise, and their first ``n_action_steps``
+    steps are served one per call (``last_policy_action`` the plan's step)."""
+
+    def __init__(self, policy, source: TeleopSource, deadband: float):
+        self._policy = policy
+        self._source = source
+        self.deadband = deadband
+        self._pending_command: np.ndarray | None = None
+        self._queue: deque = deque()
+        self._policy_queue: deque = deque()
+        self.last_policy_action: torch.Tensor | None = (
+            None  # the policy's own plan for the step just returned
+        )
+
+    def _read_command(self, read: bool = True) -> np.ndarray | None:
+        """The operator's translation for the next chunk; None when not read or inside the deadband."""
+        command = self._source.translation if read else None
+        return command if command is not None and np.max(np.abs(command)) >= self.deadband else None
+
+    def reset(self) -> None:
+        self._policy.reset()
+        self._queue.clear()
+        self._policy_queue.clear()
+        self._pending_command = None
+
+    def select_action(self, batch) -> torch.Tensor:
+        if len(self._queue) == 0:
+            chunk, plain = self._sample_chunk(batch)
+            n = self._policy.config.n_action_steps
+            actions = list(chunk[:, :n].transpose(0, 1))
+            self._queue.extend(actions)
+            self._policy_queue.extend(actions if plain is chunk else plain[:, :n].transpose(0, 1))
+        self.last_policy_action = self._policy_queue.popleft()
+        return self._queue.popleft()
+
+
+class FlowControlPolicy(_ChunkSteering):
     """pi0.5 wrapper implementing shared_flow_control (Kao et al. 2026).
 
     While the operator pushes, the command is written into ``x_t`` as the chunk's
@@ -1063,22 +1113,14 @@ class FlowControlPolicy:
         ic_gain: float | str = "action",
         deadband: float = DEADBAND,
     ):
-        self._policy = policy
-        self._source = source
-        self.deadband = deadband
+        super().__init__(policy, source, deadband)
         self.tau = tau  # the setters validate against the policy's config
         self.lam = lam
         self.ic_gain = ic_gain
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:3], std[:3]
-        self._queue: deque = deque()
         self.guided_steps = 0  # per-rollout count of Euler steps the command was written at
-        self._pending_command: np.ndarray | None = None
         self._pending_target: torch.Tensor | None = None
-        self._policy_queue: deque = deque()
-        self.last_policy_action: torch.Tensor | None = (
-            None  # the policy's own plan for the step just returned
-        )
 
     @property
     def tau(self) -> int:
@@ -1087,11 +1129,8 @@ class FlowControlPolicy:
     @tau.setter
     def tau(self, value: int | None) -> None:
         chunk = self._policy.config.chunk_size
-        if value is None:
-            value = chunk
-        if not (isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= chunk):
-            raise ValueError(f"tau must be an integer in [1, {chunk}] (chunk steps) or None, got {value!r}")
-        self._tau = value
+        check_steps("tau", value, 1, chunk, "chunk steps", optional=True)
+        self._tau = chunk if value is None else value
 
     @property
     def lam(self) -> int:
@@ -1099,19 +1138,8 @@ class FlowControlPolicy:
 
     @lam.setter
     def lam(self, value: int) -> None:
-        total = self._policy.config.num_inference_steps
-        if not (isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= total):
-            raise ValueError(f"lam must be an integer in [0, {total}] (Euler steps), got {value!r}")
+        check_steps("lam", value, 0, self._policy.config.num_inference_steps, "Euler steps")
         self._lam = value
-
-    @property
-    def n_guided_steps(self) -> int:
-        """The old name of ``lam`` (the Euler steps the command is written at)."""
-        return self._lam
-
-    @n_guided_steps.setter
-    def n_guided_steps(self, value: int) -> None:
-        self.lam = value
 
     @property
     def ic_gain(self) -> float | str:
@@ -1127,11 +1155,8 @@ class FlowControlPolicy:
         self._ic_gain = float(value)
 
     def reset(self) -> None:
-        self._policy.reset()
-        self._queue.clear()
-        self._policy_queue.clear()
+        super().reset()
         self.guided_steps = 0
-        self._pending_command = None
 
     def written_command(self, command: np.ndarray) -> np.ndarray:
         """What a command writes into ``x_t``'s translation dims: ``ic_gain * command`` in the noise
@@ -1153,25 +1178,12 @@ class FlowControlPolicy:
         self.guided_steps += 1
         return x_t
 
-    def select_action(self, batch) -> torch.Tensor:
-        # Same queue logic as PI05Policy.select_action, plus the guidance hook.
-        if len(self._queue) == 0:
-            # Hold one consumed command (including its noise) for the whole chunk,
-            # matching FRS and the synthetic operator's refresh cadence.
-            command = self._source.translation if self._lam else None
-            self._pending_command = (
-                command if command is not None and np.max(np.abs(command)) >= self.deadband else None
-            )
-            self._pending_target = None  # resolved on the device by the first write
-            chunk, plain = paired_chunks(
-                self._policy, batch, self._pending_command is not None, x_t_hook=self._x_t_hook
-            )
-            n = self._policy.config.n_action_steps
-            actions = list(chunk[:, :n].transpose(0, 1))
-            self._queue.extend(actions)
-            self._policy_queue.extend(actions if plain is chunk else plain[:, :n].transpose(0, 1))
-        self.last_policy_action = self._policy_queue.popleft()
-        return self._queue.popleft()
+    def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        # Hold one consumed command (including its noise) for the whole chunk,
+        # matching FRS and the synthetic operator's refresh cadence.
+        self._pending_command = self._read_command(read=bool(self._lam))
+        self._pending_target = None  # resolved on the device by the first write
+        return paired_chunks(self._policy, batch, self._pending_command is not None, x_t_hook=self._x_t_hook)
 
 
 def reverse_flow(
@@ -1255,7 +1267,7 @@ def delegation_mask(
     return mask
 
 
-class FlowReversalSteeringPolicy:
+class FlowReversalSteeringPolicy(_ChunkSteering):
     """pi0.5 wrapper implementing shared_flow_reversal_steering (Flow Reversal Steering).
 
     While the teleop input is deflected (beyond `deadband`), a reference chunk
@@ -1311,23 +1323,16 @@ class FlowReversalSteeringPolicy:
         deadband: float = DEADBAND,
         gripper_open: float = GRIPPER_OPEN,
     ):
-        self._policy = policy
-        self._source = source
+        super().__init__(policy, source, deadband)
         self._adapter = adapter
-        self.deadband = deadband
         self.gripper_open = gripper_open
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
+        self._operator_dims = tuple(operator_dims)
+        # The setter validates the pinned steps and builds the delegation mask (checking operator_dims)
         self.pinned_steps = policy.config.n_action_steps if pinned_steps == -1 else pinned_steps
-        self.operator_dims = operator_dims  # the setter builds the delegation mask
-        self._pending_command: np.ndarray | None = None
         self._adapter_cache: tuple | None = None
-        self._policy_queue: deque = deque()
-        self.last_policy_action: torch.Tensor | None = (
-            None  # the policy's own plan for the step just returned
-        )
         mean, std = get_action_mean_std(postprocessor)
         self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
-        self._queue: deque = deque()
         self._gripper_ref = self._normalize_gripper(gripper_open)
         self._last_reference: torch.Tensor | None = None
         self.steered_chunks = 0  # per-rollout count of chunks started from inverted noise
@@ -1341,8 +1346,19 @@ class FlowReversalSteeringPolicy:
     def operator_dims(self, value) -> None:
         cfg = self._policy.config
         dims = tuple(value)
-        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self.pinned_steps)
+        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps)
         self._operator_dims = dims
+
+    @property
+    def pinned_steps(self) -> int | None:
+        return self._pinned_steps
+
+    @pinned_steps.setter
+    def pinned_steps(self, value: int | None) -> None:
+        cfg = self._policy.config
+        check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
+        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
+        self._pinned_steps = value
 
     @property
     def n_reversal_steps(self) -> int | None:
@@ -1351,8 +1367,7 @@ class FlowReversalSteeringPolicy:
     @n_reversal_steps.setter
     def n_reversal_steps(self, value: int | None) -> None:
         total = self._policy.config.num_inference_steps
-        if value is not None and not (isinstance(value, int) and 1 <= value <= total):
-            raise ValueError(f"n_reversal_steps must be an integer in [1, {total}], got {value!r}")
+        check_steps("n_reversal_steps", value, 1, total, "Euler steps", optional=True)
         self._n_reversal_steps = None if value == total else value
 
     def _flow_kwargs(self) -> dict:
@@ -1369,9 +1384,7 @@ class FlowReversalSteeringPolicy:
         return float((gripper - self._mean[GRIPPER_DIM]) / self._std[GRIPPER_DIM])
 
     def reset(self) -> None:
-        self._policy.reset()
-        self._queue.clear()
-        self._policy_queue.clear()
+        super().reset()
         self._gripper_ref = self._normalize_gripper(self.gripper_open)
         self._last_reference = None
         self.steered_chunks = 0
@@ -1407,11 +1420,6 @@ class FlowReversalSteeringPolicy:
         ):
             self._adapter_cache = (key, self._adapter.field(self._std, like))
         return self._adapter_cache[1]
-
-    def _adapter_tensor(self, like: torch.Tensor) -> torch.Tensor | None:
-        """The fixed user matrix in normalized coordinates on `like`'s device (None without one)."""
-        field = self._adapter_field(like)
-        return None if field is None else field.matrix
 
     @torch.compiler.disable
     def _velocity_hook(self, step: int, time_: float, x_t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -1455,30 +1463,20 @@ class FlowReversalSteeringPolicy:
         )
         return torch.where(delegated, unsteered, latent)
 
-    def select_action(self, batch) -> torch.Tensor:
-        # Same queue logic as PI05Policy.select_action, plus the noise hook.
-        if len(self._queue) == 0:
-            # Sample the operator once per chunk: the forward schedule depends on
-            # whether we are steering, so it cannot be decided inside the hook.
-            command = self._source.translation
-            steering = np.max(np.abs(command)) >= self.deadband
-            self._pending_command = command if steering else None
-            flow_kwargs = self._flow_kwargs() if steering else {}
-            if not steering:
-                self._last_reference = None  # no reference to score this chunk against
-            chunk, plain = paired_chunks(
-                self._policy, batch, steering, self._common_kwargs(), noise_fn=self._noise_fn, **flow_kwargs
-            )
-            actions = chunk[:, : self._policy.config.n_action_steps]
-            executed = actions[0].float().cpu()  # one device sync per chunk
-            self._gripper_ref = float(executed[-1, GRIPPER_DIM])
-            if self._last_reference is not None:
-                target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
-                self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
-            steps = list(actions.transpose(0, 1))
-            self._queue.extend(steps)
-            self._policy_queue.extend(
-                steps if plain is chunk else plain[:, : self._policy.config.n_action_steps].transpose(0, 1)
-            )
-        self.last_policy_action = self._policy_queue.popleft()
-        return self._queue.popleft()
+    def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        # Sample the operator once per chunk: the forward schedule depends on
+        # whether we are steering, so it cannot be decided inside the hook.
+        self._pending_command = self._read_command()
+        steering = self._pending_command is not None
+        flow_kwargs = self._flow_kwargs() if steering else {}
+        if not steering:
+            self._last_reference = None  # no reference to score this chunk against
+        chunk, plain = paired_chunks(
+            self._policy, batch, steering, self._common_kwargs(), noise_fn=self._noise_fn, **flow_kwargs
+        )
+        executed = chunk[0, : self._policy.config.n_action_steps].float().cpu()  # one device sync per chunk
+        self._gripper_ref = float(executed[-1, GRIPPER_DIM])
+        if self._last_reference is not None:
+            target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
+            self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
+        return chunk, plain

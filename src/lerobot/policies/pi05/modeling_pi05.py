@@ -835,8 +835,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         for this batch on padded normalized chunks; ``time`` is a float or a (batch,) tensor. This is
         what ``sample_actions`` integrates, exposed for callers that invert chunks or train adapters on
         the field (e.g. MARS user modules) without sampling."""
-        bsize, device = tokens.shape[0], tokens.device
         prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
+        return self._velocity_fn(prefix_pad_masks, past_key_values, tokens.shape[0], tokens.device)
+
+    def _velocity_fn(self, prefix_pad_masks, past_key_values, bsize, device):
+        """``velocity(x_t, time)`` on an encoded observation prefix; ``time`` a float or a (batch,) tensor."""
 
         def velocity(x_t, time):
             if torch.is_tensor(time) and time.ndim > 0:
@@ -879,21 +882,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
+        velocity = self._velocity_fn(prefix_pad_masks, past_key_values, bsize, device)
 
         x_t_hook = kwargs.get("x_t_hook")
         noise_fn = kwargs.get("noise_fn")
         velocity_hook = kwargs.get("velocity_hook")
         if noise_fn is not None:
-
-            def velocity(x_t, time):
-                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-                return self.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    x_t=x_t,
-                    timestep=time_tensor,
-                )
-
             noise = noise_fn(velocity, noise)
 
         # The flow normally runs from t=1 (noise) to t=0 in num_steps Euler steps.
@@ -912,15 +906,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             time = start_time + step * dt
             if x_t_hook is not None:
                 x_t = x_t_hook(step, time, x_t)
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                return self.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    x_t=input_x_t,
-                    timestep=current_timestep,
-                )
+            def denoise_step_partial_call(input_x_t, current_time=time):
+                return velocity(input_x_t, current_time)
 
             if self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")

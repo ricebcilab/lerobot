@@ -55,11 +55,11 @@ from lerobot.policies.pi05.steering import (  # noqa: E402
     N_ACTION_DIMS,
     LearnedUserModule,
     ReversalAdapter,
-    apply_user_module,
     forward_flow,
     reverse_flow,
     save_adapter_module,
     uniform_reference,
+    user_field_loss,
 )
 
 # ---------------------------------------------------------------- pure parts (unit-tested)
@@ -85,13 +85,17 @@ def parse_cross_step_dims(value) -> list[int] | None:
     for v in value:
         if isinstance(v, str) and v in ACTION_DIMS:
             out.append(ACTION_DIMS.index(v))
-        elif (isinstance(v, int) and not isinstance(v, bool)) or (isinstance(v, str) and v.lstrip("-").isdigit()):
+        elif (isinstance(v, int) and not isinstance(v, bool)) or (
+            isinstance(v, str) and v.lstrip("-").isdigit()
+        ):
             out.append(int(v))
         else:
             raise ValueError(f"cross_step_dims: {v!r} is neither one of {list(ACTION_DIMS)} nor an index")
     # checked here, before collect_states, so a bad value fails in seconds rather than after state collection
     if not out or len(set(out)) != len(out) or not all(0 <= i < N_ACTION_DIMS for i in out):
-        raise ValueError(f"cross_step_dims: {value!r} must be unique, non-empty indices in [0, {N_ACTION_DIMS})")
+        raise ValueError(
+            f"cross_step_dims: {value!r} must be unique, non-empty indices in [0, {N_ACTION_DIMS})"
+        )
     return out
 
 
@@ -121,25 +125,6 @@ def serve(core: np.ndarray, raw: np.ndarray, sigma, rng: np.random.Generator) ->
     noisy = np.clip(core + rng.normal(size=core.shape) * sigma[:, None], -1.0, 1.0)
     active = np.max(np.abs(raw), axis=-1, keepdims=True) >= DEADBAND
     return np.where(active, noisy, raw)
-
-
-def field_loss(
-    user: LearnedUserModule, velocity, z_l: torch.Tensor, a_bci: torch.Tensor, t: torch.Tensor, weight=None
-):
-    """The regression along the straight path from a_bci (t = 0) to z_L (t = 1): U(x_t, t) P(x_t, t) = z_L - a_bci
-    on the first n action dims (the module's `velocity`, cross-step coupling included); per-sample errors averaged
-    with `weight` (B,) when given."""
-    tt = t[:, None, None]
-    x_t = (1 - tt) * a_bci + tt * z_l
-    with torch.no_grad():
-        v = velocity(x_t, t).float()
-    n = user.n_dims
-    pred = apply_user_module(user, x_t.float(), t, v[..., :n])
-    err = ((pred - (z_l - a_bci)[..., :n].float()) ** 2).mean((1, 2))
-    if weight is None:
-        return err.mean()
-    weight = weight.float()
-    return (err * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor) -> torch.Tensor:
@@ -330,7 +315,8 @@ def train(args) -> None:
             rng.choice(train_idx, size=min(args.batch, len(train_idx)), replace=False)
         )
         t = torch.rand(len(z_l), device=device)
-        loss = field_loss(user, velocity, z_l, a_bci, t, active)
+        # The straight path from a_bci (t = 0) to z_L (t = 1): U(x_t, t) P(x_t, t) = z_L - a_bci
+        loss = user_field_loss(user, velocity, a_bci, z_l, t, weight=active)
         opt.zero_grad(set_to_none=True)
         if torch.isfinite(loss):
             loss.backward()
