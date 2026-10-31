@@ -73,8 +73,8 @@ def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
         torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args={}, obstacle=None),
                    tmp_path / name / "adapter.pt")
     monkeypatch.setattr(session, "adapter_path", lambda name: tmp_path / name / "adapter.pt")
-    (tmp_path / "grid.yaml").write_text(GRID)
-    argv = ["--sweep", str(tmp_path / "grid.yaml"), "--depths", "2", "10", "--results", str(tmp_path), "--cpu", "--out", "grid"]
+    (tmp_path / "grid.yaml").write_text(GRID + "tune: {frs: {n_reverse_steps: [2, 10]}}\n")
+    argv = ["--sweep", str(tmp_path / "grid.yaml"), "--results", str(tmp_path), "--cpu", "--out", "grid"]
     sweep_main(argv)
     out = tmp_path / "sim" / "sweeps" / "grid"
     result = json.loads((out / "test.json").read_text())

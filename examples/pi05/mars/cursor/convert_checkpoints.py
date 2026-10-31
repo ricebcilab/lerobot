@@ -8,8 +8,8 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
   `CursorFlowPolicy` directory beside it: config.json + model.safetensors (`save_pretrained`). The
   policy.pt is kept as policy.pt.orig.
 - every adapters/**/adapter.pt (the cursor's {kind?, config, state_dict, args, obstacle}) is rewritten in
-  the `save_adapter_module` format (`convert_cursor_module`; kind, config, weights, meta, and for a task
-  module an explicit arch). The original is kept as adapter.pt.orig.
+  the `save_adapter_module` format (`convert_cursor_module`; kind, config, weights, meta). The original is
+  kept as adapter.pt.orig.
 
 Each converted file is written to a temporary name, loaded back and its weights compared with the
 original; only then is the original copied to *.orig and the new file moved into place (one atomic
@@ -32,12 +32,10 @@ from pathlib import Path
 import torch
 
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
-from lerobot.policies.pi05.steering import (LearnedTaskModule, LearnedUserModule, ObstacleTaskModule, convert_cursor_module,
-                                             load_adapter_module, save_adapter_module)
+from lerobot.policies.pi05.steering import (LearnedTaskModule, LearnedUserModule, convert_cursor_module, load_adapter_module,
+                                             save_adapter_module)
 
 CHECKPOINTS = Path(__file__).resolve().parents[1] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
-OBSTACLE_KEYS = {"heads", "layers", "scale"}  # config keys only the obstacle-reading task module has
-TASK_ARCHS = {"obstacle": ObstacleTaskModule, "mlp": LearnedTaskModule}  # a task checkpoint's "arch"
 
 
 def _same_weights(a, b):
@@ -87,26 +85,14 @@ def convert_policy(path):
     return True
 
 
-def task_arch(ckpt):
-    """A cursor task checkpoint's module architecture: its arch if it names one; else "obstacle" when it carries
-    obstacle info (the task's obstacle spec, or the obstacle module's config), "mlp" otherwise. Every cursor
-    task module so far is the obstacle-reading one (the trainer requires an obstacle)."""
-    arch = ckpt.get("arch")
-    if arch is None:
-        arch = "obstacle" if ckpt.get("obstacle") is not None or OBSTACLE_KEYS <= set(ckpt["config"]) else "mlp"
-    if arch not in TASK_ARCHS:
-        raise ValueError(f"unknown task module arch {arch!r}")
-    return arch
-
-
 def converted(ckpt):
     """The `save_adapter_module` format: a kind and a meta (the cursor formats have neither, or no meta)."""
     return "kind" in ckpt and "meta" in ckpt
 
 
 def convert_adapter(path):
-    """adapters/**/adapter.pt in place to the `save_adapter_module` format. Returns the task module's arch,
-    "user" for a user module, or None when the file is already converted."""
+    """adapters/**/adapter.pt in place to the `save_adapter_module` format. Returns its kind ("user" or
+    "task"), "skipped" for a differing backup, or None when the file is already converted."""
     path = Path(path)
     ckpt = torch.load(path, map_location="cpu")
     if converted(ckpt):
@@ -117,16 +103,13 @@ def convert_adapter(path):
         new = {"kind": ckpt["kind"], "config": dict(ckpt["config"]), "state_dict": ckpt["state_dict"],
                "meta": {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}}
     kind = new["kind"]
-    arch = None
-    if kind == "task":
-        arch = task_arch(ckpt)
-        module = TASK_ARCHS[arch](**new["config"])
-    else:
-        module = LearnedUserModule(**new["config"])
+    if kind == "task" and ckpt.get("arch", "obstacle") != "obstacle":
+        raise ValueError(f"{path}: task module arch {ckpt['arch']!r}; only LearnedTaskModule is left")
+    module = (LearnedTaskModule if kind == "task" else LearnedUserModule)(**new["config"])
     module.load_state_dict(new["state_dict"])
     tmp = path.with_name(path.name + ".tmp")
     try:
-        save_adapter_module(module, tmp, kind, meta=new["meta"], arch=arch)
+        save_adapter_module(module, tmp, kind, meta=new["meta"])
         loaded, loaded_kind, _ = load_adapter_module(tmp)
         if loaded_kind != kind or not _same_weights(loaded.state_dict(), ckpt["state_dict"]):
             raise RuntimeError(f"{path}: the converted module does not reproduce the checkpoint")
@@ -135,20 +118,18 @@ def convert_adapter(path):
         os.replace(tmp, path)  # the one step that changes adapter.pt, atomic: old or new, never neither
     finally:
         tmp.unlink(missing_ok=True)
-    return arch or "user"
+    return kind
 
 
 def convert_tree(root=CHECKPOINTS):
     """Convert every policy and adapter checkpoint under root. Returns the counts converted (policies,
-    adapters, the task modules' archs) and of the files skipped for a differing .orig backup."""
+    adapters, of which task modules) and of the files skipped for a differing .orig backup."""
     root = Path(root)
     done = [convert_policy(p) for p in sorted((root / "policies").rglob("policy.pt"))]
     kinds = Counter(convert_adapter(p) for p in sorted((root / "adapters").rglob("adapter.pt")))
     kinds.pop(None, None)
     skipped = done.count(False) + kinds.pop("skipped", 0)
-    adapters = sum(kinds.values())
-    kinds.pop("user", None)
-    return {"policies": done.count(True), "adapters": adapters, "arch": dict(kinds), "skipped": skipped}
+    return {"policies": done.count(True), "adapters": sum(kinds.values()), "tasks": kinds["task"], "skipped": skipped}
 
 
 def main(argv=None):
@@ -157,7 +138,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     counts = convert_tree(args.checkpoints)
     print(f"converted {counts['policies']} policies and {counts['adapters']} adapters "
-          f"(task module archs: {counts['arch'] or 'none'}; skipped {counts['skipped']}) under {args.checkpoints}")
+          f"({counts['tasks']} task modules; skipped {counts['skipped']}) under {args.checkpoints}")
     return counts
 
 

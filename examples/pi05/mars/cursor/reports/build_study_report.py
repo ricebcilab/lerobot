@@ -5,7 +5,7 @@
 
 Reads every session of each participant under results/<participant>/<protocol>_s<k>/ and, when
 present, the expert agent's test result for the same condition from
-results/sim/sweeps/task_space_refine/test.json. One participant gives reports/study_<participant>.pdf;
+results/sim/sweeps/study_tuning/test.json. One participant gives reports/study_<participant>.pdf;
 several give reports/study_group.pdf, where the unit of analysis is the participant (each one's
 sessions pooled first). Figures go to results/analysis/study_<participant|group>/ as PDF and PNG.
 """
@@ -47,7 +47,7 @@ ARM_COLOR = {"teleop": "#008300", "flow_control": "#e87ba4", "frs": "#e69f00", "
 OUTCOME_COLOR = {"hit": "#0ca30c", "wrong_target": "#6250d6", "collision": "#1f1f1e", "timeout": "#898781"}  # CVD-distinct
 OUTCOME_LABEL = {"hit": "Hit", "wrong_target": "Wrong target", "collision": "Collision", "timeout": "Timeout"}
 OUTCOMES = ("hit", "wrong_target", "collision", "timeout")
-REFERENCE = RESULTS / "sim" / "sweeps" / "task_space_refine" / "test.json"  # the expert agent, same condition
+REFERENCE = RESULTS / "sim" / "sweeps" / "study_tuning" / "test.json"  # the expert agent, same condition
 FULL_W, HALF_W = 7.2, 3.5  # figure widths in inches (the page's text width, and a column)
 
 FONTS = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
@@ -75,12 +75,10 @@ def sessions_of(trials):
 
 
 def reference_success(trials, arms):
-    """The expert agent's test success per arm in this condition, from the refine sweep (or {})."""
+    """The expert agent's test success per arm in this condition, from the study's tuning sweep (or {})."""
     if not REFERENCE.exists() or not trials:
         return {}
-    a = trials[0]
-    fmt = lambda v: "-".join(str(x) for x in v)
-    key = f"0.25|{float(a['input_noise'])}|targets={fmt(a['targets_range'])}|reach={fmt(a['reach'])}|dwell_s={a['dwell_s']}"
+    key = f"0.25|{float(trials[0]['input_noise'])}"  # the sweep's one cell: the study's condition
     cell = json.loads(REFERENCE.read_text())["test"].get(key)
     return {arm: cell["metrics"][arm]["success"] for arm in arms if cell and arm in cell["metrics"]}
 
@@ -484,7 +482,7 @@ def single_report(args, participant):
          table(stats_table_rows(stats, arms, focus), "Every session pooled. Hit rate with a bootstrap 95% CI; the lead pairs "
                "trials by layout (session × layout).", col_widths=STATS_WIDTHS),
          img(f1, "(a) Hit rate per arm, all sessions pooled, with a bootstrap 95% CI; hollow markers: the expert agent on "
-                 "the same condition in simulation (500 trials, run_sweep.py --sweep task_space_refine). (b) How the trials "
+                 "the same condition in simulation (500 trials, run_sweep.py --sweep study_tuning). (b) How the trials "
                  "ended.", max_h=2.8 * inch)]
     rows = [["Session"] + [ARM_LABEL[a] for a in arms]] + [[r[0]] + [pct(v) for v in r[1:]] for r in per_session]
     rows.append(["Mean"] + [pct(np.mean([r[j + 1] for r in per_session])) for j in range(len(arms))])
@@ -597,7 +595,7 @@ def group_report(args, participants):
                "the lead pairs trials by layout within session.", col_widths=STATS_WIDTHS),
          img(f1, "(a) Hit rate per arm: one connected line per session (dots in the arm's color), the bar the mean over "
                  "sessions; hollow markers: the expert agent on the same condition in simulation (500 trials, "
-                 "run_sweep.py --sweep task_space_refine). (b) How all trials ended.", max_h=2.9 * inch),
+                 "run_sweep.py --sweep study_tuning). (b) How all trials ended.", max_h=2.9 * inch),
          img_pair(f2, f3, f"{ARM_LABEL[focus]}'s lead in hit rate over each other arm, one dot per session (trials paired "
                   "by layout), the bar the mean.", "Share of trials that had selected the goal by each time, per arm: the mean "
                   "of the sessions' curves; end values are hit rates, the rise is speed."),

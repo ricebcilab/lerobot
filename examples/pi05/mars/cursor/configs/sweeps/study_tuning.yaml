@@ -1,0 +1,27 @@
+# The user study's arms, tuned on the study's condition (condition_study.yaml: gain diag(1, 0.25), input noise 1.0,
+# 4 targets, reach 0.35-0.5, dwell 0.3 s) with the simulated expert. The baselines are their papers' methods, each with
+# its one knob tuned: flow control over tau (lambda 1, Kao et al.'s initial condition; the study arm's gain, the command
+# in the policy's action units), FRS over the pinned prefix (the full reversal, Tang et al., App. D). MARS (the grid's
+# 100-demonstration user module) tunes the reversal depth x the pinned prefix (16 = the whole chunk). The best setting
+# per arm, on 200 tuning trials, goes into study_<arm>.yaml; 500 new trials test it.
+#   python run_sweep.py --sweep study_tuning
+name: study_tuning
+agent: expert
+arm: condition_study.yaml
+methods:
+  teleop: {mode: teleop}
+  flow_control: {mode: flow_control, ic_gain: 2.084264602519949}
+  frs: {mode: frs}
+  mars: {mode: frs, reversal_adapter: {learned: user_gain025y_expert_n100_s0}, tune: {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}}
+tune:  # the baselines as their papers define them, each with its one knob tuned (MARS's own knobs are in its methods)
+  flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}   # chunk steps (of 16) carrying the command; lambda 1 (Kao et al.:
+                                                       # the initial condition only)
+  frs: {pinned_steps: [2, 4, 8, 16]}                   # chunk steps the reference steers; the full reversal (Tang et al.)
+grid:
+  family: gain
+  levels: [0.25]
+  noises: [1.0]
+trials: {tune: 200, test: 500}
+focus: mars
+against: [teleop, flow_control, frs]
+seed: 1000

@@ -371,26 +371,28 @@ def test_reversal_adapter():
 
 def test_shipped_configs_load_and_flags_override_them():
     arms = {p.name: config.load_arm(p) for p in config.CONFIG_DIR.glob("*.yaml") if p.name != "study.yaml"}
-    assert {"base.yaml", "teleop.yaml", "flow_control.yaml", "frs.yaml", "teleop_gain05y.yaml",
-            "flow_control_gain05y.yaml", "frs_gain05y.yaml", "mars_fixed_gain05y.yaml"} <= set(arms)
-    assert arms["teleop_gain05y.yaml"]["mode"] == "teleop"
-    assert arms["teleop_gain05y.yaml"]["corruption"] == arms["mars_fixed_gain05y.yaml"]["corruption"]
+    assert {"base.yaml", "teleop.yaml", "flow_control.yaml", "frs.yaml", "condition_study.yaml", "condition_grid.yaml",
+            "study_teleop.yaml", "study_flow_control.yaml", "study_frs.yaml", "study_mars.yaml"} == set(arms)
+    assert {arms[f"study_{m}.yaml"]["mode"] for m in ("teleop", "flow_control", "frs", "mars")} == {"teleop", "flow_control", "frs"}
+    assert all(arms[f"study_{m}.yaml"]["corruption"] == {"scale": [1.0, 0.25]} for m in ("teleop", "flow_control", "frs", "mars"))
     assert arms["frs.yaml"]["corruption"] is None
-    cfg = config.load_arm("mars_fixed_gain05y.yaml", {"speed_gain": 0.3})
+    cfg = config.load_arm("frs.yaml", {"speed_gain": 0.3, "corruption": {"scale": [1.0, 0.5]},
+                                       "reversal_adapter": {"translation": "corruption"}})  # MARS with F = M
     assert cfg["speed_gain"] == 0.3 and cfg["mode"] == "frs" and cfg["method"] == "mars"
     np.testing.assert_allclose(cfg["adapter_matrix"], cfg["corruption_matrix"])
-    assert config.load_arm("flow_control_gain05y.yaml", {"corruption": None})["corruption_matrix"] is None
-    assert config.load_arm("study_mars.yaml")["learned_adapter"] == "gain025y_free"
+    assert config.load_arm("study_flow_control.yaml", {"corruption": None})["corruption_matrix"] is None
+    study_mars = config.load_arm("study_mars.yaml")
+    assert (study_mars["learned_adapter"], study_mars["n_reverse_steps"], study_mars["pinned_steps"]) == ("user_gain025y_expert_n100_s0", 5, 8)
     assert config.load_arm("teleop.yaml")["method"] == "teleop" and config.load_arm("frs.yaml")["method"] == "frs"
-    study_fc = config.load_arm("study_flow_control.yaml")  # the recorded study's mechanism: the whole chunk, in action units
-    assert study_fc["mode"] == "flow_control" and (study_fc["tau"], study_fc["lam"]) == (16, 1)
+    study_fc = config.load_arm("study_flow_control.yaml")  # the command in action units, at the tuned tau and lambda
+    assert study_fc["mode"] == "flow_control" and (study_fc["tau"], study_fc["lambda"]) == (14, 1)
     policy = load_checkpoints({"a": study_fc}, "cpu")[0][study_fc["model"]]
     assert study_fc["ic_gain"] == pytest.approx(action_gain(policy), abs=1e-4)
     base_fc = config.load_arm("flow_control.yaml")
-    assert (base_fc["tau"], base_fc["ic_gain"], base_fc["lam"]) == (8, 2.0, 1)
+    assert (base_fc["tau"], base_fc["ic_gain"], base_fc["lambda"]) == (8, 2.0, 1)
     assert config.load_arm("flow_control.yaml", {"mode": "shared_flow_control"})["mode"] == "flow_control"
     assert config.load_arm("flow_control.yaml", {"tau": 16})["tau"] == 16
-    for bad in ({"tau": 17}, {"lam": 11}, {"ic_gain": 0.0}):
+    for bad in ({"tau": 17}, {"lambda": 11}, {"ic_gain": 0.0}):
         with pytest.raises(ValueError, match="control"):
             config.load_arm("flow_control.yaml", bad)
 

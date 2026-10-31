@@ -17,7 +17,7 @@ methods:
                                                          T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}
   policy_retrained: {mode: policy, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
                                            T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}
-depths: [10]
+tune: {frs: {n_reverse_steps: [10]}}
 grid:
   users:
     U0: {corruption: null, adapter: null}

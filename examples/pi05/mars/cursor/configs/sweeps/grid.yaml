@@ -16,10 +16,14 @@
 # module; its user modules are calibrated on it exactly as the others are on the frozen policy
 # (user_<user>_expert_n100_s0_on_<task>), since a user module is fitted to one policy's field. T1 has nothing to retrain
 # for: there it is the frozen policy and the user module, mars_user.
-#   python run_sweep.py --sweep grid --cells U1xT1 --out grid_part_U1xT1   # a part per cell in parallel (~2 h;
-#   python run_sweep.py --sweep grid --merge grid_part_U1xT1 ... --out grid_s0   # the cells add up to ~24 h), then merged
+# Every method is tuned per cell: flow control over tau (lambda 1, Kao et al.'s initial condition), FRS over the pinned
+# prefix (the full reversal, Tang et al.), and the MARS variants and the retrained arm over the reversal depth x the
+# pinned prefix (16 = the whole chunk).
+#   python run_sweep.py --sweep grid --cells U1xT1 ... --out grid_part_a   # parts in parallel, one per GPU, then merged:
+#   python run_sweep.py --sweep grid --merge grid_part_a grid_part_b --out grid_s0
 # The modules are training seed 0 (_s0 after the demonstration count); seeds 1-4 carry _s1.._s4 in its place, side by
-# side in checkpoints/adapters/ (results/sim/sweeps/grid_s<k>/).
+# side in checkpoints/adapters/, and are tested at seed 0's tuned settings, on the same trials:
+#   python run_sweep.py --sweep grid --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_s0/settings.yaml --out grid_s1
 name: grid
 agent: expert
 arm: condition_grid.yaml
@@ -27,11 +31,12 @@ methods:
   teleop: {mode: teleop}
   flow_control: {mode: flow_control}
   frs: {mode: frs}
-  mars_user: {mode: frs, reversal_adapter: {user: cell}}                 # the user module alone (no task module)
-  mars_task: {mode: frs, reversal_adapter: {task: cell}}                 # the task module alone (no user module)
-  mars: {mode: frs, reversal_adapter: {user: cell, task: cell}}
+  mars_user: {mode: frs, reversal_adapter: {user: cell}, tune: &mars {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}}   # the user module alone (no task module)
+  mars_task: {mode: frs, reversal_adapter: {task: cell}, tune: *mars}         # the task module alone (no user module)
+  mars: {mode: frs, reversal_adapter: {user: cell, task: cell}, tune: *mars}
   retrained_mars_user:                                                   # the task's retrained policy, a user module on it
     mode: frs
+    tune: *mars
     model: {T1: flow_goaldrop, T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap, T4: flow_goaldrop_ring_goal,
             T5: flow_goaldrop_ring_start}
     reversal_adapter:
@@ -45,9 +50,10 @@ methods:
              U3: user_rot60_expert_n100_s0_on_ring_goal, U4: user_curl20_expert_n100_s0_on_ring_goal}
         T5: {U1: user_gain025y_expert_n100_s0_on_ring_start, U2: user_gain025x_expert_n100_s0_on_ring_start,
              U3: user_rot60_expert_n100_s0_on_ring_start, U4: user_curl20_expert_n100_s0_on_ring_start}
-depths:
-  flow_control: [2, 4, 6, 8, 10, 12, 14, 16]   # chunk steps (of 16) that carry the command
-  frs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]          # steps reversed (of 10)
+tune:  # the baselines as their papers define them, each with its one knob tuned (MARS's own knobs are in its methods)
+  flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}   # chunk steps (of 16) carrying the command; lambda 1 (Kao et al.:
+                                                       # the initial condition only)
+  frs: {pinned_steps: [2, 4, 8, 16]}                   # chunk steps the reference steers; the full reversal (Tang et al.)
 grid:
   users:
     U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}

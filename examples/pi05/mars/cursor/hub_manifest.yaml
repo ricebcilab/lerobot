@@ -4,7 +4,7 @@
 repo: ricebcilab/mars-cursor
 folders:
   study:
-  - adapters/gain025y_free
+  - adapters/user_gain025y_expert_n100_s0
   - policies/flow_goaldrop
   grid:
   - adapters/task_disc_large_n300_s0_with_gain025y

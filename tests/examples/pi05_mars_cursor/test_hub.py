@@ -20,7 +20,7 @@ def test_manifest_matches_configs():
 def test_manifest_covers_study_grid_and_seeds():
     folders = hub.manifest_folders()
     assert folders == hub.read_manifest()
-    assert {"policies/flow_goaldrop", "adapters/gain025y_free"} <= set(folders["study"])
+    assert {"policies/flow_goaldrop", "adapters/user_gain025y_expert_n100_s0"} <= set(folders["study"])
     assert {
         "policies/flow_goaldrop_ring_start",
         "adapters/user_rot60_expert_n100_s0_on_wall_gap",
@@ -89,7 +89,7 @@ def test_download_targets(tmp_path, monkeypatch):
 
 def test_download_fails_when_a_folder_is_missing(tmp_path, monkeypatch, capsys):
     folders = {f for group in hub.read_manifest().values() for f in group}
-    left_out = "adapters/gain025y_free"
+    left_out = "adapters/user_rot60_expert_n100_s0"
     assert left_out in folders
 
     def fake_snapshot_download(**kwargs):

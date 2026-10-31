@@ -1,17 +1,20 @@
 """Tune-then-test sweeps of the steering methods with a simulated agent, on the portal's mechanism.
 
-    python run_sweep.py --sweep gain                                   # configs/sweeps/gain.yaml
-    python run_sweep.py --sweep study_condition --tune-trials 50 --test-trials 50   # a quick look
-    python run_sweep.py --sweep task_space --resume                    # continue an interrupted sweep
+    python run_sweep.py --sweep study_tuning                           # configs/sweeps/study_tuning.yaml
+    python run_sweep.py --sweep study_tuning --tune-trials 50 --test-trials 50   # a quick look
+    python run_sweep.py --sweep grid --resume                          # continue an interrupted sweep
     python run_sweep.py --sweep grid --cells U1xT3 U2xT4 --out grid_part1   # some cells, in a process of their own
-    python run_sweep.py --sweep grid --merge grid_part1 grid_part2          # combine the parts into grid
-    python run_sweep.py --sweep grid --fixed-depths results/sim/sweeps/grid_s0/depths.yaml --out grid_again   # no tuning
+    python run_sweep.py --sweep grid --merge grid_part1 grid_part2 --out grid_s0   # combine the parts
+    python run_sweep.py --sweep grid --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_s0/settings.yaml --out grid_s1
 
 A sweep config (configs/sweeps/<name>.yaml) names the agent, the base arm, the
-methods (overrides of the arm), the depths to try (one list, or a list per
-mode: flow_control's tau counts chunk steps of 16, frs's n_reverse_steps
-Euler steps of flow_steps), the grid and the trial
-counts. The grid is a corruption family's levels x input noises, optionally x
+methods (overrides of the arm), the settings to tune per mode (`tune`: for
+flow_control tau (chunk steps of 16), lambda (Euler steps the command is written
+at) and ic_gain, for frs n_reverse_steps (Euler steps of flow_steps) and
+pinned_steps (chunk steps the reference steers); every combination of the
+listed values is a setting, the first knob the x axis of the tuning figure; a
+method may give its own `tune` in place of its mode's, and knobs left out keep
+the arm's values), the grid and the trial counts. The grid is a corruption family's levels x input noises, optionally x
 task axes (`grid.axes`: arm parameters such as targets, min_target_sep, reach or
 dwell_s, each with a list of values, or a mapping name -> value; every
 combination is a cell), or a USERS x TASKS grid (`grid.users`: named corruption
@@ -22,17 +25,16 @@ method's reversal_adapter may say `cell` in its user or task slot, resolved per
 cell to that cell's checkpoint, and a method's `model` or adapter slot may be
 given per user or per task, nested in either order, e.g. a policy retrained for
 each task with user modules calibrated on it). For every
-cell each method's depth (tau for flow_control, n_reverse_steps for frs) is
-tuned on the tuning trials, then every method is tested at its tuned depth on
-new trials (new layouts and noise); the focus method's lead over the others
-comes with a paired bootstrap 95% CI, since every method sees the same layouts.
-The showcase cell (the focus method's largest tuned lead) is chosen on the
-tuning trials only. Every trial runs through session.run_trials, exactly as a
-participant's. Cells whose layouts cannot be sampled (too many targets for the
-spacing) are skipped and listed.
+cell each method's setting is tuned on the tuning trials, then every method is
+tested at its tuned setting on new trials (new layouts and noise); the focus
+method's lead over the others comes with a paired bootstrap 95% CI, since every
+method sees the same layouts. The showcase cell (the focus method's largest
+tuned lead) is chosen on the tuning trials only. Every trial runs through
+session.run_trials, exactly as a participant's. Cells whose layouts cannot be
+sampled (too many targets for the spacing) are skipped and listed.
 
-Writes results/sim/sweeps/<name>/: tuning.json, test.json, depths.yaml (the
-tuned depths, to copy into arm configs), ranking.csv (every cell, best lead
+Writes results/sim/sweeps/<name>/: tuning.json, test.json, settings.yaml (the
+tuned settings, to copy into arm configs), ranking.csv (every cell, best lead
 first), log.txt (everything the run printed) and figs/ (a users x tasks grid:
 grid.png, the focus method's maps, and summary.png, every method on every
 cell). test.json keeps every test trial of a cell (`trials`: its
@@ -42,16 +44,19 @@ passes the obstacle on) and, with obstacles, summarizes the cell by that side
 continues where a run stopped. Every cell draws its layouts, noise and bootstrap
 from seeds of its own, so its results do not depend on which cells run with it:
 --cells runs a part of a sweep (several parts can run at once, each with its own
---out) and --merge combines the parts' outputs. --fixed-depths skips tuning and tests
-every method at the depths a depths.yaml gives (a cell per key, as a sweep writes it): the test trials
-are the same ones a tuned run would test at those depths, tuning.json is empty and depths.yaml is a copy
-of the input.
+--out) and --merge combines the parts' outputs. --fixed-settings skips tuning and
+tests every method at the settings a settings.yaml gives (a cell per key, as a
+sweep writes it): the test trials are the same ones a tuned run would test at
+those settings, tuning.json is empty and settings.yaml is a copy of the input.
+--module-seed k runs the sweep with the modules of training seed k.
 """
+
 
 import argparse
 import csv
 import itertools
 import json
+import re
 import shutil
 import time
 import zlib
@@ -84,26 +89,47 @@ FAMILY_LABEL = {"gain": "Vertical gain g", "rotation": "Rotation (deg)", "curl":
 COLORS = ["#8a8984", "#eb6834", "#1baf7a", "#2a78d6", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 METHOD_LABEL = {"teleop": "Teleop", "flow_control": "Flow control", "frs": "FRS", "mars_user": "MARS-U", "mars_task": "MARS-T",
                 "mars": "MARS", "retrained_mars_user": "Retrained policy + MARS-U", "mars_fixed": "MARS (F = M)"}
-SWEEP_KEYS = {"name", "agent", "arm", "methods", "depths", "grid", "trials", "focus", "against", "seed", "traces"}
-AXIS_KEYS = set(config.ARM_KEYS.values()) - {"mode", "tau", "lam", "n_reverse_steps"}  # what grid.axes may vary
+SWEEP_KEYS = {"name", "agent", "arm", "methods", "tune", "grid", "trials", "focus", "against", "seed", "traces"}
+AXIS_KEYS = set(config.ARM_KEYS.values()) - {"mode", "tau", "lambda", "ic_gain", "n_reverse_steps", "pinned_steps"}  # what grid.axes may vary
 GRID_KEYS = {"users", "tasks", "noises", "train"}           # a users x tasks grid
 FAMILY_GRID_KEYS = {"family", "levels", "noises", "axes"}   # a corruption family's levels x noises (x task axes)
 
 
-def load_sweep(path):
+def with_module_seed(value, seed):
+    """Every checkpoint name in a sweep's data at another training seed: `_n<demos>_s0` becomes `_n<demos>_s<seed>`."""
+    if isinstance(value, str):
+        return re.sub(r"(_n\d+)_s0(?=_|$)", rf"\g<1>_s{seed}", value)
+    if isinstance(value, dict):
+        return {k: with_module_seed(v, seed) for k, v in value.items()}
+    if isinstance(value, list):
+        return [with_module_seed(v, seed) for v in value]
+    return value
+
+
+def load_sweep(path, module_seed=None):
     path = Path(path)
     if not path.exists():
         path = config.CONFIG_DIR / "sweeps" / (path.name if path.suffix else path.name + ".yaml")
     data = yaml.safe_load(path.read_text())
+    if module_seed is not None:  # the same sweep with the modules of another training seed
+        data = with_module_seed(data, module_seed)
+        data["name"] = f"{data.get('name', path.stem)}_s{module_seed}"
     unknown = set(data) - SWEEP_KEYS
     if unknown:
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
-    depths = data.get("depths", list(range(1, 11)))
-    if isinstance(depths, dict):  # a list per mode (flow_control's tau counts chunk steps, the others Euler steps)
-        if set(depths) - set(DEPTH_MODES) or not all(isinstance(v, list) and v for v in depths.values()):
-            raise ValueError(f"{path}: depths must be a list, or a mapping of {DEPTH_MODES} to lists")
+    tune = data.get("tune", DEFAULT_TUNE)
+    for mode, knobs in tune.items():  # every combination of a mode's knob values is a setting
+        if mode not in TUNE_KNOBS or not isinstance(knobs, dict) or not knobs or set(knobs) - set(TUNE_KNOBS[mode]) \
+                or not all(isinstance(v, list) and v for v in knobs.values()):
+            raise ValueError(f"{path}: tune maps a mode to lists of its knobs' values, of {TUNE_KNOBS}; got {mode}: {knobs}")
+    for m, spec in data["methods"].items():  # a method's own knobs replace its mode's
+        own = spec.get("tune")
+        if own is not None and (spec.get("mode") not in TUNE_KNOBS or not isinstance(own, dict) or not own
+                                or set(own) - set(TUNE_KNOBS[spec["mode"]])
+                                or not all(isinstance(v, list) and v for v in own.values())):
+            raise ValueError(f"{path}: methods.{m}.tune maps its mode's knobs ({TUNE_KNOBS}) to value lists; got {own}")
     sweep = dict(name=data.get("name", path.stem), agent=data.get("agent", "expert"), arm=data.get("arm", "base.yaml"),
-                 methods=data["methods"], depths=depths,
+                 methods=data["methods"], tune=tune,
                  trials={"tune": 200, "test": 500, **data.get("trials", {})}, seed=data.get("seed", 100),
                  focus=data.get("focus"), against=data.get("against"), traces=data.get("traces"))
     grid = data.get("grid", {})
@@ -123,7 +149,7 @@ def load_sweep(path):
     axes = grid.get("axes") or {}
     bad = [k for k, v in axes.items() if k not in AXIS_KEYS or not isinstance(v, (list, dict))]
     if bad:
-        raise ValueError(f"{path}: grid.axes must map arm parameters (not the mode or depth) to lists of values, or to "
+        raise ValueError(f"{path}: grid.axes must map arm parameters (not the mode or a tuned knob) to lists of values, or to "
                          f"named values; check {bad}")
     # an axis is a list of values, or a mapping name -> value; cells carry the names, which make the cell keys
     values = {k: dict(v) for k, v in axes.items() if isinstance(v, dict)}
@@ -201,7 +227,7 @@ def method_arm(sweep, method, level, axes=None):
     grid = sweep["grid"]
     values = grid.get("axis_values", {})
     axes = {k: values[k][v] if k in values else v for k, v in (axes or {}).items()}
-    spec = {k: v for k, v in sweep["methods"][method].items() if k != "channel"}
+    spec = {k: v for k, v in sweep["methods"][method].items() if k not in ("channel", "tune")}
     if grid["family"] == "grid":
         cell = grid["cells"][level]
         limit = {} if cell["time_limit_s"] is None else {"time_limit_s": cell["time_limit_s"]}  # a task's own, if it sets one
@@ -218,35 +244,56 @@ def method_arm(sweep, method, level, axes=None):
     return config.load_arm(sweep["arm"], over)
 
 
-def with_depth(arm, depth):
+def with_setting(arm, setting):
+    """The arm at a tuned setting {knob: value} (`settings_for`; n_reverse_steps == flow_steps is the full reversal).
+    A bare number is a depth, as sweeps before `tune` recorded it: tau for flow_control, n_reverse_steps for frs."""
     arm = dict(arm)
-    if arm["mode"] == "flow_control":
-        arm["tau"] = depth
-    elif arm["mode"] == "frs":
-        arm["n_reverse_steps"] = None if depth == arm["flow_steps"] else depth
+    if not isinstance(setting, dict):
+        setting = {"tau" if arm["mode"] == "flow_control" else "n_reverse_steps": setting}
+    for knob, value in setting.items():
+        arm[knob] = None if knob == "n_reverse_steps" and value == arm["flow_steps"] else value
     return arm
 
 
-def has_depth(arm):
-    return arm["mode"] in DEPTH_MODES
+def is_tuned(arm):
+    return arm["mode"] in TUNE_KNOBS
 
 
-DEPTH_MODES = ("flow_control", "frs")
+TUNE_KNOBS = {"flow_control": ("tau", "lambda", "ic_gain"), "frs": ("n_reverse_steps", "pinned_steps")}
+DEFAULT_TUNE = {"flow_control": {"tau": [2, 4, 6, 8, 10, 12, 14, 16]}, "frs": {"n_reverse_steps": list(range(1, 11))}}
 
 
-def depths_for(sweep, mode):
-    """The depths a sweep tries for a mode: one list for every mode, or a mapping mode -> list (flow_control's
-    tau counts chunk steps of 16, the other depths Euler steps of flow_steps, so their ranges differ)."""
-    depths = sweep["depths"]
-    if isinstance(depths, dict):
-        if mode not in depths:
-            raise ValueError(f"{sweep['name']}: depths gives no list for mode {mode!r}")
-        return list(depths[mode])
-    return list(depths)
+def tuned_knobs(sweep, mode, method=None):
+    """The knobs a method tunes and their values: its own `tune` when it gives one, else its mode's."""
+    own = sweep["methods"][method].get("tune") if method is not None else None
+    if own:
+        return own
+    if mode not in sweep["tune"]:
+        raise ValueError(f"{sweep['name']}: tune gives no knobs for mode {mode!r}")
+    return sweep["tune"][mode]
+
+
+def settings_for(sweep, mode, method=None):
+    """Every setting a method tunes (or a mode's, without a method): each combination of its knobs' values, as
+    {knob: value}. Knobs left out keep the arm's values."""
+    knobs = tuned_knobs(sweep, mode, method)
+    return [dict(zip(knobs, values)) for values in itertools.product(*knobs.values())]
+
+
+def setting_key(setting):
+    """A setting's key in tuning.json and its label: "tau=12,lambda=2" ("None": an untuned method)."""
+    if isinstance(setting, dict):
+        return ",".join(f"{k}={v}" for k, v in setting.items())
+    return str(setting)
+
+
+def parse_setting(key):
+    """`setting_key` inverted."""
+    return {k: yaml.safe_load(v) for k, v in (item.split("=") for item in key.split(","))}
 
 
 def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed):
-    """One method at one depth over all noises of a level at once; per-noise records."""
+    """One method at one setting over all noises of a level at once; per-noise records."""
     n = len(layouts)
     off = sweep["methods"][method].get("channel") in ("off", False)  # YAML reads `off` as False
     channel = channel_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)
@@ -267,9 +314,9 @@ def pass_sides(layouts, target_radius):
     return out
 
 
-def best_depth(per_depth):
+def best_setting(per_setting):
     """Highest success, then the shortest median time."""
-    return max(per_depth, key=lambda d: (per_depth[d]["success"], -(per_depth[d]["time_s"] or 1e9)))
+    return max(per_setting, key=lambda d: (per_setting[d]["success"], -(per_setting[d]["time_s"] or 1e9)))
 
 
 # ---------------------------------------------------------------- cells
@@ -309,40 +356,40 @@ def cell_label(sweep, cell):
 # ---------------------------------------------------------------- figures
 
 
-def fig_depth_curves(sweep, tuning, out, groups):
-    """Success against depth on the tuning trials: a row per group, a column per noise."""
+def fig_tuning_curves(sweep, tuning, out, groups):
+    """Success against each mode's first knob on the tuning trials (the best over its other knobs at each value): a
+    row per group, a column per noise."""
     noises = sweep["grid"]["noises"]
     fig, axs = plt.subplots(len(groups), len(noises), figsize=(2.6 * len(noises), 2.2 * len(groups)),
-                            sharex=True, sharey=True, squeeze=False)
+                            sharey=True, squeeze=False)
     for r, (level, axes) in enumerate(groups):
-        shown = set()
         for c, noise in enumerate(noises):
             ax, cell = axs[r, c], tuning[cell_key(level, noise, axes)]
             for j, m in enumerate(sweep["methods"]):
                 color = COLORS[j % len(COLORS)]
                 if "None" in cell[m]:
                     ax.axhline(100 * cell[m]["None"]["success"], color=color, ls="--", lw=1.4)
-                else:
-                    depths = depths_for(sweep, method_arm(sweep, m, level, axes)["mode"])  # each mode's own list
-                    shown.update(depths)
-                    ax.plot(depths, [100 * cell[m][str(d)]["success"] for d in depths], color=color, lw=1.8)
-            depths = sorted(shown) or [0]
-            ax.set(ylim=(0, 102), xticks=[depths[0], depths[len(depths) // 2], depths[-1]])
+                    continue
+                knob, values = next(iter(tuned_knobs(sweep, method_arm(sweep, m, level, axes)["mode"], m).items()))
+                best = lambda v: max(t["success"] for k, t in cell[m].items() if parse_setting(k)[knob] == v)  # noqa: E731
+                xs = [i / max(1, len(values) - 1) for i in range(len(values))]  # each mode's knob on its own scale
+                ax.plot(xs, [100 * best(v) for v in values], color=color, lw=1.8)
+            ax.set(ylim=(0, 102), xticks=[0, 1], xticklabels=["lowest", "highest"])
             label = group_label(sweep, level, axes) if len(groups) > 1 else ""
             ax.set_title(", ".join(filter(None, [label, f"noise {noise}"])), fontsize=8, color=INK)
             if c == 0:
                 ax.set_ylabel("Success (%)")
             if r == len(groups) - 1:
-                ax.set_xlabel("depth (tau, lambda or n_reverse_steps)")
+                ax.set_xlabel(", ".join(f"{mode}: {next(iter(k))}" for mode, k in sweep["tune"].items()), fontsize=7)
     handles = [plt.Line2D([], [], color=COLORS[j % len(COLORS)], lw=1.8) for j in range(len(sweep["methods"]))]
     fig.legend(handles, list(sweep["methods"]), loc="lower center", ncol=min(5, len(sweep["methods"])),
                bbox_to_anchor=(0.5, -0.04 if len(groups) > 2 else -0.14), fontsize=8)
     where = f" at {group_label(sweep, *groups[0])}" if len(groups) == 1 and groups[0][1] else ""
-    fig.suptitle(f"{sweep['name']}: tuning trials{where}, success against depth (dashed: no depth)", color=INK, y=1.0)
+    fig.suptitle(f"{sweep['name']}: tuning trials{where}, success against each mode's first knob, the best over its "
+                 "others (dashed: untuned)", color=INK, y=1.0)
     fig.tight_layout()
-    fig.savefig(out / "depth_curves.png")
+    fig.savefig(out / "tuning_curves.png")
     plt.close(fig)
-
 
 def fig_test(sweep, test, out):
     levels, noises, focus = sweep["grid"]["levels"], sweep["grid"]["noises"], sweep["focus"]
@@ -370,7 +417,7 @@ def fig_test(sweep, test, out):
                     ax.text(c, r, fmt.format(v) + ("*" if ax is axes[1] and sig[r, c] else ""), ha="center",
                             va="center", fontsize=9, color="white" if dark else INK)
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.text(0.5, -0.02, f"Test trials, every method at its tuned depth. * {focus} beats each of "
+        fig.text(0.5, -0.02, f"Test trials, every method at its tuned setting. * {focus} beats each of "
                  f"{', '.join(sweep['against'])} (paired bootstrap 95% CI above 0).", ha="center", color=INK_2, fontsize=8)
         fig.tight_layout()
     else:  # lines over the varying axis
@@ -385,7 +432,7 @@ def fig_test(sweep, test, out):
             ax.plot(xs, y, "-o", color=COLORS[j % len(COLORS)], lw=2.2 if m == focus else 1.6, ms=4, label=m)
         ax.set(xlabel="Input noise" if len(noises) > 1 else FAMILY_LABEL[sweep["grid"]["family"]],
                ylabel="Test success (%)", ylim=(0, 105), xticks=xs)
-        ax.set_title(f"{sweep['name']}: every method at its tuned depth (95% CI)", color=INK, fontsize=9)
+        ax.set_title(f"{sweep['name']}: every method at its tuned setting (95% CI)", color=INK, fontsize=9)
         ax.legend(fontsize=8, loc="lower left")
     fig.savefig(out / "test.png", bbox_inches="tight")
     plt.close(fig)
@@ -418,7 +465,7 @@ def fig_axes(sweep, test, out):
         ax.set(xticks=range(len(values)), xticklabels=[_fmt(v) for v in values], xlabel=k)
         ax.tick_params(axis="x", labelsize=8)
     axs[0, 0].set_ylabel(f"{focus} lead over the best other (points)")
-    fig.suptitle(f"{sweep['name']}: test trials, tuned depths; one dot per cell, bar: mean. "
+    fig.suptitle(f"{sweep['name']}: test trials, tuned settings; one dot per cell, bar: mean. "
                  f"Blue: {focus} beats every other method (95% CI)", color=INK, fontsize=9, y=1.0)
     fig.tight_layout()
     fig.savefig(out / "axes.png", bbox_inches="tight")
@@ -465,7 +512,7 @@ def fig_grid(sweep, test, out):
                     if trained[i, j]:
                         ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, edgecolor=INK, lw=1.6))
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.text(0.5, -0.01, f"Test trials, every method at its tuned depth. Outlined: cells trained on. * {focus} beats each of "
+    fig.text(0.5, -0.01, f"Test trials, every method at its tuned setting. Outlined: cells trained on. * {focus} beats each of "
              f"{', '.join(sweep['against'])} (paired bootstrap 95% CI above 0).", ha="center", color=INK_2, fontsize=8)
     fig.tight_layout()
     fig.savefig(out / "grid.png", bbox_inches="tight")
@@ -552,7 +599,7 @@ def fig_summary(sweep, test, out):
     fig.text(0.04, 0.972, f"Test success on the {sweep['name']}: {len(users)} users × {len(tasks)} tasks",
              fontsize=13, weight="semibold", color=INK, va="top")
     fig.text(0.04, 0.938, f"Simulated {sweep['agent']} user at input noise {noise:g}, {sweep['trials']['test']} test "
-             f"trials per cell, every method at its depth tuned on {sweep['trials']['tune']} other trials. "
+             f"trials per cell, every method at its setting tuned on {sweep['trials']['tune']} other trials. "
              "Lines: 95% bootstrap CIs.", fontsize=9, color=INK_2, va="top")
 
     def frame(ax, value_axis):
@@ -673,9 +720,9 @@ def fig_showcase(sweep, test, key, out):
         s, (_, lo, hi) = cell["metrics"][m]["success"], cell["success_ci"][m]
         ax.bar(i, 100 * s, color=COLORS[i % len(COLORS)], width=0.6)
         ax.errorbar(i, 100 * s, yerr=[[100 * (s - lo)], [100 * (hi - s)]], color=INK, capsize=4, lw=1.2)
-        d = cell["depths"][m]
+        d = cell["settings"][m]
         if d is not None:
-            ax.text(i, 3, f"depth {d}", ha="center", color="white", fontsize=8)
+            ax.text(i, 3, setting_key(d), ha="center", color="white", fontsize=6, rotation=90)
     ax.set(xticks=range(len(sweep["methods"])), xticklabels=list(sweep["methods"]), ylim=(0, 100), ylabel="Success (%)")
     ax.tick_params(axis="x", labelsize=8)
     ax.set_title(f"Test trials at {cell_label(sweep, cell)} (95% CI)", color=INK, fontsize=8, wrap=True)
@@ -684,7 +731,7 @@ def fig_showcase(sweep, test, key, out):
 
 
 def fig_traces(sweep, test, agent, policies, adapters, device, out):
-    """Center-out reaches for every method at its tuned depth, at the trace levels."""
+    """Center-out reaches for every method at its tuned setting, at the trace levels."""
     tr = sweep["traces"]
     levels, noise = tr.get("levels", sweep["grid"]["levels"]), tr.get("noise", sweep["grid"]["noises"][0])
     methods = list(sweep["methods"])
@@ -693,8 +740,8 @@ def fig_traces(sweep, test, agent, policies, adapters, device, out):
         cell = test[cell_key(level, noise)]
         for r, m in enumerate(methods):
             arm = method_arm(sweep, m, level)
-            if cell["depths"][m] is not None:
-                arm = with_depth(arm, cell["depths"][m])
+            if cell["settings"][m] is not None:
+                arm = with_setting(arm, cell["settings"][m])
             layouts = center_out()
             recs = run_cell_batch(sweep, arm, m, layouts, [noise], agent, policies[arm["model"]], adapters, device,
                                   sweep["seed"] + 99)[str(noise)]
@@ -705,14 +752,14 @@ def fig_traces(sweep, test, agent, policies, adapters, device, out):
                 ax.plot(p[:, 0], p[:, 1], color=COLORS[r % len(COLORS)] if rec["outcome"] == "hit" else "#e34948",
                         lw=1.3, zorder=3)
             hits = sum(rec["outcome"] == "hit" for rec in recs)
-            d = cell["depths"][m]
-            ax.text(0.03, 0.03, (f"depth {d}, " if d is not None else "") + f"{hits}/{len(recs)} hit",
+            d = cell["settings"][m]
+            ax.text(0.03, 0.03, (f"{setting_key(d)}, " if d is not None else "") + f"{hits}/{len(recs)} hit",
                     transform=ax.transAxes, fontsize=8, color=INK_2)
             if r == 0:
                 ax.set_title(f"{FAMILY_LABEL[sweep['grid']['family']].split(' (')[0]} {level}", fontsize=9, color=INK)
             if c == 0:
                 ax.set_ylabel(m, color=INK)
-    fig.suptitle(f"{sweep['name']}: center-out reaches at input noise {noise}, tuned depths (red: missed)",
+    fig.suptitle(f"{sweep['name']}: center-out reaches at input noise {noise}, tuned settings (red: missed)",
                  color=INK, y=1.0, fontsize=10)
     fig.savefig(out / "traces.png", bbox_inches="tight")
     plt.close(fig)
@@ -728,13 +775,13 @@ def write_ranking(sweep, test, path):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["cell", "level", "noise", *cell_cols, *axes, *(f"{m}_success" for m in methods),
-                    *(f"{m}_collision" for m in methods), *(f"{m}_depth" for m in methods), "best_other", "lead", "lead_lo",
+                    *(f"{m}_collision" for m in methods), *(f"{m}_setting" for m in methods), "best_other", "lead", "lead_lo",
                     "lead_hi", "beats_all"])
         for k, t in sorted(test.items(), key=lambda kv: -kv[1]["lead_over_best"][1]):
             w.writerow([k, t["level"], t["noise"], *(t.get(c) for c in cell_cols), *(_fmt(t["axes"][a]) for a in axes),
                         *(round(100 * t["metrics"][m]["success"], 1) for m in methods),
                         *(round(100 * t["metrics"][m].get("collision", 0.0), 1) for m in methods),
-                        *(t["depths"][m] for m in methods),
+                        *(None if t["settings"][m] is None else setting_key(t["settings"][m]) for m in methods),
                         t["best_other"], *(round(100 * x, 1) for x in t["lead_over_best"]), t["beats_all"]])
 
 
@@ -743,7 +790,7 @@ def print_cells(sweep, rows):
     for k, t in rows:
         cols = "  ".join(f"{m} {100 * t['metrics'][m]['success']:5.1f}%"
                          + (f" c{100 * t['metrics'][m]['collision']:.0f}" if t["metrics"][m].get("collision") else "")
-                         + (f" ({t['depths'][m]})" if t["depths"][m] else "") for m in methods)
+                         + (f" ({setting_key(t['settings'][m])})" if t["settings"][m] is not None else "") for m in methods)
         lo = t["lead_over_best"]
         print(f"{k}: {cols}   lead {100 * lo[0]:+.1f} [{100 * lo[1]:+.1f}, {100 * lo[2]:+.1f}]"
               + ("  *" if t["beats_all"] else ""))
@@ -757,23 +804,21 @@ def main(argv=None):
     p.add_argument("--sweep", required=True, help="sweep config (bare names are looked up in configs/sweeps/)")
     p.add_argument("--tune-trials", type=int, help="override trials.tune")
     p.add_argument("--test-trials", type=int, help="override trials.test")
-    p.add_argument("--depths", type=int, nargs="+", help="override the depths")
     p.add_argument("--resume", action="store_true", help="keep the cells already in the output folder, run the rest")
     p.add_argument("--results", default=str(RESULTS))
     p.add_argument("--out", help="output folder name under results/sim/sweeps/ (default: the sweep name)")
     p.add_argument("--cells", nargs="+", help="run only these grid levels (e.g. U1xT3; a family's levels as written)")
     p.add_argument("--merge", nargs="+", help="output folders of parts of this sweep: combine them into --out, run nothing")
-    p.add_argument("--fixed-depths", help="a depths.yaml: skip tuning, test every method at the depths it gives per cell")
+    p.add_argument("--module-seed", type=int, help="the modules' training seed: _n<demos>_s0 -> _s<k> in every checkpoint")
+    p.add_argument("--fixed-settings", help="a settings.yaml: skip tuning, test every method at the settings it gives per cell")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)
 
-    sweep = load_sweep(args.sweep)
+    sweep = load_sweep(args.sweep, args.module_seed)
     if args.tune_trials:
         sweep["trials"]["tune"] = args.tune_trials
     if args.test_trials:
         sweep["trials"]["test"] = args.test_trials
-    if args.depths:
-        sweep["depths"] = args.depths
     out = Path(args.results) / "sim" / "sweeps" / (args.out or sweep["name"])
     (out / "figs").mkdir(parents=True, exist_ok=True)
     with logged(out / "log.txt", append=args.resume) as log:
@@ -807,18 +852,18 @@ def run(args, sweep, out):
                     seed=sweep["seed"], agent=sweep["agent"], device=device)
 
     fixed = None
-    if args.fixed_depths and not args.merge:  # every cell to run, with a depth for every method that has one
-        fixed = yaml.safe_load(Path(args.fixed_depths).read_text()) or {}
+    if args.fixed_settings and not args.merge:  # every cell to run, with a setting for every tuned method
+        fixed = yaml.safe_load(Path(args.fixed_settings).read_text()) or {}
         for level, axes in run:
             for s in noises:
                 k = cell_key(level, s, axes)
                 if k not in fixed or set(fixed[k]) != set(methods):
-                    raise ValueError(f"--fixed-depths {args.fixed_depths}: cell {k} must give a depth (or null) for "
+                    raise ValueError(f"--fixed-settings {args.fixed_settings}: cell {k} must give a setting (or null) for "
                                      f"every method {methods}, got {fixed.get(k)}")
                 for m in methods:
-                    if (fixed[k][m] is None) == has_depth(method_arm(sweep, m, level, axes)):
-                        raise ValueError(f"--fixed-depths {args.fixed_depths}: cell {k} gives {m} the depth "
-                                         f"{fixed[k][m]!r}, but {m} {'takes' if fixed[k][m] is None else 'has'} no depth")
+                    if (fixed[k][m] is None) == is_tuned(method_arm(sweep, m, level, axes)):
+                        raise ValueError(f"--fixed-settings {args.fixed_settings}: cell {k} gives {m} the setting "
+                                         f"{fixed[k][m]!r}, but {m} {'takes' if fixed[k][m] is None else 'has'} no setting")
 
     tuning, test, skipped = {}, {}, {}
     if args.merge:
@@ -838,27 +883,27 @@ def run(args, sweep, out):
         tuning = {k: v for k, v in json.loads((out / "tuning.json").read_text())["tuning"].items() if k in test}
         print(f"resuming: {len(test)} cells done, {len(skipped)} skipped", flush=True)
 
-    def tuned_depths(cell):
-        return {m: (None if "None" in cell[m] else int(best_depth(cell[m]))) for m in methods}
+    def tuned_settings(cell):
+        return {m: (None if "None" in cell[m] else parse_setting(best_setting(cell[m]))) for m in methods}
 
     def showcase():
         """The cell where the focus method's tuned lead is largest, on the tuning trials."""
         if not tuning:
             return None
-        tuned = lambda k, m: tuning[k][m][str(tuned_depths(tuning[k])[m])]["success"]
+        tuned = lambda k, m: tuning[k][m][setting_key(tuned_settings(tuning[k])[m])]["success"]
         return max(tuning, key=lambda k: (tuned(k, focus) - max(tuned(k, m) for m in against), -tuned(k, against[0])))
 
     def save():
-        depths = {k: tuned_depths(v) for k, v in tuning.items()}
+        settings = {k: tuned_settings(v) for k, v in tuning.items()}
         with open(out / "tuning.json", "w") as f:
-            json.dump(dict(args=run_args, tuning=tuning, depths=depths), f, indent=1)
-        if fixed is not None:  # the depths tested are the input's
-            if Path(args.fixed_depths).resolve() != (out / "depths.yaml").resolve():
-                shutil.copyfile(args.fixed_depths, out / "depths.yaml")
-        else:  # merged fixed-depth parts have no tuning: their cells keep the depths they were tested at
-            depths.update({k: v["depths"] for k, v in test.items() if k not in depths})
-            with open(out / "depths.yaml", "w") as f:
-                yaml.safe_dump(depths, f, sort_keys=False)
+            json.dump(dict(args=run_args, tuning=tuning, settings=settings), f, indent=1)
+        if fixed is not None:  # the settings tested are the input's
+            if Path(args.fixed_settings).resolve() != (out / "settings.yaml").resolve():
+                shutil.copyfile(args.fixed_settings, out / "settings.yaml")
+        else:  # merged fixed-setting parts have no tuning: their cells keep the settings they were tested at
+            settings.update({k: v["settings"] for k, v in test.items() if k not in settings})
+            with open(out / "settings.yaml", "w") as f:
+                yaml.safe_dump(settings, f, sort_keys=False)
         with open(out / "test.json", "w") as f:
             json.dump(dict(args=run_args, showcase=showcase(), skipped=skipped, test=test), f, indent=1)
 
@@ -881,30 +926,30 @@ def run(args, sweep, out):
             print(f"{g}/{len(run)} skipping {label}: {e}", flush=True)
             continue
 
-        # tuning: every method at every depth, all noises at once (none with --fixed-depths)
+        # tuning: every method at every setting, all noises at once (none with --fixed-settings)
         if fixed is not None:
-            depths = {s: dict(fixed[keys[s]]) for s in noises}
+            settings = {s: dict(fixed[keys[s]]) for s in noises}
         else:
             for k in keys.values():
                 tuning[k] = {m: {} for m in methods}
             for m in methods:
                 arm = method_arm(sweep, m, level, axes)
-                for d in (depths_for(sweep, arm["mode"]) if has_depth(arm) else [None]):
-                    per_noise = run_cell_batch(sweep, with_depth(arm, d) if d else arm, m, tune_layouts, noises, agent,
-                                               policies[arm["model"]], adapters, device, sweep["seed"] + 1)
+                for d in (settings_for(sweep, arm["mode"], m) if is_tuned(arm) else [None]):
+                    per_noise = run_cell_batch(sweep, arm if d is None else with_setting(arm, d), m, tune_layouts, noises,
+                                               agent, policies[arm["model"]], adapters, device, sweep["seed"] + 1)
                     for s, recs in per_noise.items():
-                        tuning[keys[float(s)]][m][str(d)] = summarize(recs)
-            depths = {s: tuned_depths(tuning[keys[s]]) for s in noises}
+                        tuning[keys[float(s)]][m][setting_key(d)] = summarize(recs)
+            settings = {s: tuned_settings(tuning[keys[s]]) for s in noises}
 
-        # test: every method at its tuned depth, on new layouts
+        # test: every method at its tuned setting, on new layouts
         hit, records = {s: {} for s in noises}, {s: {} for s in noises}
         for m in methods:
             arm = method_arm(sweep, m, level, axes)
-            by_depth = {}
+            by_setting = {}  # noises sharing a setting run together, keyed by its label
             for s in noises:
-                by_depth.setdefault(depths[s][m], []).append(s)
-            for d, ss in by_depth.items():
-                per_noise = run_cell_batch(sweep, with_depth(arm, d) if d else arm, m, test_layouts, ss, agent,
+                by_setting.setdefault(setting_key(settings[s][m]), (settings[s][m], []))[1].append(s)
+            for d, ss in by_setting.values():
+                per_noise = run_cell_batch(sweep, arm if d is None else with_setting(arm, d), m, test_layouts, ss, agent,
                                            policies[arm["model"]], adapters, device, sweep["seed"] + 11)
                 for s, recs in per_noise.items():
                     hit[float(s)][m] = np.array([r["outcome"] == "hit" for r in recs])
@@ -916,7 +961,7 @@ def run(args, sweep, out):
             lead = {m: bootstrap_mean(hit[s][focus].astype(float) - hit[s][m], boot) for m in methods if m != focus}
             best_other = max(against, key=lambda m: hit[s][m].mean())
             test[keys[s]] = dict(level=level, noise=s, axes=axes, user=cell.get("user"), task=cell.get("task"),
-                                 train_cell=cell.get("train"), depths=depths[s],
+                                 train_cell=cell.get("train"), settings=settings[s],
                                  metrics={m: summarize(records[s][m]) for m in methods},
                                  success_ci={m: bootstrap_mean(hit[s][m], boot) for m in methods},
                                  lead=lead, best_other=best_other, lead_over_best=lead[best_other],
@@ -938,12 +983,12 @@ def run(args, sweep, out):
     write_ranking(sweep, test, out / "ranking.csv")
     if grid["family"] == "grid":
         write_grid_summary(sweep, test, out / "grid_summary.md")
-    show = showcase()  # None without tuning (--fixed-depths, or merged fixed-depth parts): no depth curves, no showcase
+    show = showcase()  # None without tuning (--fixed-settings, or merged fixed-setting parts): no tuning curves, no showcase
     style()
     done = [(l, a) for l, a in groups if cell_key(l, noises[0], a) in tuning]
     if show is not None:
         few = done if len(done) <= 6 else [(test[show]["level"], test[show]["axes"])]
-        fig_depth_curves(sweep, tuning, out / "figs", [(test[show]["level"], test[show]["axes"])] if grid["axes"] else few)
+        fig_tuning_curves(sweep, tuning, out / "figs", [(test[show]["level"], test[show]["axes"])] if grid["axes"] else few)
     if grid["axes"]:
         fig_axes(sweep, test, out / "figs")
     elif grid["family"] == "grid":
@@ -956,7 +1001,7 @@ def run(args, sweep, out):
     if sweep["traces"]:
         fig_traces(sweep, test, agent, policies, adapters, device, out / "figs")
 
-    print(f"\n{sweep['name']}: test trials, tuned depths ({time.time() - tic:.0f}s). {focus} lead over the "
+    print(f"\n{sweep['name']}: test trials, tuned settings ({time.time() - tic:.0f}s). {focus} lead over the "
           f"best of {against}: points [95% CI]" + (f"; {len(skipped)} cells skipped" if skipped else ""))
     if grid["axes"] or grid["family"] == "grid":
         ranked = sorted(test.items(), key=lambda kv: -kv[1]["lead_over_best"][1])
@@ -964,7 +1009,7 @@ def run(args, sweep, out):
         print_cells(sweep, ranked[:15])
     else:
         print_cells(sweep, list(test.items()))
-    print(f"showcase (chosen on tuning trials): {show}; depths in {out / 'depths.yaml'}")
+    print(f"showcase (chosen on tuning trials): {show}; settings in {out / 'settings.yaml'}")
 
 
 if __name__ == "__main__":

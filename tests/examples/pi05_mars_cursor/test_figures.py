@@ -10,16 +10,13 @@ from cursor_sa.paths import RESULTS
 from figures import build_figures as bf
 
 
-def test_fig1_instance_is_finite_and_its_directions_are_angles():
-    inst = bf.fig1_instance("cpu", n_steps=6)
-    assert np.isfinite(inst["path"]).all() and len(inst["path"]) == 7
-    for k, v in inst["chunks"].items():
-        assert v.shape == (16, 2) and np.isfinite(v).all(), k
-        assert -1 <= inst["cosine"][k] <= 1 and -180 <= inst["direction"][k] <= 180
-    assert set(inst["latents"]) == {"frs_8", "mars_8", "frs_10", "mars_10"}
-    assert inst["depth_full"] == 10 and inst["depth_study"] == 8 and inst["execute"] == 2
-    assert len(inst["bearings"]) == 4 and inst["bearings"][inst["goal_index"]] == pytest.approx(0.0, abs=1e-6)
-    np.testing.assert_allclose(inst["served"], inst["stats"]["served"], atol=1e-3)
+def test_fig1_inputs_have_their_pictograms_and_reaches():
+    for _, name, kind in bf.FIG1_INPUTS:
+        assert (bf.ASSETS / f"{name}.svg").exists() and (bf.ASSETS / f"{name}.png").exists(), name
+        path = bf.served_path(kind)
+        assert path.ndim == 2 and path.shape[1] == 2 and np.isfinite(path).all(), kind
+        assert np.allclose(path[0], bf.START) or kind == "misjudge", kind   # misjudge's path starts at its turn
+        assert ((path >= 0) & (path <= [bf.TILE_W, bf.TILE_H])).all(), kind   # inside the tile
 
 
 def _trial(participant, run, arm, outcome, duration):
@@ -80,7 +77,7 @@ def test_fig1_builds_pdf_png_and_stats(tmp_path):
     bf.main(["--only", "fig1", "--out", str(tmp_path), "--device", "cpu"])
     assert (tmp_path / "fig1_method.pdf").exists() and (tmp_path / "fig1_method.png").exists()
     stats = json.loads((tmp_path / "stats.json").read_text())
-    assert set(stats) == {"fig1"} and stats["fig1"]["depth_shown"] == 10 and "chunk_cosine" in stats["fig1"]
+    assert set(stats) == {"fig1"} and stats["fig1"]["inputs"] == [label for label, _, _ in bf.FIG1_INPUTS]
 
 
 @pytest.mark.skipif(not any((RESULTS / f"p{i}").exists() for i in range(1, 10)), reason="no recorded study sessions")

@@ -61,17 +61,17 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
     x, t = torch.randn(3, model.horizon, 2), torch.full((3,), 0.4)
     with torch.no_grad():
         v = model(obs, x, t)
-        A, b = task(obs, x, t, v)
+        A, b = task(x, t, v, obs)
         expect_forward = torch.einsum("bsij,bsj->bsi", A, v) + b
         torch.testing.assert_close(adapter.adapt(obs, x, t, v, backward=False), expect_forward)
         torch.testing.assert_close(adapter.adapt(obs, x, t, v, backward=True), torch.einsum("ij,bsj->bsi", F, expect_forward))
         assert not torch.allclose(expect_forward, v)  # the perturbed task module does change the field
         # one Euler step through the adapted field, forward and backward
         v0 = model(obs, x, torch.zeros(3))
-        A0, b0 = task(obs, x, torch.zeros(3), v0)
+        A0, b0 = task(x, torch.zeros(3), v0, obs)
         torch.testing.assert_close(flow(model, obs, x, 0.0, 0.1, 1, adapter), x + 0.1 * (torch.einsum("bsij,bsj->bsi", A0, v0) + b0))
         v1 = model(obs, x, torch.ones(3))
-        A1, b1 = task(obs, x, torch.ones(3), v1)
+        A1, b1 = task(x, torch.ones(3), v1, obs)
         back = torch.einsum("ij,bsj->bsi", F, torch.einsum("bsij,bsj->bsi", A1, v1) + b1)
         torch.testing.assert_close(reverse_flow(model, obs, x, 1, 10, adapter), x - 0.1 * back)
     # a user-only adapter leaves the forward pass alone
@@ -80,7 +80,7 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
 
 
 def test_old_adapter_checkpoint_loads_as_a_user_only_adapter():
-    adapter = ReversalAdapter.load(adapter_path("gain025y_free"))
+    adapter = ReversalAdapter.load(adapter_path("learned_adapter/gain025y_free"))
     assert adapter.kind == "user" and adapter.task is None and isinstance(adapter.user, UserModule)
     model, obs = FlowPolicy().eval(), _obs()
     x = torch.randn(3, model.horizon, 2)
@@ -94,8 +94,8 @@ def test_old_adapter_checkpoint_loads_as_a_user_only_adapter():
 
 def test_adapter_specs_accept_single_and_composite_forms(tmp_path, monkeypatch):
     gain = {"corruption": {"scale": [1.0, 0.25]}}
-    single = config.load_arm("base.yaml", {"mode": "frs", "reversal_adapter": {"learned": "gain025y_free"}, **gain})
-    assert single["learned_adapter"] == "gain025y_free" and single["method"] == "mars" and config.adapter_names(single) == ["gain025y_free"]
+    single = config.load_arm("base.yaml", {"mode": "frs", "reversal_adapter": {"learned": "learned_adapter/gain025y_free"}, **gain})
+    assert single["learned_adapter"] == "learned_adapter/gain025y_free" and single["method"] == "mars" and config.adapter_names(single) == ["learned_adapter/gain025y_free"]
     fixed = config.load_arm("base.yaml", {"mode": "frs", "reversal_adapter": {"translation": "corruption"}, **gain})
     np.testing.assert_allclose(fixed["adapter_matrix"], np.diag([1.0, 0.25]))
     assert fixed["learned_adapter"] is None and fixed["method"] == "mars" and config.adapter_names(fixed) == []

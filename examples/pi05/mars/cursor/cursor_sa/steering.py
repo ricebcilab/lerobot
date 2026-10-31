@@ -19,7 +19,10 @@ and knobs so cursor and LIBERO results can be compared:
     frs           Flow Reversal Steering (Tang et al. 2026): the command's chunk
                   is integrated backward `n_reverse_steps` steps, then forward
                   again (LeRobot: shared_flow_reversal_steering); a partial
-                  reversal is this module's own variant; with a reversal adapter
+                  reversal is this module's own variant; `pinned_steps` steers
+                  only the reference's first chunk steps and hands the rest of the
+                  latent back to the policy (Tang et al., App. D; None = the whole
+                  chunk, what the study and the grid ran); with a reversal adapter
                   the backward pass follows the adapted field (MARS)
 
 The command's chunk moves at constant velocity in the commanded direction,
@@ -50,8 +53,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from lerobot.policies.pi05.steering import (AdaptedField, LearnedTaskModule, LearnedUserModule, ObstacleTaskModule,
-                                             apply_user_module, convert_cursor_module, integrate)
+from lerobot.policies.pi05.steering import (AdaptedField, LearnedTaskModule, LearnedUserModule, apply_user_module,
+                                             convert_cursor_module, integrate)
 from lerobot.policies.pi05.steering import steered_chunk as core_steered_chunk
 
 from .channel import DEADBAND, corrupt_chunk, is_active
@@ -156,8 +159,8 @@ class UserModule(LearnedUserModule):
 user_velocity = apply_user_module
 
 
-# A(x_t, t, v, obstacles) v + b(...): the core's obstacle-reading task module (two dims by default)
-TaskModule = ObstacleTaskModule
+# A(x_t, t, v, obstacles) v + b(...): the core's task module (two dims by default), bound to each observation
+TaskModule = LearnedTaskModule
 
 
 class ReversalAdapter(nn.Module):
@@ -199,14 +202,10 @@ class ReversalAdapter(nn.Module):
         kind = ckpt.get("kind", "user")
         if kind == "user":
             module = UserModule(**ckpt["config"])
-        else:
-            # no arch: a cursor task module, all obstacle-reading (the core's load_adapter_module defaults to
-            # "mlp", the first LIBERO files); convert_checkpoints.py writes the arch explicitly
-            arch = ckpt.get("arch", "obstacle")
-            archs = {"obstacle": TaskModule, "mlp": LearnedTaskModule}
-            if arch not in archs:
-                raise ValueError(f"unknown task module arch {arch!r}")
-            module = archs[arch](**ckpt["config"])
+        else:  # every cursor task module is the core's LearnedTaskModule (older files say arch "obstacle")
+            if ckpt.get("arch", "obstacle") != "obstacle":
+                raise ValueError(f"{path}: task module arch {ckpt['arch']!r}; only LearnedTaskModule is left")
+            module = TaskModule(**ckpt["config"])
         module.load_state_dict(ckpt["state_dict"])
         return cls(**{kind: module.to(device).eval()}).to(device).eval()
 
@@ -264,15 +263,16 @@ def action_gain(policy, dt=0.02, max_speed=MAX_SPEED):
 
 @torch.no_grad()
 def steered_chunk(policy, obs, command, mode, tau=5, n_reverse_steps=None, steps=10, dt=0.02,
-                  max_speed=MAX_SPEED, adapter=None, reference=None, ic_gain=1.0, lam=1):
+                  max_speed=MAX_SPEED, adapter=None, reference=None, ic_gain=1.0, lam=1, pinned_steps=None):
     """One action chunk [B, H, 2] in screen units per step, for commands [B, 2].
 
     The reference chunk the shared modes steer toward is the command held
     constant over the chunk, or `reference` [B, H, 2] (a deflection per step,
     e.g. the chunk an expert_chunk agent means) when given: flow_control writes
     it, scaled by `ic_gain`, into x_t (the core's `flow_control_chunk`); frs
-    converts it to action units (`to_action`) and reverses it (`frs_chunk`).
-    Rows whose command (or whole reference) is inside the deadband get the plain
+    converts it to action units (`to_action`) and reverses it (`frs_chunk`),
+    steering only its first `pinned_steps` chunk steps when given (Tang et
+    al.'s in-painting; None = the whole chunk). Rows whose command (or whole reference) is inside the deadband get the plain
     policy chunk, drawn from the same noise they would have had in mode "policy".
     The core's `steered_chunk` on this policy's field and observation.
     """
@@ -280,7 +280,7 @@ def steered_chunk(policy, obs, command, mode, tau=5, n_reverse_steps=None, steps
         _velocity(policy, obs), command, mode, horizon=policy.horizon,
         to_reference=lambda deflection: to_action(deflection, policy, dt, max_speed), tau=tau,
         n_reverse_steps=n_reverse_steps, steps=steps, adapter=_field(adapter, obs, command.device),
-        reference=reference, ic_gain=ic_gain, lam=lam, deadband=DEADBAND)
+        reference=reference, ic_gain=ic_gain, lam=lam, deadband=DEADBAND, pinned_steps=pinned_steps)
     return chunk * policy.action_scale
 
 
@@ -304,17 +304,18 @@ class SharedController:
     control step is shorter). At gain 1 the two are the same. `adapter` is the
     reversal adapter (see `as_adapter`), or None; its task module shapes every
     chunk, its user module the reversals of frs. `ic_gain` is flow_control's
-    scale of the command in the noise prior, `lam` the Euler steps it is written at.
+    scale of the command in the noise prior, `lam` the Euler steps it is written at,
+    `pinned_steps` the chunk steps frs's reference steers (None = all).
     """
 
     def __init__(self, policy, layouts, mode, tau=5, n_reverse_steps=None, steps=10, execute=8,
                  dt=0.02, max_speed=MAX_SPEED, speed_gain=1.0, adapter=None, device="cpu", gain_mode="step",
-                 ic_gain=1.0, lam=1):
+                 ic_gain=1.0, lam=1, pinned_steps=None):
         assert mode in MODES, mode
         assert speed_gain > 0, speed_gain
         assert gain_mode in GAIN_MODES, gain_mode
         self.gain, self.gain_mode, self.adapter = speed_gain, gain_mode, as_adapter(adapter, device)
-        self.ic_gain, self.lam = ic_gain, lam
+        self.ic_gain, self.lam, self.pinned_steps = ic_gain, lam, pinned_steps
         self.policy, self.mode, self.tau, self.n_reverse_steps = policy, mode, tau, n_reverse_steps
         self.steps, self.execute, self.dt, self.max_speed, self.device = steps, execute, dt, max_speed, device
         self.layouts = layouts
@@ -360,7 +361,8 @@ class SharedController:
                 ref = None if reference is None else _f32(reference, self.device)
                 self.chunk = steered_chunk(self.policy, self.observation(), _f32(command, self.device), self.mode,
                                            self.tau, self.n_reverse_steps, self.steps, self.dt, self.max_speed,
-                                           self.adapter, ref, ic_gain=self.ic_gain, lam=self.lam).cpu().numpy()
+                                           self.adapter, ref, ic_gain=self.ic_gain, lam=self.lam,
+                                           pinned_steps=self.pinned_steps).cpu().numpy()
                 self.chunks += 1
                 if self.mode != "policy":
                     self.steered_chunks += active_rows(command, reference)

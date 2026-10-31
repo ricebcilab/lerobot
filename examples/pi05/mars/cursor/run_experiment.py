@@ -4,7 +4,7 @@
     python run_experiment.py --protocol study.yaml --participant p1 --resume     # continue an interrupted visit
     python run_experiment.py --protocol study.yaml --participant sim             # the expert agent, headless
     python run_experiment.py --protocol study.yaml --participant sim --watch     # the expert, rendered
-    python run_experiment.py --arm flow_control_gain05y.yaml                        # free play, one arm
+    python run_experiment.py --arm study_mars.yaml                                  # free play, one arm
 
 A participant is p<N> (a person) or sim (the expert agent). Both run the same
 protocol through the same mechanism (cursor_sa/session.py) and write the same
@@ -35,7 +35,7 @@ from cursor_sa.session import Aborted, Run, arm_task, channel_for, load_checkpoi
 
 ARM_FLAGS = {  # free-play overrides of arm parameters
     "--model": ("model", str), "--flow-steps": ("flow_steps", int), "--execute": ("execute", int),
-    "--mode": ("mode", str), "--tau": ("tau", int), "--lambda": ("lam", int), "--ic-gain": ("ic_gain", float),
+    "--mode": ("mode", str), "--tau": ("tau", int), "--lambda": ("lambda", int), "--ic-gain": ("ic_gain", float),
     "--n-reverse-steps": ("n_reverse_steps", yaml.safe_load),
     "--speed-gain": ("speed_gain", float), "--gain-mode": ("gain_mode", str), "--input-noise": ("input_noise", float),
     "--corruption": ("corruption", yaml.safe_load), "--reversal-adapter": ("reversal_adapter", yaml.safe_load),
@@ -132,7 +132,7 @@ def print_summary(run_dir):
 
 
 def setting_text(arm):
-    depth = (f"tau {arm['tau']}/{config.CHUNK_STEPS}, gain {arm['ic_gain']:g}, lambda {arm['lam']}" if arm["mode"] == "flow_control" else
+    depth = (f"tau {arm['tau']}/{config.CHUNK_STEPS}, gain {arm['ic_gain']:g}, lambda {arm['lambda']}" if arm["mode"] == "flow_control" else
              f"n_reverse_steps {arm['n_reverse_steps'] or arm['flow_steps']}/{arm['flow_steps']}" if arm["mode"] == "frs"
              else "")
     names = arm["learned_adapter"]

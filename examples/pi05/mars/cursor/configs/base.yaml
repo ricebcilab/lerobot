@@ -15,10 +15,12 @@ control:
   mode: flow_control          # policy | teleop | flow_control | frs
   tau: 8                      # flow_control: chunk steps, of 16, the command is written into (Kao et al.'s default)
   ic_gain: 2.0                # flow_control: the command's scale in the noise prior (a full push writes ic_gain sigma); chosen
-                              #   once on the study condition (sweeps/flow_control_gain.yaml), as Kao et al. chose their gain
+                              #   once on the study condition (an ic_gain sweep, results/old/2026-10-30/), as Kao et al. chose their gain
   lambda: 1                   # flow_control: Euler steps at whose start the command is written: 1 = the initial condition
                               #   only (Kao et al.), 0 = nothing (the policy alone), > 1 = re-written as the flow proceeds
   n_reverse_steps: null       # frs: steps to reverse (null = all the way to noise); frs + reversal_adapter = mars
+  pinned_steps: null          # frs: chunk steps, of 16, the reference steers; the rest of the latent is handed back to the
+                              #   policy (Tang et al., App. D: 5 of 15); null = the whole chunk (the study and the grid)
   speed_gain: 0.5             # scales the cursor's speed in every mode (1 = the demos' speed)
   gain_mode: step             # how: step scales every executed step (the study); time plays each planned step over
                               #   1/gain control steps, the motion the policy was trained on (the obstacle grid)

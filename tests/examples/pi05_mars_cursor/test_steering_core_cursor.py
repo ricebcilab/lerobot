@@ -5,8 +5,8 @@ import torch
 from cursor_sa.policy import FlowPolicy
 
 from lerobot.policies.pi05.steering import (
+    LearnedTaskModule,
     LearnedUserModule,
-    ObstacleTaskModule,
     convert_cursor_module,
     integrate,
     load_adapter_module,
@@ -94,12 +94,12 @@ def test_cursor_task_module_converts_and_matches(tmp_path):
         "obstacle": obstacle,
     }
     converted = convert_cursor_module(ckpt)
-    assert converted["kind"] == "task" and converted["arch"] == "obstacle"
+    assert converted["kind"] == "task" and "arch" not in converted
     torch.save(converted, tmp_path / "task.pt")
     new, kind, meta = load_adapter_module(tmp_path / "task.pt")
-    assert isinstance(new, ObstacleTaskModule) and kind == "task" and meta["obstacle"] == obstacle
+    assert isinstance(new, LearnedTaskModule) and kind == "task" and meta["obstacle"] == obstacle
     obs = _obs()
     x, v, t = torch.randn(3, 16, 2), torch.randn(3, 16, 2), torch.rand(3)
     with torch.no_grad():
-        for a, b in zip(new(obs, x, t, v), old(obs, x, t, v), strict=True):
+        for a, b in zip(new(x, t, v, obs), old(obs, x, t, v), strict=True):
             torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)  # deeper net, more rounding

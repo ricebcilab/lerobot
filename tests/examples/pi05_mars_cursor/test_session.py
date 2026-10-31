@@ -148,7 +148,7 @@ def test_run_samples_layouts_from_the_arms_task(tmp_path):
 
 
 def test_run_trials_batched_matches_single(tmp_path):
-    arm = config.load_arm("frs_gain05y.yaml")
+    arm = config.load_arm("study_frs.yaml")
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     layouts, _ = make_layout_sets(7, 4, 0, (2, 4), TaskConfig())
     channel = InputChannel(arm["corruption_matrix"], 0.0)

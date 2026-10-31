@@ -1,7 +1,0 @@
-# MARS under the 90-degree rotation, at its tuned depth: the reversal
-# follows F @ v with F = the known corruption (the rotation).
-extends: condition_rot90.yaml
-control:
-  mode: frs
-  n_reverse_steps: 6
-  reversal_adapter: {translation: corruption}

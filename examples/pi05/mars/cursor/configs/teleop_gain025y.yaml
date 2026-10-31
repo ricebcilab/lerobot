@@ -1,4 +1,0 @@
-# Teleop under gain [1, 0.25] + noise 1.0.
-extends: condition_gain025y_noise1.yaml
-control:
-  mode: teleop

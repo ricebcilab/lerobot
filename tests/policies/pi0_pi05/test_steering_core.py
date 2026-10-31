@@ -22,8 +22,8 @@ import torch
 from lerobot.policies.pi05 import steering
 from lerobot.policies.pi05.steering import (
     AdaptedField,
+    LearnedTaskModule,
     LearnedUserModule,
-    ObstacleTaskModule,
     _adapt_velocity,
     apply_user_module,
     forward_flow,
@@ -149,9 +149,9 @@ def _obstacle_obs(b=3, k=2, seed=0):
     return {"pos": torch.rand(b, 2, generator=g), "obstacles": obstacles, "obstacle_mask": mask}
 
 
-def test_obstacle_task_module_starts_at_identity_and_round_trips(tmp_path):
+def test_task_module_starts_at_identity_and_round_trips(tmp_path):
     torch.manual_seed(0)
-    module = ObstacleTaskModule(horizon=16).eval()
+    module = LearnedTaskModule(horizon=16).eval()
     with_obs = _obstacle_obs()
     without = {"pos": with_obs["pos"]}
     empty = {
@@ -161,48 +161,63 @@ def test_obstacle_task_module_starts_at_identity_and_round_trips(tmp_path):
     }
     x, v, t = torch.randn(3, 16, 2), torch.randn(3, 16, 2), torch.rand(3)
     eye = torch.eye(2).expand(3, 16, 2, 2)
-    for obs in (with_obs, without, empty):
-        a, b = module(obs, x, t, v)
+    for obs in (with_obs, without, empty, None):  # obstacles, none, an empty set, no observation at all
+        a, b = module(x, t, v, obs)
         assert torch.equal(a, eye) and torch.equal(b, torch.zeros(3, 16, 2))
-        a, b = module.bind(obs)(x, 0.4, v)  # a float time too
+        a, b = (module if obs is None else module.bind(obs))(x, 0.4, v)  # a float time too
         assert torch.equal(a, eye) and torch.equal(b, torch.zeros(3, 16, 2))
     assert module.bind(with_obs).n_dims == 2
 
     with torch.no_grad():
         for p in module.parameters():
             p.add_(0.1 * torch.randn_like(p))
-    path = save_adapter_module(module, tmp_path / "task.pt", kind="task", arch="obstacle", meta={"note": "x"})
-    assert torch.load(path, weights_only=True)["arch"] == "obstacle"
+    path = save_adapter_module(module, tmp_path / "task.pt", kind="task", meta={"note": "x"})
+    assert "arch" not in torch.load(path, weights_only=True)
     loaded, kind, meta = load_adapter_module(path)
-    assert isinstance(loaded, ObstacleTaskModule) and kind == "task" and meta == {"note": "x"}
+    assert isinstance(loaded, LearnedTaskModule) and kind == "task" and meta == {"note": "x"}
     module.requires_grad_(False)  # both on nn.MultiheadAttention's same (fast, inference) path
-    for obs in (with_obs, without):
-        a0, b0 = module(obs, x, t, v)
-        a1, b1 = loaded(obs, x, t, v)
+    for obs in (with_obs, without, None):
+        a0, b0 = module(x, t, v, obs)
+        a1, b1 = loaded(x, t, v, obs)
         assert torch.equal(a0, a1) and torch.equal(b0, b1)
         assert not torch.equal(a0, eye)
     # through the adapted field, bound to the observation
     field = AdaptedField(None, task_module=loaded.bind(with_obs))
-    a, b = module(with_obs, x, 0.4, v)
+    a, b = module(x, 0.4, v, with_obs)
     torch.testing.assert_close(
         field.adapt(x, 0.4, v, backward=False), torch.einsum("bhij,bhj->bhi", a, v) + b
     )
 
 
-def test_old_task_checkpoints_without_arch_load_as_mlp(tmp_path):
-    from lerobot.policies.pi05.steering import LearnedTaskModule
-
-    module = LearnedTaskModule(4, n_dims=3)
+def test_task_checkpoints_of_the_obstacle_arch_load_and_mlp_ones_are_refused(tmp_path):
+    """Files from when there were two task modules: arch "obstacle" is LearnedTaskModule; "mlp", or an MLP's
+    weights with no arch (the first LIBERO files), is the removed MLP module, refused with a clear error."""
+    module = LearnedTaskModule(horizon=4, d=16, layers=1)
     path = save_adapter_module(module, tmp_path / "task.pt", kind="task")
     ckpt = torch.load(path, weights_only=True)
-    assert ckpt["arch"] == "mlp"
-    del ckpt["arch"]  # an old LIBERO file
-    torch.save(ckpt, path)
-    loaded, kind, _ = load_adapter_module(path)
-    assert isinstance(loaded, LearnedTaskModule) and kind == "task"
+    torch.save({**ckpt, "arch": "obstacle"}, path)
+    assert isinstance(load_adapter_module(path)[0], LearnedTaskModule)
+    for old in ({**ckpt, "arch": "mlp"}, {**ckpt, "state_dict": {"net.0.weight": torch.zeros(1)}}):
+        torch.save(old, path)
+        with pytest.raises(ValueError, match="MLP task module"):
+            load_adapter_module(path)
 
 
 # ---------------------------------------------------------------- the user module's rank knobs
+
+
+def _old_mlp(d_in, d, d_out):
+    """The core's ``_mlp`` as it was (Linear, SiLU, Linear, SiLU, Linear; the last zero-initialized), frozen."""
+    net = torch.nn.Sequential(
+        torch.nn.Linear(d_in, d),
+        torch.nn.SiLU(),
+        torch.nn.Linear(d, d),
+        torch.nn.SiLU(),
+        torch.nn.Linear(d, d_out),
+    )
+    torch.nn.init.zeros_(net[-1].weight)
+    torch.nn.init.zeros_(net[-1].bias)
+    return net
 
 
 class OldLearnedUserModule(torch.nn.Module):
@@ -212,7 +227,7 @@ class OldLearnedUserModule(torch.nn.Module):
         super().__init__()
         self.config = {"horizon": horizon, "n_dims": n_dims, "d": d, "tdim": tdim, "time_embedding": "mars"}
         self.horizon, self.n_dims, self.tdim = horizon, n_dims, tdim
-        self.net = steering._mlp(horizon * n_dims + tdim, d, horizon * n_dims * n_dims)
+        self.net = _old_mlp(horizon * n_dims + tdim, d, horizon * n_dims * n_dims)
 
     def forward(self, x_t, t):
         b, h, n = x_t.shape[0], self.horizon, self.n_dims
@@ -476,3 +491,36 @@ def test_convert_cursor_module_maps_the_ranks():
     ranked = steering.convert_cursor_module({"kind": "user", "config": cursor, "state_dict": sd})
     assert ranked["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "step_rank": 2}
     assert "cross_step_dims" not in ranked["config"]
+
+
+def test_frs_chunk_pinned_steps_in_paints_the_later_steps():
+    """frs_chunk with pinned_steps (Tang et al., App. D): the first steps are the steered chunk's, the later ones the
+    plain chunk's from the same noise (a field acting per step keeps the two apart); a pin covering the whole chunk,
+    or None, is the unpinned chunk, for a full and a partial reversal."""
+    g = torch.Generator().manual_seed(3)
+    w, c = torch.randn(2, 2, generator=g), torch.randn(2, generator=g)
+    field = lambda x, t: x @ w.T * (1.0 + t)[:, None, None] + c  # noqa: E731
+    z, ref = torch.randn(4, 16, 2, generator=g), torch.randn(4, 16, 2, generator=g)
+    steer = torch.ones(4, 1, 1, dtype=torch.bool)
+    plain = integrate(z, field, 0.0, 1 / 10, 10, batch_time=True)
+    for n in (None, 6):
+        whole = steering.frs_chunk(field, z, ref, steer, n, 10)
+        assert torch.equal(steering.frs_chunk(field, z, ref, steer, n, 10, pinned_steps=16), whole)
+        pinned = steering.frs_chunk(field, z, ref, steer, n, 10, pinned_steps=5)
+        torch.testing.assert_close(pinned[:, :5], whole[:, :5])
+        if n is None:  # the later steps start from z itself, so they are the plain chunk
+            torch.testing.assert_close(pinned[:, 5:], plain[:, 5:])
+        else:  # from the plain flow at t = 0.4, run on in the partial reversal's step
+            mid = integrate(z, field, 0.0, 1 / 10, 4, batch_time=True)
+            torch.testing.assert_close(
+                pinned[:, 5:], integrate(mid, field, 0.4, 0.6 / 4, 4, batch_time=True)[:, 5:]
+            )
+
+
+def test_steered_chunk_rejects_a_pin_outside_the_chunk():
+    field = lambda x, t: x  # noqa: E731
+    for bad in (0, 17):
+        with pytest.raises(ValueError, match="pinned_steps"):
+            steering.steered_chunk(
+                field, torch.ones(2, 2), "frs", horizon=16, to_reference=lambda d: d, pinned_steps=bad
+            )

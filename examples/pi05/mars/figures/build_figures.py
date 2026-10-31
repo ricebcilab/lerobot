@@ -13,8 +13,8 @@ Names: MARS is MARS with both modules (user and task), MARS-U the user module al
 Reads (results/ is git-ignored, so these are local):
     fig1  nothing (its reaches come from the channel's rule, its densities are made up)
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
-    fig3  the grid's five training seeds: results/sim/sweeps/grid_s0/test.json (seed 0, the grid of record) and
-          results/sim/sweeps/grid_s<k>/combined/test.json (seeds 1-4), and each seed's checkpoints for one cell's rollouts
+    fig3  the grid's five training seeds: results/sim/sweeps/grid_s<k>/test.json (seed 0 tuned, seeds 1-4 tested at
+          seed 0's settings), and each seed's checkpoints for one cell's rollouts
 
 Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
 """
@@ -48,7 +48,7 @@ from cursor_sa.env import Layouts, TaskConfig, sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import load_run
 from cursor_sa.session import arm_task, channel_for, load_checkpoints, run_trials
-from run_sweep import method_arm, with_depth
+from run_sweep import method_arm, with_setting
 
 FIG_DIR = Path(__file__).resolve().parent
 MARS = "MARS"
@@ -687,10 +687,10 @@ def build_fig2(out, results):
 # ================================================================ Figure 3: the simulated grid
 
 
-TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustration (as in reports/build_grid_report.py)
-SEED_RUNS = ("grid_s0",) + tuple(f"grid_s{k}/combined" for k in (1, 2, 3, 4))  # the grid's runs under results/sim/sweeps,
-# one per training seed: 0 is the grid of record; 1-4 retrain every module on its own draw of the demonstrations and rerun
-# the module methods on the grid's trials (the baselines train nothing, so every seed has the grid's)
+TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustration
+SEED_RUNS = tuple(f"grid_s{k}" for k in range(5))  # the grid's runs under results/sim/sweeps,
+# one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the demonstrations and
+# are tested at seed 0's settings on the grid's trials (the baselines train nothing, so every seed has the grid's)
 GRID_BASELINES = ("teleop", "flow_control", "frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
 ROLLOUT_CELL, ROLLOUT_TRIALS, ROLLOUT_SEED = "U1xT4", 40, 7  # the trials split evenly over the seeds' modules
@@ -770,9 +770,14 @@ def task_label(spec):
 
 
 def cell_arms(D, cell, methods, k=0):
-    """Run k's arms in a cell (its sweep names that seed's modules) at the depths that run tuned."""
+    """Run k's arms in a cell (its sweep names that seed's modules) at the settings that run tuned."""
     u, t = cell.split("x")
-    return {m: with_depth(method_arm(D["runs"][k]["args"]["sweep"], m, cell), D["cell"](u, t, k)["depths"][m]) for m in methods}
+    return {m: with_setting(method_arm(D["runs"][k]["args"]["sweep"], m, cell), tuned(D["cell"](u, t, k))[m]) for m in methods}
+
+
+def tuned(cell):
+    """A test cell's tuned settings per method (runs before the joint tuning recorded `depths`)."""
+    return cell.get("settings", cell.get("depths"))
 
 
 def lead_cell(ax, x, y, best, second, level, text, size=1.0):
@@ -922,10 +927,10 @@ def draw_grid_bars(fig, D, rect):
 
 def rollouts(D, device, cell=ROLLOUT_CELL, n=ROLLOUT_TRIALS, seed=ROLLOUT_SEED):
     """n trials of the two compared arms on ONE layout of a cell (the same scene), split evenly over the seeds: each
-    seed's modules at the depths its run tuned, with that seed's own channel-noise draws (the same for both arms). The
+    seed's modules at the settings its run tuned, with that seed's own channel-noise draws (the same for both arms). The
     paths show where each arm goes and where the retrained policy's trials end."""
     per = n // len(D["runs"])
-    records, depths, per_seed = {m: [] for m, _ in COMPARED}, {}, {m: {} for m, _ in COMPARED}
+    records, settings, per_seed = {m: [] for m, _ in COMPARED}, {}, {m: {} for m, _ in COMPARED}
     for k, s in enumerate(D["seeds"]):
         arms = cell_arms(D, cell, [m for m, _ in COMPARED], k)
         policies, adapters = load_checkpoints(arms, device)
@@ -937,8 +942,8 @@ def rollouts(D, device, cell=ROLLOUT_CELL, n=ROLLOUT_TRIALS, seed=ROLLOUT_SEED):
             recs = run_trials(arm, layouts, ExpertAgent(), channel, policies[arm["model"]], adapters, device)
             records[m] += recs
             per_seed[m][f"s{s}"] = {o: int(sum(r["outcome"] == o for r in recs)) for o in GRID_OUTCOMES}
-        depths[f"s{s}"] = {m: arm["n_reverse_steps"] for m, arm in arms.items()}
-    return dict(cell=cell, layouts=layouts, task=task, records=records, depths=depths, per_seed=per, outcomes_per_seed=per_seed)
+        settings[f"s{s}"] = {m: {k: arm[k] for k in ("n_reverse_steps", "pinned_steps")} for m, arm in arms.items()}
+    return dict(cell=cell, layouts=layouts, task=task, records=records, settings=settings, per_seed=per, outcomes_per_seed=per_seed)
 
 
 def draw_rollouts(fig, D, roll, rect):
@@ -1075,11 +1080,11 @@ def build_fig3(out, results, device):
         composed_over_retrained=over_retrained, composed_beats_retrained=beyond(over_retrained),
         t1_user_module_over_teleop={f"{u}x{tasks[0]}": r1(lead_ci(D, u, tasks[0], "mars", "teleop")) for u in users},
         outcome_shares_compared=shares,
-        tuned_depths={f"{u}x{t}": {f"s{s}": D["cell"](u, t, k)["depths"] for k, s in enumerate(seeds)} for u, t in cells},
+        tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},
         schematic="panel a's densities are made up",
         task_rollouts={t: {k: v[k] for k in ("cell", "trial", "hits", "of")} for t, v in shown.items()},
         rollouts=dict(cell=roll["cell"], trials=roll["per_seed"] * len(seeds), per_seed=roll["per_seed"], seed=ROLLOUT_SEED,
-                      depths=roll["depths"], outcomes=counts, outcomes_per_seed=roll["outcomes_per_seed"]),
+                      settings=roll["settings"], outcomes=counts, outcomes_per_seed=roll["outcomes_per_seed"]),
         t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the retrained arm is MARS (no task module, nothing to retrain), so only four arms are drawn",
         flow_control_note="Kao et al.'s flow control, ic_gain 2.0, tau tuned per cell"))
     return png

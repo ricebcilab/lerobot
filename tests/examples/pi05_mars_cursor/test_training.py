@@ -37,7 +37,7 @@ def test_task_loss_matches_the_formula():
     x = (1 - t[:, None, None]) * z + t[:, None, None] * a
     with torch.no_grad():
         v = policy(obs, x, t)
-        A, b = task(obs, x, t, v)
+        A, b = task(x, t, v, obs)
         fm = ((torch.einsum("bsij,bsj->bsi", A, v) + b - (a - z)) ** 2).mean()
         identity = ((A - torch.eye(2)) ** 2).mean() + (b ** 2).mean()
     torch.testing.assert_close(loss, fm + 0.01 * identity)
@@ -62,7 +62,7 @@ def test_field_loss_matches_the_formula_and_trains_only_the_free_module():
     t = torch.rand(B)
     x = (1 - t[:, None, None]) * latent + t[:, None, None] * bci
     with torch.no_grad():
-        A, b = task(free, x, t, policy(free, x, t))
+        A, b = task(x, t, policy(free, x, t), free)
         v = torch.einsum("bsij,bsj->bsi", A, policy(free, x, t)) + b
         err = ((torch.einsum("bsij,bsj->bsi", user(x, t), v) - (bci - latent)) ** 2).mean((1, 2))
     torch.testing.assert_close(loss, (err * weight).sum() / 3)

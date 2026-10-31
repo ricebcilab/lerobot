@@ -1,9 +1,9 @@
 """Train one module of the reversal adapter: a user module for a user's command corruption, or a task
 module for an obstacle task with a user's frozen user module in the loop.
 
-    python train/train_adapter.py --kind user --corruption '{scale: [1.0, 0.25]}' --name user_gain025y_expert
+    python train/train_adapter.py --kind user --corruption '{scale: [1.0, 0.25]}' --name grid_20000demos/user_gain025y_expert
     python train/train_adapter.py --kind task --obstacle '{kind: ring, around: goal, pass: left}' \
-        --user-module user_rot60_expert --corruption '{rotation_deg: 60}' --name task_ring_goal_with_rot60
+        --user-module grid_20000demos/user_rot60_expert --corruption '{rotation_deg: 60}' --name grid_20000demos/task_ring_goal_with_rot60
 
 USER MODULE: open-loop calibration with an expert that knows the goal. On demonstrations of the open-field
 task, the label is the demonstration's next chunk L, and the command is what the expert
@@ -28,8 +28,8 @@ with the reach the demonstrator would make from it (a straight min-jerk reach to
 and trains a fresh module on batches mixing the open-loop data with these (`--closed-loop-mix`). Several
 initial modules pool their trials (DAgger-style rounds: the first module's states and the recalibrated one's):
 
-    python train/train_adapter.py --kind user --corruption '{scale: [1.0, 0.25]}' --name user_gain025y_refit \
-        --closed-loop user_gain025y_expert --closed-loop-depth 6
+    python train/train_adapter.py --kind user --corruption '{scale: [1.0, 0.25]}' --name refit/user_gain025y_refit \
+        --closed-loop grid_20000demos/user_gain025y_expert --closed-loop-depth 6
 
 TASK MODULE: the policy is frozen and never saw obstacles. On demonstrations that go around the task's
 obstacles (along the expert's path), the task module T = (A, b) is trained by flow matching through the
@@ -51,7 +51,7 @@ command per step (the validation split keeps fresh draws).
 
 Saves checkpoints/adapters/<name>/{adapter.pt, train_log.json}; adapter.pt holds kind, config,
 state_dict, args and the obstacle spec (None for a user module). The trainer up to git commit 5c2167cd
-also trained user modules from the policy's own chunks (grid 1 and the study's gain025y_free) and task
+also trained user modules from the policy's own chunks (grid 1 and the study's learned_adapter/gain025y_free) and task
 modules without a user.
 """
 

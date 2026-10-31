@@ -1,7 +1,0 @@
-# The known corruption shared by the *_gain025y arms, matching the learned
-# MARS experiment (train/train_adapter.py): a vertical push arrives at a quarter of
-# its strength, plus Gaussian noise of std 1.0 on each axis while you push.
-extends: base.yaml
-control:
-  corruption: {scale: [1.0, 0.25]}
-  input_noise: 1.0

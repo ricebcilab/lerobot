@@ -1,4 +1,0 @@
-# Teleop under the gain corruption.
-extends: condition_gain05y.yaml
-control:
-  mode: teleop

@@ -26,8 +26,8 @@ from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowCon
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.pi05.steering import (
+    LearnedTaskModule,
     LearnedUserModule,
-    ObstacleTaskModule,
     load_adapter_module,
     steered_chunk,
 )
@@ -139,7 +139,7 @@ def _save_old_adapters(root: Path) -> None:
         {"config": old_user, "state_dict": user.state_dict(), "args": {}},
         root / "adapters" / "u" / "adapter.pt",
     )
-    task = ObstacleTaskModule(16, d=32, layers=1)
+    task = LearnedTaskModule(16, d=32, layers=1)
     old_task = {k: v for k, v in task.config.items() if k != "n_dims"}
     obstacle = {"kind": "disc", "radius": 0.08, "along": 0.5}
     (root / "adapters" / "group" / "t").mkdir(parents=True)
@@ -161,20 +161,19 @@ def test_converter_is_idempotent(tmp_path):
     _save_old_adapters(tmp_path)
     converter = _converter()
     first = converter.convert_tree(tmp_path)
-    assert first == {"policies": 2, "adapters": 2, "arch": {"obstacle": 1}, "skipped": 0}
+    assert first == {"policies": 2, "adapters": 2, "tasks": 1, "skipped": 0}
 
     _, kind, meta = load_adapter_module(tmp_path / "adapters" / "u" / "adapter.pt")
     assert kind == "user" and meta == {"args": {}, "obstacle": None}
     task, kind, meta = load_adapter_module(tmp_path / "adapters" / "group" / "t" / "adapter.pt")
-    assert kind == "task" and isinstance(task, ObstacleTaskModule) and meta["obstacle"]["kind"] == "disc"
-    assert torch.load(tmp_path / "adapters" / "group" / "t" / "adapter.pt")["arch"] == "obstacle"
+    assert kind == "task" and isinstance(task, LearnedTaskModule) and meta["obstacle"]["kind"] == "disc"
     assert (tmp_path / "adapters" / "u" / "adapter.pt.orig").is_file()
     assert json.loads((tmp_path / "policies" / "flow" / "config.json").read_text())["type"] == "cursor_flow"
 
     files = sorted(p for p in tmp_path.rglob("*") if p.is_file())
     stamps = {p: p.stat().st_mtime_ns for p in files}
     second = converter.convert_tree(tmp_path)
-    assert second == {"policies": 0, "adapters": 0, "arch": {}, "skipped": 0}
+    assert second == {"policies": 0, "adapters": 0, "tasks": 0, "skipped": 0}
     assert sorted(p for p in tmp_path.rglob("*") if p.is_file()) == files
     assert {p: p.stat().st_mtime_ns for p in files} == stamps
 
@@ -212,7 +211,7 @@ def test_adapter_conversion_survives_a_crash(tmp_path, monkeypatch):
     assert converter.convert_tree(tmp_path) == {
         "policies": 0,
         "adapters": 2,
-        "arch": {"obstacle": 1},
+        "tasks": 1,
         "skipped": 0,
     }
     for p, b in before.items():
@@ -263,7 +262,7 @@ def test_a_differing_backup_is_never_overwritten(tmp_path, capsys):
         p.write_bytes(b)
     before = _files(tmp_path)
     counts = _converter().convert_tree(tmp_path)
-    assert counts == {"policies": 0, "adapters": 1, "arch": {"obstacle": 1}, "skipped": 2}
+    assert counts == {"policies": 0, "adapters": 1, "tasks": 1, "skipped": 2}
     out = capsys.readouterr().out
     assert out.count("warning: skipping") == 2 and "policy.pt.orig exists and differs" in out
     after = _files(tmp_path)

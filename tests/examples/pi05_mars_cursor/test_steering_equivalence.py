@@ -310,14 +310,14 @@ def test_reversal_adapter_loads_cursor_converted_and_trainer_checkpoints(setup, 
         paths[name] = tmp_path / f"{name}.pt"
         torch.save(ckpt, paths[name])
     obs, x, v, t = setup["obs"], torch.randn(B, 16, 2), torch.randn(B, 16, 2), torch.rand(B)
-    expect = new_user(x, t) if kind == "user" else new_task(obs, x, t, v)
+    expect = new_user(x, t) if kind == "user" else new_task(x, t, v, obs)
     for name, path in paths.items():
         adapter = steering.ReversalAdapter.load(path)
         module = getattr(adapter, kind)
         assert adapter.kind == kind and isinstance(
             module, steering.UserModule if kind == "user" else steering.TaskModule
         ), name
-        got = module(x, t) if kind == "user" else module(obs, x, t, v)
+        got = module(x, t) if kind == "user" else module(x, t, v, obs)
         for a, b in zip(
             got if kind == "task" else (got,), expect if kind == "task" else (expect,), strict=True
         ):

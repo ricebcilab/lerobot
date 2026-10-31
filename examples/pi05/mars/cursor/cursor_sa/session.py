@@ -148,7 +148,8 @@ def run_trials(arm, layouts, agent, channel, policy, adapters, device, renderer=
     env = CursorEnv(layouts, task)
     ctl = SharedController(policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"],
                            arm["execute"], task.dt, speed_gain=arm["speed_gain"], adapter=arm_adapter(arm, adapters),
-                           device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"], lam=arm["lam"])
+                           device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"], lam=arm["lambda"],
+                           pinned_steps=arm["pinned_steps"])
     channel.reset(B)
     agent.reset(B, channel)
     ctx = dict(env=env, ctl=ctl, layouts=layouts, task=task, agent=agent, served=np.zeros((B, 2)), hud=hud or {})

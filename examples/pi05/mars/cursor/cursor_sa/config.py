@@ -24,9 +24,10 @@ ARM_KEYS = {  # dotted YAML key -> parameter name
     "policy.execute": "execute",
     "control.mode": "mode",
     "control.tau": "tau",
-    "control.lambda": "lam",
+    "control.lambda": "lambda",  # `lam` only where it is a keyword argument (lambda is a Python keyword)
     "control.ic_gain": "ic_gain",
     "control.n_reverse_steps": "n_reverse_steps",
+    "control.pinned_steps": "pinned_steps",
     "control.speed_gain": "speed_gain",
     "control.gain_mode": "gain_mode",
     "control.input_noise": "input_noise",
@@ -103,12 +104,14 @@ def validate_arm(params, where="arm"):
         raise ValueError(f"{where}: control.mode must be one of {MODES}, got {params['mode']!r}")
     if not 0 <= params["tau"] <= CHUNK_STEPS:  # Kao et al.: chunk steps whose initial condition carries the command
         raise ValueError(f"{where}: control.tau must be in [0, {CHUNK_STEPS}] chunk steps, got {params['tau']}")
-    if not 0 <= params["lam"] <= steps:  # the lab's variant: Euler steps the command's chunk is held for
-        raise ValueError(f"{where}: control.lambda must be in [0, {steps}] Euler steps, got {params['lam']}")
+    if not 0 <= params["lambda"] <= steps:  # the lab's variant: Euler steps the command's chunk is held for
+        raise ValueError(f"{where}: control.lambda must be in [0, {steps}] Euler steps, got {params['lambda']}")
     if params["ic_gain"] <= 0:
         raise ValueError(f"{where}: control.ic_gain must be positive")
     if params["n_reverse_steps"] is not None and not 1 <= params["n_reverse_steps"] <= steps:
         raise ValueError(f"{where}: control.n_reverse_steps must be null or in [1, {steps}]")
+    if params["pinned_steps"] is not None and not 1 <= params["pinned_steps"] <= CHUNK_STEPS:
+        raise ValueError(f"{where}: control.pinned_steps must be null or in [1, {CHUNK_STEPS}] chunk steps")
     if params["speed_gain"] <= 0:
         raise ValueError(f"{where}: control.speed_gain must be positive")
     if params["gain_mode"] not in GAIN_MODES:

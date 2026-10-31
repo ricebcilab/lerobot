@@ -100,7 +100,7 @@ def test_converted_adapters_load_as_before(tmp_path):
     assert convert_checkpoints.convert_tree(tmp_path) == {
         "policies": 0,
         "adapters": 2,
-        "arch": {"obstacle": 1},
+        "tasks": 1,
         "skipped": 0,
     }
     after = {n: ReversalAdapter.load(tmp_path / "adapters" / n / "adapter.pt") for n in ("u", "t")}
@@ -108,22 +108,19 @@ def test_converted_adapters_load_as_before(tmp_path):
     for n in ("u", "t"):
         assert after[n].kind == before[n].kind
         assert torch.equal(after[n].adapt(obs, x, t, v, True), before[n].adapt(obs, x, t, v, True))
-    assert torch.load(tmp_path / "adapters" / "t" / "adapter.pt")["arch"] == "obstacle"
+    assert "arch" not in torch.load(tmp_path / "adapters" / "t" / "adapter.pt")
 
 
-def test_unknown_task_arch_is_a_value_error(tmp_path):
+def test_a_task_arch_other_than_obstacle_is_a_value_error(tmp_path):
     task = TaskModule()
     torch.save(
-        {"kind": "task", "arch": "bogus", "config": task.config, "state_dict": task.state_dict(), "meta": {}},
+        {"kind": "task", "arch": "mlp", "config": task.config, "state_dict": task.state_dict(), "meta": {}},
         tmp_path / "adapter.pt",
     )
-    with pytest.raises(ValueError, match="unknown task module arch 'bogus'"):
+    with pytest.raises(ValueError, match="arch 'mlp'"):
         ReversalAdapter.load(tmp_path / "adapter.pt")
-    with pytest.raises(ValueError, match="unknown task module arch 'bogus'"):
+    with pytest.raises(ValueError, match="arch 'mlp'"):
         load_adapter_module(tmp_path / "adapter.pt")
-    with pytest.raises(ValueError, match="unknown task module arch 'bogus'"):
-        convert_checkpoints.task_arch({"arch": "bogus", "config": {}})
-    assert convert_checkpoints.task_arch({"config": {"horizon": 16, "d": 64, "tdim": 16}}) == "mlp"
 
 
 def test_policy_paths(tmp_path, monkeypatch):

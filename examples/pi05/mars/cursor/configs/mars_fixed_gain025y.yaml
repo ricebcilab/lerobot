@@ -1,6 +1,0 @@
-# MARS with the fixed adapter F = M under gain [1, 0.25] + noise 1.0, full reversal.
-extends: condition_gain025y_noise1.yaml
-control:
-  mode: frs
-  n_reverse_steps: null
-  reversal_adapter: {translation: corruption}

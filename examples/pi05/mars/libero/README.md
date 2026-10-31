@@ -140,9 +140,14 @@ shared-autonomy modes differ in where your command enters that schedule.
   `t = n/10` and denoised back in `n` steps, so most of what is executed is the
   reference itself (about 85% of the command at `n = 1`). Only what you command
   survives the reversal: the rotation and gripper dims, the padding dims and
-  every step beyond the executed prefix are delegated to the policy — fresh
-  noise for a full reversal, as in Tang et al., App. D, and the unsteered flow's
-  state at `t = n/10` for a partial one.
+  every step beyond `pinned_steps` (default: the executed prefix) are delegated
+  to the policy — fresh noise for a full reversal, the unsteered flow's state at
+  `t = n/10` for a partial one. This is Tang et al.'s noise-space in-painting
+  (App. D.1), but the paper pins fewer steps than it executes: a 5-step
+  reference (`action_repeats`) in a 15-step chunk, 10 of them executed, so the
+  policy fills in half of what runs. Our default pins every executed step (the
+  wrapper's `pinned_steps`, not yet a setting here; half of `n_action_steps`
+  would be the paper's ratio).
   A steered chunk costs `10 + n` velocity evaluations against 10 for FC or an
   unsteered chunk. After each rollout the REPL prints how many chunks were
   steered and how far the executed translation landed from the reference (in
@@ -625,8 +630,8 @@ are the module as it was, and a fresh module is the identity under every setting
   step's matrix is `I + Σ_k c_{s,k} B_k` over `r` 7×7 matrices shared by the
   chunk, the coefficients per step (`r = 49` spans every matrix).
 - `--cross-step-rank q` (default 0: none): a rank-`q` coupling between the
-  chunk's steps on top of the per-step matrices, `ṽ_s = A_s v_s + U_s Σ_s′ V_s′ᵀ
-  v_s′`, `U` zero-initialized. Its head on the module's hidden layer has
+  chunk's steps on top of the per-step matrices,
+  `ṽ_s = A_s v_s + U_s Σ_s′ V_s′ᵀ v_s′`, `U` zero-initialized. Its head on the module's hidden layer has
   `2 · H · n_c · q` outputs (`n_c` the coupled dims): at pi0.5's `H = 50` with all
   7 dims, **700 · q** outputs, i.e. 700 · q · (256 + 1) weights at the default
   width (180 k at q = 1).

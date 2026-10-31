@@ -1,5 +1,0 @@
-# Plain FRS (no adapter) under gain [1, 0.25] + noise 1.0, full reversal.
-extends: condition_gain025y_noise1.yaml
-control:
-  mode: frs
-  n_reverse_steps: null

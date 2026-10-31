@@ -1,4 +1,0 @@
-# Teleop under the 90-degree rotation.
-extends: condition_rot90.yaml
-control:
-  mode: teleop

@@ -38,11 +38,10 @@ def outcome_of(env, b):
 
 def arm_fields(arm):
     """The settings of an arm that every trial record repeats."""
-    keys = ("mode", "tau", "ic_gain", "n_reverse_steps", "reversal_adapter", "speed_gain", "gain_mode", "flow_steps", "execute",
-            "corruption", "input_noise", "target_radius", "min_target_sep", "reach", "dwell_s", "time_limit_s",
-            "obstacle", "velocity_tau", "curl", "model")
-    out = {k: arm[k] for k in keys}
-    out["lambda"] = arm["lam"]  # flow control's written Euler steps (the study's records predate the knob)
+    keys = ("mode", "tau", "lambda", "ic_gain", "n_reverse_steps", "pinned_steps", "reversal_adapter", "speed_gain",
+            "gain_mode", "flow_steps", "execute", "corruption", "input_noise", "target_radius", "min_target_sep", "reach",
+            "dwell_s", "time_limit_s", "obstacle", "velocity_tau", "curl", "model")
+    out = {k: arm[k] for k in keys}  # the study's records predate lambda and pinned_steps
     out["targets_range"] = list(arm["targets"])
     out["method"] = arm["method"]
     out["corruption_matrix"] = rounded(arm["corruption_matrix"])

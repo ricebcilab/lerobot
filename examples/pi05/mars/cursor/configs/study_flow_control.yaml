@@ -1,12 +1,10 @@
-# Study arm: shared flow control as the recorded sessions ran it (the lab's LeRobot implementation at its tuned
-# depth): the command, in the policy's action units, written into every chunk step of the initial condition.
-# In the knobs of `flow_control` that is tau 16, lambda 1 and ic_gain = action_gain(flow_goaldrop), 2.0843: Kao et
-# al.'s method with the whole chunk written and the command unscaled (the gain is stored to full precision so the
-# chunks match the recorded mechanism to rounding). The sessions' records, written before the
-# knobs were unified, say `tau: 1` for it (the variant's own depth) and carry no lambda or ic_gain.
+# Study arm: shared flow control as Kao et al. define it (the command written into the initial condition only, lambda
+# 1), the command in the policy's action units (ic_gain = action_gain(flow_goaldrop), 2.0843, stored to full
+# precision), at the tau sweeps/study_tuning.yaml tuned (73.8% of 500 test trials). The recorded sessions ran tau 16,
+# lambda 1 (their records say `tau: 1`, the lab variant's own depth, and carry no lambda or ic_gain).
 extends: condition_study.yaml
 control:
   mode: flow_control
-  tau: 16
-  ic_gain: 2.084264602519949
+  tau: 14
   lambda: 1
+  ic_gain: 2.084264602519949
