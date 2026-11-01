@@ -23,7 +23,10 @@ MODES = [
     ("flow_control", {"lam": 1}),
     ("flow_control", {"lam": 3}),
     ("frs", {"n_reverse_steps": None}),
-    ("frs", {"n_reverse_steps": 4}),
+    # a partial reversal: the original cursor ran its forward pass in N - n steps, the shared core (the robot's) in
+    # n steps of 1/N; the two coincide at n = N / 2, the depth checked here (tests/policies/pi0_pi05/
+    # test_steering_shared.py checks every depth against the robot's wrapper)
+    ("frs", {"n_reverse_steps": 5}),
 ]
 ADAPTERS = ("none", "per_trial_F", "user", "task", "user_task")
 

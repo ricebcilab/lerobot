@@ -1,5 +1,5 @@
 """The compositional adapter's grid: ring obstacles and asymmetric scenes (the side to pass is part of
-the scene), the pure-pursuit expert, the curl user on the command channel, and the grid's sweeps (the
+the scene), the pure-pursuit expert, the curl user on the readout, and the grid's sweeps (the
 trainers: test_training.py)."""
 
 import numpy as np
@@ -8,11 +8,11 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.channel import InputChannel, corruption_spec, curl_commands, serve_command
+from cursor_sa.readout import Readout, corruption_spec, curl_commands, serve_command
 from cursor_sa.demos import make_demos, plan_reach, replay
 from cursor_sa.env import (TaskConfig, curl_steady_state, obstacle_count, obstacle_spec, place_obstacles, plan_route,
                            route_side, sample_layouts)
-from cursor_sa.session import arm_task, channel_for, load_checkpoints, run_trials
+from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 from run_sweep import load_sweep, method_arm
 
 STUDY = dict(min_reach=0.35, max_reach=0.5)
@@ -87,7 +87,7 @@ def test_pursuit_expert_solves_every_grid_task_without_touching_anything():
     for spec in (DISC, WALL, RING_GOAL, RING_START):
         arm["obstacle"] = obstacle_spec(spec)
         layouts = sample_layouts(np.random.default_rng(4), 40, 4, arm_task(arm))
-        recs = run_trials(arm, layouts, ExpertAgent(), InputChannel(None, 0.0), policies[arm["model"]], adapters, "cpu")
+        recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
         assert [r["outcome"] for r in recs].count("hit") == 40, spec
         if spec is DISC:  # it passes the disc on the side its first route takes, away from the offset
             for r, b in zip(recs, range(40)):
@@ -117,25 +117,25 @@ def test_demos_follow_the_experts_route_and_plain_reaches_are_unchanged():
     np.testing.assert_allclose(actions[0, :len(reach) - 1], np.diff(reach, axis=0))
 
 
-def test_curl_channel_turns_and_slows_the_command_and_resets_per_batch():
+def test_curl_readout_turns_and_slows_the_command_and_resets_per_batch():
     matrix, curl = corruption_spec({"curl": 20, "tau": 0.1})
     assert matrix is None and curl == {"curl": 20.0, "tau": 0.1}
     assert corruption_spec({"scale": [1.0, 0.25]})[1] is None
     with pytest.raises(ValueError, match="control.corruption"):
         corruption_spec({"curl": 20})
-    channel = InputChannel(None, 0.0, curl=curl)
-    channel.reset(2)
+    readout = Readout(None, 0.0, curl=curl)
+    readout.reset(2)
     raw = np.array([[1.0, 0.0], [0.0, -0.5]])
     for _ in range(200):
-        served = channel(raw)
+        served = readout(raw)
     np.testing.assert_allclose(served, raw @ curl_steady_state(0.1, 20).T, atol=1e-9)   # turned 63 degrees clockwise, slowed
-    channel.reset(2)
-    first = channel(raw)
+    readout.reset(2)
+    first = readout(raw)
     assert np.linalg.norm(first, axis=1).max() < 0.25                                    # from rest it builds up
-    np.testing.assert_allclose(channel(np.zeros((2, 2))), np.zeros((2, 2)))              # idle stays idle
+    np.testing.assert_allclose(readout(np.zeros((2, 2))), np.zeros((2, 2)))              # idle stays idle
     # the training twin serves the same commands step by step
     pushes = np.random.default_rng(0).uniform(-1, 1, (3, 30, 2))
-    live = InputChannel(None, 0.0, curl=curl)
+    live = Readout(None, 0.0, curl=curl)
     live.reset(3)
     stepped = np.stack([live(pushes[:, k]) for k in range(30)], 1)
     np.testing.assert_allclose(curl_commands(pushes, curl), stepped, atol=1e-12)
@@ -149,7 +149,7 @@ def test_curl_channel_turns_and_slows_the_command_and_resets_per_batch():
         config.load_arm("frs.yaml", {"corruption": {"curl": 20, "tau": 0.1}, "reversal_adapter": {"translation": "corruption"}})
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     layouts = sample_layouts(np.random.default_rng(1), 6, 4, TaskConfig(**STUDY))
-    recs = run_trials(arm, layouts, ExpertAgent(), channel_for(arm, np.random.default_rng(0)), policies[arm["model"]],
+    recs = run_trials(arm, layouts, ExpertAgent(), readout_for(arm, np.random.default_rng(0)), policies[arm["model"]],
                       adapters, "cpu")
     served = np.array(recs[0]["served_commands"])
     raw = np.array(recs[0]["raw_commands"])

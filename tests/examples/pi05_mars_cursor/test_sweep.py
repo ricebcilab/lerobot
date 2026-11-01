@@ -8,7 +8,7 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertChunkAgent
-from cursor_sa.channel import InputChannel
+from cursor_sa.readout import Readout
 from cursor_sa.env import TaskConfig, center_out, curl_steady_state, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
@@ -46,11 +46,11 @@ def test_expert_chunk_agent_plans_the_goal_given_chunk_and_oracle_hits():
     policy = policies[arm["model"]]
     layouts = sample_layouts(np.random.default_rng(3), 6, (2, 4), TaskConfig())
     agent = ExpertChunkAgent()
-    recs = run_trials(arm, layouts, agent, InputChannel(None, 0.0), policy, adapters, "cpu")  # the oracle
+    recs = run_trials(arm, layouts, agent, Readout(None, 0.0), policy, adapters, "cpu")  # the oracle
     assert all(r["outcome"] == "hit" for r in recs)
     assert all(np.isfinite(r["raw_commands"]).all() and abs(np.array(r["raw_commands"])).max() < 4 for r in recs)
     frs = config.load_arm("frs.yaml")
-    recs = run_trials(frs, layouts, agent, InputChannel(None, 0.0), policy, adapters, "cpu")
+    recs = run_trials(frs, layouts, agent, Readout(None, 0.0), policy, adapters, "cpu")
     assert all(r["outcome"] in ("hit", "wrong_target", "timeout") for r in recs)
     assert all(r["steered_chunks"] > 0 for r in recs)
 
@@ -239,14 +239,14 @@ def test_tiny_sweep_with_task_axes_skips_impossible_cells_ranks_and_resumes(tmp_
     assert set(again["test"]) == keys and again["test"][done]["metrics"]["teleop"]["success"] == 0.123
 
 
-def test_channel_broadcasts_per_trial_parameters_over_chunks():
-    from cursor_sa.channel import matrix_spec
+def test_readout_broadcasts_per_trial_parameters_over_chunks():
+    from cursor_sa.readout import matrix_spec
     ms = np.stack([matrix_spec({"scale": [1.0, 0.5]}), matrix_spec({"rotation_deg": 90})])
     chunk = np.tile([[0.4, 0.8]], (2, 16, 1))
-    out = InputChannel(ms, np.array([0.0, 0.0]))(chunk)
+    out = Readout(ms, np.array([0.0, 0.0]))(chunk)
     np.testing.assert_allclose(out[0], np.tile([[0.4, 0.4]], (16, 1)))
     np.testing.assert_allclose(out[1], np.tile([[-0.8, 0.4]], (16, 1)), atol=1e-12)
-    noisy = InputChannel(None, np.array([0.0, 0.2]), np.random.default_rng(0))(np.tile([[0.0, 0.5]], (2, 16, 1)))
+    noisy = Readout(None, np.array([0.0, 0.2]), np.random.default_rng(0))(np.tile([[0.0, 0.5]], (2, 16, 1)))
     assert np.ptp(noisy[0], axis=0).max() == 0 and 0.1 < noisy[1, :, 0].std() < 0.35
 
 
@@ -259,7 +259,7 @@ def test_expert_chunk_under_gain_by_time_holds_each_planned_step():
     layouts = sample_layouts(np.random.default_rng(3), 2, (2, 4), TaskConfig())
     ctl = SharedController(policies[arm["model"]], layouts, "teleop", execute=2, speed_gain=0.5, gain_mode="time")
     agent = ExpertChunkAgent()
-    agent.reset(2, InputChannel(None, 0.0))
+    agent.reset(2, Readout(None, 0.0))
     out = []
     for _ in range(5):
         raw, served, ref = agent.step(ctl.pos, layouts, ctl)
@@ -273,3 +273,22 @@ def test_expert_chunk_under_gain_by_time_holds_each_planned_step():
     np.testing.assert_allclose(moves[0], 0.5 * raws[0] * ctl.max_speed * ctl.dt)
     np.testing.assert_allclose(ctl.hist[:, -2], raws[0] * ctl.max_speed * ctl.dt, rtol=1e-6)
     np.testing.assert_allclose(ctl.hist[:, -1], raws[2] * ctl.max_speed * ctl.dt, rtol=1e-6)
+
+
+def test_the_torch_twins_follow_the_shared_readout():
+    """The cursor's torch versions of the readout (training) give the shared numpy rule's numbers for the same draws."""
+    import torch
+    from cursor_sa.readout import corrupt_chunk, serve_command
+
+    from lerobot.teleoperators import readout
+
+    g = np.random.default_rng(5)
+    raw = g.uniform(-1, 1, (6, 2))
+    raw[1] = 0.02  # idle
+    m = np.array([[1.0, 0.0], [0.0, 0.25]])
+    core, sigma, noise = readout.corrupt(raw, m), g.uniform(0, 2, 6), g.normal(size=(6, 2))
+    served = serve_command(torch.tensor(core), torch.tensor(raw), torch.tensor(sigma), torch.tensor(noise))
+    np.testing.assert_allclose(served.numpy(), readout.add_noise(core, raw, sigma, noise), atol=1e-12)
+    chunk = torch.tensor(g.uniform(-1, 1, (6, 4, 2)))
+    np.testing.assert_allclose(corrupt_chunk(chunk, torch.tensor(m), torch.zeros(6)).numpy(), readout.corrupt(chunk.numpy(), m),
+                               atol=1e-12)

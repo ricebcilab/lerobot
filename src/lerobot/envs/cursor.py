@@ -42,6 +42,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from lerobot.teleoperators import readout
+
 OBSTACLE_KINDS = ("disc", "wall", "ring")
 TARGET_CLEARANCE, START_CLEARANCE = 0.01, 0.03  # an obstacle keeps this far from a target's edge / the start
 LANE = 0.1  # a disc leaves a lane this wide between itself and the screen edge on at least one side
@@ -491,20 +493,16 @@ def center_out(n=8, radius=0.32):
     return Layouts(np.full((n, 2), 0.5), np.repeat(targets[None], n, 0), np.ones((n, n), bool), np.arange(n))
 
 
-def curl_discretization(tau, curl, dt):
+def curl_discretization(tau: float, curl: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
     """(decay, drive): the exact one-step update v <- decay v + drive u of dv/dt = (u - v) / tau + curl * R v,
-    R a 90-degree clockwise rotation, for a command u held over the step."""
-    eye, rot = np.eye(2), np.array([[0.0, 1.0], [-1.0, 0.0]])
-    decay = np.exp(-dt / tau) * (np.cos(curl * dt) * eye + np.sin(curl * dt) * rot)
-    m_inv = (-eye / tau - curl * rot) / (1 / tau**2 + curl**2)
-    return decay, m_inv @ (decay - eye) / tau
+    R a 90-degree clockwise rotation, for a command u held over the step (the operator readout's curl, in 2D)."""
+    return readout.curl_discretization(tau, curl, dt, n_dims=2)
 
 
-def curl_steady_state(tau, curl):
+def curl_steady_state(tau: float, curl: float) -> np.ndarray:
     """The linear map from commanded to steady-state cursor velocity under a curl field:
     a clockwise turn by atan(tau * curl) and a slowdown by 1 / sqrt(1 + (tau * curl)^2)."""
-    rot = np.array([[0.0, 1.0], [-1.0, 0.0]])
-    return (np.eye(2) + tau * curl * rot) / (1 + (tau * curl) ** 2)
+    return readout.curl_steady_state(tau, curl, n_dims=2)
 
 
 def sample_layouts(rng, n_trials, n_targets, cfg=TaskConfig()):

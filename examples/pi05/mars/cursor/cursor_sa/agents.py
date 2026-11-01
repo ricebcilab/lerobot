@@ -1,13 +1,13 @@
 """Agents that produce the command: a simulated expert, or a person on the SpaceMouse.
 
-An agent is `reset` for a batch of trials with the input channel, then
+An agent is `reset` for a batch of trials with the readout, then
 `step(pos, layouts, ctl)` is called once per time step and returns
 
     raw        [B, 2]      the deflection in [-1, 1] the agent means this step
-    served     [B, 2]      the same after the channel (corruption, noise): what the controller gets
+    served     [B, 2]      the same after the readout (corruption, noise): what the controller gets
     reference  None, or at a replan the served chunk [B, H, 2] an expert_chunk agent means
 
-The channel (`channel.InputChannel`) is the same object for a person and for the
+The readout (`readout.Readout`) is the same object for a person and for the
 expert, so the same corruption and noise apply to both.
 """
 
@@ -17,7 +17,7 @@ from collections import deque
 import numpy as np
 import torch
 
-from .channel import InputChannel, is_active
+from .readout import Readout, is_active
 from .env import AVOID_CLEARANCE, densify, plan_route
 from .devices import Keyboard, SpaceMouse, find_spacemouse, spacemouse_full_scale, spacemouse_hid_id
 from .steering import to_deflection
@@ -26,12 +26,12 @@ from .steering import to_deflection
 class StepAgent:
     """An agent that means one deflection per step; subclasses define `command(pos, layouts) -> [B, 2]`."""
 
-    def reset(self, n_trials=1, channel=None):
-        self.channel = channel if channel is not None else InputChannel()
+    def reset(self, n_trials=1, readout=None):
+        self.readout = readout if readout is not None else Readout()
 
     def step(self, pos, layouts, ctl=None):
         raw = self.command(pos, layouts)
-        return raw, self.channel(raw), None
+        return raw, self.readout(raw), None
 
 
 def pursuit_index(pos, pts, valid, discs, dmask):
@@ -65,8 +65,8 @@ class ExpertAgent(StepAgent):
         self.target_radius, self.spacing = target_radius, spacing  # distractors are discs this big; route point spacing
         self.reset()
 
-    def reset(self, n_trials=1, channel=None):
-        super().reset(n_trials, channel)
+    def reset(self, n_trials=1, readout=None):
+        super().reset(n_trials, readout)
         self._history = deque(maxlen=self.lag + 1)
         self._routes = [None] * n_trials            # per trial: (waypoints [W, 2], points every `spacing` along them)
         self._since = np.zeros(n_trials, dtype=int)  # steps since the last plan
@@ -155,14 +155,14 @@ class ExpertChunkAgent:
     """Means the controller's own policy chunk, goal given: at every replan it plans
     with the goal flag set and pushes that chunk step by step, at the controller's
     pace (its gain mode). This is the BCI model of the learned-adapter study: what
-    the operator intends is a policy chunk, the channel corrupts each of its steps,
+    the operator intends is a policy chunk, the readout corrupts each of its steps,
     and the served chunk is the controller's reference.
     """
 
     name = "expert_chunk"
 
-    def reset(self, n_trials=1, channel=None):
-        self.channel = channel if channel is not None else InputChannel()
+    def reset(self, n_trials=1, readout=None):
+        self.readout = readout if readout is not None else Readout()
         self.raw = self.served = None
 
     @torch.no_grad()
@@ -174,9 +174,9 @@ class ExpertChunkAgent:
 
     def step(self, pos, layouts, ctl):
         new = ctl.t >= ctl.cycle  # the controller starts a chunk at this control step
-        if new:  # a replan: plan the chunk, and let the channel corrupt every step of it at once
+        if new:  # a replan: plan the chunk, and let the readout corrupt every step of it at once
             self.raw = self.plan(ctl, layouts)
-            self.served = self.channel(self.raw)
+            self.served = self.readout(self.raw)
         parts = ctl.steps_of(0 if new else ctl.t)  # the step(s) the controller plays now, at the gain's pace
         play = lambda chunk: sum((share / ctl.gain) * chunk[:, i] for i, share in parts)
         return play(self.raw), play(self.served), self.served if new else None
@@ -221,8 +221,8 @@ class HumanAgent(StepAgent):
                     self.status = f"found at {path} but cannot open it ({e.strerror})"
         return self.spacemouse is not None
 
-    def reset(self, n_trials=1, channel=None):
-        super().reset(n_trials, channel)
+    def reset(self, n_trials=1, readout=None):
+        super().reset(n_trials, readout)
         self._last = np.zeros(2)
 
     def command(self, pos=None, layouts=None):

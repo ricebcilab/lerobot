@@ -280,7 +280,7 @@ The **human** is always shown the scene's real instruction ("put the bowl on
 top of the cabinet"). The **VLA** only ever receives the config's `prompt`,
 which defaults to the deliberately uninformative `"do something"` — the policy
 contributes manipulation priors while the operator supplies the intent through
-the steering channel. `prompt: task` gives the VLA the scene's own instruction
+the steering command. `prompt: task` gives the VLA the scene's own instruction
 instead, the conventional setup where both know the goal.
 
 ### Arms, overrides and sweeps
@@ -554,7 +554,7 @@ picked the replacement by running `oracle_sweep.sh` with the SpaceMouse-like
 operator (`update_every_steps: 20, delay_steps: 4`) on tasks 4-8, 20 matched
 trials per cell, seed 0, FC over depths 4-10, FRS over 1-4, MARS
 (F@40) over 1-6, plus the ceiling. Tasks 0/2/3/9 were left out: the oracle
-sweep scores them ~0 for every method (the translation-only channel cannot
+sweep scores them ~0 for every method (the translation-only command cannot
 express them). Success at each method's best depth:
 
 | Task                           | Ceiling | FC      | FRS    | MARS   | MARS − FC (McNemar, 20 pairs) |
@@ -603,16 +603,16 @@ To repeat an F@40 cell, add
 
 ### Training a MARS user module
 
-`train_user_module.py` calibrates a learned user module for one operator channel,
+`train_user_module.py` calibrates a learned user module for one operator readout,
 the cursor project's recipe ported to pi0.5. It rolls out the task-prompted
 policy (the synthetic operator) to collect states at chunk boundaries, labels
 each with the operator's chunk `L` under the real task, the push that chunk
-implies (the `PolicyOperator` rule) through the arm's channel (its corruption or
+implies (the `PolicyOperator` rule) through the arm's readout (its corruption or
 curl, then input noise of std `sigma ~ U(sigma_min, sigma_max)`), the reference
 chunk `a_bci` FRS builds from that served command, and `z_L`, `L` reversed through
 the goal-free field (the arm's prompt). The module `U(x_t, t)` then minimizes the
 field regression `U(x_t, t) P(x_t, t) = z_L − a_bci` along `x_t = (1 − t) a_bci +
-t z_L`, so that a full reversal of what the channel delivered lands on the latent
+t z_L`, so that a full reversal of what the readout delivered lands on the latent
 of what the operator meant. The log reports, on held-out states, the heading
 cosine between the regenerated chunk and `L` with and without the module.
 
@@ -696,7 +696,7 @@ operator:
   alone, 1 under teleop or override. `chunk_authority` takes it per action
   chunk over the steps where the operator pushed, and `trial_metrics` reports
   the mean over a trial's pushing chunks as `user_authority` — what the
-  channel delivered while in use (`user_authority_all_steps` is the per-step
+  readout delivered while in use (`user_authority_all_steps` is the per-step
   mean over every step, which idle time dilutes). Depth is the knob; this is what it delivered, and
   it is the x-axis of every comparison — equal depths are not equal authority
   across methods (FC's counts steps the operator controls, FRS's steps the

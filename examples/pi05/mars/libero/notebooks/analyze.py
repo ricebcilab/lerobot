@@ -456,7 +456,7 @@ def trial_metrics(trials: pd.DataFrame) -> pd.DataFrame:
     NaN when the task has no goal or the trial lacks the element.
 
     Authority (needs the `policy_translation` array): `user_authority` is the mean of
-    `chunk_authority` over the chunks in which the operator pushed -- what the channel
+    `chunk_authority` over the chunks in which the operator pushed -- what the readout
     delivered while it was in use -- and `policy_authority` its complement;
     `user_authority_all_steps` is the per-step mean over every step (`step_authority`),
     which idle time dilutes.

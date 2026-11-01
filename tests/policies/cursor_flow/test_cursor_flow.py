@@ -28,8 +28,8 @@ from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.pi05.steering import (
     LearnedTaskModule,
     LearnedUserModule,
+    integrate,
     load_adapter_module,
-    steered_chunk,
 )
 
 CONVERTER = (
@@ -97,22 +97,16 @@ def test_round_trip_is_exact(tmp_path, obstacle_tokens):
 
 
 def test_predict_action_chunk_is_the_plain_policy_chunk():
-    """The cursor example's plain policy chunk: the core's steered_chunk in mode "policy" (noise drawn first,
-    a 10-step forward flow in the t = 0 noise convention), times the action scale."""
+    """The plain policy chunk: noise drawn first, then the core's 10-step Euler flow in the t = 0 noise convention
+    (``FlowPolicy.sample_chunk``, the loop the steering wrappers drive), times the action scale."""
     model = _small_policy(True)
     policy = CursorFlowPolicy(CursorFlowConfig(**model.config, action_scale=0.0123, device="cpu"))
     policy.model.load_state_dict(model.state_dict())
     obs = _obs()
     torch.manual_seed(7)
+    noise = torch.randn(3, model.horizon, 2)
     expected = (
-        steered_chunk(
-            lambda x, t: model(obs, x, t),
-            torch.zeros(3, 2),
-            "policy",
-            horizon=model.horizon,
-            to_reference=lambda c: c,
-        )
-        * model.action_scale
+        integrate(noise, lambda x, t: model(obs, x, t), 0.0, 0.1, 10, batch_time=True) * model.action_scale
     )
     torch.manual_seed(7)
     chunk = policy.predict_action_chunk(obs)

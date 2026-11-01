@@ -56,8 +56,8 @@ import argparse
 import csv
 import itertools
 import json
+import os
 import re
-import shutil
 import time
 import zlib
 from pathlib import Path
@@ -75,7 +75,7 @@ from cursor_sa.analysis import INK, INK_2, bootstrap_mean, draw_scene, style
 from cursor_sa.env import ROUTE_CLEARANCE, TaskConfig, center_out, curl_steady_state, plan_route, route_side, sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import logged, summarize
-from cursor_sa.session import arm_task, channel_for, load_checkpoints, run_trials
+from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
 FAMILIES = {  # level -> arm overrides; level -> the family's reversal adapter (the known corruption)
@@ -223,11 +223,11 @@ def cell_adapter(spec, cell, grid):
 
 def method_arm(sweep, method, level, axes=None):
     """The arm a method plays at a grid level (a corruption level, or a users x tasks cell) and task
-    axes; channel noise is set per trial later."""
+    axes; readout noise is set per trial later."""
     grid = sweep["grid"]
     values = grid.get("axis_values", {})
     axes = {k: values[k][v] if k in values else v for k, v in (axes or {}).items()}
-    spec = {k: v for k, v in sweep["methods"][method].items() if k not in ("channel", "tune")}
+    spec = {k: v for k, v in sweep["methods"][method].items() if k not in ("readout", "tune")}
     if grid["family"] == "grid":
         cell = grid["cells"][level]
         limit = {} if cell["time_limit_s"] is None else {"time_limit_s": cell["time_limit_s"]}  # a task's own, if it sets one
@@ -295,10 +295,10 @@ def parse_setting(key):
 def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed):
     """One method at one setting over all noises of a level at once; per-noise records."""
     n = len(layouts)
-    off = sweep["methods"][method].get("channel") in ("off", False)  # YAML reads `off` as False
-    channel = channel_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)
+    off = sweep["methods"][method].get("readout") in ("off", False)  # YAML reads `off` as False
+    readout = readout_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)
     torch.manual_seed(seed)
-    records = run_trials(arm, layouts.tile(len(noises)), agent, channel, policy, adapters, device)
+    records = run_trials(arm, layouts.tile(len(noises)), agent, readout, policy, adapters, device)
     return {str(s): records[i * n:(i + 1) * n] for i, s in enumerate(noises)}
 
 
@@ -584,7 +584,7 @@ def fig_summary(sweep, test, out):
     label = lambda m: METHOD_LABEL.get(m, m)
     lower = lambda s: s if s[1:2].isupper() else s[:1].lower() + s[1:]
     played = lambda m, t: json.dumps([{**{k: v for k, v in method_arm(sweep, m, f"{u}x{t}").items() if k != "reversal_adapter"},
-                                       "channel": sweep["methods"][m].get("channel")} for u in users],
+                                       "readout": sweep["methods"][m].get("readout")} for u in users],
                                      sort_keys=True, default=lambda o: np.asarray(o).tolist())  # as played: the derived adapter
     same = {}  # methods that play the same arm on a task (one that lacks a module they differ by), so the same trials
     for t in tasks:
@@ -893,19 +893,25 @@ def run(args, sweep, out):
         tuned = lambda k, m: tuning[k][m][setting_key(tuned_settings(tuning[k])[m])]["success"]
         return max(tuning, key=lambda k: (tuned(k, focus) - max(tuned(k, m) for m in against), -tuned(k, against[0])))
 
+    def write(name, dump):
+        """Write out/name whole or not at all (a temporary file renamed into place), so a crash or a full disk
+        leaves the last complete save for --resume."""
+        tmp = out / f".{name}.tmp"
+        with open(tmp, "w") as f:
+            dump(f)
+        os.replace(tmp, out / name)
+
     def save():
         settings = {k: tuned_settings(v) for k, v in tuning.items()}
-        with open(out / "tuning.json", "w") as f:
-            json.dump(dict(args=run_args, tuning=tuning, settings=settings), f, indent=1)
+        write("tuning.json", lambda f: json.dump(dict(args=run_args, tuning=tuning, settings=settings), f, indent=1))
         if fixed is not None:  # the settings tested are the input's
             if Path(args.fixed_settings).resolve() != (out / "settings.yaml").resolve():
-                shutil.copyfile(args.fixed_settings, out / "settings.yaml")
+                write("settings.yaml", lambda f: f.write(Path(args.fixed_settings).read_text()))
         else:  # merged fixed-setting parts have no tuning: their cells keep the settings they were tested at
             settings.update({k: v["settings"] for k, v in test.items() if k not in settings})
-            with open(out / "settings.yaml", "w") as f:
-                yaml.safe_dump(settings, f, sort_keys=False)
-        with open(out / "test.json", "w") as f:
-            json.dump(dict(args=run_args, showcase=showcase(), skipped=skipped, test=test), f, indent=1)
+            write("settings.yaml", lambda f: yaml.safe_dump(settings, f, sort_keys=False))
+        write("test.json", lambda f: json.dump(dict(args=run_args, showcase=showcase(), skipped=skipped, test=test),
+                                               f, indent=1))
 
     tic = time.time()
     if args.merge:

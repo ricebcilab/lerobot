@@ -7,7 +7,7 @@ module for an obstacle task with a user's frozen user module in the loop.
 
 USER MODULE: open-loop calibration with an expert that knows the goal. On demonstrations of the open-field
 task, the label is the demonstration's next chunk L, and the command is what the expert
-(`agents.ExpertAgent`) pushes at that moment toward the goal, through the user's channel (corruption M or
+(`agents.ExpertAgent`) pushes at that moment toward the goal, through the user's readout (corruption M or
 curl, then noise of std sigma), held over the chunk as the controller holds it: a_bci. The user module
 U(x_t, t) acts on the backward pass; the field objective pulls it toward the label's latent z_L (L reversed
 through the policy's flow), along the straight path from z_L to a_bci:
@@ -22,7 +22,7 @@ the defaults (every step's matrix free, no coupling) are the grid's. They are sa
 CLOSED-LOOP RECALIBRATION (ReFIT-style, `--closed-loop <initial module>`): expert demonstrations always head
 for the goal, so the calibration above never shows the off-course states closed loop produces (and the module
 trusts the policy's course there). The recalibration runs the initial module in closed loop on the open-field
-task (the expert pushing through the user's channel at `--closed-loop-noise`, the grid's controller), keeps
+task (the expert pushing through the user's readout at `--closed-loop-noise`, the grid's controller), keeps
 every visited state with the expert's push there (what the user meant: toward the goal), relabels the state
 with the reach the demonstrator would make from it (a straight min-jerk reach to the goal, its first chunk),
 and trains a fresh module on batches mixing the open-loop data with these (`--closed-loop-mix`). Several
@@ -45,7 +45,7 @@ modules, on that user's commands around the obstacles (the layouts with the obst
     U(x_t, t) (A v + b) = a_bci - z_L,   z_L = L reversed through the task-adapted flow.
 
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
-policy's own. Every batch draws the channel's noise anew, so even a few demonstrations give endless noisy
+policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
 commands; `--frozen-noise` draws it once per demonstration step instead, as a recorded calibration has one
 command per step (the validation split keeps fresh draws).
 
@@ -72,12 +72,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent  # noqa: E402
-from cursor_sa.channel import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
+from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
 from cursor_sa.demos import DemoConfig, DemoSampler, make_demos, plan_reach  # noqa: E402
 from cursor_sa.env import Layouts, TaskConfig, obstacle_spec, sample_layouts  # noqa: E402
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
-from cursor_sa.session import arm_task, channel_for, run_trials  # noqa: E402
+from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
@@ -109,8 +109,8 @@ def expert_pushes(layouts, pos, rows_per_call=500):
     return out
 
 
-def channel_core(push, corruption, curl):
-    """What the user's channel makes of the pushes [B, L, 2] before the noise: M @ push clipped, or a curl's
+def readout_core(push, corruption, curl):
+    """What the user's readout makes of the pushes [B, L, 2] before the noise: M @ push clipped, or a curl's
     velocity driven from rest by the pushes in turn."""
     if curl is not None:
         return curl_commands(push, curl)
@@ -119,22 +119,22 @@ def channel_core(push, corruption, curl):
 
 class ExpertData:
     """One split of expert calibration data: the demonstrations (a DemoSampler) and, at every demo step,
-    the expert's push and what the user's channel makes of it before noise."""
+    the expert's push and what the user's readout makes of it before noise."""
 
     def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False):
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
         pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
         push = expert_pushes(layouts, pos)
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
-        self.push, self.core = f32(push), f32(channel_core(push, corruption, curl))
+        self.push, self.core = f32(push), f32(readout_core(push, corruption, curl))
         self.noise = torch.randn_like(self.core) if frozen_noise else None  # one draw per demo step, or fresh ones
 
     def noise_at(self, i, k):
-        """The channel's noise draws at demo steps (i, k) [B, 2] when frozen, else None (fresh draws)."""
+        """The readout's noise draws at demo steps (i, k) [B, 2] when frozen, else None (fresh draws)."""
         return None if self.noise is None else self.noise[i, k]
 
     def sample(self, n, goal_dropout=0.0):
-        """(obs, chunk, push, core, i, k): demo samples and the expert's push and its channel core there."""
+        """(obs, chunk, push, core, i, k): demo samples and the expert's push and its readout core there."""
         obs, chunk, i, k = self.sampler.sample(n, goal_dropout, indexed=True)
         return obs, chunk, self.push[i, k], self.core[i, k], i, k
 
@@ -156,15 +156,15 @@ STRAIGHT = DemoConfig(max_bow=0.0, p_correct=0.0)   # the relabel: a straight mi
 
 
 class ClosedLoopData:
-    """One split of closed-loop recalibration data: the states a controller visited with the user's channel in
+    """One split of closed-loop recalibration data: the states a controller visited with the user's readout in
     the loop (trajectories as a DemoSampler, so an observation carries the real history), at every step the
-    expert's push there and what the channel makes of it before noise, and as the label the first chunk of a
+    expert's push there and what the readout makes of it before noise, and as the label the first chunk of a
     straight min-jerk reach from that state to the goal (what the demonstrator would do from there)."""
 
     def __init__(self, layouts, actions, lengths, raw, policy, device, corruption, curl, rng, task):
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
-        self.push, self.core = f32(raw), f32(channel_core(raw, corruption, curl))
+        self.push, self.core = f32(raw), f32(readout_core(raw, corruption, curl))
         H = policy.horizon
         pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
         labels = np.zeros((len(actions), actions.shape[1], H, 2))
@@ -199,7 +199,7 @@ def closed_loop_splits(args, policy, model, device, rng):
         for start in range(0, args.closed_loop_trials, 500):
             layouts = sample_layouts(rng, min(500, args.closed_loop_trials - start), tuple(args.targets), task)
             parts.append(layouts)
-            records += run_trials(arm, layouts, ExpertAgent(), channel_for(arm, rng), policy, adapters, device)
+            records += run_trials(arm, layouts, ExpertAgent(), readout_for(arm, rng), policy, adapters, device)
         mine = records[first:]
         rate = lambda o: np.mean([r["outcome"] == o for r in mine])
         print(f"closed loop with {name} at depth {args.closed_loop_depth}, noise {args.closed_loop_noise}: {len(mine)} trials, "
@@ -224,7 +224,7 @@ def mixed_batch(open_data, closed_data, batch, mix):
 
 
 def bci_command(policy, push, core, sigma, noise=None):
-    """The controller's reference for one served command per sample: noise on the channel core (where the
+    """The controller's reference for one served command per sample: noise on the readout core (where the
     push is active; `noise` the standard normal draws, default fresh), held over the chunk, in the policy's
     units [B, H, 2]."""
     served = serve_command(core, push, sigma, noise)
@@ -470,7 +470,7 @@ def parse_args(argv=None):
     p.add_argument("--closed-loop", nargs="+", help="user: recalibrate on closed-loop trials of these initial user modules "
                    "(ReFIT-style; several pool their trials)")
     p.add_argument("--closed-loop-trials", type=int, default=2000, help="user: closed-loop trials to run per initial module")
-    p.add_argument("--closed-loop-noise", type=float, default=1.0, help="user: the channel's noise std in those trials")
+    p.add_argument("--closed-loop-noise", type=float, default=1.0, help="user: the readout's noise std in those trials")
     p.add_argument("--closed-loop-depth", type=int, default=6, help="user: the initial module's reversal depth in them")
     p.add_argument("--closed-loop-arm", default="condition_grid.yaml", help="user: the controller and task they run under")
     p.add_argument("--closed-loop-time-limit", type=float, default=5.0, help="user: their time limit (s)")
@@ -487,7 +487,7 @@ def parse_args(argv=None):
     p.add_argument("--cross-step-dims", type=dim_indices, help="user: the dims the coupling covers, a comma list of "
                    "indices (e.g. 0 or 0,1; default: all)")
     p.add_argument("--n-demos", type=int, default=20000, help="training demonstrations (one reach each)")
-    p.add_argument("--frozen-noise", action="store_true", help="draw the channel's noise once per demonstration step "
+    p.add_argument("--frozen-noise", action="store_true", help="draw the readout's noise once per demonstration step "
                    "(as a recorded calibration has it) instead of anew in every batch")
     p.add_argument("--val-demos", type=int, default=2000)
     p.add_argument("--flow-steps", type=int, default=10)

@@ -11,7 +11,7 @@ fonts) and figures/stats.json, the numbers the captions quote (one entry per fig
 Names: MARS is MARS with both modules (user and task), MARS-U the user module alone, MARS-T the task module alone.
 
 Reads (results/ is git-ignored, so these are local):
-    fig1  nothing (its reaches come from the channel's rule, its densities are made up)
+    fig1  nothing (its reaches come from the readout's rule, its densities are made up)
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
     fig3  the grid's five training seeds: results/sim/sweeps/grid_s<k>/test.json (seed 0 tuned, seeds 1-4 tested at
           seed 0's settings), and each seed's checkpoints for one cell's rollouts
@@ -47,7 +47,7 @@ from cursor_sa.analysis import GRID, INK, INK_2, aligned_path, cumulative_hits, 
 from cursor_sa.env import Layouts, TaskConfig, sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import load_run
-from cursor_sa.session import arm_task, channel_for, load_checkpoints, run_trials
+from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 from run_sweep import method_arm, with_setting
 
 FIG_DIR = Path(__file__).resolve().parent
@@ -693,12 +693,9 @@ SEED_RUNS = tuple(f"grid_s{k}" for k in range(5))  # the grid's runs under resul
 # are tested at seed 0's settings on the grid's trials (the baselines train nothing, so every seed has the grid's)
 GRID_BASELINES = ("teleop", "flow_control", "frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
-ROLLOUT_CELL, ROLLOUT_TRIALS, ROLLOUT_SEED = "U1xT4", 40, 7  # the trials split evenly over the seeds' modules
+ROLLOUT_SEED = 7  # panel b's trials
 CORNER = 0.42  # the second method's corner in panel c's lead matrix, as a share of the cell's side
-COMPARED = [("retrained_mars_user", f"Retrained policy + {MARS}-U"), ("mars", MARS)]
-GRID_OUTCOMES = ("hit", "collision", "wrong_target", "timeout")
-METRIC_KEY = {"hit": "success", "collision": "collision", "wrong_target": "wrong", "timeout": "timeout"}  # a cell's metrics
-FIG3_H = 8.4  # in: a (the schematic) and b (the tasks) side by side on top, rows c-f below them (positions in inches from the bottom)
+FIG3_H = 6.5  # in: a (the schematic) and b (the tasks) side by side on top, rows c and d below them (positions in inches from the bottom)
 
 
 def grid_data(results):
@@ -794,7 +791,7 @@ def lead_cell(ax, x, y, best, second, level, text, size=1.0):
 
 def draw_training(fig, D, rect):
     """How the modules were trained, as a users x tasks matrix (the user modules on the open field through each
-    user's channel, the task modules on one task each with one user's module in the loop, the other cells
+    user's readout, the task modules on one task each with one user's module in the loop, the other cells
     compositions never trained together), and beside it, over the seeds, the best method in every cell, the second
     and the best one's lead over it."""
     x0, y0, w, h = rect
@@ -848,7 +845,7 @@ def draw_training(fig, D, rect):
 
 def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
     """One sampled layout per task and a successful MARS trial on it: the task's trained cell (T1 with the first user),
-    seed 0's modules at their tuned depth, the first success of n trials with the grid's channel noise."""
+    seed 0's modules at their tuned depth, the first success of n trials with the grid's readout noise."""
     out = {}
     for t, layout_seed in zip(D["tasks"], TASK_SEEDS):
         u = next((u for u in D["users"] if (u, t) in D["train"] and t != D["tasks"][0]), D["users"][0])
@@ -858,7 +855,7 @@ def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
         task = arm_task(arm)
         layouts = sample_layouts(np.random.default_rng(layout_seed), 1, (4, 4), task)
         torch.manual_seed(seed)
-        recs = run_trials(arm, layouts.tile(n), ExpertAgent(), channel_for(arm, np.random.default_rng(seed + 1), D["noise"]),
+        recs = run_trials(arm, layouts.tile(n), ExpertAgent(), readout_for(arm, np.random.default_rng(seed + 1), D["noise"]),
                           policies[arm["model"]], adapters, device)
         hits = [i for i, r in enumerate(recs) if r["outcome"] == "hit"]
         out[t] = dict(cell=f"{u}x{t}", layouts=layouts, task=task, path=np.asarray(recs[hits[0]]["path"], float) if hits else None,
@@ -919,118 +916,35 @@ def draw_grid_bars(fig, D, rect):
             for u, v in zip(users, vals):
                 hollow = m in trained and (u, t) in D["train"]
                 ax.plot(xc, v, "o", ms=2.6, color=GRID_COLOR[m], mfc="white" if hollow else GRID_COLOR[m], mew=0.8, zorder=4)
-            if m == "mars":
-                ax.text(xc, max(max(vals), min(hi, 100)) + 2.5, f"{mean:.0f}", ha="center", va="bottom", fontsize=FS_TEXT, color=INK, weight="semibold")
+            ax.text(xc, min(max(max(vals), hi), 108) + 2.5, f"{mean:.0f}", ha="center", va="bottom", fontsize=FS_TEXT, color=INK,
+                    weight="semibold" if m == "mars" else "normal", clip_on=False)   # above the CI (cut at the axis top)
     ax.set_xticklabels([f"{t}" for t in tasks], fontsize=FS_TICK)
     return means
-
-
-def rollouts(D, device, cell=ROLLOUT_CELL, n=ROLLOUT_TRIALS, seed=ROLLOUT_SEED):
-    """n trials of the two compared arms on ONE layout of a cell (the same scene), split evenly over the seeds: each
-    seed's modules at the settings its run tuned, with that seed's own channel-noise draws (the same for both arms). The
-    paths show where each arm goes and where the retrained policy's trials end."""
-    per = n // len(D["runs"])
-    records, settings, per_seed = {m: [] for m, _ in COMPARED}, {}, {m: {} for m, _ in COMPARED}
-    for k, s in enumerate(D["seeds"]):
-        arms = cell_arms(D, cell, [m for m, _ in COMPARED], k)
-        policies, adapters = load_checkpoints(arms, device)
-        task = arm_task(next(iter(arms.values())))
-        layouts = sample_layouts(np.random.default_rng(seed), 1, (4, 4), task).tile(per)
-        for m, arm in arms.items():
-            torch.manual_seed(seed + 10 * s)
-            channel = channel_for(arm, np.random.default_rng(seed + 10 * s + 1), D["noise"])
-            recs = run_trials(arm, layouts, ExpertAgent(), channel, policies[arm["model"]], adapters, device)
-            records[m] += recs
-            per_seed[m][f"s{s}"] = {o: int(sum(r["outcome"] == o for r in recs)) for o in GRID_OUTCOMES}
-        settings[f"s{s}"] = {m: {k: arm[k] for k in ("n_reverse_steps", "pinned_steps")} for m, arm in arms.items()}
-    return dict(cell=cell, layouts=layouts, task=task, records=records, settings=settings, per_seed=per, outcomes_per_seed=per_seed)
-
-
-def draw_rollouts(fig, D, roll, rect):
-    """The compared arms on the same scene: successes in the arm's colour, collisions in ink ending at an x."""
-    x0, y0, w, h = rect
-    pw = 0.46 * w
-    counts = {}
-    for i, (m, label) in enumerate(COMPARED):
-        ax = fig.add_axes([x0 + i * (w - pw), y0, pw, h])
-        draw_scene(ax, roll["layouts"][0:1], roll["task"], obstacle_style=OBSTACLE_STYLE)
-        recs = roll["records"][m]
-        for outcome, color, alpha, z in (("timeout", OUTCOME_GRAY["timeout"], 0.9, 2), ("wrong_target", OUTCOME_GRAY["wrong_target"], 0.9, 2),
-                                         ("hit", GRID_COLOR[m], 0.55, 3),
-                                         ("collision", INK, 0.6, 4)):
-            for r in (r for r in recs if r["outcome"] == outcome):
-                p = np.asarray(r["path"], float)
-                ax.plot(p[:, 0], p[:, 1], color=color, lw=0.6, alpha=alpha, zorder=z)
-                if outcome == "collision":
-                    ax.plot(*p[-1], "x", color=INK, ms=3, mew=0.8, zorder=5)
-        counts[m] = {o: int(sum(r["outcome"] == o for r in recs)) for o in GRID_OUTCOMES}
-        frame(ax)
-    return counts
-
-
-def draw_outcomes(fig, D, rect):
-    """How the compared arms' trials end on each obstacle task (mean over the users and the seeds): successes in the arm's
-    colour, the failures in the outcome ramp."""
-    ax = fig.add_axes(rect)
-    users, tasks = D["users"], D["obstacle_tasks"]
-    bw = 0.36
-    shares = {}
-    for i, t in enumerate(tasks):
-        for k, (m, _) in enumerate(COMPARED):
-            s = {o: float(np.mean([seed_mean(D, u, t, m, METRIC_KEY[o]) for u in users])) for o in GRID_OUTCOMES}
-            shares[f"{t}|{m}"] = s
-            xc, y0 = i + (k - 0.5) * (bw + 0.04), 0
-            for o in GRID_OUTCOMES:
-                v = s[o]
-                ax.add_patch(Rectangle((xc - bw / 2, y0), bw, max(v - 0.8, 0), facecolor=GRID_COLOR[m] if o == "hit" else OUTCOME_GRAY[o], lw=0, zorder=2))
-                if v >= 12 and o in ("hit", "collision"):
-                    ax.text(xc, y0 + v / 2, f"{v:.0f}", ha="center", va="center", fontsize=FS_TEXT, color="white")
-                y0 += v
-    ax.set(xticks=range(len(tasks)), xticklabels=tasks, ylim=(0, 100), yticks=range(0, 101, 25), xlim=(-0.6, len(tasks) - 0.4))
-    ax.tick_params(axis="x", length=0)
-    ax.set_ylabel("Trials (%)", labelpad=1)
-    return shares
 
 
 def build_fig3(out, results, device):
     paper_style()
     D = grid_data(results)
-    roll = rollouts(D, device)
     fig = plt.figure(figsize=(FULL_W, FIG3_H))
     y = lambda inch: inch / FIG3_H
     # a: the method with the task module, a schematic with made-up densities (as Figure 1b)
-    schematic(fig, 0.05, 6.05, fig3_schematic())
+    schematic(fig, 0.05, 4.15, fig3_schematic())
     # b: the tasks, two to a row, beside it
     shown = task_rollouts(D, device)
-    draw_tasks(fig, D, shown, (5.12 / FULL_W, y(5.9), 1.85 / FULL_W, y(2.35)))
+    draw_tasks(fig, D, shown, (5.12 / FULL_W, y(4.0), 1.85 / FULL_W, y(2.35)))
     # the marks of a and b, one legend as Figure 1's
     handles, labels = method_legend(["policy", "intent_density", "readout", "obstacle", "start", "target", "other"])
-    fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(5.62)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
+    fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(3.72)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
                handletextpad=0.5, borderaxespad=0, labelspacing=0.4, handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)})
     # c: how the modules were trained, and who wins where
-    winners = draw_training(fig, D, (0.193, y(4.25), 0.85, y(0.9)))
+    winners = draw_training(fig, D, (0.193, y(2.35), 0.85, y(0.9)))
     # the methods' legend, shared by c and d, in one line
     handles = [plt.Line2D([], [], color=GRID_COLOR[m], lw=4, solid_capstyle="butt") for m in D["methods"]]
-    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(0.5, y(3.92)), ncol=len(handles), fontsize=FS_LEGEND,
+    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(0.5, y(2.02)), ncol=len(handles), fontsize=FS_LEGEND,
                handlelength=1.1, columnspacing=1.0, handletextpad=0.5, borderaxespad=0)
     # d: every method on every task
-    task_cis = draw_grid_bars(fig, D, (0.065, y(2.3), 0.925, y(1.37)))
-    # e, f: the retrained policy against MARS
-    # e's two square scenes and f's plot share a bottom and a height; the row (e's scenes to f's right edge) is centred
-    side, bottom, f_w, between = 1.3, 0.42, 2.6, 0.9         # in; between: e's right edge to f's axis (f's ticks and label)
-    e_w = side / 0.46                                          # draw_rollouts gives each scene 0.46 of its width
-    ex = (FULL_W - (e_w + between + f_w)) / 2
-    fx = ex + e_w + between
-    counts = draw_rollouts(fig, D, roll, (ex / FULL_W, y(bottom), e_w / FULL_W, y(side)))
-    shares = draw_outcomes(fig, D, (fx / FULL_W, y(bottom), f_w / FULL_W, y(side)))
-    # the outcomes' legend, shared by e and f, centred under both (as Fig 2e's)
-    success = tuple(Rectangle((0, 0), 1, 1, facecolor=GRID_COLOR[m]) for m, _ in COMPARED)   # one swatch of the arms' colours
-    fig.legend([success] + [Rectangle((0, 0), 1, 1, facecolor=OUTCOME_GRAY[o]) for o in GRID_OUTCOMES[1:]],
-               [OUTCOME_LABEL[o] for o in GRID_OUTCOMES], handler_map={tuple: HandlerTuple(ndivide=None, pad=0)},
-               loc="center", bbox_to_anchor=(0.5, y(0.1)), ncol=len(GRID_OUTCOMES), fontsize=FS_LEGEND, handlelength=1.0,
-               handleheight=1.0, columnspacing=1.0, handletextpad=0.4, borderaxespad=0)
-    for x, yy, letter in ((0.005, 0.995, "a"), (5.1 / FULL_W, 0.995, "b"), (0.005, y(5.3), "c"), (0.005, y(3.82), "d"), (0.005, y(1.83), "e"),
-                          ((fx - 0.55) / FULL_W, y(1.83), "f")):
+    task_cis = draw_grid_bars(fig, D, (0.065, y(0.4), 0.925, y(1.37)))
+    for x, yy, letter in ((0.005, 0.995, "a"), (5.1 / FULL_W, 0.995, "b"), (0.005, y(3.4), "c"), (0.005, y(1.92), "d")):
         panel_label(fig, x, yy, letter)
     png = save(fig, out, "fig3_grid")
     users, tasks, methods, seeds = D["users"], D["tasks"], D["methods"], D["seeds"]
@@ -1079,12 +993,9 @@ def build_fig3(out, results, device):
                                                            unseen=[g["points"] for g in gain.values() if not g["trained"]]),
         composed_over_retrained=over_retrained, composed_beats_retrained=beyond(over_retrained),
         t1_user_module_over_teleop={f"{u}x{tasks[0]}": r1(lead_ci(D, u, tasks[0], "mars", "teleop")) for u in users},
-        outcome_shares_compared=shares,
         tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},
         schematic="panel a's densities are made up",
         task_rollouts={t: {k: v[k] for k in ("cell", "trial", "hits", "of")} for t, v in shown.items()},
-        rollouts=dict(cell=roll["cell"], trials=roll["per_seed"] * len(seeds), per_seed=roll["per_seed"], seed=ROLLOUT_SEED,
-                      settings=roll["settings"], outcomes=counts, outcomes_per_seed=roll["outcomes_per_seed"]),
         t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the retrained arm is MARS (no task module, nothing to retrain), so only four arms are drawn",
         flow_control_note="Kao et al.'s flow control, ic_gain 2.0, tau tuned per cell"))
     return png

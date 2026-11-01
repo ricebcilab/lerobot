@@ -1,25 +1,22 @@
-"""The input channel between an agent and the controller.
+"""The readout between an agent and the controller.
 
 A command is a deflection [x, y] in [-1, 1]; inside DEADBAND the agent counts as
-idle. `InputChannel` perturbs the command on its way to the controller, as in
+idle. `Readout` perturbs the command on its way to the controller, as in
 LeRobot's TeleopChain: raw -> M @ raw (corruption) -> + Gaussian noise. A
 corruption is a 2x2 matrix M, or a curl field on the command: the command the
 controller gets is a velocity v driven by the raw push through
 dv/dt = (raw - v) / tau + curl * R v (R a clockwise quarter turn), the dynamics
-`env.CursorEnv` gives the cursor, here acting on the command instead.
+`env.CursorEnv` gives the cursor, here acting on the command instead. The rules are LeRobot's operator
+readout (`lerobot.teleoperators.readout`), which the robot example's TeleopChain runs too; the torch twins
+below, for training, follow them step for step (the tests check they agree).
 """
 
 import numpy as np
 import torch
 
+from lerobot.teleoperators.readout import DEADBAND, add_noise, corrupt, curl_step, is_active  # noqa: F401
+
 from .env import curl_discretization
-
-DEADBAND = 0.05               # max |component| below which the operator is idle (as in LeRobot)
-
-
-def is_active(command):
-    """True where a command [..., 2] is outside the deadband."""
-    return np.abs(command).max(-1) >= DEADBAND
 
 
 def matrix_spec(spec, where="matrix"):
@@ -83,14 +80,14 @@ def adapter_spec(spec, corruption, where="reversal_adapter"):
     return matrix_spec(spec["translation"], f"{where}.translation")
 
 
-class InputChannel:
+class Readout:
     """What happens to a command between the operator and the controller:
     raw -> M @ raw (corruption, clipped to [-1, 1]) -> + N(0, input_noise^2) per
     axis (clipped again). As in LeRobot, both apply only while the operator is
     commanding (outside DEADBAND), so idle input stays exactly idle.
 
     With `curl` ({curl, tau}) the corruption is a curl field instead of M: the
-    channel keeps a velocity per trial, driven by every raw push (idle ones too)
+    readout keeps a velocity per trial, driven by every raw push (idle ones too)
     and reset by `reset(n_trials)` at the start of a batch of trials; the
     controller gets that velocity (clipped), then the noise. Steps of `dt` s.
 
@@ -105,7 +102,7 @@ class InputChannel:
         self.curl, self.vel = curl, None
         if curl is not None:
             if corruption is not None:
-                raise ValueError("a channel has a matrix corruption or a curl, not both")
+                raise ValueError("a readout has a matrix corruption or a curl, not both")
             self._decay, self._drive = curl_discretization(curl["tau"], curl["curl"], dt)
 
     def reset(self, n_trials=1):
@@ -118,35 +115,33 @@ class InputChannel:
         out = raw
         if self.curl is not None:
             if raw.ndim != 2:
-                raise ValueError("a curl channel takes one command per trial and step, [B, 2]")
+                raise ValueError("a curl readout takes one command per trial and step, [B, 2]")
             if self.vel is None or self.vel.shape != raw.shape:
                 self.vel = np.zeros_like(raw)
-            self.vel = self.vel @ self._decay.T + raw @ self._drive.T
+            self.vel = curl_step(self.vel, raw, self._decay, self._drive)
             out = np.clip(self.vel, -1.0, 1.0)
         if self.corruption is not None:
             m = self.corruption
-            if m.ndim == 3:
-                m = m.reshape(m.shape[:1] + extra + m.shape[1:])
-            out = np.clip(np.einsum("...ij,...j->...i", m, raw), -1.0, 1.0)
-        if np.any(self.input_noise):
-            sigma = self.input_noise.reshape(self.input_noise.shape + extra + (1,)) if self.input_noise.ndim else self.input_noise
-            out = np.clip(out + self.rng.normal(size=out.shape) * sigma, -1.0, 1.0)
+            out = corrupt(raw, m.reshape(m.shape[:1] + extra + m.shape[1:]) if m.ndim == 3 else m)
+        if np.any(self.input_noise):  # a draw per step and axis while the noise is on, active or not
+            sigma = self.input_noise.reshape(self.input_noise.shape + extra) if self.input_noise.ndim else self.input_noise
+            return add_noise(out, raw, sigma, self.rng.normal(size=out.shape))
         return np.where(is_active(raw)[..., None], out, raw)
 
 
 def curl_commands(raw, curl, dt=0.02):
-    """What a curl channel ({curl, tau}) serves, before noise, for raw pushes [B, L, 2] given step by
+    """What a curl readout ({curl, tau}) serves, before noise, for raw pushes [B, L, 2] given step by
     step from rest (numpy): the velocity after every step, clipped to [-1, 1]."""
     decay, drive = curl_discretization(curl["tau"], curl["curl"], dt)
     vel, out = np.zeros(raw.shape[::2]), np.empty_like(raw, dtype=float)
     for k in range(raw.shape[1]):
-        vel = vel @ decay.T + raw[:, k] @ drive.T
+        vel = curl_step(vel, raw[:, k], decay, drive)
         out[:, k] = vel
     return np.clip(out, -1.0, 1.0)
 
 
 def serve_command(core, raw, sigma, noise=None):
-    """The torch twin of the channel's last stage, for training: `core` [B, 2] (M @ raw clipped, or a
+    """The torch twin of the readout's last stage, for training: `core` [B, 2] (M @ raw clipped, or a
     curl's velocity) plus noise of std `sigma` [B], clipped, only where the raw push [B, 2] is active.
     `noise` [B, 2]: the standard normal draws to scale by sigma (default: fresh ones)."""
     noise = torch.randn_like(core) if noise is None else noise
@@ -155,7 +150,7 @@ def serve_command(core, raw, sigma, noise=None):
 
 
 def corrupt_chunk(command, corruption, sigma):
-    """`InputChannel` in torch, for training: deflection chunks `command` [B, H, 2],
+    """`Readout` in torch, for training: deflection chunks `command` [B, H, 2],
     one 2x2 `corruption` (or None) and a noise std per trial `sigma` [B]. The same
     rule, step by step: M @ raw, clip, + noise, clip, only where the step is active."""
     out = command if corruption is None else torch.clamp(command @ corruption.T, -1.0, 1.0)

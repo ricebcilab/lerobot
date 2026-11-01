@@ -1,7 +1,7 @@
 """Input devices: the SpaceMouse and the keyboard.
 
 Each exposes `translation`, the current command [x, y] in [-1, 1] (x right, y up
-on screen). The command then goes through `channel.InputChannel`.
+on screen). The command then goes through `readout.Readout`.
 
 The SpaceMouse is read by lerobot's SpaceMouse teleoperator
 (`lerobot.teleoperators.spacemouse`), which the LIBERO example
@@ -47,7 +47,7 @@ def _screen(x, y):
 def parse_report(report):
     """Raw hidraw report -> ("translation", [x, y]) | ("buttons", bitmask) | ("other", None).
 
-    Device channels: x is a push to the right (+), y a pull toward you (+), so
+    Device axes: x is a push to the right (+), y a pull toward you (+), so
     screen y is the negated device y.
     """
     kind, value = hid.parse_report(report)

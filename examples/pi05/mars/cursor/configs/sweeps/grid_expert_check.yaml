@@ -1,4 +1,4 @@
-# The grid's first gate: the simulated expert alone (teleop, clean channel, no noise) must solve every task
+# The grid's first gate: the simulated expert alone (teleop, clean readout, no noise) must solve every task
 # (>= 99% hits), so a miss in the grid is the controller's, not the user's; beside it the frozen policy
 # alone, which never saw an obstacle.
 #   python run_sweep.py --sweep grid_expert_check          # ~9 min

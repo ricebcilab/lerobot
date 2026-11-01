@@ -5,7 +5,7 @@
     run       one participant under one protocol: blocks in a counterbalanced
               order, the same target layouts in every arm, one jsonl per block
               and a manifest
-    trial     agent -> channel -> controller -> env, stepped at 50 Hz, logged
+    trial     agent -> readout -> controller -> env, stepped at 50 Hz, logged
 
 `run_trials` steps a batch of trials in lockstep. A person runs one trial at a
 time in real time with a renderer; the expert runs a whole block at once,
@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config
-from .channel import InputChannel
+from .readout import Readout
 from .env import CursorEnv, Layouts, TaskConfig, sample_layouts
 from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import FlowPolicy
@@ -125,16 +125,16 @@ def arm_adapter(arm, adapters):
     return None if arm["adapter_matrix"] is None else ReversalAdapter(user=FixedAdapter(arm["adapter_matrix"]))
 
 
-def channel_for(arm, rng=None, input_noise=None, off=False):
-    """The arm's input channel: its corruption (a matrix or a curl) and noise (`input_noise` overrides
-    the arm's, e.g. one std per trial); with `off` a clean channel, nothing corrupted, no noise."""
+def readout_for(arm, rng=None, input_noise=None, off=False):
+    """The arm's readout: its corruption (a matrix or a curl) and noise (`input_noise` overrides
+    the arm's, e.g. one std per trial); with `off` a clean readout, nothing corrupted, no noise."""
     if off:
-        return InputChannel(None, 0.0, rng)
+        return Readout(None, 0.0, rng)
     noise = arm["input_noise"] if input_noise is None else input_noise
-    return InputChannel(arm["corruption_matrix"], noise, rng, curl=arm["corruption_curl"])
+    return Readout(arm["corruption_matrix"], noise, rng, curl=arm["corruption_curl"])
 
 
-def run_trials(arm, layouts, agent, channel, policy, adapters, device, renderer=None, hud=None):
+def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None):
     """Step len(layouts) trials in lockstep until all are done; return one record per trial.
 
     With a renderer the trials run in real time (one at a time: len(layouts) must
@@ -150,8 +150,8 @@ def run_trials(arm, layouts, agent, channel, policy, adapters, device, renderer=
                            arm["execute"], task.dt, speed_gain=arm["speed_gain"], adapter=arm_adapter(arm, adapters),
                            device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"], lam=arm["lambda"],
                            pinned_steps=arm["pinned_steps"])
-    channel.reset(B)
-    agent.reset(B, channel)
+    readout.reset(B)
+    agent.reset(B, readout)
     ctx = dict(env=env, ctl=ctl, layouts=layouts, task=task, agent=agent, served=np.zeros((B, 2)), hud=hud or {})
     if renderer is not None:
         renderer.ready_phase(ctx)
@@ -273,7 +273,7 @@ class Run:
                 if not plan:
                     continue
                 log = self.dir / block_filename(block, arm_name)
-                channel = channel_for(arm, np.random.default_rng([self.seed, block]))
+                readout = readout_for(arm, np.random.default_rng([self.seed, block]))
                 hud = dict(block=block, n_blocks=len(self.order), arm=arm_name)
                 if renderer is not None:
                     renderer.block_screen(dict(**hud, n_practice=len(self.practice), n_trials=len(self.layouts),
@@ -285,7 +285,7 @@ class Run:
                     trial_hud = dict(**hud, trial=rows[0][1], n_trials=len(self.practice if practice else self.layouts),
                                      practice=practice)
                     try:
-                        recs = run_trials(arm, Layouts.concat([r[2] for r in rows]), self.agent, channel,
+                        recs = run_trials(arm, Layouts.concat([r[2] for r in rows]), self.agent, readout,
                                           self.policies[arm["model"]], self.adapters, self.device, renderer, trial_hud)
                     except Aborted as e:
                         self.append(log, block, arm_name, rows, e.args[0])

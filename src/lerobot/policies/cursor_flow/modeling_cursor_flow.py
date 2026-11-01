@@ -193,9 +193,48 @@ class FlowPolicy(nn.Module):
         """Action chunk [B, horizon, 2] in screen units per step."""
         if self.mode == "regress":
             return self(obs) * self.action_scale
-        if z is None:
-            z = torch.randn(len(obs["pos"]), self.horizon, 2, device=obs["pos"].device)
-        return self.integrate(obs, z, steps=steps) * self.action_scale
+        return self.sample_chunk(obs, steps, noise=z) * self.action_scale
+
+    @torch.no_grad()
+    def sample_chunk(
+        self,
+        obs,
+        steps=10,
+        noise=None,
+        noise_fn=None,
+        flow_start_time=None,
+        num_forward_steps=None,
+        x_t_hook=None,
+        velocity_hook=None,
+    ):
+        """A normalized chunk [B, horizon, 2] through pi0.5's sampler interface (``PI05Pytorch.sample_actions``),
+        so the steering wrappers of ``lerobot.policies.pi05.steering`` drive this policy as they drive pi0.5, in
+        the cursor's flow convention (t = 0 noise): noise drawn (or given), ``noise_fn(velocity, noise)`` may
+        replace it, then ``num_forward_steps`` Euler steps (default ``steps``) from ``flow_start_time`` (default 0)
+        to the action at t = 1, ``x_t_hook(step, t, x_t)`` before each step and ``velocity_hook(step, t, x_t, v)``
+        on its velocity. ``velocity(x, t)`` takes a float or a (B,) time."""
+        if noise is None:
+            noise = torch.randn(len(obs["pos"]), self.horizon, 2, device=obs["pos"].device)
+
+        def velocity(x, t):
+            if not torch.is_tensor(t):
+                t = torch.full((len(x),), float(t), device=x.device)
+            return self(obs, x, t)
+
+        if noise_fn is not None:
+            noise = noise_fn(velocity, noise)
+        start = 0.0 if flow_start_time is None else float(flow_start_time)
+        n = steps if num_forward_steps is None else int(num_forward_steps)
+        dt, x = (1.0 - start) / n, noise
+        for step in range(n):
+            t = start + step * dt
+            if x_t_hook is not None:
+                x = x_t_hook(step, t, x)
+            v = velocity(x, t)
+            if velocity_hook is not None:
+                v = velocity_hook(step, t, x, v)
+            x = x + dt * v
+        return x
 
 
 # ---------------------------------------------------------------- the lerobot policy wrapper

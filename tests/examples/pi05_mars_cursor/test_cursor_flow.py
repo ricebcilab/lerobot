@@ -6,7 +6,7 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.channel import InputChannel, adapter_spec, corrupt_chunk, matrix_spec
+from cursor_sa.readout import Readout, adapter_spec, corrupt_chunk, matrix_spec
 from cursor_sa.demos import DemoSampler, make_demos, replay
 from cursor_sa.devices import parse_report
 from cursor_sa.env import CursorEnv, Layouts, TaskConfig, sample_layouts
@@ -173,7 +173,7 @@ def _chunk(model, obs, mode, command, **kw):
 SHARED = ("flow_control", "frs")
 
 
-def test_idle_command_and_tau_zero_give_the_plain_policy_chunk():
+def test_idle_command_and_lambda_zero_give_the_plain_policy_chunk():
     torch.manual_seed(0)
     model, obs = FlowPolicy().eval(), _obs()
     plain = _chunk(model, obs, "policy", torch.zeros(3, 2))
@@ -181,7 +181,6 @@ def test_idle_command_and_tau_zero_give_the_plain_policy_chunk():
     for mode in SHARED:
         torch.testing.assert_close(_chunk(model, obs, mode, torch.zeros(3, 2)), plain)
         assert not torch.allclose(_chunk(model, obs, mode, push), plain)
-    torch.testing.assert_close(_chunk(model, obs, "flow_control", push, tau=0), plain)
     torch.testing.assert_close(_chunk(model, obs, "flow_control", push, lam=0), plain)  # nothing written: the policy alone
 
 
@@ -239,7 +238,7 @@ def test_teleop_moves_by_the_command_and_a_noiseless_user_always_hits():
     user.reset(len(layouts))
     while not env.done.all():
         raw, served, reference = user.step(env.pos, layouts, ctl)
-        np.testing.assert_array_equal(raw, served)  # no channel: served as meant
+        np.testing.assert_array_equal(raw, served)  # no readout: served as meant
         assert reference is None
         prev = env.pos.copy()
         env.step(ctl.act(served))
@@ -265,11 +264,11 @@ def test_observation_units_and_adapter_helpers():
     torch.testing.assert_close(FixedAdapter(F.expand(3, 2, 2))(x, torch.zeros(3)), out)
 
 
-def test_bci_chunk_is_the_input_channel_in_torch():
+def test_bci_chunk_is_the_input_readout_in_torch():
     policy = FlowPolicy().eval()
     m = matrix_spec({"scale": [1.0, 0.25]})
     deflection = torch.tensor([[[0.8, 0.8], [0.02, 0.01], [-0.5, 1.0]]])  # the middle step is idle
-    expected = InputChannel(m)(deflection.numpy())
+    expected = Readout(m)(deflection.numpy())
     served = corrupt_chunk(deflection, torch.as_tensor(m, dtype=torch.float32), torch.zeros(1))
     torch.testing.assert_close(served, torch.as_tensor(expected, dtype=torch.float32))
     bci = bci_chunk(to_action(deflection, policy), torch.as_tensor(m, dtype=torch.float32), torch.zeros(1), policy)
@@ -347,14 +346,14 @@ def test_corruption_specs():
         adapter_spec({"translation": "corruption"}, None)
 
 
-def test_input_channel_corrupts_and_adds_noise_only_while_commanding():
-    channel = InputChannel(matrix_spec({"scale": [1.0, 0.5]}), input_noise=0.3, rng=np.random.default_rng(0))
+def test_input_readout_corrupts_and_adds_noise_only_while_commanding():
+    readout = Readout(matrix_spec({"scale": [1.0, 0.5]}), input_noise=0.3, rng=np.random.default_rng(0))
     idle = np.array([[0.01, -0.02]] * 1000)
-    np.testing.assert_array_equal(channel(idle), idle)
-    pushed = channel(np.array([[0.4, 0.8]] * 20000))
+    np.testing.assert_array_equal(readout(idle), idle)
+    pushed = readout(np.array([[0.4, 0.8]] * 20000))
     np.testing.assert_allclose(pushed.mean(0), [0.4, 0.4], atol=0.02)
     assert abs(pushed[:, 0].std() - 0.3) < 0.02
-    np.testing.assert_allclose(InputChannel(matrix_spec({"scale": [2.0, 2.0]}))(np.array([0.8, -0.1])), [1.0, -0.2])
+    np.testing.assert_allclose(Readout(matrix_spec({"scale": [2.0, 2.0]}))(np.array([0.8, -0.1])), [1.0, -0.2])
 
 
 def test_reversal_adapter():
@@ -446,11 +445,11 @@ def test_config_rejects_unknown_keys(tmp_path):
 def test_per_trial_corruption_noise_and_adapter_match_single_trial_versions():
     raw = np.array([[0.4, 0.8], [0.6, -0.3]])
     ms = np.stack([matrix_spec({"scale": [1.0, 0.5]}), matrix_spec({"scale": [0.2, 1.0]})])
-    batched = InputChannel(ms)(raw)
+    batched = Readout(ms)(raw)
     for i in range(2):
-        np.testing.assert_allclose(batched[i], InputChannel(ms[i])(raw[i]))
+        np.testing.assert_allclose(batched[i], Readout(ms[i])(raw[i]))
     pushed = np.tile([0.0, 0.5], (2, 2000, 1))  # [2 trials, 2000 steps, 2]; noise far from the clip at +-1
-    noisy = InputChannel(None, np.array([0.0, 0.2]), np.random.default_rng(0))(pushed)
+    noisy = Readout(None, np.array([0.0, 0.2]), np.random.default_rng(0))(pushed)
     assert np.ptp(noisy[0], axis=0).max() == 0 and abs(noisy[1, :, 0].std() - 0.2) < 0.01
     torch.manual_seed(0)
     model, obs = FlowPolicy().eval(), _obs()

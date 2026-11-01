@@ -4,7 +4,7 @@
 # degrees, each to a random side, so the side to pass is part of the scene; test.json keeps every trial with
 # the side it passed on.
 # User modules are calibrated open loop on T1 with expert labels (the expert's next chunk; the command its
-# push through the user's channel), the task module the identity. Each obstacle task's module is then trained
+# push through the user's readout), the task module the identity. Each obstacle task's module is then trained
 # with ONE user's frozen module in the loop: T2 with U1, T3 with U2, T4 with U3, T5 with U4. Those 4 pairs and
 # the T1 column are the cells trained on; the other 12 combine a user and a task module that never met.
 # Data: a user module from 100 open-field demonstrations (500 steps, one noise draw per demonstration step:

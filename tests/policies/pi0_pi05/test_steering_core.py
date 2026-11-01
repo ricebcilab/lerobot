@@ -16,6 +16,8 @@
 """The task-generic steering core: one Euler integrator, per-trial matrices, the obstacle task module, the user
 module's rank knobs."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -452,30 +454,68 @@ def test_the_core_applies_a_ranked_module_through_its_velocity():
     assert torch.equal(plain, torch.einsum("bhij,bhj->bhi", matrices, v))
 
 
-def test_steered_chunk_reversal_uses_the_coupling():
-    """steered_chunk's frs (cursor convention) with a cross-step module: the reversal sees the coupling, so it
-    differs from the same module with the coupling cut, while the policy mode (no reversal) does not."""
+class FieldSampler:
+    """pi0.5's sampler interface over a toy field in the cursor's convention (t = 0 noise), from a fixed noise:
+    what the steering wrappers drive."""
+
+    def __init__(self, field, noise, steps=10):
+        self.field, self.noise = field, noise
+        self.config = SimpleNamespace(
+            num_inference_steps=steps,
+            chunk_size=noise.shape[1],
+            max_action_dim=noise.shape[2],
+            n_action_steps=2,
+            noise_time=0.0,
+        )
+
+    def reset(self):
+        pass
+
+    def predict_action_chunk(
+        self,
+        batch,
+        noise_fn=None,
+        flow_start_time=None,
+        num_forward_steps=None,
+        x_t_hook=None,
+        velocity_hook=None,
+    ):
+        x = self.noise.clone() if noise_fn is None else noise_fn(self.field, self.noise.clone())
+        start = 0.0 if flow_start_time is None else flow_start_time
+        n = num_forward_steps or self.config.num_inference_steps
+        dt = (1.0 - start) / n
+        for step in range(n):
+            t = start + step * dt
+            v = self.field(x, t)
+            x = x + dt * (v if velocity_hook is None else velocity_hook(step, t, x, v))
+        return x
+
+
+def _frs(sampler, reference, **kw):
+    return steering.FlowReversalSteeringPolicy(
+        sampler, None, operator_dims=None, reference_fn=lambda c: reference, **kw
+    )
+
+
+def test_frs_reversal_uses_the_coupling():
+    """FRS (cursor convention) with a cross-step user module: the reversal sees the coupling, so it differs from the
+    same module with the coupling cut, while the policy's own plan (no reversal) does not."""
     user = _perturbed_user(seed=3, horizon=6, n_dims=2, cross_step_rank=2)
     cut = LearnedUserModule(6, 2, d=32, tdim=8)
     cut.load_state_dict({k: p for k, p in user.state_dict().items() if not k.startswith("cross")})
     command = torch.tensor([[0.8, 0.1], [-0.5, 0.6]])
+    sampler = FieldSampler(
+        lambda x_, t_: torch.tanh(x_) - 0.3 * t_,
+        torch.randn(2, 6, 2, generator=torch.Generator().manual_seed(0)),
+    )
 
-    def velocity(x_, t_):
-        return torch.tanh(x_) - 0.3 * t_[:, None, None]
+    def chunks(module):
+        frs = _frs(sampler, command[:, None].expand(-1, 6, -1), pinned_steps=None)
+        return frs.steered_chunk(None, command, field=AdaptedField(None, module.eval(), n_dims=2))
 
-    def chunk(module, mode):
-        torch.manual_seed(0)
-        return steering.steered_chunk(
-            velocity,
-            command,
-            mode,
-            horizon=6,
-            to_reference=lambda c: c,
-            adapter=AdaptedField(None, module.eval(), n_dims=2),
-        )
-
-    assert not torch.allclose(chunk(user, "frs"), chunk(cut, "frs"))
-    assert torch.equal(chunk(user, "policy"), chunk(cut, "policy"))
+    (steered_user, plain_user), (steered_cut, plain_cut) = chunks(user), chunks(cut)
+    assert not torch.allclose(steered_user, steered_cut)
+    assert torch.equal(plain_user, plain_cut)
 
 
 def test_convert_cursor_module_maps_the_ranks():
@@ -493,34 +533,32 @@ def test_convert_cursor_module_maps_the_ranks():
     assert "cross_step_dims" not in ranked["config"]
 
 
-def test_frs_chunk_pinned_steps_in_paints_the_later_steps():
-    """frs_chunk with pinned_steps (Tang et al., App. D): the first steps are the steered chunk's, the later ones the
-    plain chunk's from the same noise (a field acting per step keeps the two apart); a pin covering the whole chunk,
-    or None, is the unpinned chunk, for a full and a partial reversal."""
+def test_frs_pinned_steps_in_paint_the_later_steps():
+    """FRS with pinned_steps (Tang et al., App. D): the first steps are the steered chunk's, the later ones the plain
+    chunk's from the same noise (a field acting per step keeps the two apart); a pin covering the whole chunk, or
+    None, is the unpinned chunk, for a full and a partial reversal."""
     g = torch.Generator().manual_seed(3)
     w, c = torch.randn(2, 2, generator=g), torch.randn(2, generator=g)
-    field = lambda x, t: x @ w.T * (1.0 + t)[:, None, None] + c  # noqa: E731
+    field = lambda x, t: x @ w.T * (1.0 + t) + c  # noqa: E731
     z, ref = torch.randn(4, 16, 2, generator=g), torch.randn(4, 16, 2, generator=g)
-    steer = torch.ones(4, 1, 1, dtype=torch.bool)
-    plain = integrate(z, field, 0.0, 1 / 10, 10, batch_time=True)
+    sampler, command = FieldSampler(field, z), torch.ones(4, 2)
+    plain = integrate(z, field, 0.0, 1 / 10, 10)
     for n in (None, 6):
-        whole = steering.frs_chunk(field, z, ref, steer, n, 10)
-        assert torch.equal(steering.frs_chunk(field, z, ref, steer, n, 10, pinned_steps=16), whole)
-        pinned = steering.frs_chunk(field, z, ref, steer, n, 10, pinned_steps=5)
+        whole = _frs(sampler, ref, n_reversal_steps=n, pinned_steps=None).steered_chunk(None, command)[0]
+        assert torch.equal(
+            _frs(sampler, ref, n_reversal_steps=n, pinned_steps=16).steered_chunk(None, command)[0], whole
+        )
+        pinned = _frs(sampler, ref, n_reversal_steps=n, pinned_steps=5).steered_chunk(None, command)[0]
         torch.testing.assert_close(pinned[:, :5], whole[:, :5])
         if n is None:  # the later steps start from z itself, so they are the plain chunk
             torch.testing.assert_close(pinned[:, 5:], plain[:, 5:])
-        else:  # from the plain flow at t = 0.4, run on in the partial reversal's step
-            mid = integrate(z, field, 0.0, 1 / 10, 4, batch_time=True)
-            torch.testing.assert_close(
-                pinned[:, 5:], integrate(mid, field, 0.4, 0.6 / 4, 4, batch_time=True)[:, 5:]
-            )
+        else:  # from the plain flow at t = 0.4, run on to the action in 6 steps of the policy's 1/10
+            mid = integrate(z, field, 0.0, 1 / 10, 4)
+            torch.testing.assert_close(pinned[:, 5:], integrate(mid, field, 0.4, 1 / 10, 6)[:, 5:])
 
 
-def test_steered_chunk_rejects_a_pin_outside_the_chunk():
-    field = lambda x, t: x  # noqa: E731
+def test_frs_rejects_a_pin_outside_the_chunk():
+    sampler = FieldSampler(lambda x, t: x, torch.zeros(2, 16, 2))
     for bad in (0, 17):
         with pytest.raises(ValueError, match="pinned_steps"):
-            steering.steered_chunk(
-                field, torch.ones(2, 2), "frs", horizon=16, to_reference=lambda d: d, pinned_steps=bad
-            )
+            _frs(sampler, torch.zeros(2, 16, 2), pinned_steps=bad)

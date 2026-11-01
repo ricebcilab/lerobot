@@ -9,7 +9,7 @@ import torch
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import trial_metrics
-from cursor_sa.channel import InputChannel
+from cursor_sa.readout import Readout
 from cursor_sa.demos import DemoSampler, make_demos, replay
 from cursor_sa.env import (CursorEnv, Layouts, TaskConfig, _layout, center_out, obstacle_spec, plan_route,
                            sample_layouts, segment_distance)
@@ -178,7 +178,7 @@ def test_expert_detours_and_is_unchanged_without_obstacles():
     for spec in (WALL, dict(DISC, radius=0.08, offset=0.0)):
         task = TaskConfig(**STUDY, obstacle=obstacle_spec(spec))
         layouts = sample_layouts(rng, 100, 4, task)
-        recs = run_trials(arm, layouts, ExpertAgent(), InputChannel(None, 0.0), policies[arm["model"]], adapters, "cpu")
+        recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
         outcomes = [r["outcome"] for r in recs]
         assert outcomes.count("collision") == 0 and outcomes.count("hit") >= 95, {o: outcomes.count(o) for o in set(outcomes)}
     # without obstacles the command is the closed form it always was
@@ -190,7 +190,7 @@ def test_expert_detours_and_is_unchanged_without_obstacles():
     np.testing.assert_allclose(agent.command(plain.start, plain), to_goal / dist * np.minimum(1.0, dist / 0.15))
     # no side flipping on a symmetric disc: the teleop path stays on one side of the reach line
     layouts = _one((0.2, 0.5), (0.8, 0.5), [[0.5, 0.5, 0.06]])
-    recs = run_trials(arm, layouts, ExpertAgent(), InputChannel(None, 0.0), policies[arm["model"]], adapters, "cpu")
+    recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
     lateral = np.array(recs[0]["path"])[:, 1] - 0.5
     signs = np.sign(lateral[np.abs(lateral) > 2e-3])
     assert recs[0]["outcome"] == "hit" and len(signs) and (signs == signs[0]).all()
@@ -207,7 +207,7 @@ def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records(tmp_
         config.load_arm("base.yaml", {"obstacle": {"kind": "cube"}})
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     layouts = sample_layouts(np.random.default_rng(0), 2, tuple(arm["targets"]), arm_task(arm))
-    recs = run_trials(arm, layouts, ExpertAgent(), InputChannel(None, 0.0), policies[arm["model"]], adapters, "cpu")
+    recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
     assert len(recs[0]["obstacles"]) == 1 and len(recs[0]["obstacles"][0]) == 3
     np.testing.assert_allclose(recs[0]["obstacles"], layouts.real_obstacles(0), atol=1e-4)
     # every arm of a protocol must play the same obstacles

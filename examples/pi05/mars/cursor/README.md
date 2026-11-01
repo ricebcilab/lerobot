@@ -66,7 +66,7 @@ with 401 errors.
 
 ```
 cursor_sa/            the library: env, policy, demos (+ the training sampler), steering (modes, reversal
-                      adapters), devices, channel, agents, config, session (the experiment mechanism),
+                      adapters), devices, readout, agents, config, session (the experiment mechanism),
                       renderer, records (trial records and their summary), analysis (figure style,
                       kinematics, goal-choice statistics), paths
 run_experiment.py     the portal: a protocol for a participant (human or expert), or free play
@@ -103,8 +103,8 @@ such as `checkpoints/` and `results/` are under `examples/pi05/mars/`.
   margin, so it never cuts a corner; pushed off the route it re-plans from where the cursor is);
   `expert_chunk` means the
   goal-given policy's own chunk, step by step (used by `grid_task_check`). All go through the
-  same input channel (corruption, noise), the same controller and the same records.
-- **Arm.** One control condition, a config under `configs/` (policy, mode and its settings, channel, task).
+  same readout (corruption, noise), the same controller and the same records.
+- **Arm.** One control condition, a config under `configs/` (policy, mode and its settings, readout, task).
   The four study arms extend `condition_study.yaml`: gain diag(1, 0.25) on the command plus input
   noise 1.0, 4 targets per trial at a reach of 0.35–0.5, each method at the settings `study_tuning`
   tuned for that condition.
@@ -182,7 +182,7 @@ on a task, e.g. a task-module arm where the task has none, are named below it) a
 | Sweep | Agent | Grid | Takes |
 |---|---|---|---|
 | `study_tuning` | expert | the study's condition: flow control over tau (lambda 1), FRS over pinned_steps (the full reversal), MARS over n_reverse_steps × pinned_steps; writes the study arms' settings | ~15 min |
-| `grid_expert_check` | expert | the expert alone (teleop, clean channel) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
+| `grid_expert_check` | expert | the expert alone (teleop, clean readout) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
 | `grid_task_check` | expert_chunk | the goal-given policy's own chunks executed, with and without each task module, and each task's retrained policy alone (T2–T5) | 2 min on a free GPU |
 | `grid` | expert | users {U1 … U4} × tasks {T1 … T5} at noise 1.0: the composed user × task adapter, each module alone, each task's retrained policy with its user modules, teleop, flow control and FRS; per cell flow control tunes tau (lambda 1), FRS pinned_steps (the full reversal), every MARS variant n_reverse_steps × pinned_steps | seed 0 tuned in parallel parts (`--cells`, then `--merge <parts> --out grid_s0`); seeds 1–4 at seed 0's settings (`--module-seed k --fixed-settings .../grid_s0/settings.yaml --out grid_s<k>`) |
 
@@ -224,7 +224,7 @@ Names are unified across scripts, configs, log fields, folders and figures:
   rotation in degrees, `curl20` a curl of 20/s. These replaced `gain025`, `gain` and `rot` on Oct 24;
   participant and study-session records from before keep the names they were recorded with (the
   study's adapter `learned_adapter/gain025y_free` is the file their manifests hash as `gain025_free`).
-- Channel: `corruption` (a matrix spec) and `input_noise` (a std); condition files are
+- Readout: `corruption` (a matrix spec) and `input_noise` (a std); condition files are
   `condition_<what>.yaml`; sweep cells are keyed `<level>|<noise>`, plus `|<axis>=<value or name>` per
   task axis (an axis given as a mapping `name: value` is keyed by its names).
 - Scripts are `verb_object.py` (`run_experiment.py`, `build_study_report.py`); library modules are
@@ -267,7 +267,13 @@ Main parameters (`control:` and `task:` sections):
   method (their Appendix D.2 perturbs later Euler steps only as an extension).
 - `n_reverse_steps` and `pinned_steps` are FRS's knobs (MARS's too): how many of the flow's 10 Euler
   steps the reference is reversed (null: all, to noise), and how many leading chunk steps it steers
-  (null: the whole chunk); the rest of the latent is handed back to the policy (Tang et al., App. D).
+  (null: the whole chunk); the rest of the latent is handed back to the policy (Tang et al., App. D). The forward
+  pass then runs n steps of the policy's own 1/N from where the reversal stopped. The cursor and the robot run one
+  implementation of each method: the cursor's chunks come from lerobot's `FlowControlPolicy` and
+  `FlowReversalSteeringPolicy`, the wrappers pi0.5 uses, driving the cursor policy through pi0.5's sampler interface
+  (`CursorSampler` over `FlowPolicy.sample_chunk`), and one operator readout (`lerobot.teleoperators.readout`:
+  corruption, curl, noise, deadband). Until 2026-10-31 the cursor's forward pass took N − n steps instead, coarse at
+  large depths, so earlier partial-reversal results are not comparable.
   FRS keeps the full reversal, Tang et al.'s method, and tunes `pinned_steps` (their `action_repeats`, fixed at
   5 of 15 there); MARS tunes both, since how far the reversal goes through the user module's field is part of the
   method (the 100-demonstration module fails at the full reversal).
@@ -340,7 +346,7 @@ uv run --extra mars python examples/pi05/mars/cursor/convert_checkpoints.py
 `train_adapter.py` trains one module of the reversal adapter, on the study's geometry (4 targets,
 reach 0.35–0.5) at input noise 1.0 unless told otherwise. A **user module** learns to undo one
 command corruption, calibrated open loop by an expert that knows the goal: the label is the
-demonstration's next chunk, the command the expert's push through the user's channel held over the
+demonstration's next chunk, the command the expert's push through the user's readout held over the
 chunk, and the field regression pulls the reversal of that command onto the label's latent. With
 `--closed-loop <initial modules>` the module is recalibrated ReFIT-style: the initial module runs closed loop on
 the open field at the grid's noise (`--closed-loop-trials` per module, 2000 in 10 s), every visited state joins
@@ -361,7 +367,7 @@ the policy's own chunks (`learned_adapter/*`) and task modules without a user.
 one demonstration is one reach, about a second). With few, the two modules want opposite budgets (the
 data-efficiency notes, in git history): a user module over-fits the default 20 000 steps and
 should train about five steps per demonstration (`--steps`, at least 100), while a task module needs the
-full 20 000 steps whatever its data. `--frozen-noise` draws the channel's noise once per demonstration
+full 20 000 steps whatever its data. `--frozen-noise` draws the readout's noise once per demonstration
 step, as a recorded calibration has it, instead of anew in every batch.
 
 Checkpoints go to `examples/pi05/mars/checkpoints/policies/<name>/` and `.../adapters/<name>/`, which git

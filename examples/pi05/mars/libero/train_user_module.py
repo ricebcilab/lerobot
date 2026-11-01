@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""Calibrate a MARS user module for one operator channel on LIBERO (the cursor project's
+"""Calibrate a MARS user module for one operator readout on LIBERO (the cursor project's
 `train_adapter.py --kind user`, ported to pi0.5).
 
 The user module U(x_t, t) multiplies the policy's velocity in the BACKWARD pass of Flow Reversal
-Steering, so that reversing what the channel delivered lands on the latent of what the operator
+Steering, so that reversing what the readout delivered lands on the latent of what the operator
 meant. Open-loop calibration with an expert that knows the goal, as in the cursor project's grid:
 
   state o      a LIBERO observation from a rollout of the task-prompted policy (the synthetic operator)
   label L      the policy's chunk at o under the scene's real task (what the operator means)
   command c    the operator's push for L: the mean translation of the executed prefix, clipped
-               (`PolicyOperator`'s rule), through the arm's channel: corruption M or curl, then noise
+               (`PolicyOperator`'s rule), through the arm's readout: corruption M or curl, then noise
                of std sigma ~ U(sigma_min, sigma_max) where the push is active, held over the chunk
   a_bci        the uniform-velocity reference chunk FRS builds from that served command
   z_L          L reversed through the goal-free field (the arm's prompt, e.g. "do something")
@@ -61,6 +61,7 @@ from lerobot.policies.pi05.steering import (  # noqa: E402
     uniform_reference,
     user_field_loss,
 )
+from lerobot.teleoperators import readout  # noqa: E402
 
 # ---------------------------------------------------------------- pure parts (unit-tested)
 
@@ -99,32 +100,26 @@ def parse_cross_step_dims(value) -> list[int] | None:
     return out
 
 
-def channel_core(command: np.ndarray, matrix=None, curl=None, n_steps: int = 10) -> np.ndarray:
-    """What the arm's channel serves before noise for a push held over `n_steps` control steps:
+def readout_core(command: np.ndarray, matrix=None, curl=None, n_steps: int = 10) -> np.ndarray:
+    """What the arm's readout serves before noise for a push held over `n_steps` control steps:
     clip(M @ c) for a matrix corruption, the curl field's velocity from rest after `n_steps` for a curl,
-    the push itself without either. Idle pushes pass through unchanged, as in the channel."""
+    the push itself without either. Idle pushes pass through unchanged, as in the readout."""
     command = np.asarray(command, dtype=np.float64)
-    if np.max(np.abs(command)) < DEADBAND:
-        return command.copy()
     if curl is not None:
         decay, drive = curl.discretization()
         vel = np.zeros(3)
         for _ in range(n_steps):
-            vel = decay @ vel + drive @ command
-        return np.clip(vel, -1.0, 1.0)
-    if matrix is not None:
-        return np.clip(np.asarray(matrix, dtype=np.float64) @ command, -1.0, 1.0)
-    return command.copy()
+            vel = readout.curl_step(vel, command, decay, drive)
+        return readout.curl_serve(vel, command)
+    return readout.corrupt(command, matrix)
 
 
 def serve(core: np.ndarray, raw: np.ndarray, sigma, rng: np.random.Generator) -> np.ndarray:
-    """The channel's last stage for a batch: `core` (B, 3) plus N(0, sigma^2) noise per axis (sigma (B,)),
+    """The readout's last stage for a batch: `core` (B, 3) plus N(0, sigma^2) noise per axis (sigma (B,)),
     clipped, where the raw push (B, 3) is active; idle pushes are served as they are."""
     core, raw = np.atleast_2d(core), np.atleast_2d(raw)
     sigma = np.broadcast_to(np.asarray(sigma, dtype=np.float64), (core.shape[0],))
-    noisy = np.clip(core + rng.normal(size=core.shape) * sigma[:, None], -1.0, 1.0)
-    active = np.max(np.abs(raw), axis=-1, keepdims=True) >= DEADBAND
-    return np.where(active, noisy, raw)
+    return readout.add_noise(core, raw, sigma, rng.normal(size=core.shape))
 
 
 def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor) -> torch.Tensor:
@@ -216,14 +211,14 @@ def collect_states(session, settings, episodes: int, rng: np.random.Generator) -
 @torch.no_grad()
 def label_states(session, states: list[dict], generic_prompt: str, control, mean, std) -> None:
     """Add to every state its label L (normalized chunk, (chunk, 7)), its latent z_L under the goal-free field
-    ((chunk, max_dim)), the operator's raw push, the channel's core and the gripper reference."""
+    ((chunk, max_dim)), the operator's raw push, the readout's core and the gripper reference."""
     policy, cfg = session.policy, session.policy.config
     n_out = N_ACTION_DIMS
     for i, state in enumerate(states):
         chunk = session.policy_chunk(state["observation"], state["task"])[0, :, :n_out].float()
         env_chunk = chunk.cpu().numpy() * std + mean
         raw, gripper = operator_command(env_chunk, session.settings.n_action_steps)
-        core = channel_core(
+        core = readout_core(
             raw, control.corruption_matrix, control.corruption_curl, session.settings.n_action_steps
         )
         padded = torch.zeros(1, cfg.chunk_size, cfg.max_action_dim, device=chunk.device)

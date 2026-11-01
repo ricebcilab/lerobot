@@ -7,7 +7,7 @@ import pytest
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.channel import InputChannel
+from cursor_sa.readout import Readout
 from cursor_sa.records import OUTCOMES, load_run, read_records
 from cursor_sa.session import (Aborted, Run, balanced_latin_square, block_order, block_permutation, layout_seed,
                                load_checkpoints, make_layout_sets, run_trials)
@@ -151,8 +151,8 @@ def test_run_trials_batched_matches_single(tmp_path):
     arm = config.load_arm("study_frs.yaml")
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     layouts, _ = make_layout_sets(7, 4, 0, (2, 4), TaskConfig())
-    channel = InputChannel(arm["corruption_matrix"], 0.0)
-    recs = run_trials(arm, layouts, ExpertAgent(), channel, policies[arm["model"]], adapters, "cpu")
+    readout = Readout(arm["corruption_matrix"], 0.0)
+    recs = run_trials(arm, layouts, ExpertAgent(), readout, policies[arm["model"]], adapters, "cpu")
     assert len(recs) == 4 and all(r["served_commands"] != r["raw_commands"] for r in recs)  # the gain corrupts them
     for r in recs:
         assert r["targets"][r["goal"]] is not None and 2 <= r["n_targets"] <= 4

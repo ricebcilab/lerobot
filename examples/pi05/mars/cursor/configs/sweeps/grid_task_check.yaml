@@ -1,5 +1,5 @@
 # The task modules' go/no-go, before the grid: for each obstacle task, the goal-given policy's own
-# chunks executed as they are (oracle: the expert_chunk agent in teleop, channel off) against the same
+# chunks executed as they are (oracle: the expert_chunk agent in teleop, readout off) against the same
 # through the task module (oracle_task), and the goal-hidden policy alone with and without it; beside them the
 # policy retrained for each task with an obstacle head (the grid's retrained_mars_user), alone, goal given and
 # hidden.
@@ -9,11 +9,11 @@ name: grid_task_check
 agent: expert_chunk
 arm: condition_grid.yaml
 methods:
-  oracle: {mode: teleop, channel: off}
-  oracle_task: {mode: teleop, channel: off, reversal_adapter: {task: cell}}
+  oracle: {mode: teleop, readout: off}
+  oracle_task: {mode: teleop, readout: off, reversal_adapter: {task: cell}}
   policy: {mode: policy}
   policy_task: {mode: policy, reversal_adapter: {task: cell}}
-  oracle_retrained: {mode: teleop, channel: off, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
+  oracle_retrained: {mode: teleop, readout: off, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
                                                          T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}
   policy_retrained: {mode: policy, model: {T2: flow_goaldrop_disc_large, T3: flow_goaldrop_wall_gap,
                                            T4: flow_goaldrop_ring_goal, T5: flow_goaldrop_ring_start}}

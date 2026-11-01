@@ -26,18 +26,18 @@ def test_operator_command_follows_the_policy_operator_rule():
     assert tum.operator_command(-chunk, n_action_steps=2)[1] == GRIPPER_OPEN
 
 
-def test_channel_core_matrix_curl_and_idle():
+def test_readout_core_matrix_curl_and_idle():
     m = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
-    np.testing.assert_allclose(tum.channel_core([1.0, 0.0, 0.0], matrix=m), [0.0, 1.0, 0.0])
+    np.testing.assert_allclose(tum.readout_core([1.0, 0.0, 0.0], matrix=m), [0.0, 1.0, 0.0])
     curl = Curl(20.0, 0.1, dt=0.05)
     decay, drive = curl.discretization()
     v = np.zeros(3)
     for _ in range(10):
         v = decay @ v + drive @ np.array([1.0, 0.0, 0.0])
-    np.testing.assert_allclose(tum.channel_core([1.0, 0.0, 0.0], curl=curl, n_steps=10), np.clip(v, -1, 1))
+    np.testing.assert_allclose(tum.readout_core([1.0, 0.0, 0.0], curl=curl, n_steps=10), np.clip(v, -1, 1))
     idle = np.array([DEADBAND / 2, 0.0, 0.0])
-    np.testing.assert_allclose(tum.channel_core(idle, matrix=m), idle)
-    np.testing.assert_allclose(tum.channel_core([0.5, 0.0, 0.0]), [0.5, 0.0, 0.0])
+    np.testing.assert_allclose(tum.readout_core(idle, matrix=m), idle)
+    np.testing.assert_allclose(tum.readout_core([0.5, 0.0, 0.0]), [0.5, 0.0, 0.0])
 
 
 def test_serve_adds_noise_only_where_active():

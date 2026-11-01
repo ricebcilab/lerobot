@@ -1,7 +1,7 @@
 """YAML configs: arms and protocols.
 
 An **arm** is one control condition (configs/<arm>.yaml): the policy, the control
-mode and its depth, the input channel (corruption, noise) and the task. An arm
+mode and its depth, the readout (corruption, noise) and the task. An arm
 file says `extends: base.yaml` (or another arm) and overrides only what it
 changes. A **protocol** (configs/study.yaml) names the arms a participant plays
 and how: trials and practice per block, block order, trial timing. Unknown or
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from .channel import adapter_spec, corruption_spec
+from .readout import adapter_spec, corruption_spec
 from .env import obstacle_spec
 from .paths import CONFIGS as CONFIG_DIR
 from .steering import GAIN_MODES, MODES, method_name
@@ -102,8 +102,8 @@ def validate_arm(params, where="arm"):
     steps = params["flow_steps"]
     if params["mode"] not in MODES:
         raise ValueError(f"{where}: control.mode must be one of {MODES}, got {params['mode']!r}")
-    if not 0 <= params["tau"] <= CHUNK_STEPS:  # Kao et al.: chunk steps whose initial condition carries the command
-        raise ValueError(f"{where}: control.tau must be in [0, {CHUNK_STEPS}] chunk steps, got {params['tau']}")
+    if not 1 <= params["tau"] <= CHUNK_STEPS:  # Kao et al.: chunk steps whose initial condition carries the command
+        raise ValueError(f"{where}: control.tau must be in [1, {CHUNK_STEPS}] chunk steps, got {params['tau']}")
     if not 0 <= params["lambda"] <= steps:  # the lab's variant: Euler steps the command's chunk is held for
         raise ValueError(f"{where}: control.lambda must be in [0, {steps}] Euler steps, got {params['lambda']}")
     if params["ic_gain"] <= 0:

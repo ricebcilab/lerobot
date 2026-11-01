@@ -5,7 +5,7 @@
 """Input devices: the SpaceMouse and the keyboard.
 
 Each exposes `translation`, the current command [x, y] in [-1, 1] (x right, y up
-on screen). The command then goes through `channel.InputChannel`.
+on screen). The command then goes through `readout.Readout`.
 
 The SpaceMouse reader follows the lab's LeRobot reader
 (examples/pi05/libero_shared_autonomy/teleop.py, now examples/pi05/mars/libero/teleop.py): same raw

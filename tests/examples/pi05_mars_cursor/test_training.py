@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from cursor_sa.channel import corruption_spec
+from cursor_sa.readout import corruption_spec
 from cursor_sa.env import TaskConfig, obstacle_spec, sample_layouts
 from cursor_sa.demos import DemoSampler, make_demos
 from cursor_sa.policy import FlowPolicy
@@ -131,7 +131,7 @@ def test_retrain_the_policy_for_a_task_then_calibrate_a_user_module_on_it(ckpt_d
     assert torch.load(ckpt_dir / "u_scratch" / "adapter.pt")["args"]["model"] == "scratch"
 
 
-def test_the_experts_pushes_and_the_channel_core_line_up_with_the_demonstrations():
+def test_the_experts_pushes_and_the_readout_core_line_up_with_the_demonstrations():
     policy = FlowPolicy().eval()
     args = train_adapter.parse_args(["--name", "x", "--corruption", "{scale: [1.0, 0.25]}", "--n-demos", "40",
                                      "--val-demos", "10"])

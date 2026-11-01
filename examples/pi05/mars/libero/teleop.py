@@ -43,6 +43,7 @@ from lerobot.policies.pi05.steering import (
     format_matrix,
     translation_matrix,
 )
+from lerobot.teleoperators import readout
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SpaceMouseReader as HidReader,
     find_spacemouse,
@@ -57,12 +58,12 @@ __all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN", "parse_report"]
 # environment variable takes to pin one device. Unset, the search takes any 3Dconnexion device.
 SPACEMOUSE_HID_ID = "0000046D:0000C62B"
 AXIS_SCALE = 350.0  # raw counts at full deflection (SPACEMOUSE_FULL_SCALE's default)
-# Map device channels (0=x: right push +, 1=y: pull-toward-you push +, 2=z:
+# Map device axes (0=x: right push +, 1=y: pull-toward-you push +, 2=z:
 # press-down +) onto the arm action dims [Δx, Δy, Δz]. Tuned by feel on the
 # real device so each push moves the arm the same way: forward push → forward,
 # left push → left, pull up → up. If a direction feels wrong, flip its sign;
 # if two axes are crossed, swap their AXIS_SOURCE entries.
-AXIS_SOURCE = np.array([1, 0, 2])  # device channel feeding each action dim
+AXIS_SOURCE = np.array([1, 0, 2])  # device axis feeding each action dim
 AXIS_SIGN = np.array([1.0, -1.0, -1.0])
 
 
@@ -311,7 +312,7 @@ CONTROL_DT = 0.05  # one LIBERO control step (20 steps/s): the curl field's inte
 
 @dataclass(frozen=True)
 class Curl:
-    """A curl field on the command, the cursor channel's dynamic corruption: the served translation
+    """A curl field on the command, the cursor readout's dynamic corruption: the served translation
     is a velocity driven by the push with time constant `tau` (s) and turned by `curl` (1/s, + =
     clockwise in the x-y plane; z is a plain lag): dv/dt = (u - v) / tau + curl * R v, stepped
     every `dt` s with the push held. At steady state a held push comes out turned clockwise by
@@ -325,30 +326,14 @@ class Curl:
         if not (np.isfinite(self.curl) and self.tau > 0 and self.dt > 0):
             raise ValueError(f"curl must be finite and tau, dt positive, got {self}")
 
-    @staticmethod
-    def _rot() -> np.ndarray:
-        return np.array([[0.0, 1.0], [-1.0, 0.0]])
-
     def discretization(self) -> tuple[np.ndarray, np.ndarray]:
-        """(decay, drive): the exact one-step update v <- decay v + drive u for a push u held over `dt`."""
-        eye2, rot = np.eye(2), self._rot()
-        decay2 = np.exp(-self.dt / self.tau) * (
-            np.cos(self.curl * self.dt) * eye2 + np.sin(self.curl * self.dt) * rot
-        )
-        m_inv = (-eye2 / self.tau - self.curl * rot) / (1 / self.tau**2 + self.curl**2)
-        drive2 = m_inv @ (decay2 - eye2) / self.tau
-        lag = np.exp(-self.dt / self.tau)
-        decay, drive = np.eye(3), np.eye(3)
-        decay[:2, :2], decay[2, 2] = decay2, lag
-        drive[:2, :2], drive[2, 2] = drive2, 1.0 - lag
-        return decay, drive
+        """(decay, drive): the exact one-step update v <- decay v + drive u for a push u held over `dt`
+        (LeRobot's operator readout, `lerobot.teleoperators.readout`, in 3D: z a plain lag)."""
+        return readout.curl_discretization(self.tau, self.curl, self.dt, n_dims=3)
 
     def steady_state(self) -> np.ndarray:
         """3x3 map from a held push to the steady-state served velocity (z unchanged)."""
-        k = self.tau * self.curl
-        s = np.eye(3)
-        s[:2, :2] = (np.eye(2) + k * self._rot()) / (1 + k**2)
-        return s
+        return readout.curl_steady_state(self.tau, self.curl, n_dims=3)
 
     def label(self) -> str:
         k = self.tau * self.curl
@@ -379,7 +364,7 @@ class CommandCorruption(MatrixHolder):
 
     The matrix can change at any time and is only applied while the source commands beyond
     DEADBAND, so an idle source stays idle. With a curl the field keeps evolving while the push is
-    idle (the cursor channel's rule), but an idle push is still served as is. The curl's clock is
+    idle (the cursor readout's rule), but an idle push is still served as is. The curl's clock is
     `advance(step)`, called once per environment step by the rollout; a read integrates the steps
     elapsed since the last read with the push held, so once-per-chunk reads (FC, FRS) and
     once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest.
@@ -431,14 +416,10 @@ class CommandCorruption(MatrixHolder):
                 raise ValueError("a corruption is a matrix or a curl field, not both")
             decay, drive = self._discretization
             for _ in range(self._clock - self._integrated):
-                self._vel = decay @ self._vel + drive @ clean
+                self._vel = readout.curl_step(self._vel, clean, decay, drive)
             self._integrated = max(self._integrated, self._clock)
-            if np.max(np.abs(clean)) < DEADBAND:
-                return clean
-            return np.clip(self._vel, -1.0, 1.0)
-        if self._matrix is None or np.max(np.abs(clean)) < DEADBAND:
-            return clean
-        return np.clip(self._matrix @ clean, -1.0, 1.0)
+            return readout.curl_serve(self._vel, clean)
+        return readout.corrupt(clean, self._matrix)
 
     @property
     def gripper(self) -> float:
@@ -587,9 +568,9 @@ class NoisyReader:
     @property
     def translation(self) -> np.ndarray:
         clean = np.asarray(self.source.translation, dtype=np.float64)
-        if self._input_noise == 0.0 or np.max(np.abs(clean)) < DEADBAND:
+        if self._input_noise == 0.0 or not readout.is_active(clean):  # draws only while the source pushes
             return clean
-        return np.clip(clean + self._rng.normal(0.0, self._input_noise, size=3), -1.0, 1.0)
+        return readout.add_noise(clean, clean, self._input_noise, self._rng.normal(size=3))
 
     @property
     def gripper(self) -> float:

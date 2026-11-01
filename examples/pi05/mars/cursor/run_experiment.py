@@ -31,7 +31,7 @@ from cursor_sa.agents import make_agent
 from cursor_sa.env import sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import append_record, load_run, summarize, trial_record
-from cursor_sa.session import Aborted, Run, arm_task, channel_for, load_checkpoints, run_trials
+from cursor_sa.session import Aborted, Run, arm_task, readout_for, load_checkpoints, run_trials
 
 ARM_FLAGS = {  # free-play overrides of arm parameters
     "--model": ("model", str), "--flow-steps": ("flow_steps", int), "--execute": ("execute", int),
@@ -174,7 +174,7 @@ def free_play(args):
     log_dir.mkdir(parents=True, exist_ok=True)
     log = log_dir / f"{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
     rng = np.random.default_rng()
-    channel = channel_for(arm, np.random.default_rng())
+    readout = readout_for(arm, np.random.default_rng())
     tally, n = {}, 0
     try:
         while True:
@@ -187,7 +187,7 @@ def free_play(args):
                        line2=("expert agent" if sim else f"SpaceMouse: {agent.status}   (arrow keys work too)"))
             renderer.status_line = "1-4 mode   [ ] depth   - = speed gain   space skip   esc quit"
             try:
-                rec = run_trials(arm, layouts, agent, channel, policy, adapters, device, renderer, hud)[0]
+                rec = run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer, hud)[0]
             except Skipped:
                 continue
             n += 1
@@ -200,7 +200,7 @@ def free_play(args):
                     apply_request(arm, what, value)
                     if any(n not in adapters for n in config.adapter_names(arm)):
                         adapters.update(load_checkpoints({arm["name"]: arm}, device)[1])
-            channel = channel_for(arm, channel.rng)
+            readout = readout_for(arm, readout.rng)
     except Aborted:
         pass
     finally:
