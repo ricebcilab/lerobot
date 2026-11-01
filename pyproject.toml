@@ -374,8 +374,8 @@ where = ["src"]
 target-version = "py312"
 line-length = 110
 exclude = ["tests/artifacts/**/*.safetensors", "*_pb2.py", "*_pb2_grpc.py"]
-# The MARS cursor example and its figures keep the original cursor project's style (lint and format).
-extend-exclude = ["examples/pi05/mars/cursor", "examples/pi05/mars/figures"]
+# The MARS cursor example and the paper's figure builder keep the original cursor project's style (lint and format).
+extend-exclude = ["examples/pi05/mars/cursor", "examples/pi05/mars/paper/figures"]
 
 [tool.ruff.lint]
 # E, W: pycodestyle errors and warnings
