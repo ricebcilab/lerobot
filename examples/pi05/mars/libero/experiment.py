@@ -51,7 +51,7 @@ from reproducibility import TrialSpec, corruption_rng, trial_specs
 from session import VIDEO_FPS, Session
 from teleop import CorruptionDraw, TeleopChain
 
-from lerobot.policies.pi05.steering import N_ACTION_DIMS, parse_adapter_spec
+from lerobot.policies.steering import N_ACTION_DIMS, parse_adapter_spec
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 

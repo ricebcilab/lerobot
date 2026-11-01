@@ -31,7 +31,7 @@ notebooks/analyze_human_pilot.ipynb  the human study's figures
 ```
 
 The steering methods themselves live in
-[`lerobot.policies.pi05.steering`](../../../../src/lerobot/policies/pi05/steering.py).
+[`lerobot.policies.steering`](../../../../src/lerobot/policies/steering/).
 
 ## Install
 
@@ -152,7 +152,7 @@ shared-autonomy modes differ in where your command enters that schedule.
   unsteered chunk. After each rollout the REPL prints how many chunks were
   steered and how far the executed translation landed from the reference (in
   action-std units). The mechanics are documented in the
-  [steering module](../../../../src/lerobot/policies/pi05/steering.py).
+  [steering module](../../../../src/lerobot/policies/steering/).
 
 Idle input means pure policy in every shared mode. Input sources (both active
 at once; the SpaceMouse wins while deflected):

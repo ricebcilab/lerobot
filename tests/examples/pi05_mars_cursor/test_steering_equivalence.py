@@ -14,7 +14,7 @@ from cursor_sa import steering
 from cursor_sa.policy import FlowPolicy, time_embedding
 from train import train_adapter
 
-import lerobot.policies.pi05.steering as core
+import lerobot.policies.steering.modeling_steering as core
 
 B, K = 6, 3
 # (mode, kwargs): the policy alone and the shared modes; teleop never builds a chunk
@@ -228,7 +228,7 @@ def test_field_loss_matches_the_reference(setup, exact, with_task, weighted):
 
 @pytest.mark.parametrize("with_task", (False, True))
 def test_core_user_field_loss_matches_the_reference(setup, exact, with_task):
-    from lerobot.policies.pi05.steering import user_field_loss
+    from lerobot.policies.steering import user_field_loss
 
     s = setup
     old_user, old_task, new_user, new_task = s["modules"]
@@ -265,7 +265,7 @@ def test_task_loss_matches_the_reference(setup, exact):
 
 
 def test_core_task_field_loss_matches_the_reference(setup, exact):
-    from lerobot.policies.pi05.steering import task_field_loss
+    from lerobot.policies.steering import task_field_loss
 
     s = setup
     _, old_task, _, new_task = s["modules"]

@@ -21,7 +21,7 @@ from config import (
     spec_label,
 )
 
-from lerobot.policies.pi05.steering import rotation_about_z
+from lerobot.policies.steering import rotation_about_z
 
 CONDITIONS = sorted(
     p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if not p.name.startswith("base")
@@ -153,7 +153,7 @@ def test_flow_control_knobs_and_the_old_name(tmp_path):
 
 
 def test_learned_and_composed_adapter_specs(tmp_path):
-    from lerobot.policies.pi05.steering import LearnedTaskModule, LearnedUserModule, save_adapter_module
+    from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule, save_adapter_module
 
     user = save_adapter_module(LearnedUserModule(horizon=4, d=8, tdim=4), tmp_path / "user.pt", kind="user")
     task = save_adapter_module(LearnedTaskModule(horizon=4, d=8, tdim=4), tmp_path / "task.pt", kind="task")

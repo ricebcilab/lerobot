@@ -21,8 +21,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lerobot.policies.pi05 import steering
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import modeling_steering as steering
+from lerobot.policies.steering.modeling_steering import (
     AdaptedField,
     LearnedTaskModule,
     LearnedUserModule,

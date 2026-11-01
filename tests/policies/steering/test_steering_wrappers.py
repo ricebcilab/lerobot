@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_DIM,
     N_ACTION_DIMS,
@@ -453,7 +453,7 @@ def test_reference_chunk_uses_last_gripper_and_normalization():
 
 
 def test_forward_flow_constant_field_closed_form():
-    from lerobot.policies.pi05.steering import forward_flow
+    from lerobot.policies.steering import forward_flow
 
     x = torch.zeros(1, CHUNK, MAX_DIM)
     times = []
@@ -469,7 +469,7 @@ def test_forward_flow_constant_field_closed_form():
 
 
 def test_delegation_mask_marks_uncommanded_dims_and_tail():
-    from lerobot.policies.pi05.steering import delegation_mask
+    from lerobot.policies.steering import delegation_mask
 
     mask = delegation_mask(CHUNK, MAX_DIM, ("translation",), pinned_steps=2)
     assert mask.shape == (CHUNK, MAX_DIM)
@@ -565,7 +565,7 @@ def test_flow_control_records_the_policy_plan_from_the_same_noise_without_distur
 
 # ---------------------------------------------------------------- MARS: modular reversal adapters
 
-from lerobot.policies.pi05.steering import (  # noqa: E402
+from lerobot.policies.steering import (  # noqa: E402
     AdapterSpec,
     LearnedTaskModule,
     LearnedUserModule,

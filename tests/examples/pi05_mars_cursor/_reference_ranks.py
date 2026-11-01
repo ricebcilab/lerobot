@@ -1,12 +1,12 @@
 # Frozen reference for equivalence tests: a frozen copy of the original cursor project's cursor_sa/steering.py at
 # ricebcirig commit bd2a48f2 (analysis/nishal/cursor_control_shared_autonomy; the user module's step_rank and
 # cross_step_rank knobs), with its relative imports made absolute and its one machine path dropped. Do not edit; tests
-# compare the lerobot steering core's ranked user module (src/lerobot/policies/pi05/steering.py) against it.
+# compare the lerobot steering core's ranked user module (src/lerobot/policies/steering/) against it.
 
 """Operator steering of the goal-free cursor flow policy.
 
 Mirrors the shared-autonomy modes of the lab's LeRobot pi0.5 setup
-(src/lerobot/policies/pi05/steering.py in this repo), with the same names
+(src/lerobot/policies/steering/ in this repo), with the same names
 and knobs so cursor and LIBERO results can be compared:
 
     policy        the policy alone

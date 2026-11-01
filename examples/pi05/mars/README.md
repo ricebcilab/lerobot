@@ -9,7 +9,7 @@ trained separately and composed. Two tasks carry the project. [`cursor/`](cursor
 is a 2D cursor-reaching task with a small flow policy, a human study and a
 simulated users x tasks grid. [`libero/`](libero/) steers the pi0.5 policy on
 LIBERO manipulation with the same steering methods
-(`lerobot.policies.pi05.steering`).
+(`lerobot.policies.steering`).
 
 Names: MARS is the method; `cursor_sa` is the cursor example's package, `cursor_flow`
 its policy in `lerobot.policies`, and `ricebcilab/mars-cursor` the Hub repo of its

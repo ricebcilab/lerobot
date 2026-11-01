@@ -9,7 +9,7 @@ from cursor_sa import paths
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule, steered_chunk
 
-from lerobot.policies.pi05.steering import load_adapter_module
+from lerobot.policies.steering import load_adapter_module
 
 
 def _obs(b=3, n=5, k=2):

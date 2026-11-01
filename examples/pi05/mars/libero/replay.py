@@ -44,7 +44,7 @@ from config import ControlSettings, SessionSettings  # noqa: E402
 from reproducibility import TrialSpec  # noqa: E402
 from session import Session  # noqa: E402
 
-from lerobot.policies.pi05.steering import DEADBAND  # noqa: E402
+from lerobot.policies.steering import DEADBAND  # noqa: E402
 
 STEERING_MODES = ("shared_flow_control", "shared_flow_reversal_steering")
 

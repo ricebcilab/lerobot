@@ -25,7 +25,7 @@ import torch
 from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowConfig
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.factory import get_policy_class, make_policy_config
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     LearnedTaskModule,
     LearnedUserModule,
     integrate,

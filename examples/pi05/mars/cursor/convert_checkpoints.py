@@ -32,7 +32,7 @@ from pathlib import Path
 import torch
 
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
-from lerobot.policies.pi05.steering import (LearnedTaskModule, LearnedUserModule, convert_cursor_module, load_adapter_module,
+from lerobot.policies.steering import (LearnedTaskModule, LearnedUserModule, convert_cursor_module, load_adapter_module,
                                              save_adapter_module)
 
 CHECKPOINTS = Path(__file__).resolve().parents[1] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS

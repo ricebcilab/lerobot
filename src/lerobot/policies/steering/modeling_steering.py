@@ -14,240 +14,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-autonomy steering of pi0.5's flow-matching sampler.
-
-Two ways for an operator's translation command to steer the policy without
-touching the executed action, which is always the model's own output:
-
-- ``FlowControlPolicy``: shared flow control (Kao et al. 2026): the command,
-  scaled by ``ic_gain`` into the noise prior's units, is written into the
-  translation dims of the first ``tau`` chunk steps of ``x_t`` at the start of
-  each of the first ``lam`` Euler steps (``lam`` 1 = the initial condition
-  only); the flow itself runs unmodified.
-- ``FlowReversalSteeringPolicy``: a uniform-velocity reference chunk built from
-  the command is integrated *backward* through the policy's velocity field to
-  the latent noise that maps to it (Flow Reversal Steering, Tang et al. 2026,
-  arXiv:2606.13675); the forward flow then starts from that noise.
-
-Both read an operator ``TeleopSource`` and the checkpoint's action statistics
-from the postprocessor. ``reverse_flow`` is the integrator. ``ReversalAdapter``
-is MARS (Modular Adapters for Reversal Steering, the method formerly called
-FRS-RA): a *user module* that adapts the velocity field of the reversal only
-(a fixed 7x7 matrix F, typically the known command corruption, or a learned
-``LearnedUserModule`` U(x_t, t)) and/or a *task module* (A(x_t, t, v) v + b)
-that adapts the field in both directions, so it reshapes every chunk the
-policy produces. The forward field is task(v) and the backward field
-user(task(v)); the modules are trained apart and composed here. FRS with a
-user module alone is MARS-U, with a task module alone MARS-T.
-
-Elements of the reference the operator does not command (``operator_dims``
-selects which of translation / rotation / gripper they do), the padding dims and
-the steps beyond ``pinned_steps`` are *delegated* to the policy: after the
-reversal their latent is replaced by the unsteered one (fresh Gaussian noise for
-a full reversal). This is the noise-space in-painting of Tang et al., App. D.1,
-whose human interface steers a 5-step reference (``action_repeats``) in a
-15-step chunk of which 10 steps are executed, setting the other 10 latent steps
-to N(0, I): the reference covers half the executed steps, and the policy fills in
-the rest. The wrapper's default pins the executed steps instead; set
-``pinned_steps`` to match the paper's ratio.
-
-Under the pi0.5 wrappers sits a task-generic core that takes any velocity field
-``velocity(x, t)`` and any number of action dims: ``integrate`` (one Euler
-integrator for either flow-time convention; the sign of ``h`` sets the
-direction of flow time, ``backward`` whether the user part of the adapter acts):
-
-- pi0.5 (t=1 noise, t=0 action): the reversal (action toward noise) runs
-  ``t0=0, h=+1/N``, the forward pass (noise toward action) ``t0=1, h=-1/N``;
-- the cursor (t=0 noise, t=1 action): the reversal runs ``t0=1, h=-1/N``, the
-  forward pass from the reversal's landing point ``t0=1-n/N`` with ``h>0``
-  (``t0=0, h=+1/N`` for a whole chunk from noise).
-
-Also ``AdaptedField`` (fixed or per-trial matrices, user and task modules; a user
-module acts through ``apply_user_module``, i.e. its ``velocity``), the
-module classes (``LearnedUserModule`` with its rank knobs, ``LearnedTaskModule``, which
-reads obstacles when it is given them) and their checkpoints, and the module
-training losses ``user_field_loss`` and ``task_field_loss``.
-
-The steering wrappers (``FlowControlPolicy``, ``FlowReversalSteeringPolicy``) are
-not pi0.5-specific: they steer any flow policy with pi0.5's sampler interface (a
-``config`` and ``predict_action_chunk`` taking ``noise_fn``, ``flow_start_time``,
-``num_forward_steps``, ``x_t_hook`` and ``velocity_hook``), in either flow-time
-convention, and ``steered_chunk(batch, commands)`` serves a batch of commands. The
-cursor example drives its own policy through them (``FlowPolicy.sample_chunk``), so
-the robot and the cursor run one implementation of each method.
-"""
+"""Shared-autonomy steering of a flow-matching sampler: ``FlowControlPolicy`` (Kao et al. 2026) and
+``FlowReversalSteeringPolicy`` (Tang et al. 2026) over any policy with pi0.5's sampler interface, the MARS
+adapters (``LearnedUserModule``, ``LearnedTaskModule``, ``ReversalAdapter``) with their checkpoints, losses and
+training loop, the one Euler integrator of either flow-time convention, and each method's core. The settings
+and specs are ``configuration_steering``'s; this folder's README describes the methods."""
 
 import math
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
 import numpy as np
 import torch
 from torch import nn
 
-from lerobot.teleoperators import readout
-
-# LIBERO's OSC_POSE action: end-effector position deltas, axis-angle deltas, gripper.
-ACTION_DIMS = ("dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper")
-N_ACTION_DIMS = len(ACTION_DIMS)
-GRIPPER_DIM = ACTION_DIMS.index("gripper")
-GRIPPER_OPEN = -1.0
-# Groups of action dims an operator can command; anything else is the policy's.
-OPERATOR_DIM_GROUPS = {
-    "translation": slice(0, 3),
-    "rotation": slice(3, 6),
-    "gripper": slice(GRIPPER_DIM, GRIPPER_DIM + 1),
-}
-GRIPPER_CLOSE = 1.0
-DEADBAND = (
-    readout.DEADBAND
-)  # default `deadband` of the wrappers: below this (env units) the operator counts as idle
-
-
-class TeleopSource(Protocol):
-    """What the steering wrappers read: the operator's current command."""
-
-    @property
-    def translation(self) -> np.ndarray:  # shape (3,), env units in [-1, 1]
-        ...
-
-    @property
-    def gripper(self) -> float:  # GRIPPER_OPEN or GRIPPER_CLOSE
-        ...
-
-
-def check_steps(name: str, value, low: int, high: int, unit: str, optional: bool = False) -> None:
-    """Raise unless ``value`` is an integer (not a bool) in [``low``, ``high``] ``unit``, or None when
-    ``optional``: the one check of the step knobs (tau, lambda, n_reversal_steps, pinned_steps)."""
-    if optional and value is None:
-        return
-    if not (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high):
-        none = "None or " if optional else ""
-        raise ValueError(f"{name} must be {none}an integer in [{low}, {high}] ({unit}), got {value!r}")
-
-
-# ---------------------------------------------------------------- matrices
-
-
-def validate_matrix(matrix, size: int, where: str) -> np.ndarray:
-    """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
-    try:
-        m = np.asarray(matrix, dtype=np.float64)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{where}: entries must be numbers ({e})") from e
-    if m.shape != (size, size):
-        raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
-    if not np.all(np.isfinite(m)):
-        raise ValueError(f"{where}: entries must be finite")
-    return m
-
-
-def rotation_about_z(degrees: float) -> np.ndarray:
-    """3x3 rotation of a translation command about the z axis."""
-    c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def translation_matrix(spec, where: str = "matrix", literal_key: str = "M") -> np.ndarray:
-    """Build a 3x3 from a spec: {rotation_z_deg: d}, {scale: [sx, sy, sz]}, {M: rows} or bare rows."""
-    if isinstance(spec, dict):
-        keys = set(spec)
-        if keys == {"rotation_z_deg"}:
-            return rotation_about_z(float(spec["rotation_z_deg"]))
-        if keys == {"scale"}:
-            scale = np.asarray(spec["scale"], dtype=np.float64)
-            if scale.shape != (3,) or not np.all(np.isfinite(scale)):
-                raise ValueError(f"{where}: scale must be three finite numbers, got {spec['scale']!r}")
-            return np.diag(scale)
-        if keys == {literal_key}:
-            return validate_matrix(spec[literal_key], 3, f"{where}.{literal_key}")
-        raise ValueError(
-            f"{where}: expected exactly one of rotation_z_deg, scale or {literal_key}, got {sorted(keys)}"
-        )
-    return validate_matrix(spec, 3, where)
-
-
-_BLOCK_CHOICES = ("identity", "zero")
-
-
-def build_reversal_adapter(
-    spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
-) -> np.ndarray | None:
-    """Build the 7x7 reversal adapter F from a spec, or None when the spec is None.
-
-    Forms: ``{F: rows}`` (literal), or blocks ``translation`` (``corruption`` to
-    copy the 3x3 command corruption, ``corruption_inverse`` for its inverse, the
-    adapter that recovers a curl field's steady state on the cursor task,
-    ``identity``, ``zero``, or any ``translation_matrix`` spec), ``orientation``
-    and ``gripper`` (``identity`` or ``zero``). Missing blocks are identity.
-    """
-    if spec is None:
-        return None
-    if not isinstance(spec, dict):
-        raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
-    if "F" in spec:
-        if set(spec) != {"F"}:
-            raise ValueError(f"{where}: a literal F cannot be combined with block keys")
-        return validate_matrix(spec["F"], N_ACTION_DIMS, f"{where}.F")
-    unknown = set(spec) - {"translation", "orientation", "gripper"}
-    if unknown:
-        raise ValueError(
-            f"{where}: unknown keys {sorted(unknown)} (expected translation, orientation, gripper)"
-        )
-
-    f = np.eye(N_ACTION_DIMS)
-    translation = spec.get("translation", "identity")
-    if translation in ("corruption", "corruption_inverse"):
-        if corruption is None:
-            raise ValueError(f"{where}.translation: '{translation}' requested but control.corruption is null")
-        f[:3, :3] = corruption if translation == "corruption" else np.linalg.inv(corruption)
-    elif translation == "zero":
-        f[:3, :3] = 0.0
-    elif translation != "identity":
-        f[:3, :3] = translation_matrix(translation, f"{where}.translation")
-    for key, dims in (
-        ("orientation", OPERATOR_DIM_GROUPS["rotation"]),
-        ("gripper", OPERATOR_DIM_GROUPS["gripper"]),
-    ):
-        choice = spec.get(key, "identity")
-        if choice not in _BLOCK_CHOICES:
-            raise ValueError(f"{where}.{key}: expected identity or zero, got {choice!r}")
-        if choice == "zero":
-            f[dims, dims] = 0.0
-    return f
-
-
-def format_matrix(matrix: np.ndarray) -> str:
-    """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
-    return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
-
-
-class MatrixHolder:
-    """Mutable holder for an optional square matrix (None = off) with a display label.
-
-    Consumers read the holder on every use, so replacing ``matrix`` takes effect
-    immediately; the setter validates the shape.
-    """
-
-    size: int
-    where: str
-
-    def __init__(self, matrix=None, label: str | None = None):
-        self.matrix = matrix
-        self.label = label
-
-    @property
-    def matrix(self) -> np.ndarray | None:
-        return self._matrix
-
-    @matrix.setter
-    def matrix(self, value) -> None:
-        self._matrix = None if value is None else validate_matrix(value, self.size, self.where)
-
+from .configuration_steering import (
+    DEADBAND,
+    GRIPPER_DIM,
+    GRIPPER_OPEN,
+    N_ACTION_DIMS,
+    OPERATOR_DIM_GROUPS,
+    MatrixHolder,
+    TeleopSource,
+    check_steps,
+    format_matrix,
+)
 
 # ---------------------------------------------------------------- MARS: modular reversal adapters
 
@@ -361,7 +154,7 @@ class LearnedUserModule(nn.Module):
         b, h, n = x_t.shape[0], self.horizon, self.n_dims
         x = x_t[:, :h, :n].reshape(b, h * n).to(torch.float32)
         if self.time_embedding == "pi05":
-            from .modeling_pi05 import create_sinusoidal_pos_embedding
+            from lerobot.policies.pi05.modeling_pi05 import create_sinusoidal_pos_embedding
 
             t = torch.as_tensor(t, dtype=torch.float32, device=x.device).reshape(-1)
             emb = create_sinusoidal_pos_embedding(t, self.tdim, 0.004, 4.0, x.device).float().expand(b, -1)
@@ -583,68 +376,6 @@ def convert_cursor_module(ckpt: dict) -> dict:
             "meta": meta,
         }
     raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
-
-
-@dataclass(frozen=True)
-class AdapterSpec:
-    """A parsed ``reversal_adapter`` spec: a fixed user matrix F (environment space) and/or the paths
-    of learned modules. The session loads the modules; the matrix is rebuilt per trial when the
-    corruption is random."""
-
-    matrix: np.ndarray | None = None
-    user_path: str | None = None
-    task_path: str | None = None
-
-    def __eq__(self, other):
-        if not isinstance(other, AdapterSpec):
-            return NotImplemented
-        same_matrix = (self.matrix is None and other.matrix is None) or (
-            self.matrix is not None and other.matrix is not None and np.array_equal(self.matrix, other.matrix)
-        )
-        return same_matrix and (self.user_path, self.task_path) == (other.user_path, other.task_path)
-
-
-def _module_path(value, where: str) -> str:
-    if not isinstance(value, str | Path) or not str(value):
-        raise ValueError(f"{where}: expected a checkpoint path, got {value!r}")
-    return str(value)
-
-
-def parse_adapter_spec(
-    spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
-) -> AdapterSpec:
-    """Parse a reversal-adapter spec into fixed matrix / module paths.
-
-    Forms: ``null``; a fixed user matrix as ``build_reversal_adapter`` takes it (blocks or ``{F: rows}``);
-    ``{learned: <path>}`` (a learned user module); or the composite ``{user: <fixed spec | {learned: path}
-    | null>, task: <path | null>}`` (MARS = user + task; one slot alone is MARS-U or MARS-T).
-    """
-    if spec is None:
-        return AdapterSpec()
-    if not isinstance(spec, dict):
-        raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
-    keys = set(spec)
-    if keys == {"learned"}:
-        return AdapterSpec(user_path=_module_path(spec["learned"], f"{where}.learned"))
-    if keys and keys <= {"user", "task"}:
-        user, task = spec.get("user"), spec.get("task")
-        task_path = None if task is None else _module_path(task, f"{where}.task")
-        if user is None:
-            return AdapterSpec(task_path=task_path)
-        if isinstance(user, dict) and "learned" in user:
-            if set(user) != {"learned"}:
-                raise ValueError(f"{where}.user: a learned module cannot be combined with a fixed matrix")
-            return AdapterSpec(
-                user_path=_module_path(user["learned"], f"{where}.user.learned"), task_path=task_path
-            )
-        return AdapterSpec(
-            matrix=build_reversal_adapter(user, corruption, f"{where}.user"), task_path=task_path
-        )
-    if keys & {"learned", "user", "task"}:
-        raise ValueError(
-            f"{where}: expected null, a fixed matrix spec, {{learned: path}} or {{user: ..., task: ...}}, got {sorted(keys)}"
-        )
-    return AdapterSpec(matrix=build_reversal_adapter(spec, corruption, where))
 
 
 class ReversalAdapter(MatrixHolder):

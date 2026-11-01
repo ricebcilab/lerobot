@@ -4,7 +4,7 @@ import _reference_steering as ref
 import torch
 from cursor_sa.policy import FlowPolicy
 
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     LearnedTaskModule,
     LearnedUserModule,
     convert_cursor_module,

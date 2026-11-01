@@ -4,7 +4,7 @@ import torch
 import train_user_module as tum
 from teleop import Curl
 
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_OPEN,

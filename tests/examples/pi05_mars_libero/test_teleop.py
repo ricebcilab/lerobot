@@ -137,7 +137,7 @@ def test_teleop_chain_order_and_records():
 
 
 def test_module_reexports_shared_constants():
-    from lerobot.policies.pi05 import steering
+    from lerobot.policies import steering
 
     assert teleop.DEADBAND is steering.DEADBAND
     assert teleop.GRIPPER_OPEN == steering.GRIPPER_OPEN

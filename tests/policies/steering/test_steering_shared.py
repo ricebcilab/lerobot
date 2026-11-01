@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
     FlowControlPolicy,

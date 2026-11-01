@@ -1,7 +1,7 @@
 """Operator steering of the goal-free cursor flow policy.
 
 Binds the shared-autonomy modes of lerobot's pi0.5 steering
-(src/lerobot/policies/pi05/steering.py), with the same names
+(src/lerobot/policies/steering/), with the same names
 and knobs so cursor and LIBERO results can be compared:
 
     policy        the policy alone
@@ -57,7 +57,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from lerobot.policies.pi05.steering import (AdaptedField, FlowControlPolicy, FlowReversalSteeringPolicy,
+from lerobot.policies.steering import (AdaptedField, FlowControlPolicy, FlowReversalSteeringPolicy,
                                              LearnedTaskModule, LearnedUserModule, integrate, load_adapter_module,
                                              task_velocity_hook)
 

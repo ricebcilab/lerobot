@@ -20,7 +20,7 @@ the policy:
 `TeleopChain` builds that pipeline; the modes consume `chain.source`. Every
 reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
 (-1 open, +1 close), the `TeleopSource` protocol from
-`lerobot.policies.pi05.steering`.
+`lerobot.policies.steering`.
 """
 
 import os
@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_DIM,

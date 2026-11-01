@@ -12,7 +12,7 @@ from reproducibility import trial_specs
 from session import RolloutResult, Session
 from teleop import KeyboardReader, PolicyOperator, PolicyOperatorSettings, TeleopChain
 
-from lerobot.policies.pi05.steering import ReversalAdapter
+from lerobot.policies.steering import ReversalAdapter
 
 
 class FakeSession:

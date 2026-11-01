@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from lerobot.policies.pi05.steering import GRIPPER_CLOSE, GRIPPER_OPEN
+from lerobot.policies.steering import GRIPPER_CLOSE, GRIPPER_OPEN
 
 SPACEMOUSE_HID_ID = "0000046D:0000C62B"  # vendor:product as it appears in /sys uevent
 AXIS_SCALE = 350.0

@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image
 from teleop import KeyboardReader
 
-from lerobot.policies.pi05.steering import ACTION_DIMS
+from lerobot.policies.steering import ACTION_DIMS
 
 # LIBERO's robosuite OSC_POSE controller: end-effector position deltas,
 # orientation (axis-angle) deltas, then gripper (-1 = open, +1 = close).

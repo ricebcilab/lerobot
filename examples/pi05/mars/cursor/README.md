@@ -4,7 +4,7 @@ A 2D cursor task in which a flow-matching policy (a small transformer, pi0-style
 action chunks) reaches targets, and a person's or a simulated agent's command
 steers it: teleop, shared flow control, Flow Reversal Steering (FRS) and FRS with
 a reversal adapter (MARS, fixed or learned). The steering methods are lerobot's
-pi0.5 steering ([`src/lerobot/policies/pi05/steering.py`](../../../../src/lerobot/policies/pi05/steering.py)),
+LeRobot's steering package ([`src/lerobot/policies/steering/`](../../../../src/lerobot/policies/steering/)),
 which the cursor example binds, with the same names and knobs; the LIBERO example's README ([../libero/README.md](../libero/README.md))
 describes each mode and knob on pi0.5.
 

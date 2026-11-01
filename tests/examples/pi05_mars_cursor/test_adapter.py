@@ -9,7 +9,7 @@ from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.env import TaskConfig, sample_layouts
 from cursor_sa.paths import adapter_path
 from cursor_sa.policy import FlowPolicy
-from lerobot.policies.pi05.steering import LearnedUserModule
+from lerobot.policies.steering import LearnedUserModule
 
 from cursor_sa.steering import (ReversalAdapter, SharedController, TaskModule, UserModule, flow,
                                 forward_flow, observation, reverse_flow, steered_chunk)

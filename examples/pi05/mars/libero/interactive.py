@@ -58,7 +58,7 @@ from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings,
 from session import VIDEO_FPS, Session
 from teleop import build_corruption, build_curl, read_matrix_spec
 
-from lerobot.policies.pi05.steering import parse_adapter_spec
+from lerobot.policies.steering import parse_adapter_spec
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 

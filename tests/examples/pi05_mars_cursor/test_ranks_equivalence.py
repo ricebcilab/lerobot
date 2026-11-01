@@ -12,7 +12,7 @@ import torch
 from cursor_sa import steering
 from cursor_sa.policy import FlowPolicy, time_embedding
 
-import lerobot.policies.pi05.steering as core
+import lerobot.policies.steering.modeling_steering as core
 
 RANKS = [
     {},

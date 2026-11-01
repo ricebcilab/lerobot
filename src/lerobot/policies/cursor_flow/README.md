@@ -12,8 +12,8 @@ displacements.
   t = 1 (action). `mode="regress"` is the baseline that predicts the chunk directly.
 - `CursorFlowPolicy` is a thin `PreTrainedPolicy` around it. It saves as `config.json` + `model.safetensors`,
   so it loads with `from_pretrained`. `predict_action_chunk` returns the plain policy chunk (10 Euler steps of
-  `lerobot.policies.pi05.steering.integrate`) in screen units, and `select_action` returns its first step.
-  The cursor code uses `.model` directly, together with the MARS steering in `lerobot.policies.pi05.steering`.
+  `lerobot.policies.steering.integrate`) in screen units, and `select_action` returns its first step.
+  The cursor code uses `.model` directly, together with the MARS steering in `lerobot.policies.steering`.
 
 It has no processor pipeline and no dataset features, and `lerobot-train` does not train it. It is trained by
 the example's own trainer, `examples/pi05/mars/cursor/train/train_policy.py`, which writes the cursor

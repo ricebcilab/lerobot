@@ -43,7 +43,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lerobot.policies.pi05.steering import (  # noqa: E402
+from lerobot.policies.steering import (  # noqa: E402
     ACTION_DIMS,
     DEADBAND,
     GRIPPER_CLOSE,
@@ -230,7 +230,7 @@ def train(args) -> None:
     from config import load_experiment_settings
     from session import Session
 
-    from lerobot.policies.pi05.steering import get_action_mean_std
+    from lerobot.policies.steering import get_action_mean_std
 
     settings = load_experiment_settings(args.config, {})
     control = settings.session.control

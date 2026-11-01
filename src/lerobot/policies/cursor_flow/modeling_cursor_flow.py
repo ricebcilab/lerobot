@@ -32,7 +32,7 @@ takes any number of them in any order.
 As in pi0, cursor and target tokens do not attend to the action tokens, so the
 observation encoding does not depend on the noisy chunk being denoised.
 
-The flow convention is the cursor's (see ``lerobot.policies.pi05.steering``): t=0 is
+The flow convention is the cursor's (see ``lerobot.policies.steering``): t=0 is
 Gaussian noise, t=1 is the action chunk, and sampling Euler-integrates v_theta from 0
 to 1. mode="regress" is the baseline: the same network predicts the chunk
 directly with an MSE loss, so it averages over the variety in the demos.
@@ -47,8 +47,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from lerobot.policies.pi05.steering import integrate
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.steering import integrate
 
 from .configuration_cursor_flow import CursorFlowConfig
 
@@ -208,7 +208,7 @@ class FlowPolicy(nn.Module):
         velocity_hook=None,
     ):
         """A normalized chunk [B, horizon, 2] through pi0.5's sampler interface (``PI05Pytorch.sample_actions``),
-        so the steering wrappers of ``lerobot.policies.pi05.steering`` drive this policy as they drive pi0.5, in
+        so the steering wrappers of ``lerobot.policies.steering`` drive this policy as they drive pi0.5, in
         the cursor's flow convention (t = 0 noise): noise drawn (or given), ``noise_fn(velocity, noise)`` may
         replace it, then ``num_forward_steps`` Euler steps (default ``steps``) from ``flow_start_time`` (default 0)
         to the action at t = 1, ``x_t_hook(step, t, x_t)`` before each step and ``velocity_hook(step, t, x_t, v)``

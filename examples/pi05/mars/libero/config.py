@@ -4,7 +4,7 @@ Both entry points read the same nested YAML shape (policy / scene / control /
 server) into dataclasses. A file may say `extends: other.yaml` (relative to
 itself) to overlay on another; a key set to null keeps the built-in default,
 and unknown keys are rejected. Matrix specs under `control` are resolved here
-into arrays (see `lerobot.policies.pi05.steering` for the accepted forms); a
+into arrays (see `lerobot.policies.steering` for the accepted forms); a
 `{random: ...}` corruption becomes a family that each trial draws from instead.
 """
 
@@ -24,7 +24,7 @@ from teleop import (
     check_input_gain,
 )
 
-from lerobot.policies.pi05.steering import OPERATOR_DIM_GROUPS, parse_adapter_spec
+from lerobot.policies.steering import OPERATOR_DIM_GROUPS, parse_adapter_spec
 
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")

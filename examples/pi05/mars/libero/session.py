@@ -32,7 +32,7 @@ from lerobot.envs import (
 )
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
-from lerobot.policies.pi05.steering import (
+from lerobot.policies.steering import (
     GRIPPER_DIM,
     N_ACTION_DIMS,
     FlowControlPolicy,

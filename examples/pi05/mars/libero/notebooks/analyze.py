@@ -29,7 +29,7 @@ import yaml
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 from scipy import stats
 
-from lerobot.policies.pi05.steering import DEADBAND
+from lerobot.policies.steering import DEADBAND
 
 METHODS = ("FC", "FRS", "MARS", "policy (floor)", "policy (ceiling)")
 STEERED = ("FC", "FRS", "MARS")

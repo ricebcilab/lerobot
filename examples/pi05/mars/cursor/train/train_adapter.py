@@ -79,7 +79,7 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.pi05.steering import (heading_cosine, regenerate, save_adapter_module, task_field_loss,  # noqa: E402
+from lerobot.policies.steering import (heading_cosine, regenerate, save_adapter_module, task_field_loss,  # noqa: E402
                                              train_module, user_field_loss)
 
 # ---------------------------------------------------------------- data
