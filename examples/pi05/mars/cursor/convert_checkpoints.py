@@ -16,9 +16,9 @@ original; only then is the original copied to *.orig and the new file moved into
 replace for an adapter; a policy's policy.pt, which FlowPolicy.load reads first, is removed last), so an
 interrupted run leaves every checkpoint loadable and can simply be run again. An existing *.orig that
 differs from the file is never overwritten: that file is skipped with a warning. Files already in the new
-format are left untouched, so re-running is a no-op. The trainers
-still write the cursor formats; run this again after training (FlowPolicy.load and ReversalAdapter.load
-read both formats meanwhile).
+format are left untouched, so re-running is a no-op. The policy trainer still writes policy.pt, so run this
+again after training a policy (FlowPolicy.load reads both formats meanwhile); the adapter trainer writes the
+`save_adapter_module` format itself, and ReversalAdapter.load reads only that.
 """
 
 import argparse

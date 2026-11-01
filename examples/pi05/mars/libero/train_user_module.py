@@ -35,14 +35,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -53,11 +50,13 @@ from lerobot.policies.pi05.steering import (  # noqa: E402
     GRIPPER_DIM,
     GRIPPER_OPEN,
     N_ACTION_DIMS,
+    AdaptedField,
     LearnedUserModule,
-    ReversalAdapter,
-    forward_flow,
+    heading_cosine,
+    regenerate,
     reverse_flow,
     save_adapter_module,
+    train_module,
     uniform_reference,
     user_field_loss,
 )
@@ -120,19 +119,6 @@ def serve(core: np.ndarray, raw: np.ndarray, sigma, rng: np.random.Generator) ->
     core, raw = np.atleast_2d(core), np.atleast_2d(raw)
     sigma = np.broadcast_to(np.asarray(sigma, dtype=np.float64), (core.shape[0],))
     return readout.add_noise(core, raw, sigma, rng.normal(size=core.shape))
-
-
-def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor) -> torch.Tensor:
-    """Cosine between the two chunks' total translations (sum over steps of the first 3 dims), per sample."""
-    return nn.functional.cosine_similarity(chunk_a[..., :3].sum(1), chunk_b[..., :3].sum(1), dim=-1)
-
-
-@torch.no_grad()
-def regenerate(velocity, a_bci: torch.Tensor, num_steps: int, user=None) -> torch.Tensor:
-    """FRS at full reversal: a_bci reversed through the (user-adapted) backward field, regenerated forward."""
-    adapter = ReversalAdapter(user_module=user) if user is not None else None
-    z = reverse_flow(a_bci, velocity, num_steps, adapter=adapter)
-    return forward_flow(z, velocity, num_steps)
 
 
 def as_tensors(obj):
@@ -279,8 +265,6 @@ def train(args) -> None:
         cross_step_rank=args.cross_step_rank,
         cross_step_dims=args.cross_step_dims,
     ).to(device)
-    opt = torch.optim.AdamW(user.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / args.steps)))
 
     def batch_of(idx):
         rows = [states[i] for i in idx]
@@ -304,49 +288,27 @@ def train(args) -> None:
         )
         return velocity, a_bci, z_l, label, active
 
-    log, running, skipped, tic = [], 0.0, 0, time.time()
-    for step in range(1, args.steps + 1):
+    def batch_loss(step):
         velocity, a_bci, z_l, _, active = batch_of(
             rng.choice(train_idx, size=min(args.batch, len(train_idx)), replace=False)
         )
         t = torch.rand(len(z_l), device=device)
         # The straight path from a_bci (t = 0) to z_L (t = 1): U(x_t, t) P(x_t, t) = z_L - a_bci
-        loss = user_field_loss(user, velocity, a_bci, z_l, t, weight=active)
-        opt.zero_grad(set_to_none=True)
-        if torch.isfinite(loss):
-            loss.backward()
-            norm = nn.utils.clip_grad_norm_(user.parameters(), 1.0)
-            if torch.isfinite(norm):
-                opt.step()
-            else:
-                skipped += 1
-        else:
-            skipped += 1
-        sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
-        if step % args.log_every == 0 or step == args.steps:
-            user.eval()
-            velocity, a_bci, _, label, active = batch_of(val_idx[: args.batch])
-            with torch.no_grad(), session.autocast_ctx:
-                cos_none = heading_cosine(regenerate(velocity, a_bci, cfg.num_inference_steps).float(), label)
-                cos_user = heading_cosine(
-                    regenerate(velocity, a_bci, cfg.num_inference_steps, user).float(), label
-                )
-            user.train()
-            entry = {
-                "step": step,
-                "train_loss": running / args.log_every,
-                "skipped": skipped,
-                "heading_cos_none": float(cos_none[active].mean()) if active.any() else None,
-                "heading_cos_user": float(cos_user[active].mean()) if active.any() else None,
-            }
-            log.append(entry)
-            print(
-                f"step {step:6d}  loss {entry['train_loss']:.4f}  regenerated heading cos: none "
-                f"{entry['heading_cos_none']}  U {entry['heading_cos_user']}  ({time.time() - tic:.0f}s)",
-                flush=True,
+        return user_field_loss(user, velocity, a_bci, z_l, t, weight=active)
+
+    def validate():
+        velocity, a_bci, _, label, active = batch_of(val_idx[: args.batch])
+        with torch.no_grad(), session.autocast_ctx:
+            cos_none = heading_cosine(regenerate(velocity, a_bci, cfg.num_inference_steps).float(), label)
+            cos_user = heading_cosine(
+                regenerate(velocity, a_bci, cfg.num_inference_steps, AdaptedField(None, user)).float(), label
             )
-            running = 0.0
+        return {
+            "heading_cos_none": float(cos_none[active].mean()) if active.any() else None,
+            "heading_cos_user": float(cos_user[active].mean()) if active.any() else None,
+        }
+
+    log = train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every)
     meta = {
         "corruption": control.corruption,
         "policy_path": settings.session.policy_path,

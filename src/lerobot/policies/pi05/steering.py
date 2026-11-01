@@ -77,6 +77,8 @@ cursor example drives its own policy through them (``FlowPolicy.sample_chunk``),
 the robot and the cursor run one implementation of each method.
 """
 
+import math
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -953,6 +955,89 @@ def task_field_loss(
     fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
     identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
     return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
+
+
+def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor, n_dims: int = 3) -> torch.Tensor:
+    """Cosine between two chunks' total displacements (the sum over steps of their first ``n_dims`` dims), per
+    sample: how well a regenerated chunk heads where its label does."""
+    return nn.functional.cosine_similarity(chunk_a[..., :n_dims].sum(1), chunk_b[..., :n_dims].sum(1), dim=-1)
+
+
+@torch.no_grad()
+def regenerate(
+    velocity,
+    chunk: torch.Tensor,
+    num_steps: int,
+    adapter=None,
+    noise_time: float = 1.0,
+    batch_time: bool = False,
+) -> torch.Tensor:
+    """FRS at full reversal: ``chunk`` reversed through the adapted backward field (task and user modules) all
+    the way to noise, then regenerated through the forward field (the task module alone: ``AdaptedField``
+    applies the user part backward only). Either time convention (``noise_time`` and ``batch_time`` as in
+    ``integrate``). The trainers' validation: what the policy makes of the operator's command through the
+    modules."""
+    h = (2 * noise_time - 1) / num_steps  # toward noise: +1/N in pi0.5's convention, -1/N in the cursor's
+    z = integrate(
+        chunk, velocity, 1 - noise_time, h, num_steps, adapter, backward=True, batch_time=batch_time
+    )
+    return integrate(z, velocity, noise_time, -h, num_steps, adapter, batch_time=batch_time)
+
+
+def step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
+    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
+    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
+    opt.zero_grad(set_to_none=True)
+    if not torch.isfinite(loss):
+        return False
+    loss.backward()
+    norm = nn.utils.clip_grad_norm_(list(params), clip)
+    if not torch.isfinite(norm):
+        opt.zero_grad(set_to_none=True)
+        return False
+    opt.step()
+    return True
+
+
+def train_module(
+    module: nn.Module,
+    steps: int,
+    lr: float,
+    batch_loss: Callable[[int], torch.Tensor],
+    validate: Callable[[], dict] | None = None,
+    log_every: int = 1000,
+    weight_decay: float = 1e-4,
+    clip: float = 1.0,
+) -> list[dict]:
+    """The MARS modules' training loop, shared by the cursor and the LIBERO trainers: AdamW with a cosine
+    schedule over ``steps``, gradients clipped to ``clip``, non-finite batches skipped (``step_if_finite``).
+    ``batch_loss(step)`` returns one batch's loss. Every ``log_every`` steps, and at the last, the module is put
+    in eval mode for ``validate()`` (named numbers, or None) and {step, train_loss (the window's mean),
+    skipped, **validation} is logged and printed. Returns the log."""
+    opt = torch.optim.AdamW(module.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
+    log: list[dict] = []
+    running, skipped, tic = 0.0, 0, time.time()
+    for step in range(1, steps + 1):
+        loss = batch_loss(step)
+        skipped += not step_if_finite(opt, loss, module.parameters(), clip)
+        sched.step()
+        running += loss.item() if torch.isfinite(loss) else 0.0
+        if step % log_every == 0 or step == steps:
+            module.eval()
+            val = validate() if validate is not None else {}
+            module.train()
+            entry = {"step": step, "train_loss": running / log_every, "skipped": skipped, **val}
+            log.append(entry)
+            shown = "  ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}" for k, v in val.items())
+            print(
+                f"step {step:6d}  train {entry['train_loss']:.4f}  {shown}"
+                + (f"  skipped {skipped}" if skipped else "")
+                + f"  ({time.time() - tic:.0f}s)",
+                flush=True,
+            )
+            running = 0.0
+    return log
 
 
 def _rng_state() -> tuple:

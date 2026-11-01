@@ -290,13 +290,13 @@ def test_core_task_field_loss_matches_the_reference(setup, exact):
 
 
 @pytest.mark.parametrize("kind", ("user", "task"))
-def test_reversal_adapter_loads_cursor_converted_and_trainer_checkpoints(setup, tmp_path, kind):
+def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_path, kind):
     old_user, old_task, new_user, new_task = setup["modules"]
     old, new = (old_user, new_user) if kind == "user" else (old_task, new_task)
     cursor = {"config": old.config, "state_dict": old.state_dict(), "args": {"name": "m"}, "obstacle": None}
     if kind == "task":
         cursor["kind"] = "task"  # user modules from the first adapters carry no kind
-    # what train_adapter.save writes now: the example's module config (with n_dims), no arch
+    # what train_adapter.save wrote before save_adapter_module: the module config (with n_dims), no meta
     trainer = {
         "kind": kind,
         "config": new.config,
@@ -305,11 +305,7 @@ def test_reversal_adapter_loads_cursor_converted_and_trainer_checkpoints(setup, 
         "obstacle": None,
     }
     paths = {}
-    for name, ckpt in (
-        ("cursor", cursor),
-        ("converted", core.convert_cursor_module(cursor)),
-        ("trainer", trainer),
-    ):
+    for name, ckpt in (("converted", core.convert_cursor_module(cursor)), ("trainer", trainer)):
         paths[name] = tmp_path / f"{name}.pt"
         torch.save(ckpt, paths[name])
     obs, x, v, t = setup["obs"], torch.randn(B, 16, 2), torch.randn(B, 16, 2), torch.rand(B)
@@ -318,7 +314,7 @@ def test_reversal_adapter_loads_cursor_converted_and_trainer_checkpoints(setup, 
         adapter = steering.ReversalAdapter.load(path)
         module = getattr(adapter, kind)
         assert adapter.kind == kind and isinstance(
-            module, steering.UserModule if kind == "user" else steering.TaskModule
+            module, core.LearnedUserModule if kind == "user" else steering.TaskModule
         ), name
         got = module(x, t) if kind == "user" else module(x, t, v, obs)
         for a, b in zip(

@@ -57,7 +57,6 @@ modules without a user.
 
 import argparse
 import json
-import math
 import sys
 import time
 from dataclasses import replace
@@ -65,7 +64,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -81,7 +79,8 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.pi05.steering import task_field_loss, user_field_loss  # noqa: E402
+from lerobot.policies.pi05.steering import (heading_cosine, regenerate, save_adapter_module, task_field_loss,  # noqa: E402
+                                             train_module, user_field_loss)
 
 # ---------------------------------------------------------------- data
 
@@ -284,15 +283,6 @@ def chunk_collision(policy, adapter, obs, steps):
 
 
 @torch.no_grad()
-def regenerate(policy, free, bci, steps, user=None, task=None):
-    """FRS at full reversal: a_bci reversed through the backward field (user and task modules), regenerated
-    through the forward field (task module)."""
-    back = ReversalAdapter(user=user, task=task) if user is not None or task is not None else None
-    z = reverse_flow(policy, free, bci, steps, steps, back)
-    return forward_flow(policy, free, z, 0.0, 1.0, steps, ReversalAdapter(task=task) if task is not None else None)
-
-
-@torch.no_grad()
 def expert_check(policy, data, args, user=None, task=None, n=2048):
     """Open loop on held-out demo states, at full reversal: how well the regenerated chunk heads where the
     label does (cosine of their displacements, over active commands), with no module, the user module, and
@@ -300,14 +290,13 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
     obs, chunk, push, core, _, _ = data.sample(n)
     free, active = hide_goal(obs), active_of(push)
     bci = bci_command(policy, push, core, draw_sigma(args, n, push.device))
-    label = chunk.sum(1)
     out = {}
     variants = [("none", None, None), ("user", user, None)] + ([("composed", user, task)] if task is not None else [])
     for name, u, tm in variants:
-        regen = regenerate(policy, free, bci, args.flow_steps, u, tm) * policy.action_scale
-        move = regen.sum(1)
-        cos = nn.functional.cosine_similarity(move, label, dim=-1)
-        out[f"heading_cos_{name}"] = float(cos[active].mean())
+        adapter = ReversalAdapter(user=u, task=tm) if u is not None or tm is not None else None
+        regen = regenerate(lambda x, t_: policy(free, x, t_), bci, args.flow_steps, None if adapter is None else adapter.field(free),
+                           noise_time=0.0, batch_time=True) * policy.action_scale
+        out[f"heading_cos_{name}"] = float(heading_cosine(regen, chunk, n_dims=2)[active].mean())
         if obs["obstacle_mask"].any():
             rows = active & obs["obstacle_mask"].any(1)
             out[f"collide_{name}"] = float(collides({k_: v[rows] for k_, v in obs.items()}, regen[rows]).float().mean())
@@ -322,11 +311,9 @@ def train_task(args, policy, device, rng):
     data = expert_splits(args, args.obstacle, policy, device, rng, *corruption_spec(args.corruption), args.p_free)
     samplers = {split: d.sampler for split, d in data.items()}
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers).to(device)
-    opt = torch.optim.AdamW(task.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / args.steps)))
     adapted = ReversalAdapter(task=task)
-    log, running, skipped, tic = [], 0.0, 0, time.time()
-    for step in range(1, args.steps + 1):
+
+    def batch_loss(step):
         obs, chunk, push, core, i, k = data["train"].sample(args.batch, args.goal_dropout)
         z, t = torch.randn_like(chunk), torch.rand(args.batch, device=device)
         loss, _ = task_loss(policy, task, obs, chunk, z, t, args.lambda_id)
@@ -336,32 +323,23 @@ def train_task(args, policy, device, rng):
             bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), data["train"].noise_at(i, k))
             weight = (active_of(push) & obs["obstacle_mask"].any(1)).float()  # on the obstacle-free layouts T stays I
             loss = loss + args.lambda_field * field_loss(policy, user, task, free, latent, bci, weight)
-        skipped += not step_if_finite(opt, loss, task.parameters())
-        sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
-        if step % args.log_every == 0:
-            task.eval()
-            with torch.no_grad():
-                n = min(2048, 8 * args.batch)
-                obs, chunk = samplers["val"].sample(n, args.goal_dropout)
-                _, parts = task_loss(policy, task, obs, chunk, torch.randn_like(chunk), torch.rand(n, device=device), 0.0)
-                hidden, _ = samplers["val"].sample(n, 1.0)
-                given, _ = samplers["val"].sample(n, 0.0)
-                val = dict(val_fm=parts["fm"], chunk_collision_hidden=chunk_collision(policy, adapted, hidden, args.flow_steps),
-                           chunk_collision_given=chunk_collision(policy, adapted, given, args.flow_steps),
-                           chunk_collision_policy_hidden=chunk_collision(policy, None, hidden, args.flow_steps),
-                           chunk_collision_policy_given=chunk_collision(policy, None, given, args.flow_steps))
-                val.update(expert_check(policy, data["val"], args, user, task))
-            task.train()
-            log.append(dict(step=step, train=running / args.log_every, skipped=skipped, **val))
-            print(f"step {step:6d}  train {running / args.log_every:.4f}  val fm {val['val_fm']:.4f}  chunk collisions: "
-                  f"policy {val['chunk_collision_policy_hidden']:.3f} -> adapted {val['chunk_collision_hidden']:.3f} (goal hidden), "
-                  f"{val['chunk_collision_policy_given']:.3f} -> {val['chunk_collision_given']:.3f} (given)"
-                  f"  regenerated from the user's commands: collide user {val['collide_user']:.3f} -> composed "
-                  f"{val['collide_composed']:.3f}, heading cos {val['heading_cos_user']:.3f} -> {val['heading_cos_composed']:.3f}"
-                  + (f"  skipped {skipped}" if skipped else "") + f"  ({time.time() - tic:.0f}s)", flush=True)
-            running = 0.0
-    save(args, "task", task, log)
+        return loss
+
+    @torch.no_grad()
+    def validate():
+        n = min(2048, 8 * args.batch)
+        obs, chunk = samplers["val"].sample(n, args.goal_dropout)
+        _, parts = task_loss(policy, task, obs, chunk, torch.randn_like(chunk), torch.rand(n, device=device), 0.0)
+        hidden, _ = samplers["val"].sample(n, 1.0)
+        given, _ = samplers["val"].sample(n, 0.0)
+        val = dict(val_fm=parts["fm"], chunk_collision_hidden=chunk_collision(policy, adapted, hidden, args.flow_steps),
+                   chunk_collision_given=chunk_collision(policy, adapted, given, args.flow_steps),
+                   chunk_collision_policy_hidden=chunk_collision(policy, None, hidden, args.flow_steps),
+                   chunk_collision_policy_given=chunk_collision(policy, None, given, args.flow_steps))
+        val.update(expert_check(policy, data["val"], args, user, task))
+        return val
+
+    save(args, "task", task, train_module(task, args.steps, args.lr, batch_loss, validate, args.log_every))
 
 
 # ---------------------------------------------------------------- the user module
@@ -375,10 +353,8 @@ def train_user(args, policy, model, device, rng):
     closed = closed_loop_splits(args, policy, model, device, np.random.default_rng(args.seed + 1)) if args.closed_loop else None
     user = UserModule(policy.horizon, step_rank=args.step_rank, cross_step_rank=args.cross_step_rank,
                       cross_step_dims=args.cross_step_dims).to(device)
-    opt = torch.optim.AdamW(user.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / args.steps)))
-    log, running, skipped, tic = [], 0.0, 0, time.time()
-    for step in range(1, args.steps + 1):
+
+    def batch_loss(step):
         noise = None
         if closed is None:
             obs, chunk, push, core, i, k = data["train"].sample(args.batch)
@@ -388,53 +364,28 @@ def train_user(args, policy, model, device, rng):
         free = hide_goal(obs)
         latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps)
         bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), noise)
-        loss = field_loss(policy, user, None, free, latent, bci, active_of(push).float())
-        skipped += not step_if_finite(opt, loss, user.parameters())
-        sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
-        if step % args.log_every == 0:
-            user.eval()
-            val = expert_check(policy, data["val"], args, user)
-            if closed is not None:
-                val.update({f"closed_{k}": v for k, v in expert_check(policy, closed["val"], args, user).items()})
-            user.train()
-            log.append(dict(step=step, train=running / args.log_every, skipped=skipped, **val))
-            closed_text = (f"  closed loop: none {val['closed_heading_cos_none']:.3f}  U {val['closed_heading_cos_user']:.3f}"
-                           if closed is not None else "")
-            print(f"step {step:6d}  train {running / args.log_every:.4f}  regenerated heading cos: none "
-                  f"{val['heading_cos_none']:.3f}  U {val['heading_cos_user']:.3f}" + closed_text
-                  + (f"  skipped {skipped}" if skipped else "") + f"  ({time.time() - tic:.0f}s)", flush=True)
-            running = 0.0
-    save(args, "user", user, log)
+        return field_loss(policy, user, None, free, latent, bci, active_of(push).float())
+
+    def validate():
+        val = expert_check(policy, data["val"], args, user)
+        if closed is not None:
+            val.update({f"closed_{k}": v for k, v in expert_check(policy, closed["val"], args, user).items()})
+        return val
+
+    save(args, "user", user, train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every))
 
 
 # ---------------------------------------------------------------- main
 
 
-def step_if_finite(opt, loss, params):
-    """One optimizer step, unless the loss or the clipped gradient is not finite (a batch where a flow
-    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
-    if not torch.isfinite(loss):
-        opt.zero_grad(set_to_none=True)
-        return False
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    norm = nn.utils.clip_grad_norm_(list(params), 1.0)
-    if not torch.isfinite(norm):
-        opt.zero_grad(set_to_none=True)
-        return False
-    opt.step()
-    return True
-
-
 def save(args, kind, module, log):
+    """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
+    task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     out = adapter_dir(args.name)
-    out.mkdir(parents=True, exist_ok=True)
-    torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args=vars(args), obstacle=args.obstacle),
-               out / "adapter.pt")
+    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle))
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), log=log), f, indent=1)
-    print(f"saved {out / 'adapter.pt'}")
+    print(f"saved {path}")
 
 
 def train(args):

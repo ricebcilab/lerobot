@@ -36,8 +36,8 @@ policy's velocity v at every Euler step:
     task module   v -> A(x_t, t, v, obstacles) v + b(...), in BOTH directions: it steers
                   the frozen policy's chunk distribution into a task's (around obstacles)
     user module   v -> U(x_t, t) v, in the BACKWARD pass only: it undoes the user's
-                  command corruption (`FixedAdapter` holds MARS's fixed F = M,
-                  `UserModule` a trained one)
+                  command corruption (MARS's fixed F = M, `ReversalAdapter(matrix=F)`,
+                  or a trained `UserModule`)
 
 so the forward field is task(v) and the backward field user(task(v)). The two are
 trained apart and composed here. Flow time runs from t=0 (noise) to t=1 (action),
@@ -58,8 +58,8 @@ import torch
 import torch.nn as nn
 
 from lerobot.policies.pi05.steering import (AdaptedField, FlowControlPolicy, FlowReversalSteeringPolicy,
-                                             LearnedTaskModule, LearnedUserModule, apply_user_module,
-                                             convert_cursor_module, integrate, task_velocity_hook)
+                                             LearnedTaskModule, LearnedUserModule, integrate, load_adapter_module,
+                                             task_velocity_hook)
 
 from .readout import DEADBAND, corrupt_chunk, is_active
 
@@ -116,43 +116,15 @@ def hide_goal(obs):
 # ---------------------------------------------------------------- reversal adapters
 
 
-class FixedAdapter:
-    """MARS's fixed F: one 2x2 matrix (or one per trial, [B, 2, 2]) at every step and time. In a
-    `ReversalAdapter` it is the core's fixed matrix (`AdaptedField`'s `matrix`)."""
-
-    def __init__(self, F, device="cpu"):
-        self.F = torch.as_tensor(F, dtype=torch.float32, device=device)
-
-    def __call__(self, x, t):
-        B, H = x.shape[:2]
-        return self.F.to(x.device).expand(B, 2, 2)[:, None].expand(B, H, 2, 2)
-
-
-class UserModule(LearnedUserModule):
-    """U(x_t, t): one 2x2 matrix per chunk step, applied to the policy's velocity in the backward pass; it undoes
-    one user's command corruption. Initialized to the identity. The core's `LearnedUserModule` with the cursor's
-    two dims and defaults. Two knobs set its flexibility:
-
-    step_rank r (default None: every step's matrix free): each step's correction mixes r matrices shared by the
-        chunk, A_s = I + sum_k c_sk B_k, with the coefficients c and the matrices B from (x_t, t); r = 4 spans
-        every 2x2 matrix, as the default does.
-    cross_step_rank q (default 0: none): a rank-q coupling between the chunk's steps on top of the per-step
-        matrices, U V^T on the stacked chunk: step s adds U_s m with m = sum_s' V_s'^T v_s' (U, V [H, 2, q] from
-        (x_t, t)); U starts at zero, so a fresh module is still the identity. `cross_step_dims` (indices, default
-        both dims) restricts the coupling to those dims.
-
-    `velocity(x, t, v)` applies the whole correction (`user_velocity` and the core's `AdaptedField` call it);
-    `forward(x, t)` gives the per-step matrices alone [B, H, 2, 2] (all of it when cross_step_rank is 0)."""
-
-    def __init__(self, horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step_rank=None, cross_step_rank=0,
-                 cross_step_dims=None):
-        super().__init__(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding, step_rank=step_rank,
-                         cross_step_rank=cross_step_rank, cross_step_dims=cross_step_dims)
-
-
-# A user module's correction of the velocity v: its own `velocity` (a UserModule, with any cross-step coupling), else
-# its per-step matrices (a FixedAdapter or any (x, t) -> [B, H, 2, 2] callable). The core's `apply_user_module`.
-user_velocity = apply_user_module
+def UserModule(horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step_rank=None, cross_step_rank=0,
+               cross_step_dims=None):
+    """The core's `LearnedUserModule` with the cursor's dims and defaults: U(x_t, t), one 2x2 matrix per chunk
+    step applied to the policy's velocity in the backward pass; it undoes one user's command corruption.
+    Initialized to the identity. `step_rank` and `cross_step_rank` (`cross_step_dims`) set its flexibility as the
+    core documents; `velocity(x, t, v)` applies the whole correction (the core's `apply_user_module`),
+    `forward(x, t)` gives the per-step matrices alone [B, H, 2, 2]."""
+    return LearnedUserModule(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding, step_rank=step_rank,
+                             cross_step_rank=cross_step_rank, cross_step_dims=cross_step_dims)
 
 
 # A(x_t, t, v, obstacles) v + b(...): the core's task module (two dims by default), bound to each observation
@@ -160,63 +132,48 @@ TaskModule = LearnedTaskModule
 
 
 class ReversalAdapter(nn.Module):
-    """The reversal adapter: a user module (any (x, t) -> [B, H, 2, 2] callable: a UserModule or a
-    FixedAdapter) and/or a task module, composed at test time. `adapt` applies the task module in
-    both directions and the user module in the backward pass (its `velocity` when it has one, see
-    `user_velocity`): forward task(v), backward user(task(v)). `field(obs)` is the same as the core's `AdaptedField`, which `adapt` and the
-    flows use. A checkpoint holds one module (`kind` user or task; the first adapters, saved
-    without a kind, are user modules); `load` reads the cursor's and the converted lerobot format."""
+    """The reversal adapter: a user part (`matrix`, MARS's fixed F, one 2x2 or one per trial [B, 2, 2], and/or
+    `user`, a UserModule or any (x, t) -> [B, H, 2, 2] callable) and/or a task module, composed at test time.
+    `adapt` applies the task module in both directions and the user part in the backward pass: forward task(v),
+    backward user(task(v)). `field(obs)` is the core's `AdaptedField`, which `adapt` and the flows use; `load`
+    reads a checkpoint in lerobot's `save_adapter_module` format (one module, `kind` user or task)."""
 
-    def __init__(self, user=None, task=None):
+    def __init__(self, user=None, task=None, matrix=None):
         super().__init__()
         self.user, self.task = user, task
+        self.matrix = None if matrix is None else torch.as_tensor(matrix, dtype=torch.float32)
 
     @property
     def kind(self):
+        user = self.user is not None or self.matrix is not None
         return {(True, True): "composed", (True, False): "user", (False, True): "task", (False, False): "none"}[
-            (self.user is not None, self.task is not None)]
+            (user, self.task is not None)]
 
     def field(self, obs):
-        """The core's `AdaptedField` for this observation: a FixedAdapter as its matrix, any other user
-        callable as its user module, the task module bound to `obs`."""
-        matrix, user = None, self.user
-        if isinstance(user, FixedAdapter):
-            matrix, user = user.F.to(obs["pos"].device), None
-        task = self.task
-        if task is not None and hasattr(task, "bind"):
-            task = task.bind(obs)
-        return AdaptedField(matrix, user, task, n_dims=2)
+        """The core's `AdaptedField` for this observation: the fixed matrix on its device, the user module, the
+        task module bound to `obs`."""
+        matrix = None if self.matrix is None else self.matrix.to(obs["pos"].device)
+        task = self.task.bind(obs) if self.task is not None and hasattr(self.task, "bind") else self.task
+        return AdaptedField(matrix, self.user, task, n_dims=2)
 
     def adapt(self, obs, x, t, v, backward):
         return self.field(obs).adapt(x, t, v, backward)
 
     @classmethod
     def load(cls, path, device="cpu"):
-        ckpt = torch.load(path, map_location=device)
-        if "n_dims" not in ckpt["config"]:  # the cursor project's format
-            ckpt = convert_cursor_module(ckpt)
-        kind = ckpt.get("kind", "user")
-        if kind == "user":
-            module = UserModule(**ckpt["config"])
-        else:  # every cursor task module is the core's LearnedTaskModule (older files say arch "obstacle")
-            if ckpt.get("arch", "obstacle") != "obstacle":
-                raise ValueError(f"{path}: task module arch {ckpt['arch']!r}; only LearnedTaskModule is left")
-            module = TaskModule(**ckpt["config"])
-        module.load_state_dict(ckpt["state_dict"])
-        return cls(**{kind: module.to(device).eval()}).to(device).eval()
-
+        module, kind, _ = load_adapter_module(path, device)
+        return cls(**{kind: module}).to(device).eval()
 
 def as_adapter(adapter, device="cpu"):
-    """None or a ReversalAdapter as is; a TaskModule in the task slot; a matrix F ([2, 2] or
-    [B, 2, 2]), a FixedAdapter, a UserModule or any (x, t) callable in the user slot."""
+    """None or a ReversalAdapter as is; a TaskModule in the task slot; a UserModule or any (x, t) callable in the
+    user slot; a matrix F ([2, 2] or [B, 2, 2]) as the fixed matrix."""
     if adapter is None or isinstance(adapter, ReversalAdapter):
         return adapter
     if isinstance(adapter, TaskModule):
         return ReversalAdapter(task=adapter)
     if callable(adapter):
         return ReversalAdapter(user=adapter)
-    return ReversalAdapter(user=FixedAdapter(adapter, device))
-
+    return ReversalAdapter(matrix=torch.as_tensor(adapter, dtype=torch.float32, device=device))
 
 def _field(adapter, obs, device):
     """The core's form of an adapter (see `as_adapter`) for this observation, or None."""

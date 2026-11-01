@@ -339,7 +339,7 @@ uv run --extra mars python examples/pi05/mars/cursor/train/train_policy.py --nam
     --goal_dropout 0.25 --targets 4 4 --reach 0.35 0.5 --obstacle '{kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}'
 uv run --extra mars python examples/pi05/mars/cursor/train/train_adapter.py --kind user --model flow_goaldrop_disc_large \
     --corruption '{scale: [1.0, 0.25]}' --name user_gain025y_expert_n100_s0_on_disc_large --n-demos 100 --steps 500 --frozen-noise
-# then convert what they wrote to lerobot's formats (below)
+# then convert the policy it wrote to lerobot's format (below; adapters are written in it already)
 uv run --extra mars python examples/pi05/mars/cursor/convert_checkpoints.py
 ```
 
@@ -377,13 +377,13 @@ modules of all five training seeds, each named with `_s<k>` after its demonstrat
 checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapters/grid_20000demos/`,
 `adapters/refit/` and `adapters/data_efficiency/`, and are not distributed.
 
-The trainers still write the cursor project's formats (`policy.pt`, `adapter.pt`), and the loaders
-(`FlowPolicy.load`, `ReversalAdapter.load`) read both those and lerobot's, so a fresh checkpoint works before it
-is converted. After training, rerun `convert_checkpoints.py` to get the lerobot format: a policy's folder
-becomes a `cursor_flow` policy (`config.json` + `model.safetensors`, loaded by
-`CursorFlowPolicy.from_pretrained`), and an `adapter.pt` takes the `save_adapter_module` format (kind, config,
-weights, meta). The originals stay beside them as `*.orig`, and running
-it again changes nothing. When a policy folder holds both formats (a retrained `policy.pt` beside an older
+`train_adapter.py` writes `adapter.pt` in lerobot's `save_adapter_module` format (kind, config, weights, meta),
+which `ReversalAdapter.load` (lerobot's `load_adapter_module`) reads; the policy trainer still writes the cursor
+project's `policy.pt`, which `FlowPolicy.load` reads alongside lerobot's format, so a fresh policy works before
+it is converted. After training a policy, rerun `convert_checkpoints.py`: its folder becomes a `cursor_flow`
+policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`). The converter also
+rewrites any `adapter.pt` still in the cursor's old format. The originals stay beside them as `*.orig`, and
+running it again changes nothing. When a policy folder holds both formats (a retrained `policy.pt` beside an older
 converted `model.safetensors`), `policy.pt` wins, with a warning, until you convert again. `hub.py upload`
 refuses unconverted folders.
 

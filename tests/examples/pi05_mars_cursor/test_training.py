@@ -74,7 +74,7 @@ def test_train_a_user_module_then_a_task_module_with_it(ckpt_dir):
     train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{curl: 20, tau: 0.1}", "--name", "u",
                                                   *COMMON]))
     ckpt = torch.load(ckpt_dir / "u" / "adapter.pt")
-    assert ckpt["kind"] == "user" and ckpt["obstacle"] is None and ckpt["args"]["corruption"] == {"curl": 20, "tau": 0.1}
+    assert ckpt["kind"] == "user" and ckpt["meta"]["obstacle"] is None and ckpt["meta"]["args"]["corruption"] == {"curl": 20, "tau": 0.1}
     assert ReversalAdapter.load(ckpt_dir / "u" / "adapter.pt").kind == "user"
     log = json.loads((ckpt_dir / "u" / "train_log.json").read_text())["log"]
     assert len(log) == 2 and {"heading_cos_none", "heading_cos_user"} <= set(log[-1])
@@ -83,14 +83,14 @@ def test_train_a_user_module_then_a_task_module_with_it(ckpt_dir):
                                                   "--closed-loop", "u", "--closed-loop-trials", "4", "--closed-loop-depth", "2",
                                                   "--closed-loop-time-limit", "1.0", *COMMON]))
     ckpt = torch.load(ckpt_dir / "u_refit" / "adapter.pt")
-    assert ckpt["args"]["closed_loop"] == ["u"] and ckpt["args"]["closed_loop_mix"] == 0.5
+    assert ckpt["meta"]["args"]["closed_loop"] == ["u"] and ckpt["meta"]["args"]["closed_loop_mix"] == 0.5
     log = json.loads((ckpt_dir / "u_refit" / "train_log.json").read_text())["log"]
     assert {"heading_cos_user", "closed_heading_cos_none", "closed_heading_cos_user"} <= set(log[-1])
     train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: ring, around: start, gap_angle: [15, 30]}",
                                                   "--name", "t", "--user-module", "u", "--corruption", "{curl: 20, tau: 0.1}",
                                                   "--lambda-field", "0.1", *COMMON]))
     ckpt = torch.load(ckpt_dir / "t" / "adapter.pt")
-    assert ckpt["kind"] == "task" and ckpt["obstacle"]["kind"] == "ring" and ckpt["args"]["user_module"] == "u"
+    assert ckpt["kind"] == "task" and ckpt["meta"]["obstacle"]["kind"] == "ring" and ckpt["meta"]["args"]["user_module"] == "u"
     loaded = ReversalAdapter.load(ckpt_dir / "t" / "adapter.pt")
     assert loaded.kind == "task" and isinstance(loaded.task, TaskModule)
     log = json.loads((ckpt_dir / "t" / "train_log.json").read_text())["log"]
@@ -128,7 +128,7 @@ def test_retrain_the_policy_for_a_task_then_calibrate_a_user_module_on_it(ckpt_d
     assert hasattr(FlowPolicy.load(ckpt_dir / "tuned" / "policy.pt"), "obstacle_in")
     train_adapter.train(train_adapter.parse_args(["--kind", "user", "--model", "scratch", "--corruption", "{rotation_deg: 60}",
                                                   "--name", "u_scratch", *COMMON]))
-    assert torch.load(ckpt_dir / "u_scratch" / "adapter.pt")["args"]["model"] == "scratch"
+    assert torch.load(ckpt_dir / "u_scratch" / "adapter.pt")["meta"]["args"]["model"] == "scratch"
 
 
 def test_the_experts_pushes_and_the_readout_core_line_up_with_the_demonstrations():

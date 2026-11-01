@@ -13,7 +13,7 @@ from cursor_sa.env import CursorEnv, Layouts, TaskConfig, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.records import summarize
 from cursor_sa.session import load_checkpoints
-from cursor_sa.steering import (MAX_SPEED, FixedAdapter, SharedController, action_gain, bci_chunk, forward_flow, hide_goal,
+from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, action_gain, bci_chunk, forward_flow, hide_goal,
                                 observation, reverse_flow, steered_chunk, to_action, to_deflection)
 
 CFG = TaskConfig()
@@ -258,10 +258,11 @@ def test_observation_units_and_adapter_helpers():
     torch.testing.assert_close(to_deflection(to_action(d, policy), policy), d)
     torch.testing.assert_close(to_action(d, policy), d * MAX_SPEED * CFG.dt / 0.004)
     F = torch.diag(torch.tensor([1.0, 0.5]))
-    x = torch.randn(3, policy.horizon, 2)
-    out = FixedAdapter(F)(x, torch.zeros(3))
-    assert out.shape == (3, policy.horizon, 2, 2) and torch.equal(out[1, 7], F)
-    torch.testing.assert_close(FixedAdapter(F.expand(3, 2, 2))(x, torch.zeros(3)), out)
+    x, v = torch.randn(3, policy.horizon, 2), torch.randn(3, policy.horizon, 2)
+    out = as_adapter(F).adapt(hidden, x, torch.zeros(3), v, backward=True)  # the fixed F, in the backward pass only
+    torch.testing.assert_close(out, v @ F.T)
+    torch.testing.assert_close(as_adapter(F.expand(3, 2, 2)).adapt(hidden, x, torch.zeros(3), v, backward=True), out)
+    torch.testing.assert_close(as_adapter(F).adapt(hidden, x, torch.zeros(3), v, backward=False), v)
 
 
 def test_bci_chunk_is_the_input_readout_in_torch():

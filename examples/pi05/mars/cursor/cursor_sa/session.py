@@ -25,7 +25,7 @@ from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import FlowPolicy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
                       outcome_of, read_manifest, read_records, rounded, trial_record, write_manifest)
-from .steering import FixedAdapter, ReversalAdapter, SharedController
+from .steering import ReversalAdapter, SharedController
 
 
 class Aborted(Exception):
@@ -122,7 +122,7 @@ def arm_adapter(arm, adapters):
     if isinstance(names, dict):
         return ReversalAdapter(user=adapters[names["user"]].user if names["user"] else None,
                                task=adapters[names["task"]].task if names["task"] else None)
-    return None if arm["adapter_matrix"] is None else ReversalAdapter(user=FixedAdapter(arm["adapter_matrix"]))
+    return None if arm["adapter_matrix"] is None else ReversalAdapter(matrix=arm["adapter_matrix"])
 
 
 def readout_for(arm, rng=None, input_noise=None, off=False):

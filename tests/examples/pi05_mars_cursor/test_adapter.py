@@ -9,7 +9,9 @@ from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.env import TaskConfig, sample_layouts
 from cursor_sa.paths import adapter_path
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import (FixedAdapter, ReversalAdapter, SharedController, TaskModule, UserModule, flow,
+from lerobot.policies.pi05.steering import LearnedUserModule
+
+from cursor_sa.steering import (ReversalAdapter, SharedController, TaskModule, UserModule, flow,
                                 forward_flow, observation, reverse_flow, steered_chunk)
 
 MODES = ("policy", "flow_control", "frs")
@@ -56,7 +58,7 @@ def test_fresh_task_module_is_the_identity_in_every_mode():
 def test_composed_adapter_applies_task_forward_and_user_task_backward():
     model, obs = FlowPolicy().eval(), _obs(obstacles=2)
     task, F = _perturbed_task(), torch.diag(torch.tensor([1.0, 0.5]))
-    adapter = ReversalAdapter(user=FixedAdapter(F), task=task).eval()
+    adapter = ReversalAdapter(task=task, matrix=F).eval()
     assert adapter.kind == "composed"
     x, t = torch.randn(3, model.horizon, 2), torch.full((3,), 0.4)
     with torch.no_grad():
@@ -75,13 +77,13 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
         back = torch.einsum("ij,bsj->bsi", F, torch.einsum("bsij,bsj->bsi", A1, v1) + b1)
         torch.testing.assert_close(reverse_flow(model, obs, x, 1, 10, adapter), x - 0.1 * back)
     # a user-only adapter leaves the forward pass alone
-    user_only = ReversalAdapter(user=FixedAdapter(F))
+    user_only = ReversalAdapter(matrix=F)
     torch.testing.assert_close(forward_flow(model, obs, x, 0.0, 1.0, 10, user_only), forward_flow(model, obs, x, 0.0, 1.0, 10))
 
 
 def test_old_adapter_checkpoint_loads_as_a_user_only_adapter():
     adapter = ReversalAdapter.load(adapter_path("learned_adapter/gain025y_free"))
-    assert adapter.kind == "user" and adapter.task is None and isinstance(adapter.user, UserModule)
+    assert adapter.kind == "user" and adapter.task is None and isinstance(adapter.user, LearnedUserModule)
     model, obs = FlowPolicy().eval(), _obs()
     x = torch.randn(3, model.horizon, 2)
     with torch.no_grad():
@@ -118,9 +120,9 @@ def test_adapter_specs_accept_single_and_composite_forms(tmp_path, monkeypatch):
     policies, adapters = session.load_checkpoints({"a": both, "b": fixed, "c": task_only}, "cpu")
     assert set(adapters) == {"tiny_user", "tiny_task"}
     composed = session.arm_adapter(both, adapters)
-    assert composed.kind == "composed" and isinstance(composed.user, UserModule) and isinstance(composed.task, TaskModule)
+    assert composed.kind == "composed" and isinstance(composed.user, LearnedUserModule) and isinstance(composed.task, TaskModule)
     with_fixed = session.arm_adapter(fixed, adapters)
-    assert with_fixed.kind == "user" and isinstance(with_fixed.user, FixedAdapter)
+    assert with_fixed.kind == "user" and with_fixed.user is None and with_fixed.matrix is not None
     assert session.arm_adapter(task_only, adapters).kind == "task"  # served in every mode
     assert set(session.adapter_checkpoints({"a": both})) == {"adapters/tiny_user", "adapters/tiny_task"}
     assert session.adapter_checkpoints({"t": config.load_arm("teleop.yaml")}) == {}
