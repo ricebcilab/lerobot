@@ -1,4 +1,4 @@
-"""The paper figures' builder (figures/build_figures.py)."""
+"""The paper figures' builder (paper/figures/build_figures.py)."""
 
 import json
 
@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from cursor_sa.paths import RESULTS
-from figures import build_figures as bf
+from paper.figures import build_figures as bf
 
 
 def test_fig1_inputs_have_their_pictograms_and_reaches():

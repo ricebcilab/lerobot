@@ -184,7 +184,10 @@ examples/pi05/mars/checkpoints/
 # only their build scripts are tracked
 examples/pi05/mars/cursor/reports/*
 !examples/pi05/mars/cursor/reports/*.py
-examples/pi05/mars/figures/*
-!examples/pi05/mars/figures/*.py
-# The paper draft (Markdown, Overleaf project, zip) is edited on Overleaf, not here
-examples/pi05/mars/paper/
+# The paper (draft, Overleaf project, zip) is edited on Overleaf, not here; only the figure
+# builder under paper/figures/ is tracked (git cannot re-include a file under an excluded directory,
+# hence the pairwise rules)
+examples/pi05/mars/paper/*
+!examples/pi05/mars/paper/figures/
+examples/pi05/mars/paper/figures/*
+!examples/pi05/mars/paper/figures/*.py

@@ -11,7 +11,7 @@ describes each mode and knob on pi0.5.
 Every experiment, with a person or with a simulated agent, starts from the
 same portal and runs through the same mechanism; the only difference is the
 agent. The study's report is built locally by `reports/build_study_report.py` (the PDFs are not committed); the
-paper's figures by `../figures/build_figures.py`.
+paper's figures by `../paper/figures/build_figures.py`.
 
 ## Quick start
 
@@ -45,7 +45,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --arm stu
 uv run --extra mars python examples/pi05/mars/cursor/analyze_results.py                                               # tables and figures for every run
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1          # a participant's study report (PDF)
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1 p2 p3 p4 # the group's
-uv run --extra mars python examples/pi05/mars/figures/build_figures.py --device cpu                          # the paper's figures (examples/pi05/mars/figures/*.pdf, *.png, stats.json)
+uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --device cpu                          # the paper's figures (examples/pi05/mars/figures/*.pdf, *.png, stats.json)
 uv run --extra mars python examples/pi05/mars/cursor/run_sweep.py --sweep study_tuning                                # tune the study arms' settings, test (~15 min)
 uv run --extra mars python examples/pi05/mars/cursor/run_sweep.py --sweep grid --cells U1xT1 --out grid_part_U1xT1   # a part of the grid (see Sweeps)
 ```
@@ -78,7 +78,7 @@ analyze_results.py    per-participant and pooled analysis of any runs
 train/                train_policy.py, train_adapter.py
 reports/              build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or
                       study_group.pdf for several (paper-style figures)
-../figures/           (examples/pi05/mars/figures/, beside this folder) the paper's figures, PDF + PNG, and build_figures.py (one script; `--only fig1 fig2 fig3`):
+../paper/figures/     (examples/pi05/mars/paper/figures/) the paper's figures, PDF + PNG, and build_figures.py (one script; `--only fig1 fig2 fig3`):
                       fig1_method (MARS illustrated), fig2_study (the human study), fig3_grid (the user x task
                       grid over its five training seeds); stats.json holds the numbers the captions quote. MARS
                       (Modular Adapters for Reversal Steering) is mars's display name: MARS = user + task modules,
