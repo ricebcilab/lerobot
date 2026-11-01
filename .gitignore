@@ -186,3 +186,5 @@ examples/pi05/mars/cursor/reports/*
 !examples/pi05/mars/cursor/reports/*.py
 examples/pi05/mars/figures/*
 !examples/pi05/mars/figures/*.py
+# The paper draft (Markdown, Overleaf project, zip) is edited on Overleaf, not here
+examples/pi05/mars/paper/

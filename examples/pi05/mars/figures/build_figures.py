@@ -359,7 +359,7 @@ def fig3_schematic():
         hu = on_density(ax, -0.4, pol, "o", mars_u, hollow=True)
         ax.plot(-0.67, hu + 0.02, "x", color=INK, ms=3.6, mew=1.0, zorder=7, clip_on=False)
         ax.text(0.95, h, "$\\hat a$", fontsize=FS_TEXT, color=mars, ha="left", va="center")
-        ax.text((lo + hi) / 2, -0.028, "obstacle", fontsize=FS_TEXT, color=INK_2, ha="center", va="top")
+        ax.text((lo + hi) / 2, -0.028, "task constraint", fontsize=FS_TEXT, color=INK_2, ha="center", va="top")
 
     return dict(
         gap=1.42, noise_w=1.45,
@@ -368,7 +368,7 @@ def fig3_schematic():
         callouts={"readout": READOUT_CALLOUT,
                   "noise": [[("… ", {}), ("$A_U$", dict(color=mars)), (" and ", {}), ("$A_T, b_T$", dict(color=mars)), (" steer the", {})],
                             [("reversal into ", {}), ("typical noise", EMPHASIS), (" …", {})]],
-                  "policy": [[("… which the adapted flow maps to", {})], [("an action that ", {}), ("avoids the obstacle", EMPHASIS), (".", {})]]},
+                  "policy": [[("… which the adapted flow maps to", {})], [("an action meeting the ", {}), ("task constraint", EMPHASIS), (".", {})]]},
         flows=[("$\\hat z = \\hat u - \\int_0^1 A_U (A_T\\, v_P + b_T)\\, dt$",
                 [("flow reversal", FLOW_NAME), (f"{MARS}-U: $A_T = I,\\ b_T = 0$", dict(color=mars_u))]),
                ("$\\hat a = \\hat z + \\int_0^1 (A_T\\, v_P + b_T)\\, dt$", [("flow matching", FLOW_NAME)])])
@@ -389,7 +389,7 @@ def method_legend(entries):
              "cursor": (plt.Line2D([], [], ls="none", color=INK, marker="o", ms=2.6), "cursor"),
              "target": (disc("#fbe3a1", INK, 1.0), "target"),
              "other": (disc("#ecebe6", "#c9c8c1"), "other targets"),
-             "obstacle": ((hatch, disc(OBSTACLE_STYLE["facecolor"], OBSTACLE_STYLE["edgecolor"], 0.6)), "obstacle")}
+             "obstacle": ((hatch, disc(OBSTACLE_STYLE["facecolor"], OBSTACLE_STYLE["edgecolor"], 0.6)), "task constraint")}
     return [marks[e][0] for e in entries], [marks[e][1] for e in entries]
 
 
