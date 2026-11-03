@@ -73,6 +73,7 @@ class LearnedUserModule(nn.Module):
       of the per-step matrices, U V^T on the stacked chunk: out[s, a] += sum_r U[s, a, r] m_r with
       m_r = sum_{s', a'} V[s', a', r] v[s', a'], U and V (H, n_c, q) from (x_t, t) through an extra
       head (``cross``) on the hidden layer. U starts at zero.
+    - ``cross_step_prefix`` limits coupling reads and writes to that prefix; omitted means full chunk.
     - ``cross_step_dims`` (default None: all n dims): indices into the module's dims that the
       coupling reads and writes (unique, in range, non-empty); the other dims get no cross-step
       term. Only with ``cross_step_rank`` > 0. Names (e.g. LIBERO's ``ACTION_DIMS``) are mapped to
@@ -96,6 +97,7 @@ class LearnedUserModule(nn.Module):
         step_rank: int | None = None,
         cross_step_rank: int = 0,
         cross_step_dims: list[int] | None = None,
+        cross_step_prefix: int | None = None,
     ):
         super().__init__()
         if time_embedding not in ("mars", "pi05"):
@@ -104,6 +106,11 @@ class LearnedUserModule(nn.Module):
             raise ValueError(f"step_rank must be None or >= 1, got {step_rank}")
         if cross_step_rank < 0:
             raise ValueError(f"cross_step_rank must be >= 0, got {cross_step_rank}")
+        if cross_step_prefix is not None:
+            if (not cross_step_rank or type(cross_step_prefix) is not int
+                    or not 1 <= cross_step_prefix <= horizon):
+                raise ValueError("cross_step_prefix requires positive rank and an integer in [1, horizon]")
+        self.cross_step_prefix = cross_step_prefix
         if cross_step_dims is not None:
             cross_step_dims = [int(i) for i in cross_step_dims]
             if not cross_step_rank:
@@ -125,6 +132,8 @@ class LearnedUserModule(nn.Module):
             self.config["step_rank"] = step_rank
         if cross_step_rank:
             self.config["cross_step_rank"] = cross_step_rank
+        if cross_step_prefix is not None:
+            self.config["cross_step_prefix"] = cross_step_prefix
         if cross_step_dims is not None:
             self.config["cross_step_dims"] = list(cross_step_dims)
         self.horizon, self.n_dims, self.tdim, self.time_embedding = horizon, n_dims, tdim, time_embedding
@@ -185,9 +194,12 @@ class LearnedUserModule(nn.Module):
             b, h, q = hidden.shape[0], self.horizon, self.cross_step_rank
             uv = self.cross(hidden).view(b, 2, h, self.n_coupled, q)
             dims = self.cross_step_dims
-            coupled = (v if dims is None else v[..., dims]).to(uv.dtype)
+            prefix = self.cross_step_prefix or h
+            uv = uv[:, :, :prefix]
+            coupled = (v if dims is None else v[..., dims])[:, :prefix].to(uv.dtype)
             m = torch.einsum("bsar,bsa->br", uv[:, 1], coupled)
             term = torch.einsum("bsar,br->bsa", uv[:, 0], m).to(v.dtype)
+            term = torch.cat((term, term.new_zeros(b, h - prefix, self.n_coupled)), dim=1)
             if dims is None:
                 out = out + term
             else:
