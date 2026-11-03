@@ -53,6 +53,7 @@ class EpisodeAwareSampler:
         drop_n_last_frames: int = 0,
         shuffle: bool = False,
         seed: int = 0,
+        uniform_episodes: bool = False,
     ):
         """
         Args:
@@ -63,6 +64,7 @@ class EpisodeAwareSampler:
             drop_n_last_frames: Frames to drop from the end of each episode.
             shuffle: Whether to shuffle the indices.
             seed: Seed the permutation is derived from (together with the epoch).
+            uniform_episodes: Sample an episode uniformly, then a valid frame, with replacement.
         """
         if drop_n_first_frames < 0:
             raise ValueError(f"drop_n_first_frames must be >= 0, got {drop_n_first_frames}")
@@ -101,9 +103,11 @@ class EpisodeAwareSampler:
             )
 
         self._starts = starts[used]
+        self._lengths = lengths[used]
         self._cum_lengths = np.cumsum(lengths[used])
         self._num_frames = int(self._cum_lengths[-1])
         self.shuffle = shuffle
+        self.uniform_episodes = uniform_episodes
         self.seed = seed
         self._epoch = 0
         self._start_index = 0
@@ -142,7 +146,13 @@ class EpisodeAwareSampler:
         return self._iter_epoch(epoch, start)
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
-        if self.shuffle:
+        if self.uniform_episodes:
+            generator = self._epoch_generator(epoch)
+            episodes = torch.randint(len(self._starts), (self._num_frames,), generator=generator).numpy()
+            offsets = torch.rand(self._num_frames, generator=generator, dtype=torch.float64).numpy()
+            indices = self._starts[episodes] + (offsets * self._lengths[episodes]).astype(np.int64)
+            yield from map(int, indices[start:])
+        elif self.shuffle:
             order = torch.randperm(self._num_frames, generator=self._epoch_generator(epoch))
             for k in range(start, self._num_frames):
                 yield self._frame_index(int(order[k]))

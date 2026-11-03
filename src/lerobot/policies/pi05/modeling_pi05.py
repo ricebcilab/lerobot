@@ -1353,6 +1353,24 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        if self.config.mask_padded_actions:
+            is_pad = batch.get("action_is_pad")
+            if is_pad is None or is_pad.shape != losses.shape[:2]:
+                raise ValueError("mask_padded_actions requires action_is_pad with shape (batch, action horizon)")
+            valid = ~is_pad.to(device=losses.device, dtype=torch.bool).unsqueeze(-1)
+            losses = losses.masked_fill(~valid, 0)
+            valid_steps = valid.sum(dim=(1, 2))
+            loss_dict = {
+                "loss_per_dim": (losses.sum(dim=(0, 1)) / valid_steps.sum().clamp_min(1))
+                .detach().cpu().numpy().tolist(),
+            }
+            if reduction == "none":
+                loss = losses.sum(dim=(1, 2)) / (valid_steps * original_action_dim).clamp_min(1)
+            else:
+                loss = losses.sum() / (valid_steps.sum() * original_action_dim).clamp_min(1)
+            loss_dict["loss"] = loss.mean().item()
+            return loss, loss_dict
+
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }

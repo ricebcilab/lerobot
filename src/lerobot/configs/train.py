@@ -88,6 +88,9 @@ class TrainPipelineConfig(HubMixin):
     # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
     # regardless of what's provided with the training command at the time of resumption.
     resume: bool = False
+    # Continuation on the same robot can retain the checkpoint's action/state scale.
+    preserve_checkpoint_normalization: bool = False
+    sample_episodes_uniformly: bool = False
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
