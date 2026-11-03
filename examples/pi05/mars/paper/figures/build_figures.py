@@ -1,20 +1,24 @@
 """The paper's figures: MARS (Modular Adapters for Reversal Steering, the display name of mars) illustrated,
-the human study, and the simulated user x task grid.
+the human study, and the simulated user x task grid with success against the time spent demonstrating a task.
 
     uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py                         # all three, into examples/pi05/mars/paper/figures/
     uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --only fig1 fig2        # some
     uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --out /tmp/figs --device cpu
 
-Writes figures/fig1_method.{pdf,png}, fig2_study.{pdf,png}, fig3_grid.{pdf,png} (7.0 in wide, 300 dpi, Type 42
-fonts) and figures/stats.json, the numbers the captions quote (one entry per figure, so --only keeps the rest).
+Writes figures/fig1_method.{pdf,png}, fig2_study.{pdf,png}, fig3_grid.{pdf,png} (7.0 in wide; 300 dpi, Type 42 fonts)
+and figures/stats.json, the numbers the captions quote (one entry per figure, so --only keeps the rest).
 
-Names: MARS is MARS with both modules (user and task), MARS-U the user module alone, MARS-T the task module alone.
+Names: MARS is MARS with both modules (user and task; MARS-UT in Figure 3, beside its ablations), MARS-U the user
+module alone, MARS-T the task module alone.
 
 Reads (results/ is git-ignored, so these are local):
     fig1  nothing (its reaches come from the readout's rule, its densities are made up)
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
     fig3  the grid's five training seeds: results/sim/sweeps/grid_s<k>/test.json (seed 0 tuned, seeds 1-4 tested at
-          seed 0's settings), and each seed's checkpoints for one cell's rollouts
+          seed 0's settings) with their fine-tuned arm, grid_ft_s<k>/test.json (on the same trials), and each seed's
+          checkpoints for one cell's rollouts; for panel e's curve the demonstration-time sweeps,
+          results/sim/sweeps/demo_time_{mars,ft}_s<k>/test.json (on the grid's trials), and the fine-tuned policies'
+          training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
 
 Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
 """
@@ -45,7 +49,7 @@ from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import GRID, INK, INK_2, aligned_path, cumulative_hits, draw_scene, paired_lead
 from cursor_sa.env import Layouts, TaskConfig, sample_layouts
-from cursor_sa.paths import RESULTS
+from cursor_sa.paths import CHECKPOINTS, RESULTS
 from cursor_sa.records import load_run
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 from run_sweep import method_arm, with_setting
@@ -60,14 +64,14 @@ SERVED = "#8a3a5b"  # the served (corrupted) command
 OUTCOMES = ("hit", "wrong_target", "timeout")
 OUTCOME_LABEL = {"hit": "Success", "wrong_target": "Wrong target", "collision": "Collision", "timeout": "Timeout"}
 OUTCOME_GRAY = {"hit": "#1f1f1e", "collision": "#1f1f1e", "wrong_target": "#767571", "timeout": "#aeaca4"}  # ordinal ramp
-GRID_METHODS = ["teleop", "flow_control", "frs", "mars_task", "mars_user", "retrained_mars_user", "mars"]
+GRID_METHODS = ["teleop", "flow_control", "frs", "mars_task", "mars_user", "ft_mars_user", "mars"]
 GRID_LABEL = {"teleop": "Teleop", "flow_control": "Flow control", "frs": "FRS", "mars_user": f"{MARS}-U", "mars_task": f"{MARS}-T",
-              "mars": MARS, "retrained_mars_user": f"Retrained policy + {MARS}-U"}
+              "mars": f"{MARS}-UT", "ft_mars_user": f"Fine-tuned + {MARS}-U"}  # MARS-UT: both modules
 GRID_COLOR = {"teleop": "#008300", "flow_control": "#e87ba4", "frs": "#e69f00", "mars_task": "#8a63d2", "mars_user": "#6da7ec",
-              "retrained_mars_user": "#2e7da0", "mars": ARM_COLOR[MARS_KEY]}  # one palette with Figures 1 and 2: MARS a
-# royal blue, MARS-U a sky blue, the retrained arm a cerulean, MARS-T a lighter purple; every pair of the family is 15 or more
+              "ft_mars_user": "#2e7da0", "mars": ARM_COLOR[MARS_KEY]}  # one palette with Figures 1 and 2: MARS a
+# royal blue, MARS-U a sky blue, the fine-tuned arm a cerulean, MARS-T a lighter purple; every pair of the family is 15 or more
 # colour units apart (OKLab x 100), the limit the colour checks ask for
-T1_METHODS = ("teleop", "flow_control", "frs", "mars")  # on T1 MARS-U is MARS, MARS-T is FRS and the retrained arm is MARS
+T1_METHODS = ("teleop", "flow_control", "frs", "mars")  # on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS
 FULL_W = 7.0  # in, a two-column figure
 SURFACE = "white"
 FILL = "#ebeae4"
@@ -78,9 +82,11 @@ FS_PANEL, FS_TITLE, FS_LABEL, FS_TICK, FS_LEGEND, FS_TEXT = 10, 8, 8, 7, 7, 7  #
 
 
 def paper_style():
+    # figure.dpi as savefig's: rich_text and callout measure text at the figure's dpi, and at matplotlib's default 100 the
+    # glyphs come out ~9% wide (gaps around a line's coloured pieces, callout boxes too wide)
     plt.rcParams.update({"font.size": FS_TEXT, "font.family": "Liberation Sans", "axes.edgecolor": INK_2, "axes.labelcolor": INK,
                          "xtick.color": INK_2, "ytick.color": INK_2, "axes.spines.top": False, "axes.spines.right": False,
-                         "axes.grid": False, "legend.frameon": False, "savefig.dpi": 300, "savefig.bbox": None,
+                         "axes.grid": False, "legend.frameon": False, "figure.dpi": 300, "savefig.dpi": 300, "savefig.bbox": None,
                          "pdf.fonttype": 42, "ps.fonttype": 42, "text.color": INK, "axes.titlesize": FS_TITLE, "axes.labelsize": FS_LABEL,
                          "xtick.labelsize": FS_TICK, "ytick.labelsize": FS_TICK, "legend.fontsize": FS_LEGEND, "axes.linewidth": 0.6,
                          "xtick.major.width": 0.6, "ytick.major.width": 0.6, "xtick.major.size": 2.5, "ytick.major.size": 2.5,
@@ -368,7 +374,7 @@ def fig3_schematic():
         callouts={"readout": READOUT_CALLOUT,
                   "noise": [[("… ", {}), ("$A_U$", dict(color=mars)), (" and ", {}), ("$A_T, b_T$", dict(color=mars)), (" steer the", {})],
                             [("reversal into ", {}), ("typical noise", EMPHASIS), (" …", {})]],
-                  "policy": [[("… which the adapted flow maps to", {})], [("an action meeting the ", {}), ("task constraint", EMPHASIS), (".", {})]]},
+                  "policy": [[("… which the adapted flow maps to an", {})], [("action meeting the ", {}), ("task constraint", EMPHASIS), (".", {})]]},
         flows=[("$\\hat z = \\hat u - \\int_0^1 A_U (A_T\\, v_P + b_T)\\, dt$",
                 [("flow reversal", FLOW_NAME), (f"{MARS}-U: $A_T = I,\\ b_T = 0$", dict(color=mars_u))]),
                ("$\\hat a = \\hat z + \\int_0^1 (A_T\\, v_P + b_T)\\, dt$", [("flow matching", FLOW_NAME)])])
@@ -691,17 +697,18 @@ TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustratio
 SEED_RUNS = tuple(f"grid_s{k}" for k in range(5))  # the grid's runs under results/sim/sweeps,
 # one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the demonstrations and
 # are tested at seed 0's settings on the grid's trials (the baselines train nothing, so every seed has the grid's)
+FT_ARM = "ft_mars_user"   # the policy fine-tuned on each obstacle task's 300 demonstrations (as many as its task module's),
+FT_RUNS = tuple(f"grid_ft_s{k}" for k in range(5))  # with the user modules refitted on it: a sweep of its own per seed
 GRID_BASELINES = ("teleop", "flow_control", "frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
 ROLLOUT_SEED = 7  # panel b's trials
-CORNER = 0.42  # the second method's corner in panel c's lead matrix, as a share of the cell's side
-FIG3_H = 6.5  # in: a (the schematic) and b (the tasks) side by side on top, rows c and d below them (positions in inches from the bottom)
+FIG3_H = 6.15  # in: a (the schematic) and b (the tasks) side by side on top, then c, then d and e (positions in inches from the bottom)
 
 
 def grid_data(results):
     """The grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the seed
-    D["seeds"][k]). Every run is on the grid's trials, so methods compare trial for trial within a seed and a cell's
-    numbers average over the seeds."""
+    D["seeds"][k]), each joined by its seed's fine-tuned arm. Every run is on the grid's trials, so methods compare
+    trial for trial within a seed and a cell's numbers average over the seeds."""
     sweeps = Path(results) / "sim" / "sweeps"
     seeds = [k for k, run in enumerate(SEED_RUNS) if k == 0 or (sweeps / run / "test.json").exists()]
     runs = [json.loads((sweeps / SEED_RUNS[k] / "test.json").read_text()) for k in seeds]
@@ -710,11 +717,22 @@ def grid_data(results):
         if run["test"].keys() != grid["test"].keys() or any(c["trials"]["side"] != grid["test"][key]["trials"]["side"]
                                                              for key, c in run["test"].items()):
             raise ValueError(f"seed {k}'s run ({SEED_RUNS[k]}) is not on the grid's trials")
+    for k, run in zip(seeds, runs):   # the fine-tuned arm joins its seed's run, its teleop the run's trial for trial
+        ft, test = json.loads((sweeps / FT_RUNS[k] / "test.json").read_text())["test"], run["test"]
+        if ft.keys() != test.keys() or any(c["trials"]["side"] != test[key]["trials"]["side"] or
+                                           c["trials"]["outcome"]["teleop"] != test[key]["trials"]["outcome"]["teleop"]
+                                           for key, c in ft.items()):
+            raise ValueError(f"seed {k}'s fine-tuned arm ({FT_RUNS[k]}) is not on its run's trials")
+        for key, c in ft.items():
+            for f in ("settings", "metrics"):
+                test[key][f][FT_ARM] = c[f][FT_ARM]
+            for f in ("outcome", "duration_s"):
+                test[key]["trials"][f][FT_ARM] = c["trials"][f][FT_ARM]
     G = grid["args"]["sweep"]["grid"]
     users, tasks, noise = G["users"], G["tasks"], G["noises"][0]
     train = yaml.safe_load((config.CONFIG_DIR / "sweeps" / "grid.yaml").read_text())["grid"]["train"]
     return dict(G=G, runs=runs, seeds=seeds, users=users, tasks=tasks, noise=noise, leads={},
-                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"]],
+                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"] or m == FT_ARM],
                 obstacle_tasks=[t for t in tasks if G["cells"][f"{users[0]}x{t}"]["obstacle"]],
                 cell=lambda u, t, k=0: runs[k]["test"][f"{u}x{t}|{noise}"], train={tuple(p) for p in train},
                 test_n=grid["args"]["test_trials"])
@@ -744,12 +762,6 @@ def lead_ci(D, u, t, a, b, n_boot=N_BOOT):
     return D["leads"][key]
 
 
-def ranked(D, u, t):
-    """The methods drawn in a cell, best first by their success averaged over the seeds (on T1 the four that differ)."""
-    shown = [m for m in D["methods"] if t != D["tasks"][0] or m in T1_METHODS]
-    return sorted(shown, key=lambda m: -seed_mean(D, u, t, m))
-
-
 def corruption_label(spec):
     if "scale" in spec:
         return f"gain ({spec['scale'][0]:g}, {spec['scale'][1]:g})"
@@ -777,23 +789,10 @@ def tuned(cell):
     return cell.get("settings", cell.get("depths"))
 
 
-def lead_cell(ax, x, y, best, second, level, text, size=1.0):
-    """A cell of panel c's lead matrix centred at (x, y), the y axis running down: the best method's colour, the second's
-    in the lower right corner (half the cell when the two are level), the lead (in the best one's half when level)."""
-    h = size / 2
-    ax.add_patch(Rectangle((x - h, y - h), size, size, facecolor=best, edgecolor="white", lw=0.8, zorder=1))
-    s = size if level else CORNER * size
-    ax.add_patch(Polygon([(x + h, y + h), (x + h, y + h - s), (x + h - s, y + h)], closed=True, facecolor=second,
-                         edgecolor="white", lw=0.6, zorder=2))
-    off, fontsize = (0.2, FS_TEXT) if level else (0.04, FS_TEXT)
-    ax.text(x - off * size, y - off * size, text, ha="center", va="center", fontsize=fontsize, color=text_on(best), zorder=3)
-
-
 def draw_training(fig, D, rect):
     """How the modules were trained, as a users x tasks matrix (the user modules on the open field through each
     user's readout, the task modules on one task each with one user's module in the loop, the other cells
-    compositions never trained together), and beside it, over the seeds, the best method in every cell, the second
-    and the best one's lead over it."""
+    compositions never trained together), with its key beside it."""
     x0, y0, w, h = rect
     users, tasks = D["users"], D["tasks"]
     nU, nT = len(users), len(tasks)
@@ -826,21 +825,6 @@ def draw_training(fig, D, rect):
         fig.patches.append(Rectangle((xt, yy - sh / 2), sw, sh, transform=fig.transFigure, facecolor=styles[kind], edgecolor=GRID, lw=0.6))
         fig.text(xt + 0.008, yy, kind, ha="center", va="center", fontsize=FS_TEXT, color=INK)
         fig.text(xt + 0.026, yy, text, ha="left", va="center", fontsize=FS_LEGEND, color=INK, linespacing=1.2)
-    # the best method per cell by its success over the seeds (fill), the second (the corner; half the cell when the two
-    # are level, the 95% CI of the lead holding 0) and the lead in points
-    ax = matrix(x0 + 0.56 * w, users)
-    winners = {}
-    for i, u in enumerate(users):
-        for j, t in enumerate(tasks):
-            best, second = ranked(D, u, t)[:2]
-            lead = lead_ci(D, u, t, best, second)
-            level = lead[1] <= 0
-            winners[f"{u}x{t}"] = dict(method=best, success=round(seed_mean(D, u, t, best), 1), second=second,
-                                       second_success=round(seed_mean(D, u, t, second), 1), lead=[round(v, 1) for v in lead],
-                                       level=level)
-            lead_cell(ax, j, i, GRID_COLOR[best], GRID_COLOR[second], level, f"+{lead[0]:.0f}")
-    ax.set_title("Best method (fill), second (corner), lead (points)", fontsize=FS_TITLE, pad=12, loc="center")
-    return winners
 
 
 def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
@@ -898,9 +882,12 @@ def draw_grid_bars(fig, D, rect):
     ax.tick_params(axis="x", length=0)
     trained = {"mars_user", "mars_task", "mars"}
     means = {}
+    r = fig.canvas.get_renderer()
+    line = 1.15 * FS_TEXT / 72 / (rect[3] * fig.get_figheight()) * 108   # a value label's height, in success points
     for i, t in enumerate(tasks):
         shown = [m for m in methods if t != "T1" or m in T1_METHODS]
         left = i - width * len(shown) / 2
+        labels = []
         for u in users:   # one grid cell, method to method
             ax.plot(left + width * (np.arange(len(shown)) + 0.5), [seed_mean(D, u, t, m) for m in shown], "-", color="#c9c8c1",
                     lw=0.6, zorder=2)
@@ -916,8 +903,12 @@ def draw_grid_bars(fig, D, rect):
             for u, v in zip(users, vals):
                 hollow = m in trained and (u, t) in D["train"]
                 ax.plot(xc, v, "o", ms=2.6, color=GRID_COLOR[m], mfc="white" if hollow else GRID_COLOR[m], mew=0.8, zorder=4)
-            ax.text(xc, min(max(max(vals), hi), 108) + 2.5, f"{mean:.0f}", ha="center", va="bottom", fontsize=FS_TEXT, color=INK,
-                    weight="semibold" if m == "mars" else "normal", clip_on=False)   # above the CI (cut at the axis top)
+            labels.append(ax.text(xc, min(max(max(vals), hi), 108) + 2.5, f"{mean:.0f}", ha="center", va="bottom", fontsize=FS_TEXT,
+                                  color=INK, weight="semibold" if m == "mars" else "normal", clip_on=False))   # above the CI (cut at the axis top)
+        for prev, cur in zip(labels, labels[1:]):   # a label that would touch its left neighbour's goes a line above it
+            a, b = prev.get_window_extent(r), cur.get_window_extent(r)
+            if b.x0 < a.x1 + 1.5 / 72 * fig.dpi and b.y0 < a.y1 and a.y0 < b.y1:
+                cur.set_y(prev.get_position()[1] + line)
     ax.set_xticklabels([f"{t}" for t in tasks], fontsize=FS_TICK)
     return means
 
@@ -928,23 +919,24 @@ def build_fig3(out, results, device):
     fig = plt.figure(figsize=(FULL_W, FIG3_H))
     y = lambda inch: inch / FIG3_H
     # a: the method with the task module, a schematic with made-up densities (as Figure 1b)
-    schematic(fig, 0.05, 4.15, fig3_schematic())
+    schematic(fig, 0.05, 3.8, fig3_schematic())
     # b: the tasks, two to a row, beside it
     shown = task_rollouts(D, device)
-    draw_tasks(fig, D, shown, (5.12 / FULL_W, y(4.0), 1.85 / FULL_W, y(2.35)))
+    draw_tasks(fig, D, shown, (5.12 / FULL_W, y(3.65), 1.85 / FULL_W, y(2.35)))
     # the marks of a and b, one legend as Figure 1's
     handles, labels = method_legend(["policy", "intent_density", "readout", "obstacle", "start", "target", "other"])
-    fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(3.72)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
+    fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(3.37)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
                handletextpad=0.5, borderaxespad=0, labelspacing=0.4, handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)})
-    # c: how the modules were trained, and who wins where
-    winners = draw_training(fig, D, (0.193, y(2.35), 0.85, y(0.9)))
-    # the methods' legend, shared by c and d, in one line
+    # c: how the modules were trained; beside it the methods' legend, for d and e below
+    draw_training(fig, D, (0.193, y(2.0), 0.85, y(0.9)))
     handles = [plt.Line2D([], [], color=GRID_COLOR[m], lw=4, solid_capstyle="butt") for m in D["methods"]]
-    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(0.5, y(2.02)), ncol=len(handles), fontsize=FS_LEGEND,
-               handlelength=1.1, columnspacing=1.0, handletextpad=0.5, borderaxespad=0)
-    # d: every method on every task
-    task_cis = draw_grid_bars(fig, D, (0.065, y(0.4), 0.925, y(1.37)))
-    for x, yy, letter in ((0.005, 0.995, "a"), (5.1 / FULL_W, 0.995, "b"), (0.005, y(3.4), "c"), (0.005, y(1.92), "d")):
+    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(5.6 / FULL_W, y(2.45)), ncol=2,
+               fontsize=FS_LEGEND, handlelength=1.1, columnspacing=1.4, handletextpad=0.5, labelspacing=0.6, borderaxespad=0)
+    # d: every method on every task; e: on the obstacle tasks, the two arms against the time spent demonstrating each
+    task_cis = draw_grid_bars(fig, D, (0.065, y(0.45), 4.45 / FULL_W, y(1.2)))
+    demo_time = draw_demo_time(fig, demo_time_data(results), (5.5 / FULL_W, y(0.45), 1.45 / FULL_W, y(1.2)))
+    for x, yy, letter in ((0.005, 0.995, "a"), (5.1 / FULL_W, 0.995, "b"), (0.005, y(3.05), "c"), (0.005, y(1.77), "d"),
+                          (5.0 / FULL_W, y(1.77), "e")):
         panel_label(fig, x, yy, letter)
     png = save(fig, out, "fig3_grid")
     users, tasks, methods, seeds = D["users"], D["tasks"], D["methods"], D["seeds"]
@@ -954,7 +946,7 @@ def build_fig3(out, results, device):
     per_cell = {f"{u}x{t}": {m: round(seed_mean(D, u, t, m), 1) for m in methods} for u, t in cells}
     best_base = {f"{u}x{t}": max(GRID_BASELINES, key=lambda b: seed_mean(D, u, t, b)) for u, t in obstacle}
     lead_best = {f"{u}x{t}": r1(lead_ci(D, u, t, "mars", best_base[f"{u}x{t}"])) for u, t in obstacle}
-    over_retrained = {f"{u}x{t}": r1(lead_ci(D, u, t, "mars", "retrained_mars_user")) for u, t in obstacle}
+    over_fine_tuned = {f"{u}x{t}": r1(lead_ci(D, u, t, "mars", FT_ARM)) for u, t in obstacle}
     gain = {}
     for u, t in obstacle:
         g = lead_ci(D, u, t, "mars", "mars_user")
@@ -964,15 +956,16 @@ def build_fig3(out, results, device):
     beyond = lambda leads: dict(cells=int(sum(v[1] > 0 for v in leads.values())), of=len(leads),
                                 level=[c for c, v in leads.items() if v[1] <= 0])
     write_stats(out, "fig3", dict(
-        names={"MARS": "user + task modules (mars)", "MARS-U": "user module alone (mars_user)", "MARS-T": "task module alone (mars_task)"},
+        names={"MARS-UT": "user + task modules (mars)", "MARS-U": "user module alone (mars_user)", "MARS-T": "task module alone (mars_task)"},
         seeds=seeds, seed_runs=[f"results/sim/sweeps/{SEED_RUNS[k]}" for k in seeds],
+        fine_tuned_runs=[f"results/sim/sweeps/{FT_RUNS[k]}" for k in seeds],
         seed_note="every number is over the seeds: seed 0 is the grid of record; seeds 1-4 retrain every module (user modules "
-                  "from 100 demonstrations, the retrained arm's user modules, task modules from 300) on their own draws and rerun "
-                  "the module methods on the grid's trials; the retrained policies are one seed, and the baselines train nothing, "
-                  "so theirs are the grid's in every seed",
+                  "from 100 demonstrations, task modules from 300) and the fine-tuned arm (each obstacle task's policy "
+                  "fine-tuned on 300 demonstrations, its user modules refitted on it) on their own draws and rerun them on the "
+                  "grid's trials; the baselines train nothing, so theirs are the grid's in every seed",
         ci_note=f"panel d: 95% t CIs over the four users (each user's success averaged over the seeds), the user the unit as "
-                f"the participant in Figure 2b (the drawn lines stop at the axis); panel c and the leads: 95% CIs resampling the "
-                f"seeds, then the trials within each ({N_BOOT} draws)",
+                f"the participant in Figure 2b (the drawn lines stop at the axis); panel e: 95% t CIs over the training "
+                f"seeds (demo_time); the leads: 95% CIs resampling the seeds, then the trials within each ({N_BOOT} draws)",
         users={u: corruption_label(D["G"]["cells"][f"{u}x{tasks[0]}"]["corruption"]) for u in users},
         tasks={t: dict(label=task_label(D["G"]["cells"][f"{users[0]}x{t}"]["obstacle"]), time_limit_s=D["G"]["cells"][f"{users[0]}x{t}"]["time_limit_s"] or 8.0) for t in tasks},
         test_trials_per_cell=D["test_n"], success_per_cell=per_cell,
@@ -983,22 +976,99 @@ def build_fig3(out, results, device):
         obstacle_means={m: round(float(np.mean(v)), 1) for m, v in obstacle_per_seed.items()},
         obstacle_means_per_seed={m: r1(v) for m, v in obstacle_per_seed.items()},
         obstacle_means_sd_over_seeds={m: round(float(np.std(v, ddof=1)), 1) if len(v) > 1 else 0.0 for m, v in obstacle_per_seed.items()},
-        best_per_cell=winners,
-        best_per_cell_note="fill: the best method by its success averaged over the seeds; corner: the second; lead: the best's "
-                           "success minus the second's (points) with its 95% CI; level (the cell split between the two): the CI "
-                           "includes 0",
+        demo_time=demo_time,
         composed_beats_all_baselines=beyond(lead_best), composed_lead_over_best_baseline=lead_best, best_baseline=best_base,
         composed_lead_range=[min(v[0] for v in lead_best.values()), max(v[0] for v in lead_best.values())],
         task_module_gain=gain, task_module_gain_range=dict(trained=[g["points"] for g in gain.values() if g["trained"]],
                                                            unseen=[g["points"] for g in gain.values() if not g["trained"]]),
-        composed_over_retrained=over_retrained, composed_beats_retrained=beyond(over_retrained),
+        composed_over_fine_tuned=over_fine_tuned, composed_beats_fine_tuned=beyond(over_fine_tuned),
         t1_user_module_over_teleop={f"{u}x{tasks[0]}": r1(lead_ci(D, u, tasks[0], "mars", "teleop")) for u in users},
         tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},
         schematic="panel a's densities are made up",
         task_rollouts={t: {k: v[k] for k in ("cell", "trial", "hits", "of")} for t, v in shown.items()},
-        t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the retrained arm is MARS (no task module, nothing to retrain), so only four arms are drawn",
+        t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS (no obstacle, nothing to fine-tune on), so only four arms are drawn",
         flow_control_note="Kao et al.'s flow control, ic_gain 2.0, tau tuned per cell"))
     return png
+
+
+# ================================================================ Figure 3e: success against the time spent demonstrating
+
+
+DEMO_SECONDS = (30, 60, 120, 300, 600, 1200, 3600, 10800)  # the budgets, time spent demonstrating a task (s; _t<s> in names)
+DEMO_ARMS = {"mars": ("demo_time_mars", "mars_t{s}"), "ft": ("demo_time_ft", "ft_mars_user_t{s}")}  # arm: its sweep, its method
+DEMO_COLOR = {"mars": GRID_COLOR["mars"], "ft": GRID_COLOR[FT_ARM]}
+DEMO_TASKS = {"T2": "disc_large", "T3": "wall_gap", "T4": "ring_goal", "T5": "ring_start"}  # the tasks' checkpoint names
+GRID_DEMOS = 300  # the grid's task modules (and panel d's fine-tuned policies): 300 demonstrations of the task
+
+
+def demo_time_data(results):
+    """Each arm's runs, one per training seed found (seed 0 is required). An arm's value at a budget is its success
+    averaged over the 16 obstacle cells, one value per seed. The sweeps play the grid's cells and trials: their teleop's
+    outcomes must be the grid's (grid_s0's), trial for trial."""
+    sweeps = Path(results) / "sim" / "sweeps"
+    load = lambda name: json.loads((sweeps / name / "test.json").read_text())
+    found = lambda name: [k for k in range(5) if k == 0 or (sweeps / f"{name}_s{k}" / "test.json").exists()]
+    runs = {arm: {k: load(f"{sweep}_s{k}") for k in found(sweep)} for arm, (sweep, _) in DEMO_ARMS.items()}
+    grid = load("grid_s0")
+    cells = list(runs["mars"][0]["test"])
+    teleop = lambda run, c: run["test"][c]["trials"]["outcome"]["teleop"]
+    for arm, by_seed in runs.items():
+        for k, run in by_seed.items():
+            if list(run["test"]) != cells or any(teleop(run, c) != teleop(grid, c) for c in cells):
+                raise ValueError(f"{DEMO_ARMS[arm][0]}_s{k} is not on the grid's cells and trials")
+    pooled = lambda run, m: 100 * float(np.mean([run["test"][c]["metrics"][m]["success"] for c in cells]))
+    curve = {arm: {s: [pooled(run, method.format(s=s)) for run in runs[arm].values()] for s in DEMO_SECONDS}
+             for arm, (_, method) in DEMO_ARMS.items()}
+    return dict(cells=cells, curve=curve, seeds={arm: list(by_seed) for arm, by_seed in runs.items()})
+
+
+def demo_log(task, seconds, seed=0):
+    """The training log of the policy fine-tuned on a budget of a task's demonstrations (its args hold the count the
+    budget held, the same draw as the task module's; its eval the training length picked)."""
+    path = CHECKPOINTS / "policies" / "demo_time" / f"flow_goaldrop_{task}_ft_t{seconds}_s{seed}" / "train_log.json"
+    return json.loads(path.read_text())
+
+
+def mean_ci(values):
+    """[mean, lower, upper]: the 95% t CI over the seeds, or the one value thrice."""
+    return t_ci(values) if len(values) > 1 else [float(np.mean(values))] * 3
+
+
+def draw_demo_time(fig, D, rect):
+    """Panel e: each arm's success on the 16 obstacle cells against the time spent demonstrating each task (log), the
+    mean over the training seeds with its 95% t CI as a band, on panel d's success scale, and in grey the time the grid's
+    300 demonstrations take (panel d's task modules and fine-tuned policies; each task's at its mean demonstration, from
+    the largest budget's draw). The methods' legend is the figure's. Returns the panel's numbers."""
+    ax = fig.add_axes(rect)
+    minutes = np.array(DEMO_SECONDS) / 60
+    per_demo = {t: DEMO_SECONDS[-1] / demo_log(task, DEMO_SECONDS[-1])["args"]["n_demos"] for t, task in DEMO_TASKS.items()}
+    grid_min = {t: GRID_DEMOS * v / 60 for t, v in per_demo.items()}
+    lo, hi = min(grid_min.values()), max(grid_min.values())
+    ax.axvspan(lo, hi, color=GRID, alpha=0.7, lw=0, zorder=1)
+    ax.text(np.sqrt(lo * hi), 107, f"{GRID_DEMOS} demos (d)", ha="center", va="top", fontsize=FS_TEXT, color=INK_2)
+    curve = {arm: np.array([mean_ci(D["curve"][arm][s]) for s in DEMO_SECONDS]) for arm in DEMO_ARMS}
+    for arm in ("ft", "mars"):
+        if len(D["seeds"][arm]) > 1:
+            ax.fill_between(minutes, curve[arm][:, 1], curve[arm][:, 2], color=DEMO_COLOR[arm], alpha=0.2, lw=0, zorder=2)
+        ax.plot(minutes, curve[arm][:, 0], "-o", color=DEMO_COLOR[arm], lw=1.3, ms=2.6, zorder=3)
+    ax.set_xscale("log")
+    ax.set_xticks(minutes, [f"{v:g}" for v in minutes])
+    ax.minorticks_off()
+    ax.set(xlim=(minutes[0] / 1.4, minutes[-1] * 1.4), ylim=(0, 108), yticks=[0, 25, 50, 75, 100])
+    ax.set_xlabel("Demonstration time (min)", labelpad=1)
+    ax.set_ylabel("Success, T2–T5 (%)", labelpad=1)
+    r1 = lambda v: [round(float(x), 1) for x in v]
+    return dict(
+        seconds=list(DEMO_SECONDS), seeds=D["seeds"], cells=len(D["cells"]),
+        success={arm: {str(s): r1(c) for s, c in zip(DEMO_SECONDS, curve[arm])} for arm in DEMO_ARMS},
+        success_per_seed={arm: {str(s): r1(D["curve"][arm][s]) for s in DEMO_SECONDS} for arm in DEMO_ARMS},
+        demonstrations_per_budget={t: {str(s): demo_log(task, s)["args"]["n_demos"] for s in DEMO_SECONDS}
+                                   for t, task in DEMO_TASKS.items()},
+        fine_tuned_training_steps={t: {str(s): demo_log(task, s)["best_step"] for s in DEMO_SECONDS} for t, task in DEMO_TASKS.items()},
+        grid_demonstrations_minutes={t: round(v, 1) for t, v in grid_min.items()},
+        time_note="a budget's demonstrations each take their duration up to the goal's selection (the reach and the 0.3 s "
+                  "hold), with no time between them; the grid's 300 at each task's mean duration from the largest budget's "
+                  "draw")
 
 
 # ================================================================

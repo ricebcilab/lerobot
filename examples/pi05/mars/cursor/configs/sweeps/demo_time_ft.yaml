@@ -1,0 +1,115 @@
+# The demonstration-time curve: success on the grid's 16 obstacle cells (users U1-U4 x tasks T2-T5 at noise 1.0, the
+# grid's cells, trials and seed, so every method here plays the trials it would in configs/sweeps/grid.yaml) against
+# the time spent demonstrating the task: 0.5, 1, 2, 5, 10, 20, 60 and 180 min (_t<seconds>), each task given as many
+# demonstrations as fit (train_adapter.py / train_policy.py --demo-seconds; the two draw the same demonstrations for one
+# budget and seed). teleop replays the grid's, a check that the trials are the grid's. Every steered method is tuned as
+# the grid's MARS variants are, over the reversal depth x the pinned prefix (16 = the whole chunk).
+# This file: the frozen policy fine-tuned on each budget's demonstrations (train_policy.py --init flow_goaldrop, an
+# obstacle head added; its training length picked by train_policy.py --eval_steps), steered through a user module refitted
+# on it from the same 100 open-field demonstrations as the grid's (MARS-U on the fine-tuned policy). Its partner
+# demo_time_mars.yaml has MARS on the same demonstrations.
+#   python run_sweep.py --sweep demo_time_ft --cells U1xT2 --out demo_time_ft_s0_parts/U1xT2   # a part per cell, in parallel, then:
+#   python run_sweep.py --sweep demo_time_ft --merge demo_time_ft_s0_parts/U1xT2 ... --out demo_time_ft_s0
+#   python run_sweep.py --sweep demo_time_ft --module-seed 1 --fixed-settings ../results/sim/sweeps/demo_time_ft_s0/settings.yaml --out demo_time_ft_s1
+name: demo_time_ft
+agent: expert
+arm: condition_grid.yaml
+methods:
+  teleop: {mode: teleop}
+  ft_mars_user_t30:
+    mode: frs
+    tune: &mars {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t30_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t30_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t30_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t30_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t30, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t30, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t30, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t30}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t30, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t30, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t30, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t30}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t30, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t30, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t30, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t30}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t30, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t30, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t30, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t30}
+  ft_mars_user_t60:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t60_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t60_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t60_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t60_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t60, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t60, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t60, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t60}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t60, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t60, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t60, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t60}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t60, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t60, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t60, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t60}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t60, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t60, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t60, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t60}
+  ft_mars_user_t120:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t120_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t120_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t120_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t120_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t120, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t120, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t120, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t120}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t120, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t120, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t120, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t120}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t120, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t120, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t120, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t120}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t120, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t120, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t120, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t120}
+  ft_mars_user_t300:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t300_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t300_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t300_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t300_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t300, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t300, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t300, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t300}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t300, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t300, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t300, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t300}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t300, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t300, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t300, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t300}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t300, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t300, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t300, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t300}
+  ft_mars_user_t600:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t600_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t600_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t600_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t600_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t600, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t600, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t600, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t600}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t600, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t600, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t600, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t600}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t600, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t600, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t600, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t600}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t600, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t600, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t600, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t600}
+  ft_mars_user_t1200:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t1200_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t1200_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t1200_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t1200_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t1200, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t1200, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t1200, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t1200}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t1200, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t1200, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t1200, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t1200}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t1200, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t1200, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t1200, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t1200}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t1200, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t1200, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t1200, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t1200}
+  ft_mars_user_t3600:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t3600_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t3600_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t3600_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t3600_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t3600, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t3600, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t3600, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t3600}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t3600, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t3600, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t3600, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t3600}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t3600, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t3600, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t3600, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t3600}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t3600, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t3600, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t3600, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t3600}
+  ft_mars_user_t10800:
+    mode: frs
+    tune: *mars
+    model: {T2: demo_time/flow_goaldrop_disc_large_ft_t10800_s0, T3: demo_time/flow_goaldrop_wall_gap_ft_t10800_s0, T4: demo_time/flow_goaldrop_ring_goal_ft_t10800_s0, T5: demo_time/flow_goaldrop_ring_start_ft_t10800_s0}
+    reversal_adapter:
+      user:
+        T2: {U1: demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t10800, U2: demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t10800, U3: demo_time/user_rot60_expert_n100_s0_on_disc_large_ft_t10800, U4: demo_time/user_curl20_expert_n100_s0_on_disc_large_ft_t10800}
+        T3: {U1: demo_time/user_gain025y_expert_n100_s0_on_wall_gap_ft_t10800, U2: demo_time/user_gain025x_expert_n100_s0_on_wall_gap_ft_t10800, U3: demo_time/user_rot60_expert_n100_s0_on_wall_gap_ft_t10800, U4: demo_time/user_curl20_expert_n100_s0_on_wall_gap_ft_t10800}
+        T4: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_goal_ft_t10800, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_goal_ft_t10800, U3: demo_time/user_rot60_expert_n100_s0_on_ring_goal_ft_t10800, U4: demo_time/user_curl20_expert_n100_s0_on_ring_goal_ft_t10800}
+        T5: {U1: demo_time/user_gain025y_expert_n100_s0_on_ring_start_ft_t10800, U2: demo_time/user_gain025x_expert_n100_s0_on_ring_start_ft_t10800, U3: demo_time/user_rot60_expert_n100_s0_on_ring_start_ft_t10800, U4: demo_time/user_curl20_expert_n100_s0_on_ring_start_ft_t10800}
+grid:
+  users:
+    U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}
+    U2: {corruption: {scale: [0.25, 1.0]}, adapter: user_gain025x_expert_n100_s0}
+    U3: {corruption: {rotation_deg: 60}, adapter: user_rot60_expert_n100_s0}
+    U4: {corruption: {curl: 20, tau: 0.1}, adapter: user_curl20_expert_n100_s0}
+  tasks:
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
+  noises: [1.0]
+  train: [[U1, T2], [U2, T3], [U3, T4], [U4, T5]]
+trials: {tune: 200, test: 500}
+focus: ft_mars_user_t300
+against: [teleop]
+seed: 800

@@ -61,9 +61,9 @@ def arm_folders(arms):
 
 def seed_name(name, k):
     """A seed-0 module's name for training seed k, e.g. task_ring_goal_n300_s0_with_rot60 -> task_ring_goal_n300_s2_with_rot60."""
-    new, count = re.subn(r"(_n\d+)_s0(?=_|$)", rf"\1_s{k}", name, count=1)
+    new, count = re.subn(r"(_[nt]\d+)_s0(?=_|$)", rf"\1_s{k}", name, count=1)
     if not count:
-        raise ValueError(f"{name}: no seed-0 tag (_n<N>_s0) to put seed {k} in place of")
+        raise ValueError(f"{name}: no seed-0 tag (_n<N>_s0 or _t<seconds>_s0) to put seed {k} in place of")
     return new
 
 

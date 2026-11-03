@@ -162,3 +162,48 @@ def test_frozen_noise_serves_one_draw_per_demo_step():
     assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
     with pytest.raises(SystemExit):
         train_adapter.parse_args(["--name", "x", "--corruption", "{rotation_deg: 60}", "--frozen-noise", "--closed-loop", "u"])
+
+
+def test_a_time_budget_keeps_the_demonstrations_that_fit_in_it():
+    """--demo-seconds: as many of the task's demonstrations as fit in the budget, each taking its duration up to the
+    goal's selection; a larger budget extends the same draw, and about a quarter of it is without the obstacle."""
+    args = train_adapter.parse_args(["--name", "x", "--corruption", "{scale: [1.0, 0.25]}"])
+    ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
+    def draw(seconds):
+        return train_adapter.budget_demos(args, ring, np.random.default_rng(0), seconds, p_free=0.25, chunk=16)
+
+    (small, task, _, small_lengths), (large, _, _, large_lengths) = draw(12.0), draw(40.0)
+    n = len(small)
+    assert 0 < n < len(large)
+    assert small_lengths.sum() * task.dt <= 12.0 < large_lengths[:n + 1].sum() * task.dt  # all that fit and no more
+    np.testing.assert_array_equal(small.start, large.start[:n])  # the same draw, extended
+    np.testing.assert_array_equal(small_lengths, large_lengths[:n])
+    assert 0 < (~large.obstacle_mask.any(1)).mean() < 0.5
+
+
+def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(ckpt_dir, monkeypatch):
+    """train_policy.py --demo_seconds draws the demonstrations as the adapter trainer does (a task module given the
+    same budget and seed gets the same ones); --eval_steps scores the EMA weights alone with the goal given and saves
+    the best, without changing the training itself."""
+    from train import train_policy
+    monkeypatch.setattr(train_policy, "policy_dir", lambda name: ckpt_dir / name)
+    monkeypatch.setattr(train_policy, "policy_path", lambda name: ckpt_dir / name / "policy.pt")
+    tiny = ["--val_demos", "10", "--steps", "4", "--batch", "16", "--log_every", "2", "--warmup", "2",
+            "--goal_dropout", "0.25", "--targets", "4", "4", "--reach", "0.35", "0.5"]
+    ring = "{kind: ring, around: goal, gap_angle: [15, 30]}"
+    train_policy.main(["--name", "base", "--n_demos", "30", "--d_model", "32", "--layers", "1", "--heads", "2", *tiny])
+    ft = ["--init", "base", "--obstacle", ring, "--demo_seconds", "12", *tiny]
+    train_policy.main(["--name", "scored", *ft, "--eval_steps", "2", "--eval_trials", "4"])
+    train_policy.main(["--name", "plain", *ft])
+    log, plain = (json.loads((ckpt_dir / n / "train_log.json").read_text()) for n in ("scored", "plain"))
+    assert [e["step"] for e in log["eval"]] == [2, 4]  # the step asked for and the last
+    assert log["best_step"] == max(log["eval"], key=lambda e: (e["success"], e["step"]))["step"]
+    for key in ("train", "val"):  # scoring left the training's random state alone
+        assert [e[key] for e in log["log"]] == pytest.approx([e[key] for e in plain["log"]], rel=1e-4)
+    assert "eval" not in plain
+    n = log["args"]["n_demos"]
+    args = train_adapter.parse_args(["--kind", "task", "--obstacle", ring, "--user-module", "u", "--corruption",
+                                     "{scale: [1.0, 0.25]}", "--name", "t", "--demo-seconds", "12", "--val-demos", "10"])
+    data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
+                                       *corruption_spec(args.corruption), args.p_free)
+    assert 0 < n == args.n_demos == len(data["train"].sampler.lengths)

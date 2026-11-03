@@ -13,7 +13,8 @@ from cursor_sa.env import TaskConfig, center_out, curl_steady_state, sample_layo
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import MAX_SPEED, steered_chunk
-from run_sweep import cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_setting
+from run_sweep import (cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
+                       with_setting)
 
 
 def _obs(B=3, N=5, hist=4):
@@ -63,7 +64,8 @@ def test_center_out_and_curl_steady_state():
 
 
 def test_sweep_configs_load_and_methods_resolve():
-    for name in ("study_tuning", "grid", "grid_expert_check", "grid_task_check"):
+    for name in ("study_tuning", "grid", "grid_expert_check", "grid_task_check", "demo_time_check", "demo_time_mars",
+                 "demo_time_ft", "grid_ft"):
         sweep = load_sweep(name + ".yaml")
         assert sweep["focus"] in sweep["methods"] and all(m in sweep["methods"] for m in sweep["against"])
         level = sweep["grid"]["levels"][0]
@@ -76,6 +78,13 @@ def test_sweep_configs_load_and_methods_resolve():
     assert settings_for(grid, "flow_control", "flow_control") == [{"tau": t} for t in range(2, 17, 2)]
     assert settings_for(grid, "frs", "frs") == [{"pinned_steps": p} for p in (2, 4, 8, 16)]
     assert method_arm(grid, "frs", "U1xT1")["n_reverse_steps"] is None and method_arm(grid, "flow_control", "U1xT1")["lambda"] == 1
+
+    def ft(cell, seed=None):  # the fine-tuned arm: on T1 the frozen policy, on the obstacle tasks fine-tuned, per seed
+        arm = method_arm(load_sweep("grid_ft.yaml", seed), "ft_mars_user", cell)
+        return arm["model"], arm["reversal_adapter"]["user"]
+
+    assert ft("U1xT1") == ("flow_goaldrop", "user_gain025y_expert_n100_s0")
+    assert ft("U2xT3", 1) == ("flow_goaldrop_wall_gap_ft_n300_s1", "user_gain025x_expert_n100_s1_on_wall_gap_ft_n300")
     for m in ("mars_user", "mars_task", "mars", "retrained_mars_user"):
         assert len(settings_for(grid, "frs", m)) == 10 * 4 and "tune" not in method_arm(grid, m, "U1xT1")
     arm = method_arm(grid, "frs", "U1xT1")
@@ -83,6 +92,18 @@ def test_sweep_configs_load_and_methods_resolve():
     assert with_setting(arm, {"n_reverse_steps": 6, "pinned_steps": 4})["pinned_steps"] == 4
     assert with_setting(method_arm(grid, "flow_control", "U1xT1"), {"tau": 12, "lambda": 2})["lambda"] == 2
     assert with_setting(arm, 10)["n_reverse_steps"] is None  # a bare number: an older run's depth
+
+
+def test_module_seed_swaps_the_seed_0_tag_of_a_count_or_a_time_budget():
+    """--module-seed k: `_n<demos>_s0` and a time budget's `_t<seconds>_s0` become `_s<k>` in every checkpoint name;
+    a name without either tag (one policy for every seed) stays."""
+    names = {"model": {"T2": "demo_time/flow_goaldrop_disc_large_ft_t300_s0", "T3": "flow_goaldrop_wall_gap"},
+             "user": "demo_time/user_gain025y_expert_n100_s0_on_disc_large_ft_t300",
+             "task": ["task_disc_large_n300_s0_with_gain025y", "demo_time/task_disc_large_t10800_s0_with_gain025y"]}
+    assert with_module_seed(names, 2) == {
+        "model": {"T2": "demo_time/flow_goaldrop_disc_large_ft_t300_s2", "T3": "flow_goaldrop_wall_gap"},
+        "user": "demo_time/user_gain025y_expert_n100_s2_on_disc_large_ft_t300",
+        "task": ["task_disc_large_n300_s2_with_gain025y", "demo_time/task_disc_large_t10800_s2_with_gain025y"]}
 
 
 def test_tune_lists_each_modes_knobs(tmp_path):

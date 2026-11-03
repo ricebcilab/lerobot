@@ -12,10 +12,14 @@ obstacle tokens: the grid's retrained policy for that task (`retrained_mars_user
 policy steered onto it by the task module. --init fine-tunes a trained policy instead of starting from
 scratch: its architecture, weights and action scale, with an obstacle head new to it (the obstacle
 tokens' input layer and type embedding) starting fresh (the study's policy fine-tuned this way did worse
-in closed loop than one trained from scratch: README, the grid's checks).
+in closed loop than one trained from scratch under the study's controller: README, the grid's checks).
+--demo_seconds trains on as many demonstrations as fit in that much demonstrating, drawn as the adapter
+trainer draws them (train_adapter.budget_demos), so a task module given the same budget and seed sees the same
+ones. --eval_steps picks how long the policy trains: at those steps and the last it scores the EMA weights alone
+with the goal given on layouts of its task (`goal_given_scorer`, apart from the sweeps' trials) and keeps the best.
 
-Saves the EMA weights to checkpoints/policies/<name>/policy.pt and the loss curve
-to checkpoints/policies/<name>/train_log.json. convert_checkpoints.py turns policy.pt into
+Saves the EMA weights (with --eval_steps, the best scored) to checkpoints/policies/<name>/policy.pt and the loss
+curve (and the scores) to checkpoints/policies/<name>/train_log.json. convert_checkpoints.py turns policy.pt into
 the lerobot policy directory (config.json + model.safetensors); FlowPolicy.load reads both.
 """
 
@@ -36,11 +40,32 @@ import numpy as np
 import torch
 import yaml
 
+from cursor_sa import config
+from cursor_sa.agents import make_agent
 from cursor_sa.demos import DemoSampler, make_demos
-from cursor_sa.env import obstacle_spec
+from cursor_sa.env import obstacle_spec, sample_layouts
 from cursor_sa.paths import policy_dir, policy_path
 from cursor_sa.policy import FlowPolicy, load_checkpoint
-from train.train_adapter import layouts_for
+from cursor_sa.session import arm_task, readout_for, run_trials
+from train.train_adapter import budget_demos, layouts_for
+
+
+def goal_given_scorer(args, device):
+    """The share of --eval_trials layouts of the task that a policy alone hits with the goal given (the expert_chunk
+    agent with the readout off: grid_task_check's oracle) under --eval_arm's controller. The layouts and the trials'
+    noise come from --eval_seed, and scoring leaves the training's random state as it was."""
+    arm = config.load_arm(args.eval_arm, {"mode": "teleop", "obstacle": args.obstacle})
+    layouts = sample_layouts(np.random.default_rng(args.eval_seed), args.eval_trials, tuple(arm["targets"]), arm_task(arm))
+
+    def score(policy):
+        with torch.random.fork_rng(devices=range(torch.cuda.device_count())):
+            torch.manual_seed(args.eval_seed + 1)
+            readout = readout_for(arm, np.random.default_rng(args.eval_seed + 1), off=True)
+            records = run_trials(arm, layouts, make_agent("expert_chunk"), readout, policy.eval(), {}, device)
+        policy.train()
+        return float(np.mean([r["outcome"] == "hit" for r in records]))
+
+    return score
 
 
 def main(argv=None):
@@ -48,6 +73,15 @@ def main(argv=None):
     p.add_argument("--mode", default="flow", choices=["flow", "regress"])
     p.add_argument("--name", help="output folder name (default: the mode)")
     p.add_argument("--n_demos", type=int, default=20000)
+    p.add_argument("--demo_seconds", type=float, help="instead of --n_demos, as many demonstrations as fit in this much "
+                   "demonstrating (train_adapter.budget_demos)")
+    p.add_argument("--eval_steps", type=int, nargs="+", default=[], help="score the EMA weights at these steps and the "
+                   "last, alone with the goal given (goal_given_scorer), and save the best (on a tie, the later)")
+    p.add_argument("--eval_trials", type=int, default=200, help="with --eval_steps: the layouts scored")
+    p.add_argument("--eval_seed", type=int, default=900, help="with --eval_steps: their seed, apart from the sweeps' "
+                   "trials (800 and 810)")
+    p.add_argument("--eval_arm", default="condition_grid.yaml", help="with --eval_steps: the controller and task geometry "
+                   "they run under")
     p.add_argument("--targets", type=int, nargs=2, default=[1, 8], help="min and max targets per trial")
     p.add_argument("--reach", type=yaml.safe_load, nargs=2, default=[0.2, None], help="min and max reach (null: none)")
     p.add_argument("--obstacle", type=yaml.safe_load, help="an obstacle task to train on; gives the policy obstacle tokens")
@@ -85,14 +119,19 @@ def main(argv=None):
     tic = time.time()
     data = {}
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
-        layouts, task = layouts_for(args, args.obstacle, rng, n, args.p_free)
-        data[split] = (layouts, *make_demos(rng, layouts, task, allow_failed=args.obstacle is not None))
+        if split == "train" and args.demo_seconds is not None:  # a time budget; n_demos becomes the count it held
+            layouts, task, *demos = budget_demos(args, args.obstacle, rng, args.demo_seconds, args.p_free)
+            args.n_demos = len(layouts)
+            data[split] = (layouts, *demos)
+        else:
+            layouts, task = layouts_for(args, args.obstacle, rng, n, args.p_free)
+            data[split] = (layouts, *make_demos(rng, layouts, task, allow_failed=args.obstacle is not None))
     actions = data["train"][1]
     moving = actions[np.linalg.norm(actions, axis=-1) > 0]
     action_scale = float(np.sqrt((moving ** 2).mean()))
     samplers = {k: DemoSampler(*v, args.horizon, args.hist, device) for k, v in data.items()}
-    print(f"{args.n_demos} demos ({data['train'][2].sum()} samples) in {time.time() - tic:.0f}s; "
-          f"action scale {action_scale:.4f}", flush=True)
+    print(f"{args.n_demos} demos ({data['train'][2].sum()} samples, {data['train'][2].sum() * task.dt:.0f} s of "
+          f"demonstrating) in {time.time() - tic:.0f}s; action scale {action_scale:.4f}", flush=True)
 
     if base is None:
         model = FlowPolicy(horizon=args.horizon, hist=args.hist, d_model=args.d_model, layers=args.layers,
@@ -110,6 +149,9 @@ def main(argv=None):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / args.warmup)
                                               * 0.5 * (1 + math.cos(math.pi * s / args.steps)))
 
+    scored = set(args.eval_steps) | ({args.steps} if args.eval_steps else set())
+    score = goal_given_scorer(args, device) if scored else None
+    scores, best = [], None  # best: (success, step, the EMA weights then)
     log, running, tic = [], 0.0, time.time()
     for step in range(1, args.steps + 1):
         loss = model.loss(*samplers["train"].sample(args.batch, args.goal_dropout))
@@ -122,6 +164,12 @@ def main(argv=None):
             for pe, pm in zip(ema.parameters(), model.parameters()):
                 pe.lerp_(pm, 1 - args.ema)
         running += loss.item()
+        if step in scored:
+            success = score(ema)
+            scores.append(dict(step=step, success=success))
+            if best is None or success >= best[0]:
+                best = (success, step, copy.deepcopy(ema.state_dict()))
+            print(f"step {step:6d}  alone with the goal given {100 * success:.1f}%  {time.time() - tic:.0f}s", flush=True)
 
         if step % args.log_every == 0:
             with torch.no_grad():
@@ -132,10 +180,12 @@ def main(argv=None):
                   f"{time.time() - tic:.0f}s", flush=True)
             running = 0.0
 
-    torch.save(dict(config=model.config, state_dict=ema.state_dict(), args=vars(args)), out / "policy.pt")
+    weights = ema.state_dict() if best is None else best[2]
+    torch.save(dict(config=model.config, state_dict=weights, args=vars(args)), out / "policy.pt")
+    scored_log = {} if best is None else dict(eval=scores, best_step=best[1])
     with open(out / "train_log.json", "w") as f:
-        json.dump(dict(args=vars(args), action_scale=action_scale, log=log), f, indent=1)
-    print(f"saved {out / 'policy.pt'}")
+        json.dump(dict(args=vars(args), action_scale=action_scale, log=log, **scored_log), f, indent=1)
+    print(f"saved {out / 'policy.pt'}" + ("" if best is None else f" (step {best[1]}: {100 * best[0]:.1f}% alone, goal given)"))
 
 
 if __name__ == "__main__":

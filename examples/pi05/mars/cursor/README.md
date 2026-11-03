@@ -160,7 +160,8 @@ its CI), `log.txt` (everything the sweep printed) and `figs/` (tuning curves, th
 or `axes.png` with the lead against every varied parameter, the showcase cell or, for a users × tasks
 grid, the grid's maps and summary, and center-out `traces.png` when the sweep asks for them).
 `--fixed-settings <settings.yaml>` skips tuning and tests at the given settings (the same test trials
-a tuned run would use); `--module-seed k` swaps every `_n<demos>_s0` checkpoint for training seed k's.
+a tuned run would use); `--module-seed k` swaps every `_n<demos>_s0` (or a time budget's `_t<seconds>_s0`) checkpoint
+for training seed k's.
 Results are saved after every group of cells; `--resume` continues an interrupted sweep. Every cell
 draws its layouts, noise and bootstrap from seeds of its own, so `--cells` can run parts of a sweep in
 parallel processes (each with its own `--out`) and `--merge` combines them, cell for cell the same as
@@ -185,6 +186,9 @@ on a task, e.g. a task-module arm where the task has none, are named below it) a
 | `grid_expert_check` | expert | the expert alone (teleop, clean readout) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
 | `grid_task_check` | expert_chunk | the goal-given policy's own chunks executed, with and without each task module, and each task's retrained policy alone (T2–T5) | 2 min on a free GPU |
 | `grid` | expert | users {U1 … U4} × tasks {T1 … T5} at noise 1.0: the composed user × task adapter, each module alone, each task's retrained policy with its user modules, teleop, flow control and FRS; per cell flow control tunes tau (lambda 1), FRS pinned_steps (the full reversal), every MARS variant n_reverse_steps × pinned_steps | seed 0 tuned in parallel parts (`--cells`, then `--merge <parts> --out grid_s0`); seeds 1–4 at seed 0's settings (`--module-seed k --fixed-settings .../grid_s0/settings.yaml --out grid_s<k>`) |
+| `grid_ft` | expert | the grid's 20 cells for its fine-tuned arm (Figure 3's in place of the retrained one): on each obstacle task the frozen policy fine-tuned on 300 demonstrations, as many as the task's module, MARS-U on it with each user's module refitted; on T1 the frozen policy and the user module; tuned as the grid's MARS variants, on the grid's trials | a part per cell, seed 0 tuned, seeds 1–4 at its settings; `results/research/grid_ft/pipeline.sh` trains and runs all five |
+| `demo_time_check` | expert_chunk | the demonstration-time curve's gate: on T2–T5, alone with the goal given and hidden, the frozen policy, with the grid's task module, retrained from scratch, and fine-tuned on 5 and 180 min of demonstrations | 3 min |
+| `demo_time_mars`, `demo_time_ft` | expert | the grid's 16 obstacle cells against the time spent demonstrating each task (0.5, 1, 2, 5, 10, 20, 60 and 180 min): MARS with a task module per budget, and MARS-U on the frozen policy fine-tuned on the same demonstrations; every method tuned as the grid's MARS variants, on the grid's trials | a part per cell (`--cells`, then `--merge`), seed 0 tuned, seeds 1–2 at its settings; `results/research/demo_time/pipeline.sh <seed>` runs a seed end to end |
 
 Times are on one RTX 6000 Ada. Settings only need re-tuning when something that can move them changes:
 the condition, a retrained module or a retrained policy.
@@ -369,6 +373,15 @@ data-efficiency notes, in git history): a user module over-fits the default 20 0
 should train about five steps per demonstration (`--steps`, at least 100), while a task module needs the
 full 20 000 steps whatever its data. `--frozen-noise` draws the readout's noise once per demonstration
 step, as a recorded calibration has it, instead of anew in every batch.
+
+`--demo-seconds` (the policy trainer's `--demo_seconds`) sets the budget in time instead: as many of the task's
+demonstrations as fit in that much demonstrating, each taking its duration up to the goal's selection (0.95 s on
+the disc and the wall, 1.25 s on the rings), and the two trainers draw the same ones for one budget and seed, so a
+task module and a policy fine-tuned on that budget (`train_policy.py --init flow_goaldrop`) see the same
+demonstrations (the demonstration-time sweeps; checkpoints under `demo_time/`, named with `_t<seconds>`).
+`train_policy.py --eval_steps` picks how long a policy trains: at those steps and the last it scores the EMA
+weights alone with the goal given on 200 layouts of its task under the grid's controller (seed 900, apart from the
+sweeps' trials) and keeps the best, every score in its `train_log.json`.
 
 Checkpoints go to `examples/pi05/mars/checkpoints/policies/<name>/` and `.../adapters/<name>/`, which git
 ignores. The ones the study and the grid use (the study's policy and MARS adapter, the grid's policies and

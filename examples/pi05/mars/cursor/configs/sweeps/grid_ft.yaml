@@ -1,0 +1,50 @@
+# The grid's fine-tuned arm, Figure 3's in place of the policy retrained from scratch (grid.yaml's retrained_mars_user):
+# for each obstacle task the frozen policy fine-tuned on 300 demonstrations, as many as that task's module
+# (train_policy.py --init flow_goaldrop --n_demos 300, drawn by the task trainer's recipe for one seed; an obstacle
+# head added; its training length picked by --eval_steps), steered through each user's module refitted on it from
+# 100 open-field demonstrations (user_<user>_expert_n100_s0_on_<task>_ft_n300). T1 has nothing to fine-tune for:
+# there it is the frozen policy and the user module, mars_user. The grid's cells, trials and seed, so the arm compares
+# trial for trial with grid.yaml's methods (teleop replays the grid's, a check); tuned as the grid's MARS variants are,
+# over the reversal depth x the pinned prefix (16 = the whole chunk).
+#   python run_sweep.py --sweep grid_ft --cells U1xT2 --out grid_ft_s0_parts/U1xT2   # a part per cell, in parallel, then:
+#   python run_sweep.py --sweep grid_ft --merge grid_ft_s0_parts/U1xT1 ... --out grid_ft_s0
+#   python run_sweep.py --sweep grid_ft --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_ft_s0/settings.yaml --out grid_ft_s1
+name: grid_ft
+agent: expert
+arm: condition_grid.yaml
+methods:
+  teleop: {mode: teleop}
+  ft_mars_user:                                                          # the task's fine-tuned policy, a user module on it
+    mode: frs
+    tune: {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}
+    model: {T1: flow_goaldrop, T2: flow_goaldrop_disc_large_ft_n300_s0, T3: flow_goaldrop_wall_gap_ft_n300_s0,
+            T4: flow_goaldrop_ring_goal_ft_n300_s0, T5: flow_goaldrop_ring_start_ft_n300_s0}
+    reversal_adapter:
+      user:
+        T1: cell
+        T2: {U1: user_gain025y_expert_n100_s0_on_disc_large_ft_n300, U2: user_gain025x_expert_n100_s0_on_disc_large_ft_n300,
+             U3: user_rot60_expert_n100_s0_on_disc_large_ft_n300, U4: user_curl20_expert_n100_s0_on_disc_large_ft_n300}
+        T3: {U1: user_gain025y_expert_n100_s0_on_wall_gap_ft_n300, U2: user_gain025x_expert_n100_s0_on_wall_gap_ft_n300,
+             U3: user_rot60_expert_n100_s0_on_wall_gap_ft_n300, U4: user_curl20_expert_n100_s0_on_wall_gap_ft_n300}
+        T4: {U1: user_gain025y_expert_n100_s0_on_ring_goal_ft_n300, U2: user_gain025x_expert_n100_s0_on_ring_goal_ft_n300,
+             U3: user_rot60_expert_n100_s0_on_ring_goal_ft_n300, U4: user_curl20_expert_n100_s0_on_ring_goal_ft_n300}
+        T5: {U1: user_gain025y_expert_n100_s0_on_ring_start_ft_n300, U2: user_gain025x_expert_n100_s0_on_ring_start_ft_n300,
+             U3: user_rot60_expert_n100_s0_on_ring_start_ft_n300, U4: user_curl20_expert_n100_s0_on_ring_start_ft_n300}
+grid:
+  users:
+    U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}
+    U2: {corruption: {scale: [0.25, 1.0]}, adapter: user_gain025x_expert_n100_s0}
+    U3: {corruption: {rotation_deg: 60}, adapter: user_rot60_expert_n100_s0}
+    U4: {corruption: {curl: 20, tau: 0.1}, adapter: user_curl20_expert_n100_s0}
+  tasks:
+    T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
+  noises: [1.0]
+  train: [[U1, T1], [U2, T1], [U3, T1], [U4, T1], [U1, T2], [U2, T3], [U3, T4], [U4, T5]]
+trials: {tune: 200, test: 500}
+focus: ft_mars_user
+against: [teleop]
+seed: 800

@@ -48,7 +48,7 @@ from seeds of its own, so its results do not depend on which cells run with it:
 tests every method at the settings a settings.yaml gives (a cell per key, as a
 sweep writes it): the test trials are the same ones a tuned run would test at
 those settings, tuning.json is empty and settings.yaml is a copy of the input.
---module-seed k runs the sweep with the modules of training seed k.
+--module-seed k runs the sweep with the modules of training seed k (each name's `_n<demos>_s0` or `_t<seconds>_s0`).
 """
 
 
@@ -96,9 +96,10 @@ FAMILY_GRID_KEYS = {"family", "levels", "noises", "axes"}   # a corruption famil
 
 
 def with_module_seed(value, seed):
-    """Every checkpoint name in a sweep's data at another training seed: `_n<demos>_s0` becomes `_n<demos>_s<seed>`."""
+    """Every checkpoint name in a sweep's data at another training seed: `_n<demos>_s0` becomes `_n<demos>_s<seed>`, and
+    a time budget's `_t<seconds>_s0` (train_adapter.py --demo-seconds) `_t<seconds>_s<seed>`."""
     if isinstance(value, str):
-        return re.sub(r"(_n\d+)_s0(?=_|$)", rf"\g<1>_s{seed}", value)
+        return re.sub(r"(_[nt]\d+)_s0(?=_|$)", rf"\g<1>_s{seed}", value)
     if isinstance(value, dict):
         return {k: with_module_seed(v, seed) for k, v in value.items()}
     if isinstance(value, list):
@@ -809,7 +810,8 @@ def main(argv=None):
     p.add_argument("--out", help="output folder name under results/sim/sweeps/ (default: the sweep name)")
     p.add_argument("--cells", nargs="+", help="run only these grid levels (e.g. U1xT3; a family's levels as written)")
     p.add_argument("--merge", nargs="+", help="output folders of parts of this sweep: combine them into --out, run nothing")
-    p.add_argument("--module-seed", type=int, help="the modules' training seed: _n<demos>_s0 -> _s<k> in every checkpoint")
+    p.add_argument("--module-seed", type=int, help="the modules' training seed: _n<demos>_s0 or _t<seconds>_s0 -> _s<k> "
+                   "in every checkpoint")
     p.add_argument("--fixed-settings", help="a settings.yaml: skip tuning, test every method at the settings it gives per cell")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)

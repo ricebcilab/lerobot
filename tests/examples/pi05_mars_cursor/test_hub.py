@@ -41,6 +41,10 @@ def test_seed_name_swaps_the_seed_0_tag():
     )
     assert hub.seed_name("task_ring_goal_n300_s0_with_rot60", 2) == "task_ring_goal_n300_s2_with_rot60"
     assert hub.seed_name("user_gain025y_expert_n100_s0", 1) == "user_gain025y_expert_n100_s1"
+    assert (
+        hub.seed_name("demo_time/task_ring_goal_t300_s0_with_rot60", 2)
+        == "demo_time/task_ring_goal_t300_s2_with_rot60"
+    )
     with pytest.raises(ValueError):
         hub.seed_name("user_gain025y_expert_n100", 1)  # no _s0 tag
 

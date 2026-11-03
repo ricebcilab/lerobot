@@ -95,6 +95,27 @@ def layouts_for(args, obstacle, rng, n, p_free=0.0):
     return (Layouts.concat(parts) if len(parts) > 1 else parts[0]), task
 
 
+def budget_demos(args, obstacle, rng, seconds, p_free=0.0, chunk=500):
+    """The task's demonstrations that fit in `seconds` of demonstrating, each taking its duration up to the goal's
+    selection (the reach and the hold): layouts drawn `chunk` at a time as `layouts_for` draws them (a share p_free
+    without the obstacle), shuffled, and kept while their running total fits. Both trainers draw a time budget this
+    way (`--demo-seconds`), as the first draw of their seed, so a task module and a fine-tuned policy given one budget
+    and seed train on the same demonstrations. Returns the layouts, the task, the actions and the lengths."""
+    parts, total = [], 0.0
+    while total <= seconds:  # past the budget, so the cut falls inside what was drawn
+        layouts, task = layouts_for(args, obstacle, rng, chunk, p_free)
+        layouts = layouts[rng.permutation(chunk)]
+        actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
+        parts.append((layouts, actions, lengths))
+        total += lengths.sum() * task.dt
+    width = max(a.shape[1] for _, a, _ in parts)
+    actions = np.concatenate([np.pad(a, ((0, 0), (0, width - a.shape[1]), (0, 0))) for _, a, _ in parts])
+    lengths = np.concatenate([n for _, _, n in parts])
+    layouts = Layouts.concat([l for l, _, _ in parts]) if len(parts) > 1 else parts[0][0]
+    keep = int(np.searchsorted(np.cumsum(lengths) * task.dt, seconds, side="right"))
+    return layouts[:keep], task, actions[:keep], lengths[:keep]
+
+
 def expert_pushes(layouts, pos, rows_per_call=500):
     """What the expert (`agents.ExpertAgent`) pushes at every demo step [B, L, 2], watching the
     demonstration's positions pos [B, L + 1, 2]: toward the goal, around the task's obstacles."""
@@ -139,15 +160,22 @@ class ExpertData:
 
 
 def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=0.0):
-    """ExpertData for the train and val splits of a task."""
+    """ExpertData for the train and val splits of a task: the train split --n-demos demonstrations, or with
+    --demo-seconds as many as fit in that much demonstrating (`budget_demos`; args.n_demos becomes their count)."""
     out = {}
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
-        layouts, task = layouts_for(args, obstacle, rng, n, p_free)
-        tic = time.time()
-        actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
+        if split == "train" and args.demo_seconds is not None:
+            tic = time.time()
+            layouts, task, actions, lengths = budget_demos(args, obstacle, rng, args.demo_seconds, p_free)
+            args.n_demos = n = len(layouts)
+        else:
+            layouts, task = layouts_for(args, obstacle, rng, n, p_free)
+            tic = time.time()
+            actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
                                 frozen_noise=split == "train" and args.frozen_noise)
-        print(f"{split}: {n} demonstrations and the expert's pushes ({time.time() - tic:.0f}s)", flush=True)
+        print(f"{split}: {n} demonstrations ({lengths.sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
+              f"({time.time() - tic:.0f}s)", flush=True)
     return out
 
 
@@ -438,6 +466,8 @@ def parse_args(argv=None):
     p.add_argument("--cross-step-dims", type=dim_indices, help="user: the dims the coupling covers, a comma list of "
                    "indices (e.g. 0 or 0,1; default: all)")
     p.add_argument("--n-demos", type=int, default=20000, help="training demonstrations (one reach each)")
+    p.add_argument("--demo-seconds", type=float, help="instead of --n-demos, as many demonstrations as fit in this "
+                   "much demonstrating, each one's duration up to the goal's selection (`budget_demos`)")
     p.add_argument("--frozen-noise", action="store_true", help="draw the readout's noise once per demonstration step "
                    "(as a recorded calibration has it) instead of anew in every batch")
     p.add_argument("--val-demos", type=int, default=2000)

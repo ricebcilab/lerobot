@@ -1,0 +1,82 @@
+# The demonstration-time curve: success on the grid's 16 obstacle cells (users U1-U4 x tasks T2-T5 at noise 1.0, the
+# grid's cells, trials and seed, so every method here plays the trials it would in configs/sweeps/grid.yaml) against
+# the time spent demonstrating the task: 0.5, 1, 2, 5, 10, 20, 60 and 180 min (_t<seconds>), each task given as many
+# demonstrations as fit (train_adapter.py / train_policy.py --demo-seconds; the two draw the same demonstrations for one
+# budget and seed). teleop replays the grid's, a check that the trials are the grid's. Every steered method is tuned as
+# the grid's MARS variants are, over the reversal depth x the pinned prefix (16 = the whole chunk).
+# This file: MARS (the grid's user modules, from 100 open-field demonstrations each, with a task module per budget,
+# trained as the grid's are: 20 000 steps, the same user's module in the loop: T2 with U1, T3 with U2, T4 with U3, T5
+# with U4). Its partner demo_time_ft.yaml has the policy fine-tuned on the same demonstrations.
+#   python run_sweep.py --sweep demo_time_mars --cells U1xT2 --out demo_time_mars_s0_parts/U1xT2   # a part per cell, in parallel, then:
+#   python run_sweep.py --sweep demo_time_mars --merge demo_time_mars_s0_parts/U1xT2 ... --out demo_time_mars_s0
+#   python run_sweep.py --sweep demo_time_mars --module-seed 1 --fixed-settings ../results/sim/sweeps/demo_time_mars_s0/settings.yaml --out demo_time_mars_s1
+name: demo_time_mars
+agent: expert
+arm: condition_grid.yaml
+methods:
+  teleop: {mode: teleop}
+  mars_t30:
+    mode: frs
+    tune: &mars {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t30_s0_with_gain025y, T3: demo_time/task_wall_gap_t30_s0_with_gain025x, T4: demo_time/task_ring_goal_t30_s0_with_rot60, T5: demo_time/task_ring_start_t30_s0_with_curl20}
+  mars_t60:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t60_s0_with_gain025y, T3: demo_time/task_wall_gap_t60_s0_with_gain025x, T4: demo_time/task_ring_goal_t60_s0_with_rot60, T5: demo_time/task_ring_start_t60_s0_with_curl20}
+  mars_t120:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t120_s0_with_gain025y, T3: demo_time/task_wall_gap_t120_s0_with_gain025x, T4: demo_time/task_ring_goal_t120_s0_with_rot60, T5: demo_time/task_ring_start_t120_s0_with_curl20}
+  mars_t300:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t300_s0_with_gain025y, T3: demo_time/task_wall_gap_t300_s0_with_gain025x, T4: demo_time/task_ring_goal_t300_s0_with_rot60, T5: demo_time/task_ring_start_t300_s0_with_curl20}
+  mars_t600:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t600_s0_with_gain025y, T3: demo_time/task_wall_gap_t600_s0_with_gain025x, T4: demo_time/task_ring_goal_t600_s0_with_rot60, T5: demo_time/task_ring_start_t600_s0_with_curl20}
+  mars_t1200:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t1200_s0_with_gain025y, T3: demo_time/task_wall_gap_t1200_s0_with_gain025x, T4: demo_time/task_ring_goal_t1200_s0_with_rot60, T5: demo_time/task_ring_start_t1200_s0_with_curl20}
+  mars_t3600:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t3600_s0_with_gain025y, T3: demo_time/task_wall_gap_t3600_s0_with_gain025x, T4: demo_time/task_ring_goal_t3600_s0_with_rot60, T5: demo_time/task_ring_start_t3600_s0_with_curl20}
+  mars_t10800:
+    mode: frs
+    tune: *mars
+    reversal_adapter:
+      user: cell
+      task: {T2: demo_time/task_disc_large_t10800_s0_with_gain025y, T3: demo_time/task_wall_gap_t10800_s0_with_gain025x, T4: demo_time/task_ring_goal_t10800_s0_with_rot60, T5: demo_time/task_ring_start_t10800_s0_with_curl20}
+grid:
+  users:
+    U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}
+    U2: {corruption: {scale: [0.25, 1.0]}, adapter: user_gain025x_expert_n100_s0}
+    U3: {corruption: {rotation_deg: 60}, adapter: user_rot60_expert_n100_s0}
+    U4: {corruption: {curl: 20, tau: 0.1}, adapter: user_curl20_expert_n100_s0}
+  tasks:
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
+  noises: [1.0]
+  train: [[U1, T2], [U2, T3], [U3, T4], [U4, T5]]
+trials: {tune: 200, test: 500}
+focus: mars_t300
+against: [teleop]
+seed: 800

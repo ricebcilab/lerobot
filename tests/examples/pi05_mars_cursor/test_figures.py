@@ -88,17 +88,20 @@ def test_fig2_builds_from_the_recorded_sessions(tmp_path):
     assert all(len(v) == 3 for v in stats["success_mean_ci"].values())
 
 
-@pytest.mark.skipif(not (RESULTS / "sim" / "sweeps" / "grid" / "test.json").exists(), reason="no grid results")
+@pytest.mark.skipif(not all((RESULTS / "sim" / "sweeps" / f"{name}_s0" / "test.json").exists()
+                            for name in ("grid", "grid_ft", "demo_time_mars", "demo_time_ft")),
+                    reason="no grid or demonstration-time results")
 def test_fig3_builds_from_the_grid(tmp_path):
     bf.main(["--only", "fig3", "--out", str(tmp_path), "--device", "cpu"])
     stats = json.loads((tmp_path / "stats.json").read_text())["fig3"]
     cells = {f"U{u}xT{t}" for u in range(1, 5) for t in range(1, 6)}
-    assert set(stats["success_per_cell"]) == cells == set(stats["best_per_cell"]) and stats["seeds"][0] == 0
+    assert set(stats["success_per_cell"]) == cells and stats["seeds"][0] == 0
+    assert all(set(v) == set(bf.GRID_METHODS) for v in stats["success_per_cell"].values())   # the fine-tuned arm, not the retrained
     assert all(len(v) == len(stats["seeds"]) for c in stats["success_per_cell_per_seed"].values() for v in c.values())
-    for b in stats["best_per_cell"].values():   # the lead is the best's success over the second's, with its CI
-        assert b["success"] >= b["second_success"] and b["lead"][1] <= b["lead"][0] <= b["lead"][2]
-        assert b["lead"][0] == pytest.approx(b["success"] - b["second_success"], abs=0.11) and b["level"] == (b["lead"][1] <= 0)
-    assert stats["composed_beats_all_baselines"]["of"] == 16 and stats["rollouts"]["trials"] == bf.ROLLOUT_TRIALS
+    curve = stats["demo_time"]   # panel e: both arms at every budget, on the 16 obstacle cells
+    assert curve["cells"] == 16 and all(set(curve["success"][arm]) == {str(s) for s in bf.DEMO_SECONDS} for arm in bf.DEMO_ARMS)
+    assert stats["composed_beats_all_baselines"]["of"] == 16 and stats["composed_beats_fine_tuned"]["of"] == 16
+    assert set(stats["task_rollouts"]) == {f"T{t}" for t in range(1, 6)}
     assert Image.open(tmp_path / "fig3_grid.png").size == (round(300 * bf.FULL_W), round(300 * bf.FIG3_H))
 
 
@@ -110,11 +113,76 @@ def _seed_runs(per_seed, cell="U1xT2"):
                 test_n=len(next(iter(per_seed[0].values()))), cell=lambda u, t, k=0: runs[k]["test"][f"{u}x{t}|1.0"])
 
 
+def _grid_results(sweeps, ft_teleop=("hit", "timeout")):
+    """Seed 0 of a one-user grid (teleop, the retrained arm, MARS-UT) and its fine-tuned arm, two trials a cell."""
+    cells = {"U1xT1": None, "U1xT2": {"kind": "disc"}}
+    def write(name, methods, teleop):
+        test = {f"{c}|1.0": dict(settings=dict.fromkeys(methods),
+                                 metrics={m: {"success": 0.25 if m == "ft_mars_user" else 0.5} for m in methods},
+                                 trials=dict(side=["left", "right"], duration_s={m: [1.0, 8.0] for m in methods},
+                                             outcome={m: list(teleop) if m == "teleop" else ["hit", "timeout"] for m in methods}))
+                for c in cells}
+        grid = dict(users=["U1"], tasks=["T1", "T2"], noises=[1.0], cells={c: {"obstacle": o} for c, o in cells.items()})
+        (sweeps / name).mkdir(parents=True)
+        (sweeps / name / "test.json").write_text(json.dumps(dict(args=dict(sweep=dict(methods=dict.fromkeys(methods, {}), grid=grid),
+                                                                           test_trials=2), test=test)))
+    write("grid_s0", ["teleop", "retrained_mars_user", "mars"], ("hit", "timeout"))
+    write("grid_ft_s0", ["teleop", "ft_mars_user"], ft_teleop)
+
+
+def test_grid_data_joins_each_seeds_fine_tuned_arm_trial_for_trial(tmp_path):
+    _grid_results(tmp_path / "sim" / "sweeps")
+    D = bf.grid_data(tmp_path)
+    assert D["methods"] == ["teleop", "ft_mars_user", "mars"]   # the fine-tuned arm in place of the retrained one
+    assert bf.seed_values(D, "U1", "T2", "ft_mars_user") == [25.0]
+    assert D["cell"]("U1", "T2")["trials"]["outcome"]["ft_mars_user"] == ["hit", "timeout"]
+    other = tmp_path / "other"   # a fine-tuned arm off the grid's trials is refused
+    _grid_results(other / "sim" / "sweeps", ft_teleop=("timeout", "timeout"))
+    with pytest.raises(ValueError):
+        bf.grid_data(other)
+
+
 def test_seed_statistics_pair_trials_within_a_seed_and_average_over_the_seeds():
     D = _seed_runs([{"mars": ["hit"] * 6 + ["timeout"] * 4, "teleop": ["hit"] * 3 + ["collision"] * 7},
                     {"mars": ["hit"] * 8 + ["collision"] * 2, "teleop": ["hit"] * 4 + ["timeout"] * 6}])
     assert bf.seed_values(D, "U1", "T2", "mars") == pytest.approx([60, 80]) and bf.seed_mean(D, "U1", "T2", "teleop") == pytest.approx(35)
-    assert bf.ranked(D, "U1", "T2") == ["mars", "teleop"]
     mean, lo, hi = bf.lead_ci(D, "U1", "T2", "mars", "teleop", n_boot=400)
     assert mean == pytest.approx(35) and lo <= mean <= hi
     assert bf.lead_ci(D, "U1", "T2", "mars", "mars", n_boot=100) == [0, 0, 0]
+
+
+def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
+    """Sweep outputs for Figure 3e on two cells: per arm one {method: success} per seed, and the grid's teleop."""
+    cells = ["U1xT2|1.0", "U2xT3|1.0"]
+    def run(methods):
+        return {"test": {c: {"metrics": {m: {"success": v} for m, v in methods.items()},
+                             "trials": {"outcome": {"teleop": list(teleop)}}} for c in cells}}
+    def write(name, methods):
+        (root / name).mkdir(parents=True)
+        (root / name / "test.json").write_text(json.dumps(run(methods)))
+    for k, (m, f) in enumerate(zip(mars, ft)):
+        write(f"demo_time_mars_s{k}", {"teleop": 0.2, **{f"mars_t{s}": m for s in bf.DEMO_SECONDS}})
+        write(f"demo_time_ft_s{k}", {"teleop": 0.2, **{f"ft_mars_user_t{s}": f for s in bf.DEMO_SECONDS}})
+    write("grid_s0", {"teleop": 0.2})
+
+
+def test_fig3e_pools_the_cells_per_budget_and_draws_one_line_per_arm(tmp_path, monkeypatch):
+    results = tmp_path / "results"
+    _demo_time_results(results / "sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
+    D = bf.demo_time_data(results)
+    assert D["seeds"] == {"mars": [0, 1], "ft": [0, 1]} and D["curve"]["mars"][300] == pytest.approx([70, 80])
+    monkeypatch.setattr(bf, "demo_log", lambda task, seconds, seed=0: {"args": {"n_demos": seconds}, "best_step": 5000})
+    bf.paper_style()
+    fig = bf.plt.figure(figsize=(bf.FULL_W, bf.FIG3_H))
+    stats = bf.draw_demo_time(fig, D, (0.6, 0.4, 0.35, 0.15))
+    assert [line.get_color() for line in fig.axes[0].get_lines()] == [bf.DEMO_COLOR["ft"], bf.DEMO_COLOR["mars"]]
+    assert stats["success"]["mars"]["300"][0] == pytest.approx(75) and stats["grid_demonstrations_minutes"]["T2"] == pytest.approx(5.0)
+    bf.plt.close(fig)
+    other = tmp_path / "other"  # a sweep off the grid's trials is refused
+    _demo_time_results(other / "sim" / "sweeps", mars=[0.7], ft=[0.4])
+    grid = json.loads((other / "sim" / "sweeps" / "grid_s0" / "test.json").read_text())
+    for c in grid["test"].values():
+        c["trials"]["outcome"]["teleop"] = ["timeout", "timeout"]
+    (other / "sim" / "sweeps" / "grid_s0" / "test.json").write_text(json.dumps(grid))
+    with pytest.raises(ValueError):
+        bf.demo_time_data(other)
