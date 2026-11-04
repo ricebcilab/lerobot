@@ -373,3 +373,26 @@ def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkey
     )  # fmt: skip
     assert len(list((tmp_path / "scene2").glob("*.npy"))) == 2
     assert not (tmp_path / "sim" / "sweeps" / "pre" / "test.json").exists()
+
+
+def test_precompute_scene_writes_nothing_under_out_for_skipped_cells_and_visits_done_ones(tmp_path, monkeypatch):
+    name = _image_adapter(tmp_path, monkeypatch)
+    (tmp_path / "ax.yaml").write_text(
+        "name: ax\nagent: expert\narm: condition_grid.yaml\nmethods:\n  teleop: {mode: teleop}\n"
+        f"  mars_cnn: {{mode: frs, reversal_adapter: {{task: {name}}}, tune: {{n_reverse_steps: [2]}}}}\n"
+        "grid:\n  family: gain\n  levels: [0.25]\n  noises: [1.25]\n"
+        "  axes: {targets: [[2, 2]], min_target_sep: [0.12, 1.5]}\n"  # 1.5 apart does not fit the screen
+    )
+    argv = ["--sweep", str(tmp_path / "ax.yaml"), "--results", str(tmp_path), "--out", "pre", "--scene-cache",
+            str(tmp_path / "scene"), "--precompute-scene", "--tune-trials", "2", "--test-trials", "2", "--resume"]
+    out = tmp_path / "sim" / "sweeps" / "pre"
+    out.mkdir(parents=True)
+    (out / "test.json").write_text(json.dumps({"test": {"0.25|1.25|targets=2-2|min_target_sep=0.12": {}}, "skipped": {}}))
+    before = (out / "test.json").read_text()
+    sweep_main(argv)  # the cell test.json calls done is visited all the same
+    assert {p.name for p in (tmp_path / "scene").glob("*.npy")} == {
+        "0.25|1.25|targets=2-2|min_target_sep=0.12_tune_cnn_64.npy",
+        "0.25|1.25|targets=2-2|min_target_sep=0.12_test_cnn_64.npy",
+    }
+    assert (out / "test.json").read_text() == before
+    assert sorted(p.name for p in out.iterdir()) == ["test.json"]

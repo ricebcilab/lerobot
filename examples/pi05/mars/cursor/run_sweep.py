@@ -56,7 +56,7 @@ cell's layouts, tuning and test split alike, and the arrays are cached on disk a
 training seed is not in it, so every seed reuses the files). The cache is --scene-cache, by default
 checkpoints/scene/<sweep name>; the showcase reaches of --traces are cached under its showcase/ folder.
 --precompute-scene fills the cache for every cell in one process (the vlm_* tokens need the pi0.5 encoder, loaded
-once) and exits before any trial runs.
+once), whatever --resume would skip, and exits before any trial runs, writing nothing under --out.
 """
 
 
@@ -68,6 +68,7 @@ import os
 import re
 import time
 import zlib
+from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
@@ -872,9 +873,10 @@ def main(argv=None):
     if args.test_trials:
         sweep["trials"]["test"] = args.test_trials
     out = Path(args.results) / "sim" / "sweeps" / (args.out or sweep["name"])
-    (out / "figs").mkdir(parents=True, exist_ok=True)
-    with logged(out / "log.txt", append=args.resume) as log:
-        for part in args.merge or []:  # a merged sweep's log starts with its parts' logs
+    if not args.precompute_scene:  # which writes nothing under --out
+        (out / "figs").mkdir(parents=True, exist_ok=True)
+    with (nullcontext() if args.precompute_scene else logged(out / "log.txt", append=args.resume)) as log:
+        for part in [] if args.precompute_scene else args.merge or []:  # a merged sweep's log starts with its parts' logs
             src = Path(args.results) / "sim" / "sweeps" / part / "log.txt"
             if src.exists():
                 log.write(f"=== {part}\n{src.read_text()}")
@@ -943,7 +945,7 @@ def run(args, sweep, out, encoder_factory=None):
         test, tuning, skipped = ({k: d[k] for k in order if k in d} for d in (test, tuning, skipped))
         run = []
         print(f"merging {len(args.merge)} parts: {len(test)} cells, {len(skipped)} skipped", flush=True)
-    elif args.resume and (out / "test.json").exists():
+    elif args.resume and not args.precompute_scene and (out / "test.json").exists():
         saved = json.loads((out / "test.json").read_text())
         test, skipped = saved["test"], saved.get("skipped", {})
         tuning = {k: v for k, v in json.loads((out / "tuning.json").read_text())["tuning"].items() if k in test}
@@ -994,7 +996,8 @@ def run(args, sweep, out, encoder_factory=None):
             test_layouts = sample_layouts(np.random.default_rng(sweep["seed"] + 10), sweep["trials"]["test"], targets, task)
         except ValueError as e:
             skipped.update({k: str(e) for k in keys.values()})
-            save()
+            if not args.precompute_scene:
+                save()
             print(f"{g}/{len(run)} skipping {label}: {e}", flush=True)
             continue
         scene_of(tune_layouts, f"{cell_key(level, noises[0], axes)}_tune")
