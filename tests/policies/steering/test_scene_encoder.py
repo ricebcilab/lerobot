@@ -40,15 +40,15 @@ class Stub:
         return self.image_tokens(images) + 1
 
 
-def _layouts(n=4):
+def _layouts(n=4, seed=0, obstacle=None):
     return sample_layouts(
-        np.random.default_rng(0),
+        np.random.default_rng(seed),
         n,
         4,
         TaskConfig(
             min_reach=0.3,
             max_reach=0.5,
-            obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5}),
+            obstacle=obstacle_spec(obstacle or {"kind": "disc", "radius": 0.08, "along": 0.5}),
         ),
     )
 
@@ -118,4 +118,17 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
         tok.shape == (2, 256, 2048) and tok.dtype == np.float16 and np.isfinite(tok.astype(np.float32)).all()
     )
     assert pre.shape == (2, 256, 2048) and not np.array_equal(tok, pre)
+    assert np.isfinite(pre.astype(np.float32)).all()
+    # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
+    other = scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, encoder=enc)
+    ring = scene_for(
+        _layouts(2, obstacle={"kind": "ring", "around": "goal", "gap_angle": [15, 30]}),
+        "vlm_image",
+        SCENE_SIZE,
+        encoder=enc,
+    )
+    again = scene_for(_layouts(2), "vlm_image", SCENE_SIZE, encoder=enc)
+    assert not np.array_equal(tok, other) and not np.array_equal(tok, ring)
+    assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
+    assert np.array_equal(tok, again)
     enc.close()
