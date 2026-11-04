@@ -943,7 +943,8 @@ def run(args, sweep, out, encoder_factory=None):
         policies, adapters = load_checkpoints(arms, device)
     agent = make_agent(sweep["agent"])
     sources = scene_sources(adapters)
-    cache_dir = Path(args.scene_cache) if args.scene_cache else cursor_paths.CHECKPOINTS / "scene" / sweep["name"]
+    base = sweep["name"].removesuffix(f"_s{args.module_seed}") if args.module_seed is not None else sweep["name"]
+    cache_dir = Path(args.scene_cache) if args.scene_cache else cursor_paths.CHECKPOINTS / "scene" / base  # not per seed
     scene_of = lambda layouts, key: attach_scene(layouts, sources, cache_dir, key, encoder_factory, args.vlm)  # noqa: E731
     run_args = dict(sweep=sweep, tune_trials=sweep["trials"]["tune"], test_trials=sweep["trials"]["test"],
                     seed=sweep["seed"], agent=sweep["agent"], device=device)

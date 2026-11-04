@@ -472,6 +472,32 @@ def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkey
     assert not (tmp_path / "sim" / "sweeps" / "pre" / "test.json").exists()
 
 
+def test_module_seed_runs_use_the_same_default_scene_folder(tmp_path, monkeypatch):
+    name = _image_adapter(tmp_path, monkeypatch)
+    (tmp_path / "tiny.yaml").write_text(
+        "name: tiny_seed\nagent: expert\narm: condition_grid.yaml\nmethods:\n  teleop: {mode: teleop}\n"
+        f"  mars_cnn: {{mode: frs, reversal_adapter: {{task: {name}}}, tune: {{n_reverse_steps: [2]}}}}\n"
+        "grid:\n  users: {U1: {corruption: {scale: [1.0, 0.25]}, adapter: null}}\n"
+        "  tasks: {T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5}, adapter: null}}\n  noises: [1.0]\nfocus: mars_cnn\nseed: 3\n"
+    )  # the module name has no _n<demos>_s0 tag, so --module-seed renames the sweep and nothing else
+    real = run_sweep.cursor_paths.CHECKPOINTS
+    (tmp_path / "ck").mkdir()
+    for p in real.iterdir():  # the policies are read from the real folder; the scene cache goes to the temp one
+        if p.name != "scene":
+            (tmp_path / "ck" / p.name).symlink_to(p)
+    monkeypatch.setattr(run_sweep.cursor_paths, "CHECKPOINTS", tmp_path / "ck")
+    argv = ["--sweep", str(tmp_path / "tiny.yaml"), "--results", str(tmp_path), "--precompute-scene",
+            "--tune-trials", "2", "--test-trials", "2"]
+    sweep_main(argv + ["--out", "plain"])
+    folders = sorted(p for p in (tmp_path / "ck" / "scene").iterdir())
+    assert [p.name for p in folders] == ["tiny_seed"]
+    files = _files(folders[0])
+    assert len(files) == 2
+    sweep_main(argv + ["--out", "seeded", "--module-seed", "1"])
+    assert sorted(p.name for p in (tmp_path / "ck" / "scene").iterdir()) == ["tiny_seed"]
+    assert _files(folders[0]) == files  # seed 1 hit seed 0's files
+
+
 def test_precompute_scene_writes_nothing_under_out_for_skipped_cells_and_visits_done_ones(tmp_path, monkeypatch):
     name = _image_adapter(tmp_path, monkeypatch)
     (tmp_path / "ax.yaml").write_text(
