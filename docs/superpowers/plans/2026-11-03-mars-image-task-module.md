@@ -204,7 +204,7 @@ git commit -m "MARS: the task module's scene tokens come from a pluggable source
 **Interfaces:**
 - Consumes: `render_layouts`, `SCENE_SIZE` (Task 1); `SCENE_SOURCES` (Task 2); π0.5: `PI05Policy.from_pretrained(path)`, `policy.model.paligemma_with_expert.embed_image(img)` (float32 `[B, 3, 224, 224]` in [-1, 1] → `[B, 256, 2048]`), `policy.model.embed_prefix(images, img_masks, tokens, masks)` and `policy.model.paligemma_with_expert.forward(attention_mask, position_ids, inputs_embeds=[prefix, None], use_cache=False)` (→ `[prefix_hidden, None], _`), `resize_with_pad_torch`.
 - Produces:
-  - `scene_spec(source: str, size: int = SCENE_SIZE) -> dict` → `{"token_source", "scene_dim", "scene_tokens", "image_size"}` for `LearnedTaskModule(**spec)`: `vlm_*` → `scene_dim 2048, scene_tokens (size // 14) ** 2, image_size size` (size % 14 == 0 required); `cnn` → `scene_dim None, scene_tokens (size // 16) ** 2, image_size size`; `discs` → `{"token_source": "discs"}`.
+  - `scene_spec(source: str, size: int = SCENE_SIZE) -> dict` → `{"token_source", "scene_dim", "scene_tokens", "image_size"}` for `LearnedTaskModule(**spec)`: `vlm_*` → `scene_dim 2048, scene_tokens 256, image_size size` (the encoder always resizes the render to 224 for SigLIP, so the token count never depends on the render size; `size` is only what is drawn and cached); `cnn` → `scene_dim None, scene_tokens (size // 16) ** 2, image_size size` (size % 16 == 0 required); `discs` → `{"token_source": "discs"}`.
   - `class SceneEncoder(path: str = "lerobot/pi05_base", device: str = "cuda", prompt: str = "Move the cursor to the target.")`, lazy: nothing π0.5-related is imported until `image_tokens`/`prefix_tokens` first run; `image_tokens(images: np.ndarray, batch: int = 64) -> np.ndarray` (uint8 `[B, 3, S, S]` → float16 `[B, 256, 2048]`; resize-with-pad to 224 when S ≠ 224; `/255`, `* 2 - 1`, `embed_image`, no grad); `prefix_tokens(images, batch=64) -> np.ndarray` (float16 `[B, 256, 2048]`: the image-token slice of the prefix's last hidden states with the fixed prompt tokenized by the policy's tokenizer, no state tokens); `close()` frees the policy.
   - `scene_for(layouts, source: str, size: int = SCENE_SIZE, encoder=None) -> np.ndarray`: `cnn` → `render_layouts(layouts, size)`; `vlm_image` → `encoder.image_tokens(render)`; `vlm_prefix` → `encoder.prefix_tokens(render)`; `discs` → `ValueError`. `encoder` is anything with those two methods (tests pass a stub).
 
@@ -218,7 +218,7 @@ from lerobot.policies.steering import LearnedTaskModule, SceneEncoder, scene_for
 
 class Stub:
     def __init__(self): self.calls = []
-    def image_tokens(self, images): self.calls.append(images.shape); return np.zeros((len(images), (images.shape[-1] // 14) ** 2, 2048), np.float16) + images.mean()
+    def image_tokens(self, images): self.calls.append(images.shape); return np.zeros((len(images), 256, 2048), np.float16) + images.mean()
     def prefix_tokens(self, images): return self.image_tokens(images) + 1
 
 def _layouts(n=4): return sample_layouts(np.random.default_rng(0), n, 4, TaskConfig(min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})))
@@ -226,14 +226,15 @@ def _layouts(n=4): return sample_layouts(np.random.default_rng(0), n, 4, TaskCon
 def test_scene_spec_builds_a_module_that_accepts_scene_for():
     lay = _layouts(); stub = Stub()
     for src in ("vlm_image", "vlm_prefix", "cnn"):
-        spec = scene_spec(src, 56); m = LearnedTaskModule(horizon=16, **spec)
-        arr = scene_for(lay, src, 56, encoder=stub)
+        spec = scene_spec(src, 112); m = LearnedTaskModule(horizon=16, **spec)
+        arr = scene_for(lay, src, 112, encoder=stub)
         assert arr.shape[0] == 4 and (arr.dtype == np.uint8 if src == "cnn" else arr.dtype == np.float16)
         obs = {"pos": torch.rand(4, 2), "scene": {src: torch.as_tensor(arr)}}
         a, _ = m(torch.randn(4, 16, 2), torch.rand(4), torch.randn(4, 16, 2), obs); assert a.shape == (4, 16, 2, 2)
-    assert stub.calls[0] == (4, 3, 56, 56) and scene_spec("vlm_image")["scene_tokens"] == 256 and scene_spec("cnn")["scene_tokens"] == 196
+    assert stub.calls[0] == (4, 3, 112, 112) and scene_spec("vlm_image")["scene_tokens"] == 256 and scene_spec("cnn")["scene_tokens"] == 196
+    assert scene_spec("vlm_image", 112)["scene_tokens"] == 256 and scene_spec("cnn", 112)["scene_tokens"] == 49
     with pytest.raises(ValueError): scene_for(lay, "discs")
-    with pytest.raises(ValueError): scene_spec("vlm_image", 50)
+    with pytest.raises(ValueError): scene_spec("cnn", 50)
 
 def test_steering_imports_without_transformers(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", None)   # import of transformers would now raise ImportError
@@ -356,7 +357,7 @@ def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):
     calls = []
     class Stub:
         def __init__(self, *a, **k): pass
-        def image_tokens(self, images): calls.append(len(images)); return np.zeros((len(images), 16, 2048), np.float16)
+        def image_tokens(self, images): calls.append(len(images)); return np.zeros((len(images), 256, 2048), np.float16)
         def close(self): calls.append("closed")
     monkeypatch.setattr(train_adapter, "SceneEncoder", Stub)
     train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
