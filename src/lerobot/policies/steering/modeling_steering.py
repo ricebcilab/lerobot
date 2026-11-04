@@ -215,6 +215,9 @@ class _BoundTaskModule:
         return self.module(x_t, t, v, self.obs)
 
 
+SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn")
+
+
 class LearnedTaskModule(nn.Module):
     """MARS task module (the cursor example's ``TaskModule``): A(x_t, t, v[, obstacles]) v + b, one affine
     map of the policy's velocity per chunk step, in BOTH directions of the flow; it reshapes the frozen
@@ -224,9 +227,16 @@ class LearnedTaskModule(nn.Module):
     the identity. ``obs`` is optional: ``pos`` (B, 2, the agent's position in [0, 1]; zeros when absent),
     ``obstacles`` (B, K, 3: center, radius) and ``obstacle_mask`` (B, K, True for real obstacles). Without
     it (pi0.5, which sees the scene through its own field) the module is called as ``(x_t, t, v)``; with
-    it, ``bind(obs)`` gives that callable."""
+    it, ``bind(obs)`` gives that callable.
 
-    def __init__(
+    ``token_source`` picks where the scene tokens come from (the null token is always first):
+    ``discs`` the obstacle discs above; ``vlm_image`` / ``vlm_prefix`` the frozen VLM's image / prefix
+    tokens, ``obs["scene"][source]`` (B, ``scene_tokens``, ``scene_dim``), through a linear projection;
+    ``cnn`` the rendered image, ``obs["scene"]["cnn"]`` (B, 3, S, S) uint8 with S = ``image_size``,
+    through a small CNN trained with the module (stride 16: ``(S / 16) ** 2`` tokens). The image
+    sources add a learned position per token."""
+
+    def __init__(  # nosec B107 (token_source is not a password)
         self,
         horizon: int = 16,
         d: int = 128,
@@ -235,8 +245,22 @@ class LearnedTaskModule(nn.Module):
         layers: int = 2,
         scale: float = 0.2,
         n_dims: int = 2,
+        token_source: str = "discs",
+        scene_dim: int | None = None,
+        scene_tokens: int | None = None,
+        image_size: int | None = None,
     ):
         super().__init__()
+        if token_source not in SCENE_SOURCES:
+            raise ValueError(f"token_source must be one of {SCENE_SOURCES}, got {token_source!r}")
+        if token_source.startswith("vlm") and (scene_dim is None or scene_tokens is None):
+            raise ValueError(f"token_source {token_source!r} needs scene_dim and scene_tokens")
+        if token_source == "cnn":  # nosec B105
+            if image_size is None or image_size <= 0 or image_size % 16:
+                raise ValueError(
+                    f"token_source 'cnn' needs an image_size that is a multiple of 16, got {image_size}"
+                )
+            scene_tokens = (image_size // 16) ** 2
         self.config = {
             "horizon": horizon,
             "d": d,
@@ -246,7 +270,20 @@ class LearnedTaskModule(nn.Module):
             "scale": scale,
             "n_dims": n_dims,
         }
+        if token_source != "discs":  # nosec B105
+            self.config |= {
+                "token_source": token_source,
+                "scene_dim": scene_dim,
+                "scene_tokens": scene_tokens,
+                "image_size": image_size,
+            }
         self.horizon, self.tdim, self.scale, self.n_dims = horizon, tdim, scale, n_dims
+        self.token_source, self.scene_dim, self.scene_tokens, self.image_size = (
+            token_source,
+            scene_dim,
+            scene_tokens,
+            image_size,
+        )
         self.token_in = nn.Sequential(
             nn.Linear(4, d), nn.GELU(), nn.Linear(d, d)
         )  # the obstacle tokens' encoder
@@ -265,10 +302,36 @@ class LearnedTaskModule(nn.Module):
         self.out = nn.Linear(d, n_dims * n_dims + n_dims)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
+        # after everything above, so a discs module's weights do not depend on the image sources
+        if token_source.startswith("vlm"):
+            self.scene_in = nn.Linear(scene_dim, d)
+        elif token_source == "cnn":  # nosec B105
+            chans = [3, 32, 64, 128, d]
+            convs = []
+            for i in range(4):
+                convs.append(nn.Conv2d(chans[i], chans[i + 1], kernel_size=3, stride=2, padding=1))
+                if i < 3:
+                    convs.append(nn.GELU())
+            self.cnn = nn.Sequential(*convs)
+        if token_source != "discs":  # nosec B105
+            self.scene_pos = nn.Parameter(0.02 * torch.randn(scene_tokens, d))
 
     def tokens(self, obs: dict | None, b: int) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """The obstacle tokens (B, 1 + K, d) with the null token first, and their padding mask."""
+        """The scene tokens (B, 1 + N, d) with the null token first, and their padding mask (None when
+        every token is real). Without ``obs`` only the null token."""
         null = self.null.expand(b, 1, -1)
+        src = self.token_source
+        if src != "discs":
+            if obs is None:
+                return null, None
+            x = (obs.get("scene") or {}).get(src)
+            if x is None:
+                raise ValueError(f"task module with token_source {src!r} needs obs['scene'][{src!r}]")
+            if src == "cnn":
+                scene = self.cnn(x.float() / 255).flatten(2).transpose(1, 2)
+            else:
+                scene = self.scene_in(x.float())
+            return torch.cat([null, scene + self.scene_pos], 1), None
         obstacles = None if obs is None else obs.get("obstacles")
         if obstacles is None or obstacles.shape[1] == 0:
             return null, None
