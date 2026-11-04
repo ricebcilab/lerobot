@@ -3,7 +3,8 @@
 
 Reads ``<results>/sim/sweeps/<run>/test.json`` of the gate run (``grid_task_check_image``), the grid
 runs (``grid_image_s<k>``) and optionally the fine-tuned runs (``grid_ft_s<k>``), and writes
-``report.md`` and ``report.json`` to ``--out``.
+``report.md`` and ``report.json`` to ``--out``. Without ``--grid`` only the gate is reported (the arms are the
+check run's ``oracle_task_<x>`` methods), so the gate can be read before the grid exists.
 """
 
 import argparse
@@ -70,11 +71,13 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
 def join_ft(grid_run: dict, ft_run: dict, arm: str = "ft_mars_user") -> dict:
     """Copy the fine-tuned arm into a copy of the grid run, after checking the trials are the same.
 
-    Raises ValueError unless the cell keys, ``trials.side`` and the ``teleop`` outcomes agree.
+    The fine-tuned run may have more cells than the grid (it also runs T1); the result has the grid's cells.
+    Raises ValueError unless every grid cell is in the fine-tuned run and, cell for cell, ``trials.side`` and
+    the ``teleop`` outcomes agree.
     """
     g, f = grid_run["test"], ft_run["test"]
-    if set(g) != set(f):
-        raise ValueError(f"trials differ: cell keys {sorted(set(g) ^ set(f))}")
+    if not set(g) <= set(f):
+        raise ValueError(f"trials differ: grid cells missing from the fine-tuned run {sorted(set(g) - set(f))}")
     out = copy.deepcopy(grid_run)
     for key, cell in out["test"].items():
         fc = f[key]
@@ -140,11 +143,13 @@ def _methods(run: dict) -> list[str]:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", required=True, help="gate run name")
-    ap.add_argument("--grid", nargs="+", required=True, help="grid run names, one per seed")
+    ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
     ap.add_argument("--ft", nargs="*", default=[], help="fine-tuned run names, paired with --grid by position")
     ap.add_argument("--results", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args(argv)
+    if a.ft and not a.grid:
+        ap.error("--ft needs --grid: it pairs with the grid runs by position")
     if a.ft and len(a.ft) != len(a.grid):
         ap.error("--ft must pair with --grid by position")
 
@@ -152,8 +157,12 @@ def main(argv=None):
     grids = [_load(a.results, n) for n in a.grid]
     if a.ft:
         grids = [join_ft(g, _load(a.results, n)) for g, n in zip(grids, a.ft, strict=True)]
-    gmethods = _methods(grids[0])
-    arms = [m[len("mars_"):] for m in gmethods if m.startswith("mars_")]
+    if grids:
+        gmethods = _methods(grids[0])
+        arms = [m[len("mars_"):] for m in gmethods if m.startswith("mars_")]
+    else:
+        gmethods = []
+        arms = [m[len("oracle_task_"):] for m in _methods(check) if m.startswith("oracle_task_")]
 
     gate = gate_table(check, arms)
     md = ["# Image task modules: gate and grid", "", "## Gate (success and collision in %)", ""]
@@ -172,20 +181,27 @@ def main(argv=None):
 
     pooled_methods = [m for m in ["mars", *[f"mars_{x}" for x in arms], "ft_mars_user"] if m in gmethods]
     pooled = {m: pooled_over_seeds(grids, m) for m in pooled_methods}
-    md += [f"## Pooled over cells, {len(grids)} seed(s), success % (mean, 95% t-CI over seeds)", ""]
-    md += _table(
-        ["method", "mean", "lo", "hi", "per seed"],
-        [[m, f"{p['mean']:.1f}", f"{p['lo']:.1f}", f"{p['hi']:.1f}", ", ".join(f"{v:.1f}" for v in p["per_seed"])]
-         for m, p in pooled.items()],
-    )
+    if grids:
+        md += [f"## Pooled over cells, {len(grids)} seed(s), success % (mean, 95% t-CI over seeds)", ""]
+        ci = (lambda p, k: f"{p[k]:.1f}") if len(grids) > 1 else (lambda p, k: "n/a")  # one seed has no interval
+        md += _table(
+            ["method", "mean", "lo", "hi", "per seed"],
+            [[m, f"{p['mean']:.1f}", ci(p, "lo"), ci(p, "hi"), ", ".join(f"{v:.1f}" for v in p["per_seed"])]
+             for m, p in pooled.items()],
+        )
 
     per_cell, per_ctx = {}, {}
     for name, run in zip(a.grid, grids, strict=True):
         ms = _methods(run)
         keys = sorted(run["test"])
         md += [f"## Per-cell success %, {name}", ""]
-        md += _table(
-            ["cell", *ms], [[k, *[_fmt(run["test"][k]["metrics"].get(m, {}).get("success")) for m in ms]] for k in keys]
+        md += _table(  # train: a cell the modules were trained on (`train_cell` in test.json)
+            ["cell", "train", *ms],
+            [
+                [k, "train" if run["test"][k].get("train_cell") else "", *[
+                    _fmt(run["test"][k]["metrics"].get(m, {}).get("success")) for m in ms]]
+                for k in keys
+            ],
         )
         per_cell[name] = {k: {m: run["test"][k]["metrics"].get(m, {}).get("success") for m in ms} for k in keys}
         ctxs = sorted({c for c in map(_context, keys) if c})
