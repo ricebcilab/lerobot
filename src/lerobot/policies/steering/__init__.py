@@ -24,6 +24,7 @@ from .configuration_steering import (
     GRIPPER_OPEN,
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
+    SCENE_SOURCES,
     AdapterSpec,
     MatrixHolder,
     TeleopSource,
@@ -32,17 +33,18 @@ from .configuration_steering import (
     format_matrix,
     parse_adapter_spec,
     rotation_about_z,
+    scene_spec,
     translation_matrix,
     validate_matrix,
 )
 from .modeling_steering import (
-    SCENE_SOURCES,
     AdaptedField,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     LearnedTaskModule,
     LearnedUserModule,
     ReversalAdapter,
+    SceneEncoder,
     apply_user_module,
     convert_cursor_module,
     delegation_mask,
@@ -58,6 +60,7 @@ from .modeling_steering import (
     regenerate,
     reverse_flow,
     save_adapter_module,
+    scene_for,
     sinusoidal_time_embedding,
     step_if_finite,
     task_field_loss,
@@ -66,7 +69,6 @@ from .modeling_steering import (
     uniform_reference,
     user_field_loss,
 )
-from .scene import SceneEncoder, scene_for, scene_spec
 
 __all__ = [
     "ACTION_DIMS",

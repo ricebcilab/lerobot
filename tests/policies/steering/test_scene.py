@@ -84,7 +84,8 @@ def test_steering_imports_without_transformers():
     # encoder loads nothing.
     code = (
         "import sys; sys.modules['transformers'] = None; "
-        "import lerobot.policies.steering, lerobot.policies.steering.scene; "
+        "import lerobot.policies.steering, lerobot.policies.steering.modeling_steering, "
+        "lerobot.policies.steering.configuration_steering; "
         "from lerobot.policies.steering import SceneEncoder; SceneEncoder(device='cpu')"
     )
     subprocess.run([sys.executable, "-c", code], check=True)  # nosec B603

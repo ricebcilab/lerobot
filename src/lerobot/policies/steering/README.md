@@ -65,7 +65,7 @@ the robot and the cursor run one implementation of each method.
 `LearnedTaskModule`'s `token_source` picks where its scene tokens come from:
 `discs` (the default) encodes the obstacle discs, `obs["obstacles"]`, relative to
 the cursor `obs["pos"]`; the image sources read `obs["scene"][source]`, a per-layout array that
-`scene.py`'s `scene_for(layouts, source, size, encoder)` builds from the rendered
+`scene_for(layouts, source, size, encoder)` (in `modeling_steering`) builds from the rendered
 layout (`render_layouts`), and `scene_spec(source, size)` gives the module's
 kwargs for it. `cnn` reads the render itself (uint8 `[B, 3, S, S]`) through a
 small CNN stem trained with the module; `vlm_image` reads pi0.5's frozen SigLIP

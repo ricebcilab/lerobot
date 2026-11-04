@@ -26,6 +26,7 @@ from typing import Protocol
 
 import numpy as np
 
+from lerobot.envs.cursor import SCENE_SIZE
 from lerobot.teleoperators import readout
 
 ACTION_DIMS = ("dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper")
@@ -248,3 +249,38 @@ def parse_adapter_spec(
             f"{where}: expected null, a fixed matrix spec, {{learned: path}} or {{user: ..., task: ...}}, got {sorted(keys)}"
         )
     return AdapterSpec(matrix=build_reversal_adapter(spec, corruption, where))
+
+
+SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn")
+VLM_SCENE_TOKENS = 256  # SigLIP's patches of the 224 px input every render is resized to
+VLM_SCENE_DIM = 2048  # the width of pi0.5's prefix (SigLIP after the multimodal projector, and Gemma's)
+CNN_PATCH = 16  # the task module's CNN stem downsamples by 16
+PI05_TOKENIZER = "google/paligemma-3b-pt-224"  # the tokenizer pi0.5's processor uses
+
+
+def scene_spec(source: str, size: int = SCENE_SIZE) -> dict:
+    """The ``LearnedTaskModule`` kwargs for ``source`` on size-``size`` renders: ``discs`` needs none beyond
+    the source; ``vlm_*`` read 256 tokens of width 2048 whatever the size (the encoder resizes every render
+    to 224 for SigLIP; ``size`` is only what is drawn and cached); ``cnn`` reads the render itself,
+    ``(size // 16) ** 2`` tokens (size a multiple of 16)."""
+    if source not in SCENE_SOURCES:
+        raise ValueError(f"source must be one of {SCENE_SOURCES}, got {source!r}")
+    if source == "discs":  # nosec B105
+        return {"token_source": "discs"}
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}")
+    if source == "cnn":  # nosec B105
+        if size % CNN_PATCH:
+            raise ValueError(f"source 'cnn' needs a size that is a multiple of {CNN_PATCH}, got {size}")
+        return {
+            "token_source": "cnn",
+            "scene_dim": None,
+            "scene_tokens": (size // CNN_PATCH) ** 2,
+            "image_size": size,
+        }
+    return {
+        "token_source": source,
+        "scene_dim": VLM_SCENE_DIM,
+        "scene_tokens": VLM_SCENE_TOKENS,
+        "image_size": size,
+    }
