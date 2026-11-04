@@ -393,8 +393,8 @@ def test_a_vlm_source_digest_depends_on_the_encoder_path(tmp_path):
     for vlm in ("a/one", "a/two", "a/one"):
         attach_scene(_lay(), {"vlm_image": 56}, tmp_path, "k", lambda: Stub(), vlm=vlm)
     assert len(_files(tmp_path)) == 2
-    attach_scene(_lay(), {"cnn": 56}, tmp_path, "k", None, vlm="a/one")
-    attach_scene(_lay(), {"cnn": 56}, tmp_path, "k", None, vlm="a/two")  # a cnn source does not read the encoder
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", None, vlm="a/one")
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", None, vlm="a/two")  # a cnn source does not read the encoder
     assert len(_files(tmp_path)) == 3
 
 
