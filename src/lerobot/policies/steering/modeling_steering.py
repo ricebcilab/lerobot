@@ -213,13 +213,20 @@ def apply_user_module(user, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tens
 
 class _BoundTaskModule:
     """A ``LearnedTaskModule`` with its observation fixed: the ``(x_t, t, v) -> (A, b)`` callable
-    that ``AdaptedField`` takes as a task module."""
+    that ``AdaptedField`` takes as a task module. The scene tokens depend on the observation alone, so the
+    first call makes them and the calls after it (a flow's Euler steps) reuse them, as long as the batch size
+    and the gradient mode are the same; the result is the unbound call's."""
 
     def __init__(self, module: "LearnedTaskModule", obs: dict):
         self.module, self.obs, self.n_dims = module, obs, module.n_dims
+        self._tokens: tuple[torch.Tensor, torch.Tensor | None] | None = None
+        self._key: tuple[int, bool] | None = None  # batch size and grad mode the tokens were made for
 
     def __call__(self, x_t: torch.Tensor, t, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.module(x_t, t, v, self.obs)
+        key = (x_t.shape[0], torch.is_grad_enabled())
+        if self._tokens is None or self._key != key:
+            self._tokens, self._key = self.module.tokens(self.obs, key[0]), key
+        return self.module(x_t, t, v, self.obs, precomputed=self._tokens)
 
 
 class LearnedTaskModule(nn.Module):
@@ -348,11 +355,18 @@ class LearnedTaskModule(nn.Module):
         return tokens, torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=tokens.device), ~mask], 1)
 
     def forward(
-        self, x_t: torch.Tensor, t, v: torch.Tensor, obs: dict | None = None
+        self,
+        x_t: torch.Tensor,
+        t,
+        v: torch.Tensor,
+        obs: dict | None = None,
+        precomputed: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """x_t (B, H, >= n), v (B, H, >= n), t a float or (B,), obs optional -> (A (B, H, n, n), b (B, H, n))."""
+        """x_t (B, H, >= n), v (B, H, >= n), t a float or (B,), obs optional -> (A (B, H, n, n), b (B, H, n)).
+        ``precomputed`` is ``self.tokens(obs, B)`` made earlier (what ``bind`` does once per observation); the
+        tokens are made here without it."""
         b, h, n = x_t.shape[0], x_t.shape[1], self.n_dims
-        tokens, pad = self.tokens(obs, b)
+        tokens, pad = self.tokens(obs, b) if precomputed is None else precomputed
         temb = (
             sinusoidal_time_embedding(t, self.tdim, device=x_t.device)
             .expand(b, -1)[:, None]
