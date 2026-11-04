@@ -82,6 +82,7 @@ class Layouts:
     goal: np.ndarray  # [B] index of the goal target
     obstacles: np.ndarray | None = None  # [B, K, 3] disc center x, y and radius
     obstacle_mask: np.ndarray | None = None  # [B, K] True for real discs
+    scene: dict[str, np.ndarray] | None = None  # per-layout scene arrays, each [B, ...]; None when absent
 
     def __post_init__(self):
         if self.obstacles is None:
@@ -100,6 +101,7 @@ class Layouts:
             self.goal[idx],
             self.obstacles[idx],
             self.obstacle_mask[idx],
+            None if self.scene is None else {k: v[idx] for k, v in self.scene.items()},
         )
 
     @property
@@ -129,6 +131,9 @@ class Layouts:
             np.tile(self.goal, k),
             np.tile(self.obstacles, (k, 1, 1)),
             np.tile(self.obstacle_mask, (k, 1)),
+            None
+            if self.scene is None
+            else {key: np.tile(v, (k,) + (1,) * (v.ndim - 1)) for key, v in self.scene.items()},
         )
 
     @staticmethod
@@ -140,6 +145,12 @@ class Layouts:
 
         n = max(p.mask.shape[1] for p in parts)
         k = max(p.obstacle_mask.shape[1] for p in parts)
+        scenes = [p.scene for p in parts]
+        scene: dict[str, np.ndarray] | None = None
+        if any(sc is not None for sc in scenes):
+            if any(sc is None for sc in scenes) or any(set(sc) != set(scenes[0]) for sc in scenes):
+                raise ValueError("scene: some parts carry one and some do not")
+            scene = {key: np.concatenate([sc[key] for sc in scenes]) for key in scenes[0]}
         return Layouts(
             np.concatenate([p.start for p in parts]),
             np.concatenate([pad(p.targets, n) for p in parts]),
@@ -147,6 +158,7 @@ class Layouts:
             np.concatenate([p.goal for p in parts]),
             np.concatenate([pad(p.obstacles, k) for p in parts]),
             np.concatenate([pad(p.obstacle_mask, k) for p in parts]),
+            scene,
         )
 
 
@@ -525,6 +537,53 @@ def sample_layouts(rng, n_trials, n_targets, cfg=TaskConfig()):
         )
         mask[b, : counts[b]] = True
     return Layouts(start, targets, mask, goal, obstacles, obstacle_mask)
+
+
+RENDER_PALETTE: dict[str, tuple[int, int, int]] = {
+    "bg": (255, 255, 255),
+    "obstacle": (40, 40, 40),
+    "obstacle_edge": (0, 0, 0),
+    "target_fill": (205, 218, 242),
+    "target_edge": (60, 100, 200),
+}
+SCENE_SIZE: int = 224
+
+
+def render_layouts(
+    layouts: Layouts, size: int = SCENE_SIZE, target_radius: float = 0.05, supersample: int = 2
+) -> np.ndarray:
+    """The layouts as pictures, uint8 [B, 3, size, size]: the unit screen fills the square, x to the right and
+    y downward (as the pygame renderer's `to_px`). Obstacles first, targets on top; no goal mark, no cursor.
+    Drawn at `size * supersample` and resized down. Pillow is imported here, so the module needs it only
+    when rendering."""
+    from PIL import Image, ImageDraw
+
+    big = size * supersample
+    scale = big
+    radius_px = max(target_radius * size, 1.5) * supersample
+    out = []
+    for b in range(len(layouts)):
+        img = Image.new("RGB", (big, big), RENDER_PALETTE["bg"])
+        draw = ImageDraw.Draw(img)
+        for x, y, r in layouts.real_obstacles(b):
+            rr = max(float(r) * size, 1.5) * supersample
+            draw.ellipse(
+                (x * scale - rr, y * scale - rr, x * scale + rr, y * scale + rr),
+                fill=RENDER_PALETTE["obstacle"],
+                outline=RENDER_PALETTE["obstacle_edge"],
+                width=supersample,
+            )
+        for x, y in layouts.targets[b, layouts.mask[b]]:
+            draw.ellipse(
+                (x * scale - radius_px, y * scale - radius_px, x * scale + radius_px, y * scale + radius_px),
+                fill=RENDER_PALETTE["target_fill"],
+                outline=RENDER_PALETTE["target_edge"],
+                width=2 * supersample,
+            )
+        if supersample != 1:
+            img = img.resize((size, size), Image.LANCZOS)
+        out.append(np.asarray(img).transpose(2, 0, 1))
+    return np.stack(out) if out else np.zeros((0, 3, size, size), np.uint8)
 
 
 # ---------------------------------------------------------------- environment

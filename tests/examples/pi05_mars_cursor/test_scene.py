@@ -1,0 +1,67 @@
+import numpy as np
+import pytest
+from cursor_sa.env import (
+    RENDER_PALETTE,
+    SCENE_SIZE,
+    Layouts,
+    TaskConfig,
+    obstacle_spec,
+    render_layouts,
+    sample_layouts,
+)
+
+
+def _layouts(n=3, spec=None, seed=4):
+    cfg = TaskConfig(min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec(spec))
+    return sample_layouts(np.random.default_rng(seed), n, 4, cfg)
+
+
+def test_scene_rides_through_indexing_tile_and_concat():
+    a = _layouts(3)
+    a.scene = {
+        "cnn": np.arange(3 * 2 * 4 * 4, dtype=np.uint8).reshape(3, 2, 4, 4),
+        "vlm_image": np.ones((3, 5, 6), np.float16),
+    }
+    assert a[[1]].scene["cnn"].shape == (1, 2, 4, 4) and np.array_equal(
+        a[[1]].scene["cnn"][0], a.scene["cnn"][1]
+    )
+    perm = np.array([2, 0, 1])
+    assert np.array_equal(a[perm].scene["vlm_image"], a.scene["vlm_image"][perm])
+    assert a.tile(2).scene["cnn"].shape == (6, 2, 4, 4) and np.array_equal(
+        a.tile(2).scene["cnn"][3:], a.scene["cnn"]
+    )
+    both = Layouts.concat([a, a[[0]]])
+    assert both.scene["vlm_image"].shape == (4, 5, 6) and set(both.scene) == {"cnn", "vlm_image"}
+    plain = _layouts(2)
+    assert (
+        plain.scene is None and Layouts.concat([plain, plain]).scene is None and plain.tile(2).scene is None
+    )
+    with pytest.raises(ValueError, match="scene"):
+        Layouts.concat([a, plain])
+
+
+def test_render_draws_discs_and_targets_and_never_the_goal():
+    lay = _layouts(2, {"kind": "disc", "radius": 0.08, "along": 0.5})
+    img = render_layouts(lay, size=SCENE_SIZE)
+    assert img.shape == (2, 3, SCENE_SIZE, SCENE_SIZE) and img.dtype == np.uint8
+    x, y, r = lay.real_obstacles(0)[0]
+    px, py = int(x * SCENE_SIZE), int(y * SCENE_SIZE)
+    assert tuple(img[0, :, py, px]) == RENDER_PALETTE["obstacle"]  # disc center is obstacle colour
+    assert tuple(img[0, :, 2, 2]) == RENDER_PALETTE["bg"]  # a corner is background
+    gx, gy = (lay.goal_pos[0] * SCENE_SIZE).astype(int)
+    ox, oy = (lay.targets[0, (lay.goal[0] + 1) % 4] * SCENE_SIZE).astype(int)
+    assert (
+        tuple(img[0, :, gy, gx]) == tuple(img[0, :, oy, ox]) == RENDER_PALETTE["target_fill"]
+    )  # goal looks like any target
+    no_obstacle = render_layouts(_layouts(1))
+    assert not (no_obstacle == np.array(RENDER_PALETTE["obstacle"])[None, :, None, None]).all(1).any()
+
+
+def test_render_keeps_the_wall_visible():
+    lay = _layouts(
+        1, {"kind": "wall", "along": 0.5, "gap": 0.16, "gap_offset": 0.14, "radius": 0.015, "extent": 0.4}
+    )
+    img = render_layouts(lay).astype(int)
+    discs = lay.real_obstacles(0)
+    for x, y, _ in discs[::3]:  # along the wall every disc center is well darker than the background
+        assert img[0, :, int(y * SCENE_SIZE), int(x * SCENE_SIZE)].mean() < 128
