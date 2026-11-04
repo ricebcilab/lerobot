@@ -121,14 +121,20 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert np.isfinite(pre.astype(np.float32)).all()
     # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
     other = scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, encoder=enc)
-    ring = scene_for(
-        _layouts(2, obstacle={"kind": "ring", "around": "goal", "gap_angle": [15, 30]}),
-        "vlm_image",
-        SCENE_SIZE,
-        encoder=enc,
-    )
+    # T3 wall against T2 disc at one seed: the same targets and an unrendered start, so only the obstacles differ
+    wall_spec = {
+        "kind": "wall",
+        "along": 0.5,
+        "gap": 0.16,
+        "gap_offset": 0.14,
+        "radius": 0.015,
+        "extent": 0.4,
+    }
+    wall_layouts = _layouts(2, obstacle=wall_spec)
+    assert np.array_equal(wall_layouts.targets, _layouts(2).targets)
+    wall = scene_for(wall_layouts, "vlm_image", SCENE_SIZE, encoder=enc)
     again = scene_for(_layouts(2), "vlm_image", SCENE_SIZE, encoder=enc)
-    assert not np.array_equal(tok, other) and not np.array_equal(tok, ring)
+    assert not np.array_equal(tok, other) and not np.array_equal(tok, wall)
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)
     enc.close()
