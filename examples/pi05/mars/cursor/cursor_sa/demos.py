@@ -182,6 +182,7 @@ class DemoSampler:
         self.goal = torch.as_tensor(layouts.goal_mask(), device=device)
         self.obstacles = f32(layouts.obstacles)
         self.obstacle_mask = torch.as_tensor(layouts.obstacle_mask, device=device)
+        self.scene = None if layouts.scene is None else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()}
         self.lengths = torch.as_tensor(lengths, device=device)
         self.valid = torch.nonzero(self.lengths > 0).squeeze(1)   # demos that exist (length 0: none was found)
         self.window = torch.arange(hist + horizon, device=device)
@@ -196,4 +197,6 @@ class DemoSampler:
         goal = self.goal[i] & (torch.rand(n, 1, device=i.device) >= goal_dropout)
         obs = dict(pos=self.pos[i, k], hist=seq[:, :self.hist], targets=self.targets[i],
                    mask=self.mask[i], goal=goal, obstacles=self.obstacles[i], obstacle_mask=self.obstacle_mask[i])
+        if self.scene is not None:
+            obs["scene"] = {k: v[i] for k, v in self.scene.items()}
         return (obs, seq[:, self.hist:], i, k) if indexed else (obs, seq[:, self.hist:])

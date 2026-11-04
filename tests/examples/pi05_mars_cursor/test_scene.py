@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+import torch
+from cursor_sa.demos import DemoSampler, make_demos
 from cursor_sa.env import (
     RENDER_PALETTE,
     SCENE_SIZE,
@@ -9,6 +11,8 @@ from cursor_sa.env import (
     render_layouts,
     sample_layouts,
 )
+from cursor_sa.policy import FlowPolicy
+from cursor_sa.steering import SharedController, hide_goal, observation
 
 
 def _layouts(n=3, spec=None, seed=4):
@@ -65,3 +69,26 @@ def test_render_keeps_the_wall_visible():
     discs = lay.real_obstacles(0)
     for x, y, _ in discs[::3]:  # along the wall every disc center is well darker than the background
         assert img[0, :, int(y * SCENE_SIZE), int(x * SCENE_SIZE)].mean() < 128
+
+
+def test_observation_and_sampler_carry_the_scene():
+    lay = _layouts(3, {"kind": "disc", "radius": 0.08, "along": 0.5})
+    lay.scene = {"cnn": render_layouts(lay, 64)}
+    obs = observation(lay, lay.start, np.zeros((3, 4, 2)))
+    assert (
+        obs["scene"]["cnn"].dtype == torch.uint8
+        and obs["scene"]["cnn"].shape == (3, 3, 64, 64)
+        and "scene" in hide_goal(obs)
+    )
+    assert "scene" not in observation(_layouts(2), np.zeros((2, 2)), np.zeros((2, 4, 2)))
+    policy = FlowPolicy().eval()
+    ctl = SharedController(policy, lay, "policy")
+    assert torch.equal(ctl.observation()["scene"]["cnn"], obs["scene"]["cnn"])
+    cfg = TaskConfig(
+        min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
+    )
+    sampler = DemoSampler(
+        lay, *make_demos(np.random.default_rng(0), lay, cfg), policy.horizon, policy.hist, "cpu"
+    )
+    o, _, i, _ = sampler.sample(5, indexed=True)
+    assert torch.equal(o["scene"]["cnn"], torch.as_tensor(lay.scene["cnn"])[i])

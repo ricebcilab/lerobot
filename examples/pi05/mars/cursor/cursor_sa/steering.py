@@ -101,11 +101,14 @@ def _f32(a, device):
 def observation(layouts, pos, hist, device="cpu", goal_given=False):
     """The policy's observation of a batch of trials: cursor positions [B, 2], their last
     displacements [B, h, 2], the targets, the goal flags (all False unless goal_given), and the
-    task's obstacles (which the policy ignores and a task module reads)."""
+    task's obstacles (which the policy ignores and a task module reads) and, when the layouts have one, their scene."""
     goal = layouts.goal_mask() if goal_given else np.zeros(layouts.mask.shape, dtype=bool)
-    return dict(pos=_f32(pos, device), hist=_f32(hist, device), targets=_f32(layouts.targets, device),
-                mask=torch.as_tensor(layouts.mask, device=device), goal=torch.as_tensor(goal, device=device),
-                obstacles=_f32(layouts.obstacles, device), obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
+    obs = dict(pos=_f32(pos, device), hist=_f32(hist, device), targets=_f32(layouts.targets, device),
+               mask=torch.as_tensor(layouts.mask, device=device), goal=torch.as_tensor(goal, device=device),
+               obstacles=_f32(layouts.obstacles, device), obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
+    if layouts.scene is not None:  # the scene arrays keep their dtype (uint8 render, float16 tokens)
+        obs["scene"] = {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()}
+    return obs
 
 
 def hide_goal(obs):
