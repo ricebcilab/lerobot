@@ -517,6 +517,35 @@ git commit -m "MARS: sweeps attach and cache the scene the image task modules re
 
 ---
 
+### Task 7b: Fold `scene.py` into the steering package's two modules
+
+(Added 2026-11-03 at the user's request after Task 7: the steering package keeps its two-module layout, `configuration_steering.py` and `modeling_steering.py`; no `scene.py`.)
+
+**Files:**
+- Modify: `src/lerobot/policies/steering/configuration_steering.py` (gains `SCENE_SOURCES`, `scene_spec`), `src/lerobot/policies/steering/modeling_steering.py` (gains `scene_for`, `SceneEncoder`; imports `SCENE_SOURCES` from the configuration module and keeps exposing it), `src/lerobot/policies/steering/__init__.py` (imports from the new homes; `__all__` unchanged), `src/lerobot/policies/steering/README.md` (no `scene.py` mention), `tests/policies/steering/test_scene.py` (the subprocess import test imports `lerobot.policies.steering` and `lerobot.policies.steering.modeling_steering`, `lerobot.policies.steering.configuration_steering`)
+- Delete: `src/lerobot/policies/steering/scene.py`
+- Test: `tests/policies/steering/test_scene.py`, `tests/policies/steering/test_scene_tokens.py` (unchanged assertions), plus the package tests
+
+**Interfaces:**
+- Consumes: everything `scene.py` defines today (Task 3), unchanged in behaviour and signature.
+- Produces: the same public names from `lerobot.policies.steering`; `from lerobot.policies.steering.modeling_steering import SCENE_SOURCES` keeps working; `lerobot.policies.steering.scene` no longer exists. Laziness unchanged: `modeling_steering.py` imports `lerobot.envs.cursor` (numpy-only) at module level and π0.5/`transformers`/`huggingface_hub` only inside `SceneEncoder`'s methods.
+
+- [ ] **Step 1: Move the code** — `SCENE_SOURCES` and `scene_spec` into `configuration_steering.py` (next to the adapter specs); `scene_for` and `SceneEncoder` into `modeling_steering.py` (after the task-module checkpoint helpers); delete `scene.py`; update `__init__.py`, the README and the subprocess test's import list. Docstrings travel with the code.
+
+- [ ] **Step 2: Verify**
+
+Run: `uv run --extra mars --extra test pytest tests/policies/steering tests/examples/pi05_mars_cursor/test_training.py tests/examples/pi05_mars_cursor/test_scene.py -q && git grep -n "steering.scene\|steering/scene\|from .scene"`
+Expected: all PASS (the real-weights test skipped); the grep finds nothing.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add -A src/lerobot/policies/steering tests/policies/steering/test_scene.py
+git commit -m "MARS: the scene helpers live in the steering package's two modules" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
 ### Task 8: The gate and grid sweep configs, and the README rows
 
 **Files:**
