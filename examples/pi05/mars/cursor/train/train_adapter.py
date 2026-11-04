@@ -361,13 +361,21 @@ def entries_of(args):
 
 def train_task(args, policy, device, rng):
     """One task module over the contexts of `entries_of(args)` (one for a single-context run): each entry has its
-    own demonstrations and frozen user module; batches alternate between entries."""
+    own demonstrations and frozen user module; batches alternate between entries. The first entry draws from `rng`
+    (seeded by `train`), each later one from a fresh stream of `args.seed` (numpy and torch), so every entry's
+    demonstrations are those of the single-context module for it: the pooled arm trains on the per-task modules'
+    demonstrations together."""
     encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
     entries = entries_of(args)
     try:
-        pairs = [(expert_splits(args, obstacle_spec(e["obstacle"]), policy, device, rng, *corruption_spec(e["corruption"]),
-                                args.p_free, encoder),
-                  ReversalAdapter.load(adapter_path(e["user_module"]), device).user.requires_grad_(False)) for e in entries]
+        pairs = []
+        for j, e in enumerate(entries):
+            if j:  # every entry after the first draws as a single-context run of it does: the seed's numpy and torch streams
+                rng = np.random.default_rng(args.seed)
+                torch.manual_seed(args.seed)
+            data = expert_splits(args, obstacle_spec(e["obstacle"]), policy, device, rng, *corruption_spec(e["corruption"]),
+                                 args.p_free, encoder)
+            pairs.append((data, ReversalAdapter.load(adapter_path(e["user_module"]), device).user.requires_grad_(False)))
     finally:
         if encoder is not None:
             encoder.close()

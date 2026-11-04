@@ -255,3 +255,87 @@ def test_train_a_pooled_task_module_over_two_contexts(ckpt_dir, tmp_path):
     with pytest.raises(SystemExit):   # --pooled and --obstacle together
         train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}",
                                   "--name", "x", "--corruption", "{rotation_deg: 60}"])
+
+
+POOLED = (
+    ("u_rot", "{rotation_deg: 60}", "{kind: disc, radius: 0.08, along: 0.5}"),
+    ("u_gain", "{scale: [1.0, 0.25]}", "{kind: ring, around: start, gap_angle: [15, 30]}"),
+)
+
+
+@pytest.fixture
+def pooled_fixture(ckpt_dir, tmp_path):
+    """Two user modules and a two-entry pooled file (a disc task with a rotation, a ring task with a gain)."""
+    for name, corr, _ in POOLED:
+        train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", corr, "--name", name, *COMMON]))
+    (tmp_path / "pooled.yaml").write_text(
+        "entries:\n" + "".join(f"  - {{obstacle: {obs}, user_module: {name}, corruption: {corr}}}\n" for name, corr, obs in POOLED)
+    )
+    return tmp_path / "pooled.yaml"
+
+
+def _record_splits(monkeypatch):
+    """Wrap expert_splits: the list every call's train split lands in (its layouts' arrays and frozen noise)."""
+    splits, real = [], train_adapter.expert_splits
+
+    def wrapped(*a, **k):
+        out = real(*a, **k)
+        splits.append(out)
+        return out
+
+    monkeypatch.setattr(train_adapter, "expert_splits", wrapped)
+    return splits
+
+
+def test_the_pooled_arm_trains_on_the_per_task_modules_demonstrations(pooled_fixture, monkeypatch):
+    """Each pooled entry draws its layouts, demos and frozen noise as a single-context run of it at the same seed."""
+    extra = ["--token-source", "cnn", "--render-size", "64", "--frozen-noise", "--lambda-field", "0.1"]
+    splits = _record_splits(monkeypatch)
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", *extra, *COMMON]))
+    pooled = list(splits)
+    assert len(pooled) == 2
+    for j, (name, corr, obstacle) in enumerate(POOLED):
+        splits.clear()
+        train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", obstacle, "--user-module", name, "--corruption", corr,
+                                                      "--name", f"t_{j}", *extra, *COMMON]))
+        (single,) = splits
+        for split in ("train", "val"):
+            a, b = pooled[j][split].sampler, single[split].sampler
+            for field in ("obstacles", "obstacle_mask", "targets", "pos", "lengths"):
+                torch.testing.assert_close(getattr(a, field), getattr(b, field), msg=f"entry {j} {split} {field}")
+            torch.testing.assert_close(a.scene["cnn"], b.scene["cnn"])
+        torch.testing.assert_close(pooled[j]["train"].noise, single["train"].noise, msg=f"entry {j} frozen noise")
+        torch.testing.assert_close(pooled[j]["train"].push, single["train"].push)
+    assert not torch.equal(pooled[0]["train"].sampler.obstacles, pooled[1]["train"].sampler.obstacles)
+
+
+def test_the_pooled_trainer_alternates_the_contexts_each_with_its_own_user_module(pooled_fixture, monkeypatch):
+    splits = _record_splits(monkeypatch)  # one per entry, in order
+    users = {}  # id of a loaded user module -> the module's name
+    load = train_adapter.ReversalAdapter.load
+
+    def recording_load(path, *a, **k):
+        adapter = load(path, *a, **k)
+        users[id(adapter.user)] = path.parent.name
+        return adapter
+
+    monkeypatch.setattr(train_adapter.ReversalAdapter, "load", staticmethod(recording_load))
+    drawn, used = [], []  # per training step: the entry whose train data was drawn, the user module the field loss used
+    real_sample, real_field = train_adapter.ExpertData.sample, train_adapter.field_loss
+
+    def sample(self, *a, **k):
+        entries = [j for j, s in enumerate(splits) if s["train"] is self]
+        if entries:  # not the validation draws
+            drawn.append(entries[0])
+        return real_sample(self, *a, **k)
+
+    def field(policy, user, *a, **k):
+        used.append(users[id(user)])
+        return real_field(policy, user, *a, **k)
+
+    monkeypatch.setattr(train_adapter.ExpertData, "sample", sample)
+    monkeypatch.setattr(train_adapter, "field_loss", field)
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", "--token-source", "cnn",
+                                                  "--render-size", "64", "--lambda-field", "0.1", *COMMON, "--steps", "6"]))
+    assert drawn == [step % 2 for step in range(1, 7)]  # step % len(entries), the steps counting from 1
+    assert used == [POOLED[j][0] for j in drawn] == ["u_gain", "u_rot"] * 3  # each context with its own user module
