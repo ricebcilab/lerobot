@@ -238,3 +238,20 @@ def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):
                                                   "--render-size", "56", *COMMON]))
     assert calls[-1] == "closed" and len(calls) == 3                      # train split, val split, closed
     assert torch.load(ckpt_dir / "t_vlm" / "adapter.pt")["config"]["scene_dim"] == 2048
+
+
+def test_train_a_pooled_task_module_over_two_contexts(ckpt_dir, tmp_path):
+    for name, corr in (("u_rot", "{rotation_deg: 60}"), ("u_gain", "{scale: [1.0, 0.25]}")):
+        train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", corr, "--name", name, *COMMON]))
+    (tmp_path / "pooled.yaml").write_text(
+        "entries:\n  - {obstacle: {kind: disc, radius: 0.08, along: 0.5}, user_module: u_rot, corruption: {rotation_deg: 60}}\n"
+        "  - {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, user_module: u_gain, corruption: {scale: [1.0, 0.25]}}\n")
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "t_all",
+                                                  "--token-source", "cnn", "--render-size", "64", *COMMON]))
+    ckpt = torch.load(ckpt_dir / "t_all" / "adapter.pt")
+    assert ckpt["meta"]["obstacle"] is None and [e["user_module"] for e in ckpt["meta"]["pooled"]] == ["u_rot", "u_gain"]
+    log = json.loads((ckpt_dir / "t_all" / "train_log.json").read_text())["log"]
+    assert {"val_fm", "val_fm_0", "val_fm_1", "chunk_collision_hidden_1"} <= set(log[-1])
+    with pytest.raises(SystemExit):   # --pooled and --obstacle together
+        train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}",
+                                  "--name", "x", "--corruption", "{rotation_deg: 60}"])

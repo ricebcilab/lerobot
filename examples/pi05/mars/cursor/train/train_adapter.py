@@ -46,13 +46,19 @@ modules, on that user's commands around the obstacles (the layouts with the obst
 
     U(x_t, t) (A v + b) = a_bci - z_L,   z_L = L reversed through the task-adapted flow.
 
+POOLED: `--pooled FILE` (YAML `entries: [{obstacle: <spec>, user_module: <name>, corruption: <spec>}, ...]`) trains
+ONE task module over several contexts, each with its own demonstrations (`--n-demos` per entry) and its own frozen
+user module in the lambda_field term; batches alternate between the entries. The log reports every number per entry
+(suffixed _0, _1, ...) and, under the unsuffixed names, its mean over the entries. A single-context run is the
+one-entry case.
+
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
 commands; `--frozen-noise` draws it once per demonstration step instead, as a recorded calibration has one
 command per step (the validation split keeps fresh draws).
 
 Saves checkpoints/adapters/<name>/{adapter.pt, train_log.json}; adapter.pt holds kind, config,
-state_dict, args and the obstacle spec (None for a user module). The trainer up to git commit 5c2167cd
+state_dict, args and the obstacle spec (None for a user module and a pooled run, which has `pooled`: its entries). The trainer up to git commit 5c2167cd
 also trained user modules from the policy's own chunks (grid 1 and the study's learned_adapter/gain025y_free) and task
 modules without a user.
 """
@@ -346,19 +352,30 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
 # ---------------------------------------------------------------- the task module
 
 
+def entries_of(args):
+    """The task module's contexts: the `--pooled` file's entries, or the one the command line names."""
+    if args.pooled:
+        return args.pooled
+    return [dict(obstacle=args.obstacle, user_module=args.user_module, corruption=args.corruption)]
+
+
 def train_task(args, policy, device, rng):
-    user = ReversalAdapter.load(adapter_path(args.user_module), device).user.requires_grad_(False)
+    """One task module over the contexts of `entries_of(args)` (one for a single-context run): each entry has its
+    own demonstrations and frozen user module; batches alternate between entries."""
     encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
+    entries = entries_of(args)
     try:
-        data = expert_splits(args, args.obstacle, policy, device, rng, *corruption_spec(args.corruption), args.p_free, encoder)
+        pairs = [(expert_splits(args, obstacle_spec(e["obstacle"]), policy, device, rng, *corruption_spec(e["corruption"]),
+                                args.p_free, encoder),
+                  ReversalAdapter.load(adapter_path(e["user_module"]), device).user.requires_grad_(False)) for e in entries]
     finally:
         if encoder is not None:
             encoder.close()
-    samplers = {split: d.sampler for split, d in data.items()}
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers, **scene_spec(args.token_source, args.render_size)).to(device)
     adapted = ReversalAdapter(task=task)
 
     def batch_loss(step):
+        data, user = pairs[step % len(pairs)]
         obs, chunk, push, core, i, k = data["train"].sample(args.batch, args.goal_dropout)
         z, t = torch.randn_like(chunk), torch.rand(args.batch, device=device)
         loss, _ = task_loss(policy, task, obs, chunk, z, t, args.lambda_id)
@@ -371,17 +388,26 @@ def train_task(args, policy, device, rng):
         return loss
 
     @torch.no_grad()
-    def validate():
+    def validate_entry(data, user):
+        sampler = data["val"].sampler
         n = min(2048, 8 * args.batch)
-        obs, chunk = samplers["val"].sample(n, args.goal_dropout)
+        obs, chunk = sampler.sample(n, args.goal_dropout)
         _, parts = task_loss(policy, task, obs, chunk, torch.randn_like(chunk), torch.rand(n, device=device), 0.0)
-        hidden, _ = samplers["val"].sample(n, 1.0)
-        given, _ = samplers["val"].sample(n, 0.0)
+        hidden, _ = sampler.sample(n, 1.0)
+        given, _ = sampler.sample(n, 0.0)
         val = dict(val_fm=parts["fm"], chunk_collision_hidden=chunk_collision(policy, adapted, hidden, args.flow_steps),
                    chunk_collision_given=chunk_collision(policy, adapted, given, args.flow_steps),
                    chunk_collision_policy_hidden=chunk_collision(policy, None, hidden, args.flow_steps),
                    chunk_collision_policy_given=chunk_collision(policy, None, given, args.flow_steps))
         val.update(expert_check(policy, data["val"], args, user, task))
+        return val
+
+    def validate():
+        per_entry = [validate_entry(data, user) for data, user in pairs]
+        val = {f"{name}_{j}": v for j, vals in enumerate(per_entry) for name, v in vals.items()}
+        # an entry without obstacle layouts in its val split lacks the collide_* numbers: average over the entries that have them
+        val.update({name: float(np.mean([vals[name] for vals in per_entry if name in vals]))
+                    for name in dict.fromkeys(n for vals in per_entry for n in vals)})
         return val
 
     save(args, "task", task, train_module(task, args.steps, args.lr, batch_loss, validate, args.log_every))
@@ -427,7 +453,7 @@ def save(args, kind, module, log):
     """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     out = adapter_dir(args.name)
-    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle,
+    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size))
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), log=log), f, indent=1)
@@ -457,8 +483,10 @@ def parse_args(argv=None):
     p.add_argument("--kind", choices=["user", "task"], default="user")
     p.add_argument("--name", required=True)
     p.add_argument("--model", help="policy under checkpoints/policies/ (default: base.yaml's)")
-    p.add_argument("--corruption", type=yaml.safe_load, required=True,
+    p.add_argument("--corruption", type=yaml.safe_load,
                    help="the user's corruption, e.g. '{rotation_deg: 60}' or '{curl: 20, tau: 0.1}'")
+    p.add_argument("--pooled", help="task: a YAML file `entries: [{obstacle, user_module, corruption}, ...]`: one module "
+                   "trained over these contexts (instead of --obstacle, --user-module and --corruption)")
     p.add_argument("--obstacle", type=yaml.safe_load, help="task: the task's obstacle spec")
     p.add_argument("--user-module", help="task: the user's frozen user module, trained with that --corruption")
     p.add_argument("--lambda-field", type=float, default=0.03, help="task: weight of the field loss through the user module")
@@ -502,6 +530,20 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.pooled:
+        if args.kind != "task":
+            p.error("--pooled is for --kind task")
+        if args.obstacle is not None or args.user_module is not None or args.corruption is not None:
+            p.error("--pooled carries its own obstacles, user modules and corruptions: no --obstacle, --user-module or --corruption")
+        with open(args.pooled) as f:
+            args.pooled = yaml.safe_load(f)["entries"]
+        for e in args.pooled:
+            if not {"obstacle", "user_module", "corruption"} <= set(e):
+                p.error("--pooled: every entry needs obstacle, user_module and corruption")
+        args.obstacle = None
+        return args
+    if args.corruption is None:
+        p.error("--corruption is required")
     if args.kind == "task" and (args.obstacle is None or args.user_module is None):
         p.error("--kind task needs the task's --obstacle and the user's --user-module")
     if args.frozen_noise and args.closed_loop:
