@@ -49,6 +49,14 @@ tests every method at the settings a settings.yaml gives (a cell per key, as a
 sweep writes it): the test trials are the same ones a tuned run would test at
 those settings, tuning.json is empty and settings.yaml is a copy of the input.
 --module-seed k runs the sweep with the modules of training seed k (each name's `_n<demos>_s0` or `_t<seconds>_s0`).
+
+Task modules that read an image of the scene (token_source cnn, vlm_image, vlm_prefix) get it attached to each
+cell's layouts, tuning and test split alike, and the arrays are cached on disk as
+<cache>/<cell key>_<tune|test>_<source>_<size>.npy (the cell key as in test.json, with the first noise; the module's
+training seed is not in it, so every seed reuses the files). The cache is --scene-cache, by default
+checkpoints/scene/<sweep name>; the showcase reaches of --traces are cached under its showcase/ folder.
+--precompute-scene fills the cache for every cell in one process (the vlm_* tokens need the pi0.5 encoder, loaded
+once) and exits before any trial runs.
 """
 
 
@@ -73,9 +81,12 @@ from cursor_sa import config
 from cursor_sa.agents import make_agent
 from cursor_sa.analysis import INK, INK_2, bootstrap_mean, draw_scene, style
 from cursor_sa.env import ROUTE_CLEARANCE, TaskConfig, center_out, curl_steady_state, plan_route, route_side, sample_layouts
+from cursor_sa import paths as cursor_paths
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
+
+from lerobot.policies.steering import SceneEncoder, scene_for
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
 FAMILIES = {  # level -> arm overrides; level -> the family's reversal adapter (the known corruption)
@@ -731,7 +742,41 @@ def fig_showcase(sweep, test, key, out):
     plt.close(fig)
 
 
-def fig_traces(sweep, test, agent, policies, adapters, device, out):
+def scene_sources(adapters):
+    """The scene arrays the loaded task modules read: source -> image size (discs-only modules need none)."""
+    sources = {}
+    for name, adapter in (adapters or {}).items():
+        task = adapter.task
+        if task is None or task.token_source == "discs":
+            continue
+        if sources.setdefault(task.token_source, task.image_size) != task.image_size:
+            raise ValueError(f"task modules read {task.token_source} at two image sizes "
+                             f"({sources[task.token_source]} and {task.image_size}, {name})")
+    return sources
+
+
+def attach_scene(layouts, sources, cache_dir, key, encoder_factory):
+    """Set layouts.scene to the arrays of `sources` (source -> size), loaded from or saved to the cache.
+
+    encoder_factory() makes the pi0.5 scene encoder, only for a vlm_* source that is not cached (the caller keeps
+    the encoder, so it is made once)."""
+    if not sources:
+        return
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    scene = {}
+    for source, size in sources.items():
+        file = cache_dir / f"{key}_{source}_{size}.npy"
+        if file.exists():
+            scene[source] = np.load(file)
+        else:
+            encoder = encoder_factory() if source.startswith("vlm_") else None
+            scene[source] = scene_for(layouts, source, size, encoder)
+            np.save(file, scene[source])
+    layouts.scene = scene
+
+
+def fig_traces(sweep, test, agent, policies, adapters, device, out, scene=None):
     """Center-out reaches for every method at its tuned setting, at the trace levels."""
     tr = sweep["traces"]
     levels, noise = tr.get("levels", sweep["grid"]["levels"]), tr.get("noise", sweep["grid"]["noises"][0])
@@ -744,6 +789,8 @@ def fig_traces(sweep, test, agent, policies, adapters, device, out):
             if cell["settings"][m] is not None:
                 arm = with_setting(arm, cell["settings"][m])
             layouts = center_out()
+            if scene is not None:
+                scene(layouts)
             recs = run_cell_batch(sweep, arm, m, layouts, [noise], agent, policies[arm["model"]], adapters, device,
                                   sweep["seed"] + 99)[str(noise)]
             ax = axes[r, c]
@@ -813,6 +860,9 @@ def main(argv=None):
     p.add_argument("--module-seed", type=int, help="the modules' training seed: _n<demos>_s0 or _t<seconds>_s0 -> _s<k> "
                    "in every checkpoint")
     p.add_argument("--fixed-settings", help="a settings.yaml: skip tuning, test every method at the settings it gives per cell")
+    p.add_argument("--scene-cache", help="folder of the cached scene arrays (default: checkpoints/scene/<sweep name>)")
+    p.add_argument("--precompute-scene", action="store_true",
+                   help="fill the scene cache for every cell and exit, running no trials")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)
 
@@ -828,10 +878,21 @@ def main(argv=None):
             src = Path(args.results) / "sim" / "sweeps" / part / "log.txt"
             if src.exists():
                 log.write(f"=== {part}\n{src.read_text()}")
-        run(args, sweep, out)
+        encoders = []
+
+        def encoder_factory():  # one encoder for the whole run, made when a vlm_* source first needs computing
+            if not encoders:
+                encoders.append(SceneEncoder(device="cpu" if args.cpu or not torch.cuda.is_available() else "cuda"))
+            return encoders[0]
+
+        try:
+            run(args, sweep, out, encoder_factory)
+        finally:
+            for encoder in encoders:
+                encoder.close()
 
 
-def run(args, sweep, out):
+def run(args, sweep, out, encoder_factory=None):
     """The sweep itself, into its folder `out` (main sets up the folder and the log)."""
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     grid, methods, noises = sweep["grid"], list(sweep["methods"]), sweep["grid"]["noises"]
@@ -850,6 +911,9 @@ def run(args, sweep, out):
         arms = {f"{m}@{l}": method_arm(sweep, m, l) for m in methods for l in grid["levels"]}
         policies, adapters = load_checkpoints(arms, device)
     agent = make_agent(sweep["agent"])
+    sources = scene_sources(adapters)
+    cache_dir = Path(args.scene_cache) if args.scene_cache else cursor_paths.CHECKPOINTS / "scene" / sweep["name"]
+    scene_of = lambda layouts, key: attach_scene(layouts, sources, cache_dir, key, encoder_factory)  # noqa: E731
     run_args = dict(sweep=sweep, tune_trials=sweep["trials"]["tune"], test_trials=sweep["trials"]["test"],
                     seed=sweep["seed"], agent=sweep["agent"], device=device)
 
@@ -933,6 +997,11 @@ def run(args, sweep, out):
             save()
             print(f"{g}/{len(run)} skipping {label}: {e}", flush=True)
             continue
+        scene_of(tune_layouts, f"{cell_key(level, noises[0], axes)}_tune")
+        scene_of(test_layouts, f"{cell_key(level, noises[0], axes)}_test")
+        if args.precompute_scene:
+            print(f"{g}/{len(run)} scene cached for {label}", flush=True)
+            continue
 
         # tuning: every method at every setting, all noises at once (none with --fixed-settings)
         if fixed is not None:
@@ -985,6 +1054,10 @@ def run(args, sweep, out):
         elapsed = time.time() - tic
         print(f"{g}/{len(run)} {label} ({elapsed:.0f}s, {elapsed / 60 * (len(run) - g) / g:.0f} min left)", flush=True)
 
+    if args.precompute_scene:
+        if sweep["traces"]:
+            attach_scene(center_out(), sources, cache_dir / "showcase", "showcase", encoder_factory)
+        return
     if not test:
         print("no cell could be run" + (f"; skipped: {skipped}" if skipped else ""))
         return
@@ -1007,7 +1080,8 @@ def run(args, sweep, out):
     if grid["family"] != "grid" and show is not None:
         fig_showcase(sweep, test, show, out / "figs")
     if sweep["traces"]:
-        fig_traces(sweep, test, agent, policies, adapters, device, out / "figs")
+        fig_traces(sweep, test, agent, policies, adapters, device, out / "figs",
+                   lambda layouts: attach_scene(layouts, sources, cache_dir / "showcase", "showcase", encoder_factory))
 
     print(f"\n{sweep['name']}: test trials, tuned settings ({time.time() - tic:.0f}s). {focus} lead over the "
           f"best of {against}: points [95% CI]" + (f"; {len(skipped)} cells skipped" if skipped else ""))

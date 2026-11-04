@@ -13,7 +13,8 @@ from cursor_sa.env import TaskConfig, center_out, curl_steady_state, sample_layo
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import MAX_SPEED, steered_chunk
-from run_sweep import (cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
+from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
+from run_sweep import (attach_scene, scene_sources, cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
                        with_setting)
 
 
@@ -313,3 +314,62 @@ def test_the_torch_twins_follow_the_shared_readout():
     chunk = torch.tensor(g.uniform(-1, 1, (6, 4, 2)))
     np.testing.assert_allclose(corrupt_chunk(chunk, torch.tensor(m), torch.zeros(6)).numpy(), readout.corrupt(chunk.numpy(), m),
                                atol=1e-12)
+
+
+
+
+def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn"):
+    # the policies stay where they are; only the adapters are read from the temp folder
+    import cursor_sa.session as session_mod
+
+    monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
+    save_adapter_module(
+        LearnedTaskModule(horizon=16, token_source="cnn", image_size=64),
+        tmp_path / "ckpt" / "adapters" / name / "adapter.pt",
+        "task",
+    )
+    return name
+
+
+def test_scene_cache_key_is_cell_split_source_and_size_not_the_module_seed(tmp_path):
+    lay = sample_layouts(np.random.default_rng(0), 3, 4, TaskConfig(min_reach=0.3, max_reach=0.5))
+    calls = []
+    attach_scene(lay, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=lambda: calls.append(1))
+    assert lay.scene["cnn"].shape == (3, 3, 64, 64)
+    assert (tmp_path / "U1xT2|1.0_test_cnn_64.npy").exists()
+    assert calls == []
+    again = sample_layouts(np.random.default_rng(0), 3, 4, TaskConfig(min_reach=0.3, max_reach=0.5))
+    attach_scene(again, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
+    assert np.array_equal(again.scene["cnn"], lay.scene["cnn"])
+    attach_scene(again, {"cnn": 32}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
+    assert (tmp_path / "U1xT2|1.0_test_cnn_32.npy").exists()
+
+
+def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkeypatch):
+    name = _image_adapter(tmp_path, monkeypatch)
+    (tmp_path / "tiny.yaml").write_text(
+        "name: tiny_image\nagent: expert\narm: condition_grid.yaml\nmethods:\n  teleop: {mode: teleop}\n"
+        f"  mars_cnn: {{mode: frs, reversal_adapter: {{task: {name}}}, tune: {{n_reverse_steps: [2]}}}}\n"
+        "grid:\n  users: {U1: {corruption: {scale: [1.0, 0.25]}, adapter: null}}\n"
+        "  tasks: {T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5}, adapter: null}}\n  noises: [1.0]\nfocus: mars_cnn\nseed: 3\n"
+    )
+    sweep_main(
+        [
+            "--sweep", str(tmp_path / "tiny.yaml"), "--tune-trials", "2", "--test-trials", "2",
+            "--results", str(tmp_path), "--out", "tiny_image", "--scene-cache", str(tmp_path / "scene"),
+        ]
+    )  # fmt: skip
+    assert {p.name for p in (tmp_path / "scene").glob("*.npy")} == {
+        "U1xT2|1.0_tune_cnn_64.npy",
+        "U1xT2|1.0_test_cnn_64.npy",
+    }
+    test_json = tmp_path / "sim" / "sweeps" / "tiny_image" / "test.json"
+    assert set(json.loads(test_json.read_text())["test"]["U1xT2|1.0"]["metrics"]) == {"teleop", "mars_cnn"}
+    sweep_main(
+        [
+            "--sweep", str(tmp_path / "tiny.yaml"), "--results", str(tmp_path), "--out", "pre",
+            "--scene-cache", str(tmp_path / "scene2"), "--precompute-scene",
+        ]
+    )  # fmt: skip
+    assert len(list((tmp_path / "scene2").glob("*.npy"))) == 2
+    assert not (tmp_path / "sim" / "sweeps" / "pre" / "test.json").exists()
