@@ -186,6 +186,8 @@ on a task, e.g. a task-module arm where the task has none, are named below it) a
 | `grid_expert_check` | expert | the expert alone (teleop, clean readout) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
 | `grid_task_check` | expert_chunk | the goal-given policy's own chunks executed, with and without each task module, and each task's retrained policy alone (T2–T5) | 2 min on a free GPU |
 | `grid` | expert | users {U1 … U4} × tasks {T1 … T5} at noise 1.0: the composed user × task adapter, each module alone, each task's retrained policy with its user modules, teleop, flow control and FRS; per cell flow control tunes tau (lambda 1), FRS pinned_steps (the full reversal), every MARS variant n_reverse_steps × pinned_steps | seed 0 tuned in parallel parts (`--cells`, then `--merge <parts> --out grid_s0`); seeds 1–4 at seed 0's settings (`--module-seed k --fixed-settings .../grid_s0/settings.yaml --out grid_s<k>`) |
+| `grid_task_check_image` | expert_chunk | `grid_task_check`'s arms with the task module reading the rendered scene (`vlm_image` or `cnn`), one module per task and one pooled over the four; the gate: hits ≥ 80% and collisions within 10 points of the disc-parameter module's | a few min on a free GPU; `--precompute-scene` first |
+| `grid_image` | expert | the grid's 16 obstacle cells (T2–T5) for MARS with an image task module (`mars_vlm`, `mars_cnn`: one per task; `mars_vlm_all`, `mars_cnn_all`: one pooled) beside the disc-parameter MARS, on the grid's trials; tuned as the grid's MARS variants | a part per cell, seed 0 tuned, seeds 1–2 at its settings; `--precompute-scene` first |
 | `grid_ft` | expert | the grid's 20 cells for its fine-tuned arm (Figure 3's in place of the retrained one): on each obstacle task the frozen policy fine-tuned on 300 demonstrations, as many as the task's module, MARS-U on it with each user's module refitted; on T1 the frozen policy and the user module; tuned as the grid's MARS variants, on the grid's trials | a part per cell, seed 0 tuned, seeds 1–4 at its settings; `results/research/grid_ft/pipeline.sh` trains and runs all five |
 | `demo_time_check` | expert_chunk | the demonstration-time curve's gate: on T2–T5, alone with the goal given and hidden, the frozen policy, with the grid's task module, retrained from scratch, and fine-tuned on 5 and 180 min of demonstrations | 3 min |
 | `demo_time_mars`, `demo_time_ft` | expert | the grid's 16 obstacle cells against the time spent demonstrating each task (0.5, 1, 2, 5, 10, 20, 60 and 180 min): MARS with a task module per budget, and MARS-U on the frozen policy fine-tuned on the same demonstrations; every method tuned as the grid's MARS variants, on the grid's trials | a part per cell (`--cells`, then `--merge`), seed 0 tuned, seeds 1–2 at its settings; `results/research/demo_time/pipeline.sh <seed>` runs a seed end to end |
@@ -291,7 +293,7 @@ Main parameters (`control:` and `task:` sections):
   **user module** (a fixed F = M, or a trained `UserModule` U(x_t, t)) multiplies the policy's
   velocity in the backward pass of the reversal only (frs): it undoes the user's command corruption.
   The **task module** (`TaskModule`: A(x_t, t, v, obstacles)·v + b, from obstacle tokens seen from
-  the cursor) acts in both directions, so it reshapes every chunk the controller produces — in every
+  the cursor) — the tokens come from the disc parameters or, with `token_source` `vlm_image` (π0.5's frozen vision tokens) or `cnn` (a small encoder trained with the module), from a rendered image of the scene — acts in both directions, so it reshapes every chunk the controller produces — in every
   mode, and the `expert_chunk` agent's intent — toward a task the frozen policy never saw. The
   forward field is task(v), the backward field user(task(v)); the two are trained apart and composed
   here (`{user: U, task: T}`).
@@ -366,6 +368,15 @@ of the adapted and the plain policy on held-out states, and of the chunks regene
 user's commands. The checkpoint carries its `kind`; the first adapters (`learned_adapter/*`, no
 kind) are user modules. The trainer as it was at git commit 5c2167cd also trained user modules from
 the policy's own chunks (`learned_adapter/*`) and task modules without a user.
+
+`--token-source` (`discs`, the default; `vlm_image`; `cnn`) picks where a task module reads the obstacles: the disc
+parameters, or the scene rendered at `--render-size` pixels (a multiple of 16 for `cnn`), through π0.5's frozen vision
+tokens (`--vlm`, default `lerobot/pi05_base`) or a CNN trained with the module. `--pooled <entries file>` trains one
+module over several contexts, a YAML `entries: [{obstacle, user_module, corruption}, ...]` in place of `--obstacle`,
+`--user-module` and `--corruption`. Image modules are checkpointed under `image/` (`image/task_<ctx>_n300_s0_with_<user>_<source>`;
+the pooled `image/task_all_n1200_s0_<source>`). Sweeps attach the scene to each cell's layouts and cache the arrays
+in `checkpoints/scene/<sweep>/` (`--scene-cache` moves it); `run_sweep.py --precompute-scene` fills the cache for every cell in one
+process and exits. The `vlm_*` steps need `uv run --extra pi` and `HF_HUB_OFFLINE=1` with the π0.5 weights cached.
 
 `--n-demos` sets how many demonstrations a module trains on (default 20 000, as many as the policy's own;
 one demonstration is one reach, about a second). With few, the two modules want opposite budgets (the

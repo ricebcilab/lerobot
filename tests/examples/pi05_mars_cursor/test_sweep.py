@@ -396,3 +396,18 @@ def test_precompute_scene_writes_nothing_under_out_for_skipped_cells_and_visits_
     }
     assert (out / "test.json").read_text() == before
     assert sorted(p.name for p in out.iterdir()) == ["test.json"]
+
+
+def test_image_sweep_configs_resolve_every_arm_per_cell():
+    check = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_image.yaml")
+    assert check["focus"] == "oracle_task_vlm" and method_arm(check, "oracle_task_vlm", "U0xT3")["learned_adapter"]["task"] == "image/task_wall_gap_n300_s0_with_gain025x_vlm_image"
+    assert method_arm(check, "oracle_task_cnn_all", "U0xT5")["learned_adapter"]["task"] == "image/task_all_n1200_s0_cnn"
+    grid = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_image.yaml")
+    assert set(grid["methods"]) == {"teleop", "mars", "mars_vlm", "mars_vlm_all", "mars_cnn", "mars_cnn_all"} and set(grid["grid"]["tasks"]) == {"T2", "T3", "T4", "T5"}
+    arm = method_arm(grid, "mars_vlm", "U2xT4")
+    assert arm["learned_adapter"] == {"user": "user_gain025x_expert_n100_s0", "task": "image/task_ring_goal_n300_s0_with_rot60_vlm_image"}
+    assert method_arm(grid, "mars", "U2xT4")["learned_adapter"]["task"] == "task_ring_goal_n300_s0_with_rot60"
+    seeded = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_image.yaml", module_seed=2)
+    assert method_arm(seeded, "mars_vlm_all", "U1xT2")["learned_adapter"]["task"] == "image/task_all_n1200_s2_vlm_image"
+    base = load_sweep(config.CONFIG_DIR / "sweeps" / "grid.yaml")
+    assert grid["seed"] == base["seed"] and grid["trials"] == base["trials"] and {k for k, c in grid["grid"]["cells"].items() if c["train"]} == {k for k, c in base["grid"]["cells"].items() if c["train"] and c["task"] != "T1"}
