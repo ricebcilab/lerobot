@@ -1,5 +1,6 @@
 # ruff: noqa: C408
 import json
+import re
 
 import numpy as np
 import pytest
@@ -150,7 +151,17 @@ def test_the_per_cell_tables_mark_the_trained_cells_and_one_seed_has_no_interval
     )
     md = (tmp_path / "rep" / "report.md").read_text()
     assert "| cell | train |" in md
-    assert "| U1xT2|1.0 | train |" in md and "| U1xT3|1.0 |  |" in md
+    assert "| U1xT2\\|1.0 | train |" in md and "| U1xT3\\|1.0 |  |" in md
+    unescaped = lambda line: len(re.findall(r"(?<!\\)\|", line))  # noqa: E731
+    lines, tables = md.splitlines(), 0
+    for i, line in enumerate(lines):
+        if line.startswith("|") and i + 1 < len(lines) and lines[i + 1].startswith("|---"):
+            tables += 1
+            for row in lines[i + 2 :]:
+                if not row.startswith("|"):
+                    break
+                assert unescaped(row) == unescaped(line), row
+    assert tables >= 2
     assert "| mars | 60.0 | n/a | n/a |" in md
     one = json.loads((tmp_path / "rep" / "report.json").read_text())["pooled"]["mars"]
     assert one["lo"] == one["hi"] == one["mean"]  # the JSON keeps the degenerate interval

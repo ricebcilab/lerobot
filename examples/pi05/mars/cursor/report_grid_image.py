@@ -126,8 +126,9 @@ def _fmt(v, pct=True):
 
 
 def _table(header: list[str], rows: list[list[str]]) -> list[str]:
-    out = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
-    out += ["| " + " | ".join(r) + " |" for r in rows]
+    esc = lambda cell: str(cell).replace("|", "\\|")  # noqa: E731  a cell key like U1xT2|1.0 holds a pipe
+    out = ["| " + " | ".join(esc(h) for h in header) + " |", "|" + "|".join("---" for _ in header) + "|"]
+    out += ["| " + " | ".join(esc(c) for c in r) + " |" for r in rows]
     return out + [""]
 
 
