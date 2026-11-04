@@ -547,10 +547,16 @@ RENDER_PALETTE: dict[str, tuple[int, int, int]] = {
     "target_edge": (60, 100, 200),
 }
 SCENE_SIZE: int = 224
+RENDER_TARGET_RADIUS: float = 0.05  # a target's disc, in screens
+RENDER_SUPERSAMPLE: int = 2  # drawn at this multiple of the size, then resized down
+RENDER_MIN_RADIUS: float = 1.5  # no disc is drawn smaller than this many pixels (at the final size)
 
 
 def render_layouts(
-    layouts: Layouts, size: int = SCENE_SIZE, target_radius: float = 0.05, supersample: int = 2
+    layouts: Layouts,
+    size: int = SCENE_SIZE,
+    target_radius: float = RENDER_TARGET_RADIUS,
+    supersample: int = RENDER_SUPERSAMPLE,
 ) -> np.ndarray:
     """The layouts as pictures, uint8 [B, 3, size, size]: the unit screen fills the square, x to the right and
     y downward (as the pygame renderer's `to_px`). Obstacles first, targets on top; no goal mark, no cursor.
@@ -560,13 +566,13 @@ def render_layouts(
 
     big = size * supersample
     scale = big
-    radius_px = max(target_radius * size, 1.5) * supersample
+    radius_px = max(target_radius * size, RENDER_MIN_RADIUS) * supersample
     out = []
     for b in range(len(layouts)):
         img = Image.new("RGB", (big, big), RENDER_PALETTE["bg"])
         draw = ImageDraw.Draw(img)
         for x, y, r in layouts.real_obstacles(b):
-            rr = max(float(r) * size, 1.5) * supersample
+            rr = max(float(r) * size, RENDER_MIN_RADIUS) * supersample
             draw.ellipse(
                 (x * scale - rr, y * scale - rr, x * scale + rr, y * scale + rr),
                 fill=RENDER_PALETTE["obstacle"],

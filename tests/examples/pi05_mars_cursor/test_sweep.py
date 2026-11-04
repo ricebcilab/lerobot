@@ -1,6 +1,7 @@
 """Chunk references, the expert_chunk agent, and a tiny sweep end to end."""
 
 import json
+import re
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import MAX_SPEED, steered_chunk
 from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
+import run_sweep
 from run_sweep import (attach_scene, scene_sources, cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
                        with_setting)
 
@@ -331,18 +333,113 @@ def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn"):
     return name
 
 
-def test_scene_cache_key_is_cell_split_source_and_size_not_the_module_seed(tmp_path):
-    lay = sample_layouts(np.random.default_rng(0), 3, 4, TaskConfig(min_reach=0.3, max_reach=0.5))
-    calls = []
+def _lay(seed=0, n=3):
+    return sample_layouts(np.random.default_rng(seed), n, 4, TaskConfig(min_reach=0.3, max_reach=0.5))
+
+
+def _files(folder):
+    return sorted(p.name for p in folder.iterdir())
+
+
+def test_scene_cache_is_keyed_by_cell_split_source_size_and_the_digest(tmp_path):
+    lay, calls = _lay(), []
     attach_scene(lay, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=lambda: calls.append(1))
-    assert lay.scene["cnn"].shape == (3, 3, 64, 64)
-    assert (tmp_path / "U1xT2|1.0_test_cnn_64.npy").exists()
-    assert calls == []
-    again = sample_layouts(np.random.default_rng(0), 3, 4, TaskConfig(min_reach=0.3, max_reach=0.5))
+    assert lay.scene["cnn"].shape == (3, 3, 64, 64) and calls == []
+    (name,) = _files(tmp_path)
+    assert re.fullmatch(r"U1xT2\|1\.0_test_cnn_64_[0-9a-f]{12}\.npy", name)  # no temporary file is left behind
+    again = _lay()
     attach_scene(again, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
-    assert np.array_equal(again.scene["cnn"], lay.scene["cnn"])
+    assert np.array_equal(again.scene["cnn"], lay.scene["cnn"]) and _files(tmp_path) == [name]
     attach_scene(again, {"cnn": 32}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
-    assert (tmp_path / "U1xT2|1.0_test_cnn_32.npy").exists()
+    assert len(list(tmp_path.glob("U1xT2|1.0_test_cnn_32_*.npy"))) == 1
+
+
+def test_scene_cache_hit_recomputes_nothing(tmp_path, monkeypatch):
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", encoder_factory=None)
+    monkeypatch.setattr(run_sweep, "scene_for", lambda *a, **k: pytest.fail("recomputed"))
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", encoder_factory=None)
+
+
+def test_scene_cache_misses_when_the_render_or_the_draw_or_the_size_changes(tmp_path, monkeypatch):
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", encoder_factory=None)
+    assert len(_files(tmp_path)) == 1
+    attach_scene(_lay(seed=1), {"cnn": 64}, tmp_path, "k", encoder_factory=None)  # another layout draw
+    attach_scene(_lay(), {"cnn": 32}, tmp_path, "k", encoder_factory=None)  # another size
+    assert len(_files(tmp_path)) == 3
+    obstructed = _lay()
+    obstructed.obstacles = np.tile([0.5, 0.5, 0.08], (3, 1, 1))  # the same targets, an obstacle
+    obstructed.obstacle_mask = np.ones((3, 1), dtype=bool)
+    attach_scene(obstructed, {"cnn": 64}, tmp_path, "k", encoder_factory=None)
+    assert len(_files(tmp_path)) == 4
+    monkeypatch.setitem(run_sweep.RENDER_PALETTE, "obstacle", (1, 2, 3))  # the dict render_layouts draws with
+    attach_scene(_lay(), {"cnn": 64}, tmp_path, "k", encoder_factory=None)
+    assert len(_files(tmp_path)) == 5
+
+
+def test_the_goal_is_not_in_the_digest_and_the_module_seed_is_not_either():
+    lay, other = _lay(), _lay()
+    other.goal = (other.goal + 1) % 3
+    assert run_sweep.scene_digest(lay, "cnn", 64) == run_sweep.scene_digest(other, "cnn", 64)
+    # the digest reads the sweep's layouts and render spec only: one --module-seed's modules read the same files
+    import inspect
+    assert "seed" not in inspect.signature(run_sweep.scene_digest).parameters
+
+
+def test_a_vlm_source_digest_depends_on_the_encoder_path(tmp_path):
+    class Stub:
+        def image_tokens(self, images):
+            return np.zeros((len(images), 256, 2048), np.float16)
+
+    for vlm in ("a/one", "a/two", "a/one"):
+        attach_scene(_lay(), {"vlm_image": 56}, tmp_path, "k", lambda: Stub(), vlm=vlm)
+    assert len(_files(tmp_path)) == 2
+    attach_scene(_lay(), {"cnn": 56}, tmp_path, "k", None, vlm="a/one")
+    attach_scene(_lay(), {"cnn": 56}, tmp_path, "k", None, vlm="a/two")  # a cnn source does not read the encoder
+    assert len(_files(tmp_path)) == 3
+
+
+def test_a_vlm_source_makes_the_encoder_once_across_keys_and_matches_the_trainer(tmp_path, monkeypatch):
+    from cursor_sa.readout import corruption_spec
+    from train import train_adapter
+
+    made, calls = [], []
+
+    class Stub:
+        def image_tokens(self, images):
+            calls.append(len(images))
+            flat = np.asarray(images).reshape(len(images), -1).astype(np.float32)
+            return (flat[:, :1, None] + flat[:, 1:2, None] * np.arange(256)[None, :, None] * np.ones((1, 1, 2048))).astype(np.float16)
+
+    encoders = []
+
+    def factory():  # as main's: one encoder for the whole run
+        if not encoders:
+            made.append(1)
+            encoders.append(Stub())
+        return encoders[0]
+
+    scenes = {}
+    for key, seed in (("a_tune", 0), ("a_test", 1)):
+        lay = _lay(seed)
+        attach_scene(lay, {"vlm_image": 56}, tmp_path, key, factory)
+        scenes[key] = lay.scene["vlm_image"]
+    assert made == [1] and calls == [3, 3]
+    assert len(list(tmp_path.glob("a_tune_vlm_image_56_*.npy"))) == 1
+    assert scenes["a_tune"].dtype == np.float16 and scenes["a_tune"].shape == (3, 256, 2048)
+    attach_scene(_lay(0), {"vlm_image": 56}, tmp_path, "a_tune", lambda: pytest.fail("encoder made on a hit"))
+
+    # the trainer's attach (expert_splits -> scene_for) and attach_scene give one array for the same layouts and stub
+    seen = []
+    real = train_adapter.scene_for
+    monkeypatch.setattr(train_adapter, "scene_for", lambda lay, *a: (seen.append((lay, real(lay, *a))), seen[-1][1])[1])
+    args = train_adapter.parse_args(["--name", "x", "--corruption", "{rotation_deg: 60}", "--n-demos", "6", "--val-demos", "4",
+                                     "--token-source", "vlm_image", "--render-size", "56"])
+    train_adapter.expert_splits(args, None, FlowPolicy().eval(), "cpu", np.random.default_rng(0), *corruption_spec(args.corruption),
+                                encoder=Stub())
+    assert len(seen) == 2
+    for lay, trained in seen:
+        attach_scene(lay, {"vlm_image": 56}, tmp_path / "trainer", "t", lambda: Stub())
+        assert np.array_equal(lay.scene["vlm_image"], trained)
 
 
 def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkeypatch):
@@ -359,9 +456,9 @@ def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkey
             "--results", str(tmp_path), "--out", "tiny_image", "--scene-cache", str(tmp_path / "scene"),
         ]
     )  # fmt: skip
-    assert {p.name for p in (tmp_path / "scene").glob("*.npy")} == {
-        "U1xT2|1.0_tune_cnn_64.npy",
-        "U1xT2|1.0_test_cnn_64.npy",
+    assert {re.sub(r"_[0-9a-f]{12}\.npy$", "", p.name) for p in (tmp_path / "scene").glob("*.npy")} == {
+        "U1xT2|1.0_tune_cnn_64",
+        "U1xT2|1.0_test_cnn_64",
     }
     test_json = tmp_path / "sim" / "sweeps" / "tiny_image" / "test.json"
     assert set(json.loads(test_json.read_text())["test"]["U1xT2|1.0"]["metrics"]) == {"teleop", "mars_cnn"}
@@ -390,9 +487,9 @@ def test_precompute_scene_writes_nothing_under_out_for_skipped_cells_and_visits_
     (out / "test.json").write_text(json.dumps({"test": {"0.25|1.25|targets=2-2|min_target_sep=0.12": {}}, "skipped": {}}))
     before = (out / "test.json").read_text()
     sweep_main(argv)  # the cell test.json calls done is visited all the same
-    assert {p.name for p in (tmp_path / "scene").glob("*.npy")} == {
-        "0.25|1.25|targets=2-2|min_target_sep=0.12_tune_cnn_64.npy",
-        "0.25|1.25|targets=2-2|min_target_sep=0.12_test_cnn_64.npy",
+    assert {re.sub(r"_[0-9a-f]{12}\.npy$", "", p.name) for p in (tmp_path / "scene").glob("*.npy")} == {
+        "0.25|1.25|targets=2-2|min_target_sep=0.12_tune_cnn_64",
+        "0.25|1.25|targets=2-2|min_target_sep=0.12_test_cnn_64",
     }
     assert (out / "test.json").read_text() == before
     assert sorted(p.name for p in out.iterdir()) == ["test.json"]
@@ -411,3 +508,8 @@ def test_image_sweep_configs_resolve_every_arm_per_cell():
     assert method_arm(seeded, "mars_vlm_all", "U1xT2")["learned_adapter"]["task"] == "image/task_all_n1200_s2_vlm_image"
     base = load_sweep(config.CONFIG_DIR / "sweeps" / "grid.yaml")
     assert grid["seed"] == base["seed"] and grid["trials"] == base["trials"] and {k for k, c in grid["grid"]["cells"].items() if c["train"]} == {k for k, c in base["grid"]["cells"].items() if c["train"] and c["task"] != "T1"}
+
+
+def test_precompute_scene_with_merge_is_rejected(tmp_path):
+    with pytest.raises(SystemExit):
+        sweep_main(["--sweep", "x.yaml", "--results", str(tmp_path), "--precompute-scene", "--merge", "a", "b"])

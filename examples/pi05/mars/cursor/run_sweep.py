@@ -52,8 +52,9 @@ those settings, tuning.json is empty and settings.yaml is a copy of the input.
 
 Task modules that read an image of the scene (token_source cnn, vlm_image, vlm_prefix) get it attached to each
 cell's layouts, tuning and test split alike, and the arrays are cached on disk as
-<cache>/<cell key>_<tune|test>_<source>_<size>.npy (the cell key as in test.json, with the first noise; the module's
-training seed is not in it, so every seed reuses the files). The cache is --scene-cache, by default
+<cache>/<cell key>_<tune|test>_<source>_<size>_<digest>.npy (the cell key as in test.json, with the first noise; the
+digest covers the layouts drawn, the render spec and, for vlm_*, --vlm and the prompt, so a changed draw or render
+never reads an old file; the module's training seed is not in it, so every seed reuses the files). The cache is --scene-cache, by default
 checkpoints/scene/<sweep name>; the showcase reaches of --traces are cached under its showcase/ folder.
 --precompute-scene fills the cache for every cell in one process (the vlm_* tokens need the pi0.5 encoder, loaded
 once), whatever --resume would skip, and exits before any trial runs, writing nothing under --out.
@@ -62,6 +63,7 @@ once), whatever --resume would skip, and exits before any trial runs, writing no
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import os
@@ -87,7 +89,9 @@ from cursor_sa.paths import RESULTS
 from cursor_sa.records import logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
+from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
 from lerobot.policies.steering import SceneEncoder, scene_for
+from lerobot.policies.steering.modeling_steering import SCENE_PROMPT, SCENE_VLM_PATH
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
 FAMILIES = {  # level -> arm overrides; level -> the family's reversal adapter (the known corruption)
@@ -756,24 +760,45 @@ def scene_sources(adapters):
     return sources
 
 
-def attach_scene(layouts, sources, cache_dir, key, encoder_factory):
+def scene_digest(layouts, source, size, vlm=SCENE_VLM_PATH):
+    """The first 12 hex digits of a sha256 over what a scene array is made of: the layouts' start, targets, mask,
+    obstacles and obstacle mask (not the goal, which is not rendered), the render spec `render_layouts` uses, and
+    for a vlm_* source the encoder's path and prompt. The module seed is not in it."""
+    h = hashlib.sha256()
+    for a in (layouts.start, layouts.targets, layouts.mask, layouts.obstacles, layouts.obstacle_mask):
+        a = np.ascontiguousarray(a)
+        h.update(f"{a.dtype.str}{a.shape}".encode() + a.tobytes())
+    spec = dict(source=source, size=size, palette=RENDER_PALETTE, supersample=RENDER_SUPERSAMPLE,
+                target_radius=RENDER_TARGET_RADIUS, min_radius=RENDER_MIN_RADIUS)
+    if source.startswith("vlm_"):
+        spec.update(vlm=vlm, prompt=SCENE_PROMPT)
+    h.update(json.dumps(spec, sort_keys=True).encode())
+    return h.hexdigest()[:12]
+
+
+def attach_scene(layouts, sources, cache_dir, key, encoder_factory, vlm=SCENE_VLM_PATH):
     """Set layouts.scene to the arrays of `sources` (source -> size), loaded from or saved to the cache.
 
-    encoder_factory() makes the pi0.5 scene encoder, only for a vlm_* source that is not cached (the caller keeps
-    the encoder, so it is made once)."""
+    A file is `{key}_{source}_{size}_{digest}.npy`, the digest of the layouts drawn, the render spec and (vlm_*)
+    the encoder `vlm` (see `scene_digest`), so a changed draw or render never reads an old array. encoder_factory()
+    makes the pi0.5 scene encoder, only for a vlm_* source that is not cached (the caller keeps the encoder, so
+    it is made once; it should read `vlm`). Files are written to a temporary name and renamed."""
     if not sources:
         return
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     scene = {}
     for source, size in sources.items():
-        file = cache_dir / f"{key}_{source}_{size}.npy"
+        file = cache_dir / f"{key}_{source}_{size}_{scene_digest(layouts, source, size, vlm)}.npy"
         if file.exists():
             scene[source] = np.load(file)
         else:
             encoder = encoder_factory() if source.startswith("vlm_") else None
             scene[source] = scene_for(layouts, source, size, encoder)
-            np.save(file, scene[source])
+            tmp = file.with_name(f"{file.name}.{os.getpid()}.tmp")
+            with open(tmp, "wb") as f:
+                np.save(f, scene[source])
+            os.replace(tmp, file)
     layouts.scene = scene
 
 
@@ -862,10 +887,14 @@ def main(argv=None):
                    "in every checkpoint")
     p.add_argument("--fixed-settings", help="a settings.yaml: skip tuning, test every method at the settings it gives per cell")
     p.add_argument("--scene-cache", help="folder of the cached scene arrays (default: checkpoints/scene/<sweep name>)")
+    p.add_argument("--vlm", default=SCENE_VLM_PATH, help="the pi0.5 checkpoint whose vision tokens vlm_* sources use "
+                   "(the trainer's --vlm; it is in the scene cache's file names)")
     p.add_argument("--precompute-scene", action="store_true",
                    help="fill the scene cache for every cell and exit, running no trials")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)
+    if args.precompute_scene and args.merge:
+        p.error("--precompute-scene runs no trials; it cannot be combined with --merge")
 
     sweep = load_sweep(args.sweep, args.module_seed)
     if args.tune_trials:
@@ -884,7 +913,7 @@ def main(argv=None):
 
         def encoder_factory():  # one encoder for the whole run, made when a vlm_* source first needs computing
             if not encoders:
-                encoders.append(SceneEncoder(device="cpu" if args.cpu or not torch.cuda.is_available() else "cuda"))
+                encoders.append(SceneEncoder(args.vlm, device="cpu" if args.cpu or not torch.cuda.is_available() else "cuda"))
             return encoders[0]
 
         try:
@@ -915,7 +944,7 @@ def run(args, sweep, out, encoder_factory=None):
     agent = make_agent(sweep["agent"])
     sources = scene_sources(adapters)
     cache_dir = Path(args.scene_cache) if args.scene_cache else cursor_paths.CHECKPOINTS / "scene" / sweep["name"]
-    scene_of = lambda layouts, key: attach_scene(layouts, sources, cache_dir, key, encoder_factory)  # noqa: E731
+    scene_of = lambda layouts, key: attach_scene(layouts, sources, cache_dir, key, encoder_factory, args.vlm)  # noqa: E731
     run_args = dict(sweep=sweep, tune_trials=sweep["trials"]["tune"], test_trials=sweep["trials"]["test"],
                     seed=sweep["seed"], agent=sweep["agent"], device=device)
 
@@ -1059,7 +1088,7 @@ def run(args, sweep, out, encoder_factory=None):
 
     if args.precompute_scene:
         if sweep["traces"]:
-            attach_scene(center_out(), sources, cache_dir / "showcase", "showcase", encoder_factory)
+            attach_scene(center_out(), sources, cache_dir / "showcase", "showcase", encoder_factory, args.vlm)
         return
     if not test:
         print("no cell could be run" + (f"; skipped: {skipped}" if skipped else ""))
@@ -1084,7 +1113,7 @@ def run(args, sweep, out, encoder_factory=None):
         fig_showcase(sweep, test, show, out / "figs")
     if sweep["traces"]:
         fig_traces(sweep, test, agent, policies, adapters, device, out / "figs",
-                   lambda layouts: attach_scene(layouts, sources, cache_dir / "showcase", "showcase", encoder_factory))
+                   lambda layouts: attach_scene(layouts, sources, cache_dir / "showcase", "showcase", encoder_factory, args.vlm))
 
     print(f"\n{sweep['name']}: test trials, tuned settings ({time.time() - tic:.0f}s). {focus} lead over the "
           f"best of {against}: points [95% CI]" + (f"; {len(skipped)} cells skipped" if skipped else ""))

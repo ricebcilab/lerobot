@@ -465,6 +465,10 @@ def scene_for(
     return np.asarray(tokens, dtype=np.float16)
 
 
+SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
+SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
+
+
 class SceneEncoder:
     """pi0.5's frozen vision tokens of rendered scenes. ``image_tokens`` are SigLIP's patch tokens after the
     multimodal projector (``embed_image``), the tokens pi0.5's prefix starts with; ``prefix_tokens`` are the
@@ -479,9 +483,9 @@ class SceneEncoder:
 
     def __init__(
         self,
-        path: str = "lerobot/pi05_base",
+        path: str = SCENE_VLM_PATH,
         device: str = "cuda",
-        prompt: str = "Move the cursor to the target.",
+        prompt: str = SCENE_PROMPT,
     ):
         self.path, self.device, self.prompt = path, device, prompt
         self._policy = None
