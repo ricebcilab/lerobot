@@ -90,6 +90,21 @@ def test_steering_imports_without_transformers():
     subprocess.run([sys.executable, "-c", code], check=True)  # nosec B603
 
 
+@pytest.mark.parametrize("where", ["dir", "repo"])
+def test_encoder_without_weights_raises_before_building_a_policy(where, tmp_path):
+    # PI05Policy.from_pretrained returns a randomly initialised policy when model.safetensors is missing; the
+    # encoder must refuse instead of producing tokens from random weights.
+    if where == "dir":
+        (tmp_path / "config.json").write_text("{}")
+        path = str(tmp_path)
+    else:
+        path = "lerobot/no_such_checkpoint"  # not in the local HF cache
+    enc = SceneEncoder(path=path, device="cpu")
+    with pytest.raises(FileNotFoundError, match="model.safetensors"):
+        enc.image_tokens(np.zeros((1, 3, 224, 224), np.uint8))
+    assert enc._policy is None
+
+
 @pytest.mark.skipif(
     os.environ.get("MARS_SCENE_REAL") != "1",
     reason="loads lerobot/pi05_base (14 GB); MARS_SCENE_REAL=1 to run",

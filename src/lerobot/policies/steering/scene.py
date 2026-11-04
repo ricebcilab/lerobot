@@ -19,6 +19,8 @@
 frozen vision tokens of the rendered layouts). pi0.5 and ``transformers`` are imported only when the encoder
 first runs, so this module imports without them."""
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -89,7 +91,8 @@ class SceneEncoder:
     differs, and return float16 ``[B, 256, 2048]`` on the CPU.
 
     Lazy: constructing it loads nothing; the first call loads ``path`` (``PI05Policy.from_pretrained``) and
-    imports pi0.5 and ``transformers``. ``close`` frees the policy."""
+    imports pi0.5 and ``transformers``, after checking that its ``model.safetensors`` is on disk. ``close``
+    frees the policy."""
 
     def __init__(
         self,
@@ -101,8 +104,25 @@ class SceneEncoder:
         self._policy = None
         self._prompt_ids: tuple[torch.Tensor, torch.Tensor] | None = None  # tokens, masks: [1, L]
 
+    def _check_weights(self) -> None:
+        """Raises unless ``path``'s ``model.safetensors`` is on disk (in the directory ``path``, or in the local
+        Hugging Face cache for a repo id): ``PI05Policy.from_pretrained`` returns a randomly initialised policy
+        when it cannot find the file, and its tokens would look like real ones."""
+        from huggingface_hub import try_to_load_from_cache
+
+        if Path(self.path).is_dir():
+            found = (Path(self.path) / "model.safetensors").is_file()
+        else:
+            found = isinstance(try_to_load_from_cache(self.path, "model.safetensors"), str)
+        if not found:
+            raise FileNotFoundError(
+                f"no model.safetensors for {self.path!r} (a directory, or a repo id in the local Hugging Face "
+                "cache); refusing to encode with randomly initialised weights"
+            )
+
     def _load(self):
         if self._policy is None:
+            self._check_weights()
             from transformers import AutoTokenizer
 
             from lerobot.policies.pi05.modeling_pi05 import PI05Policy
