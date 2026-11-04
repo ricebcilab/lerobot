@@ -36,6 +36,7 @@ from .configuration_steering import (
     validate_matrix,
 )
 from .modeling_steering import (
+    SCENE_SOURCES,
     AdaptedField,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
@@ -65,6 +66,7 @@ from .modeling_steering import (
     uniform_reference,
     user_field_loss,
 )
+from .scene import SceneEncoder, scene_for, scene_spec
 
 __all__ = [
     "ACTION_DIMS",
@@ -82,6 +84,8 @@ __all__ = [
     "N_ACTION_DIMS",
     "OPERATOR_DIM_GROUPS",
     "ReversalAdapter",
+    "SCENE_SOURCES",
+    "SceneEncoder",
     "TeleopSource",
     "apply_user_module",
     "build_reversal_adapter",
@@ -103,6 +107,8 @@ __all__ = [
     "reverse_flow",
     "rotation_about_z",
     "save_adapter_module",
+    "scene_for",
+    "scene_spec",
     "sinusoidal_time_embedding",
     "step_if_finite",
     "task_field_loss",

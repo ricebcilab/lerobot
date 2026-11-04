@@ -61,3 +61,21 @@ not pi0.5-specific: they steer any flow policy with pi0.5's sampler interface (a
 convention, and `steered_chunk(batch, commands)` serves a batch of commands. The
 cursor example drives its own policy through them (`FlowPolicy.sample_chunk`), so
 the robot and the cursor run one implementation of each method.
+
+`LearnedTaskModule`'s `token_source` picks where its scene tokens come from:
+`discs` (the default) encodes the obstacle discs, `obs["obstacles"]`, relative to
+the cursor `obs["pos"]`; the image sources read `obs["scene"][source]`, a per-layout array that
+`scene.py`'s `scene_for(layouts, source, size, encoder)` builds from the rendered
+layout (`render_layouts`), and `scene_spec(source, size)` gives the module's
+kwargs for it. `cnn` reads the render itself (uint8 `[B, 3, S, S]`) through a
+small CNN stem trained with the module; `vlm_image` reads pi0.5's frozen SigLIP
+tokens of the render (`embed_image`: the patch tokens after the multimodal
+projector, float16 `[B, 256, 2048]`: every render is resized to 224 px first, so
+the count does not depend on the render size); `vlm_prefix` reads the same
+image positions in the last hidden state of pi0.5's language model on the prefix
+(the image, then the fixed prompt "Move the cursor to the target.", without
+state tokens). `SceneEncoder` computes both from `lerobot/pi05_base`; it loads the
+policy (and imports pi0.5 and `transformers`) only on its first call, so the
+steering package imports without them, and `close()` frees it. The checkpoint is
+read from the local Hugging Face cache: on a machine without a valid HF token,
+run with `HF_HUB_OFFLINE=1`.
