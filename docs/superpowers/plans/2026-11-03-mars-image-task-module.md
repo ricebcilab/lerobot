@@ -28,7 +28,7 @@
 2. The wall's 0.015-radius discs after anti-aliased downsampling — must stay visible (darker than background along the wall) or the gate blames the module for the render. Test in Task 1.
 3. A module with an image `token_source` given an observation that has no matching scene (a sweep whose layouts were never attached, e.g. `grid.yaml` by mistake) — must raise naming the source, not run as the identity; `obs=None` (the LIBERO call) still runs. Test in Task 2.
 4. fp16 cached tokens fed to float32 projection weights — must work and match float32 input within tolerance. Test in Task 2.
-5. The sweep's scene cache key — must include cell, split, source and image size and must NOT include `--module-seed` (the layouts are the sweep's, not the module's), so seeds 1–2 reuse seed 0's cache and a different render size misses it. Test in Task 7.
+5. The sweep's scene cache key — must include cell, split, source, image size and a digest of the layout draw and render spec (and, for `vlm_*`, the encoder path and prompt), as the spec requires, and must NOT include `--module-seed` (the layouts are the sweep's, not the module's), so seeds 1–2 reuse seed 0's cache while a changed palette, draw or render size misses it. Test in Task 7.
 
 ---
 
@@ -453,7 +453,7 @@ git commit -m "MARS: one task module trained over several contexts" -m "Co-Autho
 
 **Interfaces:**
 - Consumes: `scene_for`, `SceneEncoder` (Task 3); `Layouts.scene` (Task 1); loaded `adapters` (`ReversalAdapter.task.token_source`, `.image_size`).
-- Produces: `scene_sources(adapters) -> dict[str, int]` (source → image size over every loaded task module with an image source); `attach_scene(layouts, sources: dict[str, int], cache_dir: Path, key: str, encoder_factory) -> None` (per source: `cache_dir / f"{key}_{source}_{size}.npy"` loaded if present, else computed with `scene_for` and saved; `encoder_factory()` called at most once per process, only for `vlm_*`); in the cell loop, `attach_scene(tune_layouts, ..., key=f"{cell_key(level, noises[0], axes)}_tune")` and `_test` likewise with `cache_dir = CHECKPOINTS / "scene" / sweep["name"]`; `--precompute-scene` (attach for every cell and exit before tuning); `--scene-cache DIR` override (default above). `--module-seed` does not enter the key.
+- Produces: `scene_sources(adapters) -> dict[str, int]` (source → image size over every loaded task module with an image source); `attach_scene(layouts, sources: dict[str, int], cache_dir: Path, key: str, encoder_factory) -> None` (per source: `cache_dir / f"{key}_{source}_{size}_{digest}.npy"`, the digest covering the layout draw, the render spec and, for `vlm_*`, the encoder path and prompt, loaded if present, else computed with `scene_for` and saved atomically; `encoder_factory()` called at most once per process, only for `vlm_*`); in the cell loop, `attach_scene(tune_layouts, ..., key=f"{cell_key(level, noises[0], axes)}_tune")` and `_test` likewise with `cache_dir = CHECKPOINTS / "scene" / sweep["name"]`; `--precompute-scene` (attach for every cell and exit before tuning); `--scene-cache DIR` override (default above). `--module-seed` does not enter the key.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -674,10 +674,12 @@ git commit -m "MARS: a report for the image task modules' gate and grid" -m "Co-
 - [ ] **Step 1: Write the job list for seed 0** — 10 lines, one per module, from the repo root, e.g.
 
 ```
-CUDA_VISIBLE_DEVICES=1 uv run --extra mars --extra pi python examples/pi05/mars/cursor/train/train_adapter.py --kind task --obstacle '{kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}' --user-module user_gain025y_expert_n100_s0 --corruption '{scale: [1.0, 0.25]}' --name image/task_disc_large_n300_s0_with_gain025y_vlm_image --token-source vlm_image --n-demos 300 --frozen-noise --seed 0
+CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 uv run --extra mars --extra pi python examples/pi05/mars/cursor/train/train_adapter.py --kind task --obstacle '{kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}' --user-module user_gain025y_expert_n100_s0 --corruption '{scale: [1.0, 0.25]}' --name image/task_disc_large_n300_s0_with_gain025y_vlm_image --token-source vlm_image --n-demos 300 --frozen-noise --seed 0
 ```
 
 (T3/T4/T5 with their user and corruption; the same four with `--token-source cnn` and `_cnn` names, no `--extra pi`; the two pooled: `--pooled pooled_s0.yaml --name image/task_all_n1200_s0_<source> --steps 80000`, the YAML's four entries = the four per-task lines' obstacle/user_module/corruption.) `pipeline.sh <seed>` modeled on `demo_time/pipeline.sh`: `vlm_*` jobs one per GPU at a time (each loads 14 GB), `cnn` jobs four per GPU; then `run_sweep.py --sweep grid_image --precompute-scene` (GPU, once), then the gate, then the parts, then the merge.
+
+- [ ] **Step 1b: Pre-flight before committing the GPUs** — with `HF_HUB_OFFLINE=1`, run `MARS_SCENE_REAL=1` on `tests/policies/steering/test_scene_encoder.py -k real` (real tokens differ across layouts and contexts), then one `vlm_image` and one `cnn` module at `--n-demos 300 --steps 100`, timing the steps and the peak memory. Re-estimate the whole run from those timings and tell the user before Step 2.
 
 - [ ] **Step 2: Train seed 0's ten modules**
 
@@ -687,13 +689,13 @@ Expected: ten `adapter.pt` under `checkpoints/adapters/image/`; each `train_log.
 - [ ] **Step 3: Run the gate**
 
 Run: `cd examples/pi05/mars/cursor && CUDA_VISIBLE_DEVICES=1 uv run --extra mars --extra pi python run_sweep.py --sweep grid_task_check_image --precompute-scene && uv run --extra mars python run_sweep.py --sweep grid_task_check_image`
-Then: `uv run --extra mars python report_grid_image.py --check grid_task_check_image --grid grid_image_s0 --results ../results --out ../results/sim/reports/grid_image` is for later; for the gate alone read `results/sim/sweeps/grid_task_check_image/grid_summary.md`.
-Expected: per context, every `oracle_task_<x>` row hits ≥ 80% with collision ≤ `oracle_task` + 10. A failing per-task module goes back to Step 2 with the render ablation (display palette, `--render-size 448`), then the spec's agent-centered fallback — stop and report to the user before building the fallback.
+Then: `uv run --extra mars python report_grid_image.py --check grid_task_check_image --results ../results --out ../results/sim/reports/grid_image_gate`.
+Expected: per context, every `oracle_task_<x>` row hits ≥ 80% with collision ≤ `oracle_task` + 10. A failing per-task module goes back to Step 2 with the render ablation (the display palette, by editing `RENDER_PALETTE`, which changes the scene cache key; `--render-size 448` applies to `cnn` only, since the encoder resizes every render to 224 for `vlm_*`), then the spec's agent-centered fallback — stop and report to the user before building the fallback.
 
 - [ ] **Step 4: Run the grid at seed 0**
 
 Run: `CUDA_VISIBLE_DEVICES=1 uv run --extra mars --extra pi python run_sweep.py --sweep grid_image --precompute-scene`, then the 16 parts `run_sweep.py --sweep grid_image --cells <cell> --out grid_image_s0_parts/<cell>` in the background (two GPUs alternating, as the pipeline does), then `--merge grid_image_s0_parts/* --out grid_image_s0`.
-Expected: `results/sim/sweeps/grid_image_s0/test.json` with 16 cells and the six methods; `teleop` outcomes identical to `grid_s0`'s cell for cell (the report's join checks it).
+Expected: `results/sim/sweeps/grid_image_s0/test.json` with 16 cells and the six methods; `teleop` outcomes identical to `grid_s0`'s cell for cell (the report's join checks it), and `mars` close to `grid_s0`'s per cell (a cheap check on the whole sweep path).
 
 - [ ] **Step 5: Record** — in the pipeline log, the wall time per stage; nothing to commit (results are git-ignored). Post the gate table and the per-context means to the user before starting seeds 1–2.
 
