@@ -207,3 +207,34 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(ckpt_dir, mo
     data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
                                        *corruption_spec(args.corruption), args.p_free)
     assert 0 < n == args.n_demos == len(data["train"].sampler.lengths)
+
+
+def test_train_an_image_task_module_from_the_render(ckpt_dir):
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_cnn",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn",
+                                                  "--render-size", "64", *COMMON]))
+    ckpt = torch.load(ckpt_dir / "t_cnn" / "adapter.pt")
+    assert ckpt["config"]["token_source"] == "cnn" and ckpt["config"]["image_size"] == 64 and ckpt["meta"]["token_source"] == "cnn"
+    loaded = ReversalAdapter.load(ckpt_dir / "t_cnn" / "adapter.pt")
+    assert loaded.task.token_source == "cnn"
+    log = json.loads((ckpt_dir / "t_cnn" / "train_log.json").read_text())["log"]
+    assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(log[-1])
+
+
+def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):
+    calls = []
+    class Stub:
+        def __init__(self, *a, **k): pass
+        def image_tokens(self, images):
+            calls.append(len(images))
+            return np.zeros((len(images), 256, 2048), np.float16)
+
+        def close(self): calls.append("closed")
+    monkeypatch.setattr(train_adapter, "SceneEncoder", Stub)
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_vlm",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "vlm_image",
+                                                  "--render-size", "56", *COMMON]))
+    assert calls[-1] == "closed" and len(calls) == 3                      # train split, val split, closed
+    assert torch.load(ckpt_dir / "t_vlm" / "adapter.pt")["config"]["scene_dim"] == 2048

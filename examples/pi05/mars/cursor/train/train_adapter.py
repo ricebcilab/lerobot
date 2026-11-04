@@ -39,6 +39,8 @@ adapted field, on the policy's own interpolation x_t = (1 - t) z + t a,
 
 with the policy's goal dropout, so the adapted field reproduces the detours with the goal given and
 hidden alike; a share `p_free` of the layouts has no obstacle, where the module should be the identity.
+With `--token-source` vlm_image / vlm_prefix / cnn the module reads the obstacles from the rendered scene
+(`--render-size` pixels) instead of the disc parameters: pi0.5's vision tokens (`--vlm`) or a CNN trained with it.
 The user's frozen module is in the loop through lambda_field x the field regression above through both
 modules, on that user's commands around the obstacles (the layouts with the obstacle only):
 
@@ -72,15 +74,16 @@ from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
 from cursor_sa.demos import DemoConfig, DemoSampler, make_demos, plan_reach  # noqa: E402
-from cursor_sa.env import Layouts, TaskConfig, obstacle_spec, sample_layouts  # noqa: E402
+from cursor_sa.env import SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, sample_layouts  # noqa: E402
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
 from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (heading_cosine, regenerate, save_adapter_module, task_field_loss,  # noqa: E402
-                                             train_module, user_field_loss)
+from lerobot.policies.steering import (SCENE_SOURCES, SceneEncoder, heading_cosine, regenerate,  # noqa: E402
+                                       save_adapter_module, scene_for, scene_spec, task_field_loss, train_module,
+                                       user_field_loss)
 
 # ---------------------------------------------------------------- data
 
@@ -159,9 +162,11 @@ class ExpertData:
         return obs, chunk, self.push[i, k], self.core[i, k], i, k
 
 
-def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=0.0):
+def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=0.0, encoder=None):
     """ExpertData for the train and val splits of a task: the train split --n-demos demonstrations, or with
-    --demo-seconds as many as fit in that much demonstrating (`budget_demos`; args.n_demos becomes their count)."""
+    --demo-seconds as many as fit in that much demonstrating (`budget_demos`; args.n_demos becomes their count).
+    With an image --token-source each split's layouts carry that source's scene arrays (`encoder` for vlm_*; the
+    caller closes it)."""
     out = {}
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
         if split == "train" and args.demo_seconds is not None:
@@ -172,6 +177,8 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             layouts, task = layouts_for(args, obstacle, rng, n, p_free)
             tic = time.time()
             actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
+        if args.token_source != "discs":
+            layouts.scene = {args.token_source: scene_for(layouts, args.token_source, args.render_size, encoder)}
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
                                 frozen_noise=split == "train" and args.frozen_noise)
         print(f"{split}: {n} demonstrations ({lengths.sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
@@ -298,6 +305,11 @@ def collides(obs, chunk):
     return ((dist < r) & obs["obstacle_mask"][:, None]).any(-1).any(-1)
 
 
+def rows_of(obs, rows):
+    """The observation's `rows`; its scene (a dict source -> tensor) too."""
+    return {k: rows_of(v, rows) if isinstance(v, dict) else v[rows] for k, v in obs.items()}
+
+
 @torch.no_grad()
 def chunk_collision(policy, adapter, obs, steps):
     """Share of the obstacle trials among `obs` whose chunk, sampled from the (adapted) forward flow,
@@ -305,7 +317,7 @@ def chunk_collision(policy, adapter, obs, steps):
     rows = obs["obstacle_mask"].any(1)
     if not rows.any():
         return float("nan")
-    obs = {k: v[rows] for k, v in obs.items()}
+    obs = rows_of(obs, rows)
     z = torch.randn(len(obs["pos"]), policy.horizon, 2, device=obs["pos"].device)
     return collides(obs, forward_flow(policy, obs, z, 0.0, 1.0, steps, adapter) * policy.action_scale).float().mean().item()
 
@@ -327,7 +339,7 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
         out[f"heading_cos_{name}"] = float(heading_cosine(regen, chunk, n_dims=2)[active].mean())
         if obs["obstacle_mask"].any():
             rows = active & obs["obstacle_mask"].any(1)
-            out[f"collide_{name}"] = float(collides({k_: v[rows] for k_, v in obs.items()}, regen[rows]).float().mean())
+            out[f"collide_{name}"] = float(collides(rows_of(obs, rows), regen[rows]).float().mean())
     return out
 
 
@@ -336,9 +348,14 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
 
 def train_task(args, policy, device, rng):
     user = ReversalAdapter.load(adapter_path(args.user_module), device).user.requires_grad_(False)
-    data = expert_splits(args, args.obstacle, policy, device, rng, *corruption_spec(args.corruption), args.p_free)
+    encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
+    try:
+        data = expert_splits(args, args.obstacle, policy, device, rng, *corruption_spec(args.corruption), args.p_free, encoder)
+    finally:
+        if encoder is not None:
+            encoder.close()
     samplers = {split: d.sampler for split, d in data.items()}
-    task = TaskModule(policy.horizon, d=args.d, layers=args.layers).to(device)
+    task = TaskModule(policy.horizon, d=args.d, layers=args.layers, **scene_spec(args.token_source, args.render_size)).to(device)
     adapted = ReversalAdapter(task=task)
 
     def batch_loss(step):
@@ -410,7 +427,8 @@ def save(args, kind, module, log):
     """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     out = adapter_dir(args.name)
-    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle))
+    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle,
+                                                              token_source=args.token_source, render_size=args.render_size))
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), log=log), f, indent=1)
     print(f"saved {path}")
@@ -457,6 +475,12 @@ def parse_args(argv=None):
     p.add_argument("--p-free", type=float, default=0.25, help="task: share of layouts without the obstacle")
     p.add_argument("--goal-dropout", type=float, default=0.25, help="task: as the policy was trained")
     p.add_argument("--lambda-id", type=float, default=1e-3, help="task: pull of A, b toward the identity")
+    p.add_argument("--token-source", choices=SCENE_SOURCES, default="discs",
+                   help="task: what the module reads the obstacles from: the disc parameters, or the rendered scene "
+                        "through pi0.5's vision tokens (vlm_image, vlm_prefix) or a CNN trained with the module (cnn)")
+    p.add_argument("--render-size", type=int, default=SCENE_SIZE, help="task: side of the rendered scene in pixels (cnn: a multiple of 16)")
+    p.add_argument("--vlm", default="lerobot/pi05_base", help="task: the pi0.5 checkpoint whose vision tokens vlm_* sources use "
+                                                              "(loaded offline from the HF cache)")
     p.add_argument("--d", type=int, default=128, help="task: width")
     p.add_argument("--layers", type=int, default=2, help="task: cross-attention layers")
     p.add_argument("--targets", type=int, nargs=2, default=[4, 4], help="min and max targets per layout")
