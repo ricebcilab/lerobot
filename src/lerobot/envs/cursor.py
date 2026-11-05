@@ -573,7 +573,7 @@ def _draw_window(
 ) -> np.ndarray:
     """Trial b's square window of the screen as uint8 [3, size, size]: the window's top-left corner is the screen
     point `origin`, its side `side` screens; every radius is divided by `side`. What lies outside the screen is
-    background. The cursor mark, if any, is drawn last. Pillow is imported here."""
+    background (cut at the screen's edge). The cursor mark, if any, is drawn last. Pillow is imported here."""
     from PIL import Image, ImageDraw
 
     big = size * supersample
@@ -599,6 +599,18 @@ def _draw_window(
             outline=RENDER_PALETTE["target_edge"],
             width=2 * supersample,
         )
+    # what lies beyond the unit screen is background, as the overhead picture cuts it at the image border
+    x0, x1 = round(-ox * scale), round((1 - ox) * scale)
+    y0, y1 = round(-oy * scale), round((1 - oy) * scale)
+    bg = RENDER_PALETTE["bg"]
+    if x0 > 0:
+        draw.rectangle((0, 0, x0 - 1, big), fill=bg)
+    if x1 < big:
+        draw.rectangle((x1, 0, big, big), fill=bg)
+    if y0 > 0:
+        draw.rectangle((0, 0, big, y0 - 1), fill=bg)
+    if y1 < big:
+        draw.rectangle((0, y1, big, big), fill=bg)
     if cursor is not None:
         px, py = (cursor[0] - ox) * scale, (cursor[1] - oy) * scale
         rc = max(RENDER_CURSOR_RADIUS / side * size, RENDER_MIN_RADIUS) * supersample

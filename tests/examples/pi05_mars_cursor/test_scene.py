@@ -150,3 +150,43 @@ def test_a_wrist_window_as_wide_as_the_screen_at_its_centre_is_the_overhead_view
     ):
         with pytest.raises(ValueError):
             bad()
+
+
+def test_the_wrist_view_cuts_a_disc_at_the_screen_edge():
+    ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
+    lay = sample_layouts(
+        np.random.default_rng(0), 40, 4, TaskConfig(min_reach=0.35, max_reach=0.5, obstacle=ring)
+    )
+    xy, r = lay.obstacles[..., :2], lay.obstacles[..., 2]
+    span, found = 0.5, None
+    for b, k in np.argwhere(lay.obstacle_mask):
+        for axis in (0, 1):
+            c, rad = xy[b, k, axis], r[b, k]
+            for edge in (0.0, 1.0):
+                if not abs(c - edge) < rad:
+                    continue  # the disc does not straddle this edge
+                keep = (edge, c + rad) if edge == 0.0 else (c - rad, edge)  # the part on the screen
+                cut = (c - rad, edge) if edge == 0.0 else (edge, c + rad)  # the part beyond it
+                inside, outside = xy[b, k].copy(), xy[b, k].copy()
+                inside[axis], outside[axis] = np.mean(keep), np.mean(cut)
+                other = 1 - axis
+                inside[other] = outside[other] = np.clip(xy[b, k, other], 0.05, 0.95)
+                if all(np.hypot(*(p - xy[b, k])) < 0.9 * rad for p in (inside, outside)):
+                    found = b, axis, edge, inside, outside
+                    break
+            if found:
+                break
+        if found:
+            break
+    assert found, "no sampled disc straddles a screen edge"
+    b, axis, edge, inside, outside = found
+    pos = inside.copy()
+    pos[axis] = edge + (0.1 if edge == 0.0 else -0.1)  # the cursor just inside that edge
+    view = render_views(lay[[b]], pos[None], span)[0, 1]
+
+    def pixel(point):  # a screen point -> its wrist-window pixel
+        col, row = ((point - pos) / span + 0.5) * 224
+        return view[:, int(row), int(col)]
+
+    assert _near(pixel(inside), RENDER_PALETTE["obstacle"])
+    assert (pixel(outside) == 255).all()
