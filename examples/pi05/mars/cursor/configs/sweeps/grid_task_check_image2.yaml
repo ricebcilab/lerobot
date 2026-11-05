@@ -1,15 +1,18 @@
 # The round-2 image task modules' go/no-go, before the grid (all four tasks): grid_task_check_image's
-# arms with the task module reading each obstacle token's offset from the cursor (vlm_image, relative token geometry, _rel) instead of a
+# arms with the task module reading each obstacle token's offset from the cursor (vlm_image, relative token
+# geometry, _rel) instead of a
 # learned position; one module per task, plus one module pooled over the four tasks (_rel_all),
 # and a new row, oracle_ft: the task's fine-tuned policy (flow_goaldrop_<task>_ft_n300_s0, grid_ft's) with no module,
 # the bar the image module has to meet. Oracle: the expert_chunk agent in teleop, readout off; policy: the goal-hidden
 # policy alone.
-# Gate, per context, on oracle_task_rel's hit rate against oracle_task (the parametric module) and oracle_ft:
-#   pass      within 10 points of oracle_task, no fewer hits than oracle_ft, collisions at most oracle_task's + 10 points
-#   marginal  within 10 points of oracle_task but below oracle_ft, or collisions over the +10 bar
-#   FAIL      more than 10 points below oracle_task
-# A goal-hidden policy_task_rel that hits more than 10 points above policy_task is flagged whatever the verdict (the
-# module is steering by something other than the obstacles).
+# Gate, per context, on oracle_task_rel against oracle_task (the parametric module) and oracle_ft (the fine-tuned
+# policy, the floor); hits and collisions are rates over the test trials:
+#   pass      hits within 10 points of oracle_task, or above it, and collisions at most oracle_task's + 10 points
+#   marginal  more hits than oracle_ft but more than 10 points below oracle_task, collisions within the same +10 bar
+#   FAIL      hits at or below oracle_ft's, or collisions more than 10 points over oracle_task's
+# (On T5 the parametric module itself hits 74.2%, so "within 10 points" there is 64.2% or better.)
+# A goal-hidden policy_task_rel that hits more than 10 points above policy_task is flagged whatever the verdict
+# (the module is steering by something other than the obstacles).
 #   python run_sweep.py --sweep grid_task_check_image2 --precompute-scene  # fills checkpoints/scene/grid_task_check_image2
 #   python run_sweep.py --sweep grid_task_check_image2                     # a few minutes on a free GPU
 # The vlm_* tokens need `uv run --extra pi` with CUDA_VISIBLE_DEVICES set and HF_HUB_OFFLINE=1.
