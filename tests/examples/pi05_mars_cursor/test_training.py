@@ -1,6 +1,7 @@
 """The adapter trainer: user modules from expert labels, task modules with a user module in the loop."""
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ import torch
 
 from cursor_sa.readout import corruption_spec
 from cursor_sa.env import TaskConfig, obstacle_spec, sample_layouts
-from cursor_sa.demos import DemoSampler, make_demos
+from cursor_sa.demos import DemoSampler, make_demos, replay
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
 from train import train_adapter
@@ -354,3 +355,60 @@ def test_the_pooled_trainer_alternates_the_contexts_each_with_its_own_user_modul
                                                   "--render-size", "64", "--lambda-field", "0.1", *COMMON, "--steps", "6"]))
     assert drawn == [step % 2 for step in range(1, 7)]  # step % len(entries), the steps counting from 1
     assert used == [POOLED[j][0] for j in drawn] == ["u_gain", "u_rot"] * 3  # each context with its own user module
+
+
+def test_planned_steps_resample_a_half_speed_path_and_drop_an_odd_final_control_step():
+    path = np.cumsum(np.repeat([[0.01, 0.0]], 6, axis=0), axis=0)          # 6 positions: 5 control steps
+    assert train_adapter.planned_steps(path).shape == (2, 2)                # control steps 0-1 and 2-3; the 5th is half a step
+    assert np.allclose(train_adapter.planned_steps(path), [[0.02, 0.0], [0.02, 0.0]])
+    seven = np.vstack([path, path[-1:] + [0.01, 0.0]])                      # 7 positions: 6 control steps, 3 planned
+    assert train_adapter.planned_steps(seven).shape == (3, 2)
+
+
+def _tiny_teacher(ckpt_dir):
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "t",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON]))
+
+
+def test_teacher_demonstrations_are_the_teachers_hits_at_the_policys_step_rate(ckpt_dir):
+    _tiny_teacher(ckpt_dir)
+    args = train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "s", "--user-module", "u",
+                                     "--corruption", "{rotation_deg: 60}", "--teacher", "t", "--teacher-chunk", "8", *COMMON])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy = FlowPolicy.load(train_adapter.policy_path(train_adapter.config.load_arm("base.yaml")["model"]), device)
+    layouts, task, actions, lengths, info = train_adapter.teacher_demos(args, args.obstacle, policy, device, np.random.default_rng(0), 4, args.p_free)
+    print(f"teacher keep rate: {info['kept']} kept / {info['drawn']} drawn, {info['outcomes']}")
+    assert len(layouts) == 4 and info["kept"] == 4 and info["drawn"] >= 4 and info["drawn"] % 8 == 0
+    assert all(r["outcome"] == "hit" for r in info["records"]) and sum(info["outcomes"].values()) == info["drawn"]
+    for i, r in enumerate(info["records"]):
+        path = np.asarray(r["path"])
+        assert lengths[i] == (len(path) - 1) // 2 and np.allclose(actions[i, :lengths[i]], train_adapter.planned_steps(path))
+        assert np.allclose(np.abs(np.diff(path[::2], axis=0)).sum(), np.abs(np.diff(path, axis=0)).sum(), atol=2e-3)  # same travel, half the steps
+    assert np.all(actions[np.arange(actions.shape[1])[None] >= lengths[:, None]] == 0)
+    assert replay(actions, layouts, replace(task, cursor_noise=0.0)).success.all()        # a valid demonstration at the policy's rate
+
+
+def test_train_a_task_module_on_teacher_demonstrations(ckpt_dir):
+    _tiny_teacher(ckpt_dir)
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "s",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON,
+                                                  "--teacher", "t", "--teacher-chunk", "8", "--n-demos", "4", "--val-demos", "2"]))
+    ckpt = torch.load(ckpt_dir / "s" / "adapter.pt")
+    assert ckpt["meta"]["teacher"] == "t" and ckpt["meta"]["teacher_demos"]["train"]["kept"] == 4 and ckpt["meta"]["teacher_demos"]["val"]["kept"] == 2
+    assert {"val_fm", "collide_composed"} <= set(json.loads((ckpt_dir / "s" / "train_log.json").read_text())["log"][-1])
+    base = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "x", "--user-module", "u", "--corruption", "{rotation_deg: 60}"]
+    for bad in ([*base, "--teacher", "t", "--demo-seconds", "10"],                                  # a time budget is the scripted expert's
+                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--teacher", "t"],   # user modules calibrate on the open field
+                ["--kind", "task", "--pooled", "p.yaml", "--name", "x", "--teacher", "t"]):           # no pooled teacher run
+        with pytest.raises(SystemExit):
+            train_adapter.parse_args(bad)
+
+
+def test_an_image_module_is_refused_as_a_teacher(ckpt_dir):
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_cnn",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn", "--render-size", "64", *COMMON]))
+    with pytest.raises(ValueError, match="discs"):
+        train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "s",
+                                                      "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON, "--teacher", "t_cnn", "--n-demos", "2", "--val-demos", "2"]))

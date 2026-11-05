@@ -53,6 +53,12 @@ user module in the lambda_field term; batches alternate between the entries. The
 (suffixed _0, _1, ...) and, under the unsuffixed names, its mean over the entries. A single-context run is the
 one-entry case.
 
+TEACHER: `--teacher NAME` (task) swaps the scripted expert for a parametric task module's demonstrations: that
+module's `oracle_task` rollouts (the gate's arm with a clean readout and the expert-chunk agent) on random layouts of
+the task, their hits only. The rollout runs at half speed, two control steps per planned step, so its path is resampled
+to the planned steps (`planned_steps`), the policy's own step rate, which is the rate a module trained on them acts at.
+The student learns what the teacher's composed field does, with the teacher's own mistakes (non-hits) left out.
+
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
 commands; `--frozen-noise` draws it once per demonstration step instead, as a recorded calibration has one
@@ -78,7 +84,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cursor_sa import config  # noqa: E402
-from cursor_sa.agents import ExpertAgent  # noqa: E402
+from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
 from cursor_sa.demos import DemoConfig, DemoSampler, make_demos, plan_reach  # noqa: E402
 from cursor_sa.env import SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, sample_layouts  # noqa: E402
@@ -103,6 +109,52 @@ def layouts_for(args, obstacle, rng, n, p_free=0.0):
     if n_free:
         parts.append(sample_layouts(rng, n_free, tuple(args.targets), replace(task, obstacle=None)))
     return (Layouts.concat(parts) if len(parts) > 1 else parts[0]), task
+
+
+def planned_steps(path):
+    """The planned steps a `gain_mode: time, speed_gain: 0.5` rollout executed from its path (a position per control
+    step): the gate's arm plays each planned step over two control steps, so every second position is a planned
+    one. An odd final control step is half a planned step inside the hold and is dropped."""
+    return np.diff(np.asarray(path)[::2], axis=0)
+
+
+def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
+    """n hits of the teacher's `oracle_task` rollouts (`--teacher`) as demonstrations: random layouts of the task
+    run `--teacher-chunk` at a time under the gate's arm (teleop, a clean readout, the expert-chunk agent) with the
+    teacher in the reversal, the hits kept until n are. Returns the layouts, the task, the actions [n, L, 2] (the
+    planned steps, zero after each demonstration's length), the lengths [n] and info: drawn, kept, outcomes (counts
+    over everything drawn) and records (the kept trials')."""
+    adapter = ReversalAdapter.load(adapter_path(args.teacher), device)
+    if adapter.task is None or adapter.task.token_source != "discs":
+        raise ValueError(f"--teacher must be a parametric (discs) task module: {args.teacher} has "
+                         f"{'no task module' if adapter.task is None else 'token source ' + adapter.task.token_source}")
+    arm = config.load_arm("condition_grid.yaml", dict(
+        model=args.model or config.load_arm("base.yaml")["model"], mode="teleop", reversal_adapter={"user": None, "task": args.teacher},
+        obstacle=obstacle, corruption=None, targets=list(args.targets), reach=list(args.reach)))
+    assert (arm["mode"], arm["gain_mode"], arm["speed_gain"], arm["execute"]) == ("teleop", "time", 0.5, 2), (
+        "the teacher's rollout must play each planned step over two control steps (teleop, gain_mode time, speed_gain 0.5, "
+        f"execute 2): `planned_steps` resamples by that pacing; got {arm['mode']}, {arm['gain_mode']}, {arm['speed_gain']}, {arm['execute']}")
+    assert arm_task(arm).obstacle == TaskConfig(obstacle=obstacle).obstacle, "the rollouts must run on the trainer's task"
+    tic, parts, records, drawn, outcomes = time.time(), [], [], 0, {}
+    while len(records) < n:
+        layouts, task = layouts_for(args, obstacle, rng, args.teacher_chunk, p_free)
+        trials = run_trials(arm, layouts, ExpertChunkAgent(), readout_for(arm, rng, off=True), policy, {args.teacher: adapter}, device)
+        drawn += len(layouts)
+        for r in trials:
+            outcomes[r["outcome"]] = outcomes.get(r["outcome"], 0) + 1
+        hits = [i for i, r in enumerate(trials) if r["outcome"] == "hit"]
+        if hits:
+            parts.append(layouts[np.array(hits)])
+            records += [trials[i] for i in hits]
+    records = records[:n]
+    layouts = (Layouts.concat(parts) if len(parts) > 1 else parts[0])[np.arange(n)]
+    steps = [planned_steps(r["path"]) for r in records]
+    lengths = np.array([len(s) for s in steps])
+    actions = np.zeros((n, lengths.max(), 2))
+    for i, s in enumerate(steps):
+        actions[i, :len(s)] = s
+    print(f"teacher {args.teacher}: kept {n} of {drawn} rollouts {outcomes} ({time.time() - tic:.0f}s)", flush=True)
+    return layouts, task, actions, lengths, dict(drawn=drawn, kept=n, outcomes=outcomes, records=records)
 
 
 def budget_demos(args, obstacle, rng, seconds, p_free=0.0, chunk=500):
@@ -172,11 +224,16 @@ class ExpertData:
 def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=0.0, encoder=None):
     """ExpertData for the train and val splits of a task: the train split --n-demos demonstrations, or with
     --demo-seconds as many as fit in that much demonstrating (`budget_demos`; args.n_demos becomes their count).
-    With an image --token-source each split's layouts carry that source's scene arrays (`encoder` for vlm_*; the
+    With --teacher both splits are the teacher's hits instead (`teacher_demos`; their counts go to
+    args.teacher_demos). With an image --token-source each split's layouts carry that source's scene arrays (`encoder` for vlm_*; the
     caller closes it)."""
-    out = {}
+    out, args.teacher_demos = {}, {}
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
-        if split == "train" and args.demo_seconds is not None:
+        if args.teacher:
+            tic = time.time()
+            layouts, task, actions, lengths, info = teacher_demos(args, obstacle, policy, device, rng, n, p_free)
+            args.teacher_demos[split] = {k: v for k, v in info.items() if k != "records"}
+        elif split == "train" and args.demo_seconds is not None:
             tic = time.time()
             layouts, task, actions, lengths = budget_demos(args, obstacle, rng, args.demo_seconds, p_free)
             args.n_demos = n = len(layouts)
@@ -465,7 +522,8 @@ def save(args, kind, module, log):
     out = adapter_dir(args.name)
     path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
-                                                              token_geometry=args.token_geometry))
+                                                              token_geometry=args.token_geometry,
+                                                              teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None)))
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), log=log), f, indent=1)
     print(f"saved {path}")
@@ -520,6 +578,9 @@ def parse_args(argv=None):
     p.add_argument("--token-geometry", choices=TOKEN_GEOMETRIES, default="absolute",
                    help="task: relative puts each scene token's offset from the cursor into the token (vlm_image, cnn) "
                         "instead of a learned position")
+    p.add_argument("--teacher", help="task: demonstrations are this parametric task module's oracle_task rollouts (hits only, "
+                   "resampled to the policy's step rate) instead of the scripted expert's")
+    p.add_argument("--teacher-chunk", type=int, default=500, help="task: layouts per teacher rollout batch")
     p.add_argument("--render-size", type=int, default=SCENE_SIZE, help="task: side of the rendered scene in pixels (cnn: a multiple of 16)")
     p.add_argument("--vlm", default="lerobot/pi05_base", help="task: the pi0.5 checkpoint whose vision tokens vlm_* sources use "
                                                               "(loaded offline from the HF cache)")
@@ -544,6 +605,10 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.teacher and (args.kind != "task" or args.pooled):
+        p.error("--teacher is for a single-context --kind task (user modules calibrate on the open field; no pooled teacher run)")
+    if args.teacher and args.demo_seconds is not None:
+        p.error("--teacher draws --n-demos hits: a --demo-seconds budget is the scripted expert's")
     if args.token_geometry == "relative" and args.token_source in ("discs", "vlm_prefix"):
         p.error("--token-geometry relative needs screen tokens: --token-source vlm_image or cnn")
     if args.pooled:
