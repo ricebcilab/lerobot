@@ -534,6 +534,18 @@ def test_image_sweep_configs_resolve_every_arm_per_cell():
     assert method_arm(seeded, "mars_vlm_all", "U1xT2")["learned_adapter"]["task"] == "image/task_all_n1200_s2_vlm_image"
     base = load_sweep(config.CONFIG_DIR / "sweeps" / "grid.yaml")
     assert grid["seed"] == base["seed"] and grid["trials"] == base["trials"] and {k for k, c in grid["grid"]["cells"].items() if c["train"]} == {k for k, c in base["grid"]["cells"].items() if c["train"] and c["task"] != "T1"}
+    quick = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_image2_quick.yaml")
+    assert set(quick["grid"]["tasks"]) == {"T2", "T4"} and quick["focus"] == "oracle_task_rel" and quick["against"] == ["oracle_task", "oracle_ft"]
+    assert set(quick["methods"]) == {"oracle", "oracle_task", "oracle_ft", "oracle_task_rel", "oracle_task_teach_rel", "policy", "policy_task", "policy_task_rel", "policy_task_teach_rel"}
+    assert method_arm(quick, "oracle_ft", "U0xT4")["model"] == "flow_goaldrop_ring_goal_ft_n300_s0" and method_arm(quick, "oracle_ft", "U0xT4")["learned_adapter"] is None
+    assert method_arm(quick, "oracle_task_rel", "U0xT2")["learned_adapter"]["task"] == "image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel"
+    assert method_arm(quick, "oracle_task_teach_rel", "U0xT4")["learned_adapter"]["task"] == "image/task_ring_goal_n10000_s0_with_rot60_vlm_image_teacher_rel"
+    assert quick["seed"] == check["seed"] and quick["trials"] == check["trials"] and quick["arm"] == check["arm"] and quick["agent"] == check["agent"]
+    full = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_image2.yaml")
+    assert set(full["grid"]["tasks"]) == {"T2", "T3", "T4", "T5"} and set(full["methods"]) == {"oracle", "oracle_task", "oracle_ft", "oracle_task_rel", "oracle_task_rel_all", "policy", "policy_task", "policy_task_rel", "policy_task_rel_all"}
+    assert method_arm(full, "oracle_ft", "U0xT3")["model"] == "flow_goaldrop_wall_gap_ft_n300_s0"
+    assert method_arm(full, "oracle_task_rel", "U0xT5")["learned_adapter"]["task"] == "image/task_ring_start_n300_s0_with_curl20_vlm_image_rel"
+    assert method_arm(full, "oracle_task_rel_all", "U0xT3")["learned_adapter"]["task"] == "image/task_all_n1200_s0_vlm_image_rel"
 
 
 def test_precompute_scene_with_merge_is_rejected(tmp_path):
