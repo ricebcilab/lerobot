@@ -3,7 +3,7 @@ import hashlib
 import numpy as np
 import pytest
 import torch
-from cursor_sa.demos import DemoSampler, make_demos
+from cursor_sa.demos import DemoSampler, frame_steps, make_demos
 from cursor_sa.env import (
     RENDER_CURSOR,
     RENDER_CURSOR_RADIUS,
@@ -190,3 +190,50 @@ def test_the_wrist_view_cuts_a_disc_at_the_screen_edge():
 
     assert _near(pixel(inside), RENDER_PALETTE["obstacle"])
     assert (pixel(outside) == 255).all()
+
+
+def test_frame_steps_cover_every_demonstration_at_the_stride():
+    demo, step, start = frame_steps(np.array([5, 0, 4, 1]), 2)
+    assert (
+        demo.tolist() == [0, 0, 0, 2, 2, 3]
+        and step.tolist() == [0, 2, 4, 0, 2, 0]
+        and start.tolist() == [0, 3, 3, 5]
+    )
+    assert frame_steps(np.array([3]), 1)[1].tolist() == [0, 1, 2]
+
+
+def test_the_sampler_reads_each_samples_own_frame():
+    rng, task, policy = np.random.default_rng(0), TaskConfig(min_reach=0.35, max_reach=0.5), FlowPolicy()
+    lay = sample_layouts(rng, 6, 4, task)
+    actions, lengths = make_demos(rng, lay, task)
+    demo, step, start = frame_steps(lengths, 2)
+    tokens = torch.stack([torch.as_tensor(demo), torch.as_tensor(step)], -1).float()[
+        :, None
+    ]  # each frame names its demo and step
+    sampler = DemoSampler(
+        lay, actions, lengths, policy.horizon, policy.hist, "cpu", frames={"vlm_views": (tokens, start, 2)}
+    )
+    obs, _, i, k = sampler.sample(512, indexed=True)
+    assert (k % 2 == 0).all() and (k < sampler.lengths[i]).all() and set(k.tolist()) >= {0, 2, 4}
+    got = obs["scene"]["vlm_views"][:, 0]
+    assert torch.equal(got[:, 0].long(), i) and torch.equal(got[:, 1].long(), k)
+    torch.testing.assert_close(obs["pos"], sampler.pos[i, k])
+    plain = DemoSampler(lay, actions, lengths, policy.horizon, policy.hist, "cpu")
+    assert "scene" not in plain.sample(8)[0]
+    torch.manual_seed(5)
+    a = plain.sample(64, indexed=True)
+    torch.manual_seed(5)
+    b = DemoSampler(lay, actions, lengths, policy.horizon, policy.hist, "cpu", frames=None).sample(
+        64, indexed=True
+    )
+    assert torch.equal(a[3], b[3]) and (a[3] % 2 == 1).any()  # no frames: every step, the same draws
+    with pytest.raises(ValueError):
+        DemoSampler(
+            lay,
+            actions,
+            lengths,
+            policy.horizon,
+            policy.hist,
+            "cpu",
+            frames={"a": (tokens, start, 2), "b": (tokens, start, 4)},
+        )

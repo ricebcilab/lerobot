@@ -167,11 +167,24 @@ def _pad(seqs):
     return out
 
 
+def frame_steps(lengths, stride):
+    """The frames of every demonstration: step 0, stride, ... < length. Returns (demo [F], step [F], start [B]) as int64,
+    where demonstration i's frames are the rows start[i], start[i] + 1, ... (an empty demonstration has none)."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    count = -(-lengths // stride)
+    start = np.concatenate([[0], np.cumsum(count)[:-1]]).astype(np.int64)
+    demo = np.repeat(np.arange(len(lengths), dtype=np.int64), count)
+    step = (np.arange(len(demo), dtype=np.int64) - start[demo]) * stride
+    return demo, step, start
+
+
 class DemoSampler:
     """Draws (observation, action chunk) pairs uniformly over all demo time steps.
-    Steps before a demo starts count as rest; steps after it ends are holds."""
+    Steps before a demo starts count as rest; steps after it ends are holds. With `frames` = {source: (tokens, start, stride)}
+    (one token row per frame, demo i's frames from row start[i], a frame every `stride` steps) every step is floored to its
+    frame and obs["scene"][source] holds that frame's tokens."""
 
-    def __init__(self, layouts, actions, lengths, horizon, hist, device):
+    def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None):
         B = len(actions)
         zeros = lambda n: np.zeros((B, n, 2))
         pos = layouts.start[:, None] + np.concatenate([zeros(1), np.cumsum(actions, 1)], 1)
@@ -183,6 +196,10 @@ class DemoSampler:
         self.obstacles = f32(layouts.obstacles)
         self.obstacle_mask = torch.as_tensor(layouts.obstacle_mask, device=device)
         self.scene = None if layouts.scene is None else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()}
+        if frames and len({stride for _, _, stride in frames.values()}) > 1:
+            raise ValueError(f"frame sources need one stride, got {({n: f[2] for n, f in frames.items()})}")
+        self.stride = next(iter(frames.values()))[2] if frames else None
+        self.frames = {n: (t, torch.as_tensor(st, device=t.device)) for n, (t, st, _) in (frames or {}).items()}
         self.lengths = torch.as_tensor(lengths, device=device)
         self.valid = torch.nonzero(self.lengths > 0).squeeze(1)   # demos that exist (length 0: none was found)
         self.window = torch.arange(hist + horizon, device=device)
@@ -193,10 +210,15 @@ class DemoSampler:
         also the demo i and its step k of every sample (to look up what the expert pushed there)."""
         i = self.valid[torch.randint(len(self.valid), (n,), device=self.lengths.device)]
         k = (torch.rand(n, device=i.device) * self.lengths[i]).long()
+        if self.stride:
+            k = k // self.stride * self.stride
         seq = self.actions[i[:, None], k[:, None] + self.window]
         goal = self.goal[i] & (torch.rand(n, 1, device=i.device) >= goal_dropout)
         obs = dict(pos=self.pos[i, k], hist=seq[:, :self.hist], targets=self.targets[i],
                    mask=self.mask[i], goal=goal, obstacles=self.obstacles[i], obstacle_mask=self.obstacle_mask[i])
         if self.scene is not None:
-            obs["scene"] = {k: v[i] for k, v in self.scene.items()}
+            obs["scene"] = {name: v[i] for name, v in self.scene.items()}
+        for name, (tokens, start) in self.frames.items():
+            row = start[i.to(start.device)] + (k // self.stride).to(start.device)
+            obs.setdefault("scene", {})[name] = tokens[row].to(i.device)
         return (obs, seq[:, self.hist:], i, k) if indexed else (obs, seq[:, self.hist:])
