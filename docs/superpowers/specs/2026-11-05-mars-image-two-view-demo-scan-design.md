@@ -8,12 +8,12 @@ transformed actions), which the user ruled out on 2026-11-05.
 
 Round 2's quick gate (500 fresh layouts, hits / collisions in %):
 
-| arm | T2 | T4 |
-|---|---|---|
-| parametric module, 300 demos (`oracle_task`) | 99.6 / 0.0 | 92.8 / 3.4 |
-| fine-tuned policy, 300 demos (`oracle_ft`) | 41.8 / 58.2 | 34.6 / 63.4 |
-| `rel300`: relative geometry, 300 demos | 55.2 / 38.2 | 35.6 / 62.0 |
-| `teach10k_rel`: relative geometry, 10,000 teacher scenes | 99.6 / 0.0 | 95.8 / 2.8 |
+| arm                                                      | T2          | T4          |
+| -------------------------------------------------------- | ----------- | ----------- |
+| parametric module, 300 demos (`oracle_task`)             | 99.6 / 0.0  | 92.8 / 3.4  |
+| fine-tuned policy, 300 demos (`oracle_ft`)               | 41.8 / 58.2 | 34.6 / 63.4 |
+| `rel300`: relative geometry, 300 demos                   | 55.2 / 38.2 | 35.6 / 62.0 |
+| `teach10k_rel`: relative geometry, 10,000 teacher scenes | 99.6 / 0.0  | 95.8 / 2.8  |
 
 The image module can do the task when it has enough scenes, and 300 demonstrations of one
 fixed overhead picture each are not enough. Two things in rounds 1–2 do not exist on the
@@ -103,10 +103,10 @@ them), saved with the checkpoint and applied to the rollouts' tokens; the module
 `scene_in` then reads width 256. The run prints the share of variance kept.
 
 | demonstrations | images to encode (T2 / T4) | reduced tokens (T2 / T4) |
-|---|---|---|
-| 300 | 14,400 / 18,600 | 1.9 / 2.4 GB |
-| 1,000 | 48,000 / 62,000 | 6.3 / 8.1 GB |
-| 3,000 | 144,000 / 186,000 | 19 / 24 GB |
+| -------------- | -------------------------- | ------------------------ |
+| 300            | 14,400 / 18,600            | 1.9 / 2.4 GB             |
+| 1,000          | 48,000 / 62,000            | 6.3 / 8.1 GB             |
+| 3,000          | 144,000 / 186,000          | 19 / 24 GB               |
 
 **Check that the reduction is harmless,** in stage A, before any larger run: one T4 run of the
 base recipe at 300 demonstrations with full-width tokens (about 39 GB with its validation
@@ -128,8 +128,9 @@ Two methods, both valid on recorded robot data, both applied to the training spl
   from the attention (never the null token), in the flow-matching loss only. The field term
   through the user module (its reverse flow and its loss) sees every token, so its target and
   its prediction come from the same field.
-- **Small shift and rotation of the picture, actions unchanged.** lerobot's default
-  `RandomAffine` magnitudes: up to 5° about the image centre and up to 5% of the image side.
+- **Small shift and rotation of the picture, actions unchanged.** The trainer's own bilinear
+  resample (`move_pictures`, not torchvision's transform) at lerobot's default `RandomAffine`
+  magnitudes: up to 5° about the image centre and up to 5% of the image side.
   Because the tokens are precomputed, the draw is frozen: each stored picture (each view of
   each frame, independently) is moved with probability 0.5 by one random draw before it is
   encoded, and keeps that draw for the run. This costs no extra encoding or storage, and a
@@ -201,7 +202,8 @@ follow-up on the user's go.
   `report_grid_image.py` for the curve.
 - Job lists and the pipeline stay in the git-ignored run folder
   (`examples/pi05/mars/results/research/image/`).
-- The affine uses torchvision's transform with lerobot's default magnitudes
+- The affine is the trainer's own bilinear resample (`move_pictures` in `train_adapter.py`, the
+  uncovered border in the background's colour) at lerobot's default `RandomAffine` magnitudes
   (`src/lerobot/transforms/transforms.py`); nothing new goes into that package, whose
   `ImageTransforms` run inside `LeRobotDataset`, which the cursor demonstrations are not.
 

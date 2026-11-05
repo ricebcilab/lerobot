@@ -593,12 +593,14 @@ def encode_views(images: np.ndarray, encoder, batch: int = 256) -> torch.Tensor:
 
 
 def fit_token_reduction(
-    batches: Iterable[torch.Tensor], rank: int
+    batches: Iterable[torch.Tensor], rank: int, center: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """A PCA of token batches ``[..., W]`` (leading dims flattened): the ``mean`` ``[W]``, the ``basis``
     ``[W, rank]`` of orthonormal columns (largest variance first), both float32, and the share of the variance
     the basis keeps. Sums are kept in float64 on the first batch's device. Raises ``ValueError`` unless
-    ``0 < rank < W``."""
+    ``0 < rank < W``. ``center=False`` keeps the tokens' constant part: ``mean`` is zeros and ``basis`` the top
+    ``rank`` eigenvectors of the uncentred second moment (largest first), ``kept`` their share of the total
+    second moment."""
     total = second = None
     count = 0
     for batch in batches:
@@ -614,6 +616,12 @@ def fit_token_reduction(
         count += len(x)
     if total is None or second is None or count < 2:
         raise ValueError("fit_token_reduction needs at least two tokens")
+    if not center:
+        values, vectors = torch.linalg.eigh(second / count)  # ascending
+        values = values.clamp_min(0)
+        kept = float(values[-rank:].sum() / values.sum())
+        zeros = torch.zeros(second.shape[0], dtype=torch.float32, device=second.device)
+        return zeros, vectors[:, -rank:].flip(1).float().contiguous(), kept
     mean = total / count
     cov = (second - count * torch.outer(mean, mean)) / (count - 1)
     values, vectors = torch.linalg.eigh(cov)  # ascending
@@ -716,8 +724,10 @@ class SceneEncoder:
         return torch.cat(out)
 
     def image_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:
-        """``encode`` on the CPU as numpy: float16 ``[B, 256, 2048]``."""
-        return self.encode(images, batch).cpu().numpy()
+        """``encode`` on the CPU as numpy: float16 ``[B, 256, 2048]``, ``batch`` pictures at a time, each batch's
+        tokens moved to the CPU before the next is encoded (the device holds one batch, not all of them)."""
+        out = [self.encode(images[i : i + batch], batch).cpu() for i in range(0, len(images), batch)]
+        return torch.cat(out).numpy() if out else np.zeros((0, VLM_SCENE_TOKENS, VLM_SCENE_DIM), np.float16)
 
     @torch.no_grad()
     def prefix_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:

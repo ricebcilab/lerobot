@@ -188,3 +188,43 @@ def test_token_reduction_keeps_the_top_directions():
     for bad in (16, 0):
         with pytest.raises(ValueError):
             fit_token_reduction(iter(x.split(500)), bad)
+
+
+def test_image_tokens_encodes_batch_by_batch_and_frees_each_on_the_cpu():
+    class Recording(SceneEncoder):
+        def __init__(self):
+            super().__init__(device="cpu")
+            self.sizes = []
+
+        def encode(self, images, batch=256):
+            self.sizes.append(len(images))
+            return torch.full((len(images), 256, 2048), float(images.mean()), dtype=torch.float16)
+
+    enc = Recording()
+    images = np.arange(5, dtype=np.uint8)[:, None, None, None] * np.ones((1, 3, 4, 4), np.uint8)
+    out = enc.image_tokens(images, batch=2)
+    assert enc.sizes == [2, 2, 1]
+    assert isinstance(out, np.ndarray) and out.dtype == np.float16 and out.shape == (5, 256, 2048)
+    np.testing.assert_array_equal(out[:, 0, 0], np.array([0.5, 0.5, 2.5, 2.5, 4.0], np.float16))
+
+
+def test_the_uncentred_token_reduction_keeps_the_offset_direction():
+    g = torch.Generator().manual_seed(0)
+    offset = torch.linalg.qr(torch.randn(16, 1, generator=g))[0][:, 0]
+    x = torch.randn(4000, 16, generator=g) + 50.0 * offset  # a large constant part, as pi0.5's tokens have
+    mean, basis, kept = fit_token_reduction(iter(x.split(500)), 3, center=False)
+    assert mean.shape == (16,) and mean.dtype == basis.dtype == torch.float32 and not mean.any()
+    assert basis.shape == (16, 3) and abs(float(basis[:, 0] @ offset)) > 0.99
+    torch.testing.assert_close(basis.T @ basis, torch.eye(3), atol=1e-5, rtol=0)
+    second = (x.double().T @ x.double()) / len(x)
+    values = torch.linalg.eigvalsh(second)
+    assert abs(kept - float(values[-3:].sum() / values.sum())) < 1e-6 and kept > 0.99
+    centred, default = (
+        fit_token_reduction(iter(x.split(500)), 3, center=True),
+        fit_token_reduction(iter(x.split(500)), 3),
+    )
+    assert (
+        all(torch.equal(a, b) for a, b in zip(centred[:2], default[:2], strict=True))
+        and centred[2] == default[2]
+    )
+    torch.testing.assert_close(centred[0], x.mean(0), atol=1e-4, rtol=0)

@@ -6,7 +6,7 @@
 
 **Architecture:** A new token source `vlm_views`: the env renders two 224 px views at the cursor's position, pi0.5's vision tokens of both (512 tokens) feed `LearnedTaskModule` with a learned position per token and nothing derived from the cursor. The trainer encodes a frame every 2 planned steps into a frame table (tokens reduced to 256 dims by a PCA the module carries), the sampler reads each sample's own frame, and rollouts encode at every observation through a scene provider on the controller. Small sweeps and three rules in the report (recipe choice, width check, scan) run the experiment.
 
-**Tech Stack:** Python 3.12, PyTorch, torchvision (the affine), numpy, Pillow, PyYAML, pytest; `uv run --extra mars` (`--extra pi` for the VLM, `--extra test` for pytest, `--extra dev` for pre-commit), `HF_HUB_OFFLINE=1`.
+**Tech Stack:** Python 3.12, PyTorch, numpy (the affine: the trainer's own bilinear resample `move_pictures`, at lerobot's default `RandomAffine` magnitudes), Pillow, PyYAML, pytest; `uv run --extra mars` (`--extra pi` for the VLM, `--extra test` for pytest, `--extra dev` for pre-commit), `HF_HUB_OFFLINE=1`.
 
 **Spec:** `docs/superpowers/specs/2026-11-05-mars-image-two-view-demo-scan-design.md` (follows `2026-11-04-mars-image-round2-teacher-relative-design.md`).
 
@@ -34,10 +34,12 @@
 ### Task 1: The two views in the cursor env
 
 **Files:**
+
 - Modify: `src/lerobot/envs/cursor.py` (next to `render_layouts`)
 - Test: `tests/examples/pi05_mars_cursor/test_scene.py`
 
 **Interfaces:**
+
 - Consumes: `Layouts`, `render_layouts`, `RENDER_PALETTE`, `RENDER_TARGET_RADIUS`, `RENDER_SUPERSAMPLE`, `RENDER_MIN_RADIUS`, `SCENE_SIZE`.
 - Produces:
   - `RENDER_CURSOR: tuple[int, int, int] = (230, 60, 30)` and `RENDER_CURSOR_RADIUS: float = 0.02` (screens). Not a `RENDER_PALETTE` entry.
@@ -97,12 +99,14 @@ Expected: FAIL (ImportError: `render_views`).
 ### Task 2: The `vlm_views` token source in `LearnedTaskModule`
 
 **Files:**
+
 - Modify: `src/lerobot/policies/steering/configuration_steering.py` (`SCENE_SOURCES`, `scene_spec`)
 - Modify: `src/lerobot/policies/steering/modeling_steering.py` (`LearnedTaskModule`, `reduce_tokens`, class docstring)
 - Modify: `src/lerobot/policies/steering/__init__.py` (export `reduce_tokens`, `VLM_VIEWS_TOKENS`)
 - Test: `tests/policies/steering/test_scene_tokens.py`
 
 **Interfaces:**
+
 - Consumes: `LearnedTaskModule(horizon, d, tdim, heads, layers, scale, n_dims, token_source, scene_dim, scene_tokens, image_size, token_geometry)`; `tokens(obs, b) -> (tokens, pad)`; `scene_in`, `scene_pos`; `VLM_SCENE_TOKENS`, `VLM_SCENE_DIM`.
 - Produces:
   - `SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")`; `VLM_VIEWS_TOKENS = 2 * VLM_SCENE_TOKENS`.
@@ -208,11 +212,13 @@ Also add `("vlm_views", "absolute")` to the file's parametrized bound-equals-unb
 ### Task 3: Encoding views and fitting the token reduction
 
 **Files:**
+
 - Modify: `src/lerobot/policies/steering/modeling_steering.py` (`SceneEncoder`, next to `scene_for`)
 - Modify: `src/lerobot/policies/steering/__init__.py` (export `encode_views`, `fit_token_reduction`)
 - Test: `tests/policies/steering/test_scene_encoder.py`
 
 **Interfaces:**
+
 - Consumes: `SceneEncoder.image_tokens`, `_pixels`, `embed_image`; `reduce_tokens` (Task 2).
 - Produces:
   - `SceneEncoder.encode(self, images: np.ndarray, batch: int = 256) -> torch.Tensor`: uint8 `[B, 3, S, S]` to float16 `[B, 256, 2048]` on the encoder's device. `image_tokens` returns the same values as before (it becomes `encode(images, batch).cpu().numpy()`).
@@ -271,10 +277,12 @@ In the file's real-pi0.5 test (`test_real_pi05_image_tokens_have_the_documented_
 ### Task 4: Per-frame scene lookup in the demo sampler
 
 **Files:**
+
 - Modify: `examples/pi05/mars/cursor/cursor_sa/demos.py` (`DemoSampler`, new `frame_steps`)
 - Test: `tests/examples/pi05_mars_cursor/test_scene.py`
 
 **Interfaces:**
+
 - Consumes: `DemoSampler(layouts, actions, lengths, horizon, hist, device)`, `sample(n, goal_dropout, indexed)`.
 - Produces:
   - `frame_steps(lengths, stride) -> tuple[np.ndarray, np.ndarray, np.ndarray]`: `(demo [F], step [F], start [B])`, int64. Demonstration `i` has frames at steps `0, stride, ... < lengths[i]`, stored from row `start[i]`; an empty demonstration has none.
@@ -326,10 +334,12 @@ def test_the_sampler_reads_each_samples_own_frame():
 ### Task 5: The trainer's two-view data path, augmentation and flags
 
 **Files:**
+
 - Modify: `examples/pi05/mars/cursor/train/train_adapter.py` (docstring paragraph VIEWS, `move_pictures`, `view_frames`, `ExpertData`, `expert_splits`, `train_task`, `save`, `parse_args`)
 - Test: `tests/examples/pi05_mars_cursor/test_training.py`
 
 **Interfaces:**
+
 - Consumes: `render_views` (Task 1); `scene_spec(..., wrist_span, scene_rank)`, `set_reduction`, `obs["scene_keep"]`, `reduce_tokens` (Task 2); `SceneEncoder.encode`, `encode_views`, `fit_token_reduction` (Task 3); `frame_steps`, `DemoSampler(frames=)` (Task 4).
 - Produces:
   - Flags: `--token-source vlm_views`; `--wrist-span` (float, 0.5); `--view-stride` (int, 2); `--scene-rank` (int, 256; 0 = full width); `--view-affine` (float, 0.0: the probability a stored training picture is moved); `--token-drop` (float, 0.0); `--render-workers` (int, 16; 0 renders in-process).
@@ -467,12 +477,14 @@ def test_full_width_views_and_the_flags_refusals(ckpt_dir, monkeypatch):
 ### Task 6: Views in the rollouts
 
 **Files:**
+
 - Modify: `examples/pi05/mars/cursor/cursor_sa/steering.py` (`observation`, `SharedController`, new `view_scene_fn`)
 - Modify: `examples/pi05/mars/cursor/cursor_sa/session.py` (`run_trials`)
 - Modify: `examples/pi05/mars/cursor/run_sweep.py` (`scene_sources`, `run_cell_batch` and its callers, the docstring's scene paragraph)
 - Test: `tests/examples/pi05_mars_cursor/test_scene.py`, `tests/examples/pi05_mars_cursor/test_sweep.py`
 
 **Interfaces:**
+
 - Consumes: `render_views` (Task 1); a `vlm_views` module's `wrist_span`, `image_size` (Task 2); `encode_views` (Task 3).
 - Produces:
   - `observation(layouts, pos, hist, device="cpu", goal_given=False, scene=None)`: `scene` (source to tensor) is added to `obs["scene"]` beside the layouts' own, moved to `device`.
@@ -567,11 +579,13 @@ def test_tiny_sweep_runs_two_view_modules_at_their_own_spans(tmp_path, monkeypat
 ### Task 7: The sweeps and the report's three rules
 
 **Files:**
+
 - Create: `examples/pi05/mars/cursor/configs/sweeps/grid_task_check_views_select.yaml`, `grid_task_check_views_width.yaml`, `grid_task_check_views_n300.yaml`, `grid_task_check_views_n1000.yaml`, `grid_task_check_views_n3000.yaml`
 - Modify: `examples/pi05/mars/cursor/report_grid_image.py`
 - Test: `tests/examples/pi05_mars_cursor/test_sweep.py`, `tests/examples/pi05_mars_cursor/test_report_grid_image.py`
 
 **Interfaces:**
+
 - Consumes: `grid_task_check_image2_quick.yaml` as the template (agent, arm, `tune`, the `U0` user, the T2 and T4 task entries, `noises: [0.0]`, `trials: {tune: 20, test: 500}`, `against: [oracle_task, oracle_ft]`); `gate_table`, `_within`, `_context`, `_load`, `_table`, `_fmt`.
 - Produces, sweeps (each header states its stage and rule, as the template's does):
   - `..._views_select` (seed 821, T2 and T4): `oracle`, `oracle_task`, `oracle_ft`, and `oracle_task_views_<r>` for `r` in `base`, `span1`, `nomask`, `noaffine`, each naming `image/task_disc_large_n300_s0_with_gain025y_views_<r>` (T2) and `image/task_ring_goal_n300_s0_with_rot60_views_<r>` (T4). `focus: oracle_task_views_base`. No goal-hidden rows.
@@ -668,6 +682,7 @@ Add a test that runs `main(["--scan", ...])` on three small `test.json` files wr
 ### Task 8: Jobs, pipeline stages and a real-encoder smoke run (controller; the run folder is git-ignored)
 
 **Files:**
+
 - Create: `examples/pi05/mars/results/research/image/make_jobs3.py`
 - Modify: `examples/pi05/mars/results/research/image/pipeline.sh` (by rename, not in place, if any pipeline is running)
 

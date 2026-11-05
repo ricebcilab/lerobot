@@ -556,3 +556,51 @@ def test_the_frame_table_is_the_same_rendered_in_a_process_pool(monkeypatch):
     (pooled, start, info), (inline, start0, info0) = tables[2], tables[0]
     assert info["frames"] == len(inline) > 2 * 8 and info["moved"] == info0["moved"] > 0   # several chunks through the pool
     assert torch.equal(pooled, inline) and np.array_equal(start, start0) and pooled.shape[1:] == (512, 2)
+
+
+def _views_ready(monkeypatch):
+    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
+    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
+    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+
+
+def test_an_uncentred_reduction_is_carried_with_a_zero_mean_and_its_refusals(ckpt_dir, monkeypatch):
+    _views_ready(monkeypatch)
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_unc", *VIEW_FLAGS, "--scene-center", "no", *COMMON]))
+    ckpt = torch.load(ckpt_dir / "t_unc" / "adapter.pt")
+    assert not ckpt["state_dict"]["scene_mean"].any() and ckpt["state_dict"]["scene_basis"].abs().sum() > 0
+    assert ckpt["meta"]["scene_center"] == "no"
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_cnn", "--token-source", "cnn", "--render-size", "64", *COMMON]))
+    assert torch.load(ckpt_dir / "t_cnn" / "adapter.pt")["meta"]["scene_center"] is None
+    for bad in ([*VIEW_TASK, "--name", "x", *VIEW_FLAGS, "--scene-center", "no", "--scene-rank", "0"],
+                [*VIEW_TASK, "--name", "x", "--token-source", "cnn", "--scene-center", "no"]):
+        with pytest.raises(SystemExit):
+            train_adapter.parse_args(bad)
+
+
+def test_the_task_log_has_the_loss_parts(ckpt_dir, monkeypatch):
+    _views_ready(monkeypatch)
+    for name, flags in (("t_views", VIEW_FLAGS), ("t_discs", [])):
+        train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", name, *flags, *COMMON]))
+        log = json.loads((ckpt_dir / name / "train_log.json").read_text())["log"]
+        assert all({"train_fm", "train_field"} <= set(row) for row in log)
+        assert all(np.isfinite(log[-1][k]) and log[-1][k] >= 0 for k in ("train_fm", "train_field")), log[-1]
+
+
+def test_step_checkpoints_are_saved_as_sibling_modules(ckpt_dir, monkeypatch):
+    _views_ready(monkeypatch)
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_steps", *VIEW_FLAGS, *COMMON, "--save-every", "2"]))
+    final = torch.load(ckpt_dir / "t_steps" / "adapter.pt")
+    for n in (2, 4):
+        path = ckpt_dir / f"t_steps_step{n}" / "adapter.pt"
+        assert ReversalAdapter.load(path).task is not None
+        ckpt = torch.load(path)
+        assert ckpt["meta"]["step"] == n and ckpt["config"] == final["config"] and "step" not in final["meta"]
+        assert {k: v for k, v in ckpt["meta"].items() if k != "step"} == final["meta"]
+    step4 = torch.load(ckpt_dir / "t_steps_step4" / "adapter.pt")["state_dict"]
+    assert all(torch.equal(step4[k], v) for k, v in final["state_dict"].items())
+    step2 = torch.load(ckpt_dir / "t_steps_step2" / "adapter.pt")["state_dict"]
+    assert not all(torch.equal(step2[k], v) for k, v in final["state_dict"].items())   # the module as it was at step 2
+    with pytest.raises(SystemExit):
+        train_adapter.parse_args([*VIEW_TASK, "--name", "x", *COMMON, "--save-every", "3"])

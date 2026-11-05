@@ -69,12 +69,16 @@ at the demonstration's position at that step, and the sampler floors every sampl
 action chunk and the frame's tokens). `--view-affine p` moves a share p of the train split's stored pictures (each view
 on its own) by a small rotation and shift, drawn once and frozen in the table (`move_pictures`); the val split's are
 never moved. `--scene-rank r` (default 256; 0: full width) fits a PCA token reduction on `REDUCTION_SAMPLE` train
-frames, stores the reduced tokens and carries the reduction in the module (its `scene_mean`, `scene_basis`).
-`--token-drop p` hides a share p of the scene tokens, drawn anew every batch, from the flow-matching loss only; the
+frames, stores the reduced tokens and carries the reduction in the module (its `scene_mean`, `scene_basis`);
+`--scene-center no` fits it uncentred (the tokens' constant part kept: a zero `scene_mean` and the top directions of
+the second moment). `--token-drop p` hides a share p of the scene tokens, drawn anew every batch, from the flow-matching loss only; the
 field term and the validation see every token. The views pipeline draws from its own `default_rng([seed, 7])` and
 leaves torch's generators as it found them (the encoder's load included), so the demonstrations, the frozen noise and
 the module's initialisation are those of any other source at the seed. The checkpoint's meta records the flags and
-every split's frames, moved pictures, variance kept and seconds (`views`).
+every split's frames, moved pictures, variance kept and seconds (`views`). `--save-every N` (any task module, a
+multiple of `--log-every`) also saves the module as it is at every N-th step as the module `<name>_step<N>`
+(`meta["step"]`); the log's `train_fm` and `train_field` are the window's means of the flow-matching part and of the
+field part (before its `--lambda-field` weight; None without the field term) of the training loss.
 
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
@@ -326,7 +330,8 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
         kept = None
         if args.scene_rank and reduction is None:
             sample = np.sort(rng.choice(len(demo), min(len(demo), REDUCTION_SAMPLE), replace=False))
-            mean, basis, kept = fit_token_reduction((t for _, t, _ in encoded(sample, pool)), args.scene_rank)
+            mean, basis, kept = fit_token_reduction((t for _, t, _ in encoded(sample, pool)), args.scene_rank,
+                                                    center=args.scene_center == "yes")
             reduction = (mean, basis)
         shape = (len(demo), spec["scene_tokens"], args.scene_rank or spec["scene_dim"])
         on_device = int(np.prod(shape)) * 2 <= VIEW_GPU_BYTES
@@ -399,7 +404,8 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
                 args.view_reduction = info["reduction"]
             args.view_info[split] = {k: v for k, v in info.items() if k != "reduction"}
             frames = {"vlm_views": (tokens, start, args.view_stride)}
-            kept = "" if info["kept"] is None else f", {100 * info['kept']:.1f}% of the token variance kept"
+            what = "variance" if args.scene_center == "yes" else "second moment"
+            kept = "" if info["kept"] is None else f", {100 * info['kept']:.1f}% of the token {what} kept"
             print(f"{split}: {info['frames']} frames of two views, {info['moved']} pictures moved{kept} "
                   f"({info['seconds']:.0f}s)", flush=True)
         elif args.token_source != "discs":
@@ -604,21 +610,26 @@ def train_task(args, policy, device, rng):
     if views.get("scene_rank"):
         task.set_reduction(*args.view_reduction)
     adapted = ReversalAdapter(task=task)
+    parts = dict(step=0, fm=[], field=[])  # the window's loss parts, reported and cleared by validate
 
     def batch_loss(step):
+        parts["step"] = step
         data, user = pairs[step % len(pairs)]
         obs, chunk, push, core, i, k = data["train"].sample(args.batch, args.goal_dropout)
         z, t = torch.randn_like(chunk), torch.rand(args.batch, device=device)
         seen = obs
         if args.token_drop:  # the flow matching alone sees a share of the scene tokens hidden
             seen = {**obs, "scene_keep": torch.rand(args.batch, task.scene_tokens, device=device) >= args.token_drop}
-        loss, _ = task_loss(policy, task, seen, chunk, z, t, args.lambda_id)
+        loss, fm_parts = task_loss(policy, task, seen, chunk, z, t, args.lambda_id)
+        parts["fm"].append(fm_parts["fm"])
         if args.lambda_field:  # the user's commands, through the frozen user module and this task module
             free = hide_goal(obs)
             latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps, adapted)
             bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), data["train"].noise_at(i, k))
             weight = (active_of(push) & obs["obstacle_mask"].any(1)).float()  # on the obstacle-free layouts T stays I
-            loss = loss + args.lambda_field * field_loss(policy, user, task, free, latent, bci, weight)
+            field = field_loss(policy, user, task, free, latent, bci, weight)
+            parts["field"].append(field.item())
+            loss = loss + args.lambda_field * field
         return loss
 
     @torch.no_grad()
@@ -636,12 +647,20 @@ def train_task(args, policy, device, rng):
         val.update(expert_check(policy, data["val"], args, user, task))
         return val
 
+    def window_mean(values):
+        finite = [v for v in values if np.isfinite(v)]   # as train_loss, a non-finite batch adds nothing
+        return float(np.mean(finite)) if finite else None
+
     def validate():
+        val = dict(train_fm=window_mean(parts["fm"]), train_field=window_mean(parts["field"]))
+        parts["fm"], parts["field"] = [], []
         per_entry = [validate_entry(data, user) for data, user in pairs]
-        val = {f"{name}_{j}": v for j, vals in enumerate(per_entry) for name, v in vals.items()}
+        val.update({f"{name}_{j}": v for j, vals in enumerate(per_entry) for name, v in vals.items()})
         # an entry without obstacle layouts in its val split lacks the collide_* numbers: average over the entries that have them
         val.update({name: float(np.mean([vals[name] for vals in per_entry if name in vals]))
                     for name in dict.fromkeys(n for vals in per_entry for n in vals)})
+        if args.save_every and parts["step"] % args.save_every == 0:   # the module as it is at this step
+            save_module(args, "task", task, f"{args.name}_step{parts['step']}", step=parts["step"])
         return val
 
     save(args, "task", task, train_module(task, args.steps, args.lr, batch_loss, validate, args.log_every))
@@ -686,18 +705,26 @@ def train_user(args, policy, model, device, rng):
 def save(args, kind, module, log):
     """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
-    out = adapter_dir(args.name)
+    path, saved = save_module(args, kind, module, args.name)
+    with open(adapter_dir(args.name) / "train_log.json", "w") as f:
+        json.dump(dict(args=saved, log=log), f, indent=1)
+    print(f"saved {path}")
+
+
+def save_module(args, kind, module, name, **extra):
+    """checkpoints/adapters/<name>/adapter.pt in lerobot's `save_adapter_module` format, `extra` added to its meta;
+    returns its path and the saved arguments."""
     saved = {k: v for k, v in vars(args).items() if k != "view_reduction"}   # the reduction travels in the module's buffers
-    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
+    center = args.scene_center if args.token_source == "vlm_views" else None
+    path = save_adapter_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
                                                               teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None),
                                                               wrist_span=args.wrist_span, view_stride=args.view_stride,
                                                               scene_rank=args.scene_rank, view_affine=args.view_affine,
-                                                              token_drop=args.token_drop, views=getattr(args, "view_info", None)))
-    with open(out / "train_log.json", "w") as f:
-        json.dump(dict(args=saved, log=log), f, indent=1)
-    print(f"saved {path}")
+                                                              token_drop=args.token_drop, views=getattr(args, "view_info", None),
+                                                              scene_center=center, **extra))
+    return path, saved
 
 
 def train(args):
@@ -751,6 +778,8 @@ def parse_args(argv=None):
     p.add_argument("--view-stride", type=int, default=2, help="task, vlm_views: a frame every this many demo steps")
     p.add_argument("--scene-rank", type=int, default=256, help="task, vlm_views: width of the PCA token reduction fitted "
                    "on the train split's frames (0: full width, 2048)")
+    p.add_argument("--scene-center", choices=["yes", "no"], default="yes", help="task, vlm_views: no fits the reduction "
+                   "uncentred (the tokens' constant part kept: a zero mean, the second moment's top directions)")
     p.add_argument("--view-affine", type=float, default=0.0, help="task, vlm_views: the probability a stored training "
                    "picture is moved (a small rotation and shift, frozen in the frame table)")
     p.add_argument("--token-drop", type=float, default=0.0, help="task, an image source: the share of scene tokens hidden "
@@ -785,6 +814,8 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--log-every", type=int, default=1000)
+    p.add_argument("--save-every", type=int, default=0, help="task: also save the module as it is at every this many "
+                   "steps, as <name>_step<N> (a multiple of --log-every; 0: off)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     if args.teacher and (args.kind != "task" or args.pooled):
@@ -812,6 +843,10 @@ def parse_args(argv=None):
         p.error("--view-stride must be at least 1")
     if not 0 <= args.scene_rank <= 2047:
         p.error("--scene-rank must be in 0..2047 (0: full width)")
+    if args.scene_center == "no" and (args.token_source != "vlm_views" or not args.scene_rank):
+        p.error("--scene-center no fits the token reduction of --token-source vlm_views: not with --scene-rank 0 or another source")
+    if args.save_every and (args.kind != "task" or args.save_every < 0 or args.save_every % args.log_every):
+        p.error("--save-every is for --kind task and must be a positive multiple of --log-every")
     if not 0 <= args.token_drop < 1:
         p.error("--token-drop must be in [0, 1)")
     if not 0 <= args.view_affine <= 1:
