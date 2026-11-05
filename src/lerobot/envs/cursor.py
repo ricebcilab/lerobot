@@ -552,6 +552,62 @@ RENDER_SUPERSAMPLE: int = 2  # drawn at this multiple of the size, then resized 
 RENDER_MIN_RADIUS: float = 1.5  # no disc is drawn smaller than this many pixels (at the final size)
 
 
+RENDER_CURSOR: tuple[int, int, int] = (
+    230,
+    60,
+    30,
+)  # the cursor's mark in the views; not a RENDER_PALETTE entry
+RENDER_CURSOR_RADIUS: float = 0.02  # in screens
+VIEWS: tuple[str, ...] = ("overhead", "wrist")
+
+
+def _draw_window(
+    layouts: Layouts,
+    b: int,
+    origin: tuple[float, float],
+    side: float,
+    cursor: tuple[float, float] | None,
+    size: int,
+    target_radius: float,
+    supersample: int,
+) -> np.ndarray:
+    """Trial b's square window of the screen as uint8 [3, size, size]: the window's top-left corner is the screen
+    point `origin`, its side `side` screens; every radius is divided by `side`. What lies outside the screen is
+    background. The cursor mark, if any, is drawn last. Pillow is imported here."""
+    from PIL import Image, ImageDraw
+
+    big = size * supersample
+    scale = big / side
+    radius_px = max(target_radius / side * size, RENDER_MIN_RADIUS) * supersample
+    ox, oy = origin
+    img = Image.new("RGB", (big, big), RENDER_PALETTE["bg"])
+    draw = ImageDraw.Draw(img)
+    for x, y, r in layouts.real_obstacles(b):
+        rr = max(float(r) / side * size, RENDER_MIN_RADIUS) * supersample
+        px, py = (x - ox) * scale, (y - oy) * scale
+        draw.ellipse(
+            (px - rr, py - rr, px + rr, py + rr),
+            fill=RENDER_PALETTE["obstacle"],
+            outline=RENDER_PALETTE["obstacle_edge"],
+            width=supersample,
+        )
+    for x, y in layouts.targets[b, layouts.mask[b]]:
+        px, py = (x - ox) * scale, (y - oy) * scale
+        draw.ellipse(
+            (px - radius_px, py - radius_px, px + radius_px, py + radius_px),
+            fill=RENDER_PALETTE["target_fill"],
+            outline=RENDER_PALETTE["target_edge"],
+            width=2 * supersample,
+        )
+    if cursor is not None:
+        px, py = (cursor[0] - ox) * scale, (cursor[1] - oy) * scale
+        rc = max(RENDER_CURSOR_RADIUS / side * size, RENDER_MIN_RADIUS) * supersample
+        draw.ellipse((px - rc, py - rc, px + rc, py + rc), fill=RENDER_CURSOR)
+    if supersample != 1:
+        img = img.resize((size, size), Image.LANCZOS)
+    return np.asarray(img).transpose(2, 0, 1)
+
+
 def render_layouts(
     layouts: Layouts,
     size: int = SCENE_SIZE,
@@ -560,36 +616,43 @@ def render_layouts(
 ) -> np.ndarray:
     """The layouts as pictures, uint8 [B, 3, size, size]: the unit screen fills the square, x to the right and
     y downward (as the pygame renderer's `to_px`). Obstacles first, targets on top; no goal mark, no cursor.
-    Drawn at `size * supersample` and resized down. Pillow is imported here, so the module needs it only
+    Drawn at `size * supersample` and resized down. Pillow is imported on drawing, so the module needs it only
     when rendering."""
-    from PIL import Image, ImageDraw
+    out = [
+        _draw_window(layouts, b, (0.0, 0.0), 1.0, None, size, target_radius, supersample)
+        for b in range(len(layouts))
+    ]
+    return np.stack(out) if out else np.zeros((0, 3, size, size), np.uint8)
 
-    big = size * supersample
-    scale = big
-    radius_px = max(target_radius * size, RENDER_MIN_RADIUS) * supersample
+
+def render_views(
+    layouts: Layouts,
+    pos: np.ndarray,
+    wrist_span: float,
+    size: int = SCENE_SIZE,
+    target_radius: float = RENDER_TARGET_RADIUS,
+    supersample: int = RENDER_SUPERSAMPLE,
+) -> np.ndarray:
+    """Two pictures per trial, uint8 [B, 2, 3, size, size], in the order of `VIEWS`. "overhead" is the unit
+    screen as `render_layouts` draws it plus the cursor mark at `pos[b]`. "wrist" is the square window of side
+    `wrist_span` screens centred on `pos[b]`: a screen point p lands at pixel (p - pos + wrist_span / 2) /
+    wrist_span * size, every radius is divided by `wrist_span`, and what lies outside the screen is background;
+    the mark sits at its centre."""
+    pos = np.asarray(pos, dtype=float)
+    if wrist_span <= 0:
+        raise ValueError(f"wrist_span must be positive, got {wrist_span}")
+    if pos.shape != (len(layouts), 2):
+        raise ValueError(f"pos must have shape ({len(layouts)}, 2), got {pos.shape}")
+    half = wrist_span / 2
     out = []
     for b in range(len(layouts)):
-        img = Image.new("RGB", (big, big), RENDER_PALETTE["bg"])
-        draw = ImageDraw.Draw(img)
-        for x, y, r in layouts.real_obstacles(b):
-            rr = max(float(r) * size, RENDER_MIN_RADIUS) * supersample
-            draw.ellipse(
-                (x * scale - rr, y * scale - rr, x * scale + rr, y * scale + rr),
-                fill=RENDER_PALETTE["obstacle"],
-                outline=RENDER_PALETTE["obstacle_edge"],
-                width=supersample,
-            )
-        for x, y in layouts.targets[b, layouts.mask[b]]:
-            draw.ellipse(
-                (x * scale - radius_px, y * scale - radius_px, x * scale + radius_px, y * scale + radius_px),
-                fill=RENDER_PALETTE["target_fill"],
-                outline=RENDER_PALETTE["target_edge"],
-                width=2 * supersample,
-            )
-        if supersample != 1:
-            img = img.resize((size, size), Image.LANCZOS)
-        out.append(np.asarray(img).transpose(2, 0, 1))
-    return np.stack(out) if out else np.zeros((0, 3, size, size), np.uint8)
+        x, y = float(pos[b, 0]), float(pos[b, 1])
+        overhead = _draw_window(layouts, b, (0.0, 0.0), 1.0, (x, y), size, target_radius, supersample)
+        wrist = _draw_window(
+            layouts, b, (x - half, y - half), wrist_span, (x, y), size, target_radius, supersample
+        )
+        out.append(np.stack([overhead, wrist]))
+    return np.stack(out) if out else np.zeros((0, 2, 3, size, size), np.uint8)
 
 
 # ---------------------------------------------------------------- environment

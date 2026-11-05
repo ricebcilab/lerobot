@@ -1,14 +1,20 @@
+import hashlib
+
 import numpy as np
 import pytest
 import torch
 from cursor_sa.demos import DemoSampler, make_demos
 from cursor_sa.env import (
+    RENDER_CURSOR,
+    RENDER_CURSOR_RADIUS,
     RENDER_PALETTE,
     SCENE_SIZE,
+    VIEWS,
     Layouts,
     TaskConfig,
     obstacle_spec,
     render_layouts,
+    render_views,
     sample_layouts,
 )
 from cursor_sa.policy import FlowPolicy
@@ -92,3 +98,55 @@ def test_observation_and_sampler_carry_the_scene():
     )
     o, _, i, _ = sampler.sample(5, indexed=True)
     assert torch.equal(o["scene"]["cnn"], torch.as_tensor(lay.scene["cnn"])[i])
+
+
+def _near(pixel, colour, tol=3):
+    return np.abs(pixel.astype(int) - np.array(colour)).max() <= tol
+
+
+def test_render_layouts_pixels_are_unchanged():
+    ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
+    lay = sample_layouts(
+        np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5, obstacle=ring)
+    )
+    assert (
+        hashlib.sha256(render_layouts(lay).tobytes()).hexdigest()
+        == "6f2b3fdd5379ee5b294c7ef59a09f1b031f83805eb538c8e6acbcef9c2decf5b"
+    )
+
+
+def test_views_draw_the_cursor_and_centre_the_wrist_window_on_it():
+    task = TaskConfig(
+        min_reach=0.35, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
+    )
+    lay = sample_layouts(np.random.default_rng(0), 3, 4, task)
+    disc = lay.obstacles[:, 0, :2]
+    pos = disc + np.where(disc > 0.5, -1.0, 1.0) * np.array(
+        [0.1, 0.05]
+    )  # beside the disc, screen-centre side
+    views = render_views(lay, pos, 0.5)
+    assert VIEWS == ("overhead", "wrist") and views.shape == (3, 2, 3, 224, 224) and views.dtype == np.uint8
+    base = render_layouts(lay)
+    reach = int(np.ceil(RENDER_CURSOR_RADIUS * 224)) + 5
+    for b in range(3):
+        cx, cy = (pos[b] * 224).astype(int)
+        assert _near(views[b, 0, :, cy, cx], RENDER_CURSOR) and _near(views[b, 1, :, 112, 112], RENDER_CURSOR)
+        far = np.ones((224, 224), bool)
+        far[max(cy - reach, 0) : cy + reach + 1, max(cx - reach, 0) : cx + reach + 1] = False
+        assert np.array_equal(views[b, 0][:, far], base[b][:, far])  # away from the mark: render_layouts'
+        col, row = ((disc[b] - pos[b]) / 0.5 + 0.5) * 224  # where the window puts the disc's centre
+        assert _near(views[b, 1, :, int(row), int(col)], RENDER_PALETTE["obstacle"])
+
+
+def test_a_wrist_window_as_wide_as_the_screen_at_its_centre_is_the_overhead_view():
+    lay = sample_layouts(np.random.default_rng(1), 2, 4, TaskConfig(min_reach=0.35, max_reach=0.5))
+    views = render_views(lay, np.full((2, 2), 0.5), 1.0)
+    assert np.array_equal(views[:, 1], views[:, 0])
+    corner = render_views(lay, np.full((2, 2), 0.05), 0.5)  # the window reaches 0.2 outside the screen
+    assert (corner[:, 1, :, 0, 0] == 255).all()
+    for bad in (
+        lambda: render_views(lay, np.full((2, 2), 0.5), 0.0),
+        lambda: render_views(lay, np.full((1, 2), 0.5), 0.5),
+    ):
+        with pytest.raises(ValueError):
+            bad()
