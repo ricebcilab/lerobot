@@ -251,23 +251,30 @@ def parse_adapter_spec(
     return AdapterSpec(matrix=build_reversal_adapter(spec, corruption, where))
 
 
-SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn")
+SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")
 # absolute: a learned position per image token (round 1); relative: the token centre's offset from the cursor
 # through the disc-token MLP
 TOKEN_GEOMETRIES: tuple[str, ...] = ("absolute", "relative")
 VLM_SCENE_TOKENS = 256  # SigLIP's patches of the 224 px input every render is resized to
+VLM_VIEWS_TOKENS = 2 * VLM_SCENE_TOKENS  # vlm_views: the overhead view's tokens, then the wrist view's
 VLM_SCENE_DIM = 2048  # the width of pi0.5's prefix (SigLIP after the multimodal projector, and Gemma's)
 CNN_PATCH = 16  # the task module's CNN stem downsamples by 16
 PI05_TOKENIZER = "google/paligemma-3b-pt-224"  # the tokenizer pi0.5's processor uses
 
 
-def scene_spec(source: str, size: int = SCENE_SIZE) -> dict:
+def scene_spec(
+    source: str, size: int = SCENE_SIZE, *, wrist_span: float | None = None, scene_rank: int | None = None
+) -> dict:
     """The ``LearnedTaskModule`` kwargs for ``source`` on size-``size`` renders: ``discs`` needs none beyond
     the source; ``vlm_*`` read 256 tokens of width 2048 whatever the size (the encoder resizes every render
     to 224 for SigLIP; ``size`` is only what is drawn and cached); ``cnn`` reads the render itself,
-    ``(size // 16) ** 2`` tokens (size a multiple of 16)."""
+    ``(size // 16) ** 2`` tokens (size a multiple of 16); ``vlm_views`` reads both views' tokens (512 of
+    width 2048) and needs the wrist view's ``wrist_span`` (> 0), plus optionally the ``scene_rank`` (1..2047)
+    of the carried token reduction; the two keywords belong to ``vlm_views`` alone."""
     if source not in SCENE_SOURCES:
         raise ValueError(f"source must be one of {SCENE_SOURCES}, got {source!r}")
+    if source != "vlm_views" and (wrist_span is not None or scene_rank is not None):  # nosec B105
+        raise ValueError(f"wrist_span and scene_rank belong to source 'vlm_views', not {source!r}")
     if source == "discs":  # nosec B105
         return {"token_source": "discs"}
     if size <= 0:
@@ -280,6 +287,19 @@ def scene_spec(source: str, size: int = SCENE_SIZE) -> dict:
             "scene_dim": None,
             "scene_tokens": (size // CNN_PATCH) ** 2,
             "image_size": size,
+        }
+    if source == "vlm_views":  # nosec B105
+        if wrist_span is None or wrist_span <= 0:
+            raise ValueError(f"source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
+        if scene_rank is not None and not 1 <= scene_rank < VLM_SCENE_DIM:
+            raise ValueError(f"scene_rank must be in 1..{VLM_SCENE_DIM - 1}, got {scene_rank}")
+        return {
+            "token_source": source,
+            "scene_dim": VLM_SCENE_DIM,
+            "scene_tokens": VLM_VIEWS_TOKENS,
+            "image_size": size,
+            "wrist_span": wrist_span,
+            "scene_rank": scene_rank,
         }
     return {
         "token_source": source,

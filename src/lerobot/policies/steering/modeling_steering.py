@@ -230,6 +230,12 @@ class _BoundTaskModule:
         return self.module(x_t, t, v, self.obs, precomputed=self._tokens)
 
 
+def reduce_tokens(tokens: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """The fixed linear token reduction of a ``vlm_views`` module: ``(tokens - mean) @ basis`` in float32,
+    stored as float16. ``tokens`` (..., scene_dim), ``mean`` (scene_dim,), ``basis`` (scene_dim, rank)."""
+    return ((tokens.float() - mean) @ basis).to(torch.float16)
+
+
 class LearnedTaskModule(nn.Module):
     """MARS task module (the cursor example's ``TaskModule``): A(x_t, t, v[, obstacles]) v + b, one affine
     map of the policy's velocity per chunk step, in BOTH directions of the flow; it reshapes the frozen
@@ -253,7 +259,22 @@ class LearnedTaskModule(nn.Module):
     disc-token MLP and no learned position. For ``cnn`` the assumed cell centres are the stride grid's
     ``((c + 0.5) * 16) / S``, while a 4-layer k3/s2/p1 stem's receptive field is centred near ``16c`` px, about
     half a cell up and left: exact for ``vlm_image`` (SigLIP's patch grid), to be corrected before a ``cnn``
-    relative run."""
+    relative run.
+
+    ``vlm_views`` reads the frozen VLM's vision tokens of two camera views, ``obs["scene"]["vlm_views"]``
+    (B, ``scene_tokens``, ``scene_dim``): the overhead view's tokens, then the wrist view's (512 in all);
+    ``wrist_span`` (> 0, required) records how much of the scene the wrist view spans. Nothing derived from
+    the cursor's position enters these tokens, so ``relative`` geometry is refused. With ``scene_rank`` the
+    module carries a fixed linear reduction (``scene_mean`` (scene_dim,), ``scene_basis`` (scene_dim,
+    scene_rank), zeros until ``set_reduction``; persistent, so they travel in the checkpoint) and
+    ``scene_in`` reads ``scene_rank`` wide tokens: ``tokens`` reduces a full-width input with
+    ``reduce_tokens`` and takes a ``scene_rank``-wide one as stored; any other width raises. ``scene_rank``
+    and ``wrist_span`` are config keys of ``vlm_views`` only (``scene_rank`` only when set), so the other
+    sources' configs and weights are unchanged.
+
+    ``obs["scene_keep"]`` (B, ``scene_tokens``, bool; any image source, optional) marks the scene tokens the
+    attention may see; the others are padded out of it. The null token is never hidden. Without it every
+    token is visible."""
 
     def __init__(  # nosec B107 (token_source is not a password)
         self,
@@ -269,6 +290,8 @@ class LearnedTaskModule(nn.Module):
         scene_tokens: int | None = None,
         image_size: int | None = None,
         token_geometry: str = "absolute",
+        wrist_span: float | None = None,
+        scene_rank: int | None = None,
     ):
         super().__init__()
         if token_geometry not in TOKEN_GEOMETRIES:
@@ -281,6 +304,14 @@ class LearnedTaskModule(nn.Module):
             raise ValueError(f"token_source must be one of {SCENE_SOURCES}, got {token_source!r}")
         if token_source.startswith("vlm") and (scene_dim is None or scene_tokens is None):
             raise ValueError(f"token_source {token_source!r} needs scene_dim and scene_tokens")
+        if token_source == "vlm_views" and (wrist_span is None or wrist_span <= 0):  # nosec B105
+            raise ValueError(f"token_source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
+        if token_source != "vlm_views" and wrist_span is not None:  # nosec B105
+            raise ValueError(f"wrist_span belongs to token_source 'vlm_views', not {token_source!r}")
+        if scene_rank is not None and token_source != "vlm_views":  # nosec B105
+            raise ValueError(f"scene_rank belongs to token_source 'vlm_views', not {token_source!r}")
+        if scene_rank is not None and not 1 <= scene_rank < scene_dim:
+            raise ValueError(f"scene_rank must be in 1..{scene_dim - 1}, got {scene_rank}")
         if token_source == "cnn":  # nosec B105
             if image_size is None or image_size <= 0 or image_size % 16:
                 raise ValueError(
@@ -306,8 +337,13 @@ class LearnedTaskModule(nn.Module):
                 "scene_tokens": scene_tokens,
                 "image_size": image_size,
             }
+        if token_source == "vlm_views":  # nosec B105
+            self.config["wrist_span"] = wrist_span
+            if scene_rank is not None:
+                self.config["scene_rank"] = scene_rank
         if token_geometry == "relative":  # nosec B105
             self.config["token_geometry"] = token_geometry
+        self.wrist_span, self.scene_rank = wrist_span, scene_rank
         self.token_geometry = token_geometry
         self.horizon, self.tdim, self.scale, self.n_dims = horizon, tdim, scale, n_dims
         self.token_source, self.scene_dim, self.scene_tokens, self.image_size = (
@@ -336,7 +372,7 @@ class LearnedTaskModule(nn.Module):
         nn.init.zeros_(self.out.bias)
         # after everything above, so a discs module's weights do not depend on the image sources
         if token_source.startswith("vlm"):
-            self.scene_in = nn.Linear(scene_dim, d)
+            self.scene_in = nn.Linear(scene_rank or scene_dim, d)
         elif token_source == "cnn":  # nosec B105
             chans = [3, 32, 64, 128, d]
             convs = []
@@ -353,6 +389,22 @@ class LearnedTaskModule(nn.Module):
             self.token_half = 0.5 / grid
         elif token_source != "discs":  # nosec B105
             self.scene_pos = nn.Parameter(0.02 * torch.randn(scene_tokens, d))
+        if scene_rank is not None:  # zeros until set_reduction; persistent, so a checkpoint carries them
+            self.register_buffer("scene_mean", torch.zeros(scene_dim))
+            self.register_buffer("scene_basis", torch.zeros(scene_dim, scene_rank))
+
+    def set_reduction(self, mean: torch.Tensor, basis: torch.Tensor) -> None:
+        """Set the fixed linear token reduction: ``mean`` (scene_dim,), ``basis`` (scene_dim, scene_rank)."""
+        if self.scene_rank is None:
+            raise ValueError("set_reduction needs a module built with scene_rank")
+        if mean.shape != self.scene_mean.shape or basis.shape != self.scene_basis.shape:
+            raise ValueError(
+                f"reduction shapes must be {tuple(self.scene_mean.shape)} and {tuple(self.scene_basis.shape)}, "
+                f"got {tuple(mean.shape)} and {tuple(basis.shape)}"
+            )
+        with torch.no_grad():
+            self.scene_mean.copy_(mean)
+            self.scene_basis.copy_(basis)
 
     def tokens(self, obs: dict | None, b: int) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The scene tokens (B, 1 + N, d) with the null token first, and their padding mask (None when
@@ -368,6 +420,14 @@ class LearnedTaskModule(nn.Module):
             if src == "cnn":
                 scene = self.cnn(x.float() / 255).flatten(2).transpose(1, 2)
             else:
+                if self.scene_rank is not None:
+                    if x.shape[-1] == self.scene_dim:
+                        x = reduce_tokens(x, self.scene_mean, self.scene_basis)
+                    elif x.shape[-1] != self.scene_rank:
+                        raise ValueError(
+                            f"a reduced task module takes tokens of width {self.scene_dim} or "
+                            f"{self.scene_rank}, got width {x.shape[-1]}"
+                        )
                 scene = self.scene_in(x.float())
             if self.token_geometry == "relative":  # nosec B105
                 pos = obs.get("pos")
@@ -379,7 +439,15 @@ class LearnedTaskModule(nn.Module):
                 scene = scene + self.token_in(feats)
             else:
                 scene = scene + self.scene_pos
-            return torch.cat([null, scene], 1), None
+            keep = obs.get("scene_keep")
+            if keep is None:
+                return torch.cat([null, scene], 1), None
+            if tuple(keep.shape) != (b, scene.shape[1]):
+                raise ValueError(
+                    f"obs['scene_keep'] must have shape {(b, scene.shape[1])}, got {tuple(keep.shape)}"
+                )
+            pad = torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=scene.device), ~keep.bool()], 1)
+            return torch.cat([null, scene], 1), pad
         obstacles = None if obs is None else obs.get("obstacles")
         if obstacles is None or obstacles.shape[1] == 0:
             return null, None
