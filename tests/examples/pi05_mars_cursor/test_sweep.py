@@ -552,3 +552,21 @@ def test_image_sweep_configs_resolve_every_arm_per_cell():
 def test_precompute_scene_with_merge_is_rejected(tmp_path):
     with pytest.raises(SystemExit):
         sweep_main(["--sweep", "x.yaml", "--results", str(tmp_path), "--precompute-scene", "--merge", "a", "b"])
+
+
+def test_view_sweep_configs_resolve_every_arm():
+    sel = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_views_select.yaml")
+    assert sel["seed"] == 821 and set(sel["grid"]["tasks"]) == {"T2", "T4"} and sel["focus"] == "oracle_task_views_base"
+    assert set(sel["methods"]) == {"oracle", "oracle_task", "oracle_ft", *(f"oracle_task_views_{r}" for r in ("base", "span1", "nomask", "noaffine"))}
+    assert method_arm(sel, "oracle_task_views_span1", "U0xT4")["learned_adapter"]["task"] == "image/task_ring_goal_n300_s0_with_rot60_views_span1"
+    width = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_views_width.yaml")
+    assert width["seed"] == 821 and set(width["grid"]["tasks"]) == {"T4"}
+    assert method_arm(width, "oracle_task_views_full", "U0xT4")["learned_adapter"]["task"] == "image/task_ring_goal_n300_s0_with_rot60_views_full"
+    quick = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_image2_quick.yaml")
+    for n in (300, 1000, 3000):
+        scan = load_sweep(config.CONFIG_DIR / "sweeps" / f"grid_task_check_views_n{n}.yaml")
+        assert scan["seed"] == 820 and scan["trials"] == quick["trials"] and scan["arm"] == quick["arm"] and scan["agent"] == quick["agent"]
+        assert {"oracle", "oracle_task", "oracle_ft", "policy", "policy_task", f"oracle_task_views_n{n}", f"policy_task_views_n{n}"} <= set(scan["methods"])
+        assert method_arm(scan, f"oracle_task_views_n{n}", "U0xT2")["learned_adapter"]["task"] == f"image/task_disc_large_n{n}_s0_with_gain025y_views"
+        assert method_arm(scan, f"policy_task_views_n{n}", "U0xT4")["learned_adapter"]["task"] == f"image/task_ring_goal_n{n}_s0_with_rot60_views"
+        assert ("oracle_task_teach_rel" in scan["methods"]) == (n == 300)

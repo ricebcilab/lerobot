@@ -4,7 +4,17 @@ import re
 
 import numpy as np
 import pytest
-from report_grid_image import gate_table, join_ft, main as report_main, pooled_over_seeds
+from report_grid_image import (
+    crossing,
+    first_count,
+    gate_table,
+    join_ft,
+    main as report_main,
+    pooled_over_seeds,
+    scan_rows,
+    select_recipe,
+    width_check,
+)
 
 
 def _cell(methods, hits, side=None, n=10, train_cell=False):
@@ -236,3 +246,125 @@ def test_pooling_over_really_different_seeds_and_the_degenerate_interval():
     assert same["lo"] == same["hi"] == same["mean"] == pytest.approx(50.0)
     single = pooled_over_seeds([low], "mars")
     assert single["lo"] == single["hi"] == single["mean"]
+
+
+def _m(hits, col=0.0):
+    return {"success": hits, "collision": col}
+
+
+def _run(by_ctx):
+    return {"test": {f"U0x{ctx}|0.0": {"metrics": m} for ctx, m in by_ctx.items()}}
+
+
+def _scan_runs():
+    ref = {"oracle_task": _m(0.928, 0.034), "policy_task": _m(0.764)}
+    return {
+        300: _run(
+            {"T4": {**ref, "oracle_task_views_n300": _m(0.50, 0.45), "policy_task_views_n300": _m(0.40)}}
+        ),
+        1000: _run(
+            {"T4": {**ref, "oracle_task_views_n1000": _m(0.83, 0.13), "policy_task_views_n1000": _m(0.87)}}
+        ),
+        3000: _run(
+            {"T4": {**ref, "oracle_task_views_n3000": _m(0.898, 0.064), "policy_task_views_n3000": _m(0.70)}}
+        ),
+    }
+
+
+def test_scan_rows_level_band_flag_and_first_counts():
+    runs = _scan_runs()
+    rows = scan_rows(runs)
+    assert [(r["demos"], r["level"], r["in_band"], r["flag"]) for r in rows] == [
+        (300, False, False, False),
+        (1000, False, True, True),
+        (3000, True, True, False),
+    ]  # 3000 sits exactly 3 points off on both
+    assert first_count(rows, "level") == {"T4": 3000} and first_count(rows, "in_band") == {"T4": 1000}
+    assert first_count(rows[:1], "level") == {"T4": None}
+    runs[1000]["test"]["U0xT4|0.0"]["metrics"]["oracle_task"] = _m(0.90, 0.034)
+    with pytest.raises(ValueError, match="layouts"):
+        scan_rows(runs)
+
+
+def test_crossing_is_log_linear_and_marks_an_extrapolation():
+    n, extra = crossing([300, 3000], [0.5, 0.9], 0.7)
+    assert abs(n - 10 ** (np.log10(300) + 0.5)) < 1e-6 and not extra  # halfway in log10
+    n, extra = crossing([300, 1000, 3000], [0.2, 0.4, 0.6], 0.8)
+    assert extra and abs(n - 3000 * (3000 / 1000)) < 1e-6  # one more step of the last rise
+    assert crossing([300, 1000, 3000], [0.6, 0.5, 0.4], 0.8) == (None, False)
+    assert crossing([300, 1000], [0.9, 0.95], 0.8) == (300.0, False)
+
+
+def test_select_recipe_and_width_check_apply_their_margins():
+    check = _run(
+        {
+            "T2": {
+                f"oracle_task_views_{r}": _m(h)
+                for r, h in (("base", 0.50), ("span1", 0.56), ("nomask", 0.53), ("noaffine", 0.40))
+            },
+            "T4": {
+                f"oracle_task_views_{r}": _m(h)
+                for r, h in (("base", 0.30), ("span1", 0.32), ("nomask", 0.33), ("noaffine", 0.36))
+            },
+        }
+    )
+    out = select_recipe(check)
+    assert (
+        out["adopted"] == ["span1"] and abs(out["means"]["base"] - 0.40) < 1e-9
+    )  # +4; nomask +3 exactly; noaffine -2
+    width = _run({"T4": {"oracle_task_views_base": _m(0.35), "oracle_task_views_full": _m(0.40)}})
+    assert width_check(width)["ok"]  # exactly 5 points under
+    width["test"]["U0xT4|0.0"]["metrics"]["oracle_task_views_base"] = _m(0.348)
+    assert not width_check(width)["ok"]
+
+
+def _write_runs(tmp_path, runs):
+    names = []
+    for n, run in runs.items():
+        d = tmp_path / "sim" / "sweeps" / f"scan{n}"
+        d.mkdir(parents=True)
+        (d / "test.json").write_text(json.dumps(run))
+        names.append(f"scan{n}")
+    return names
+
+
+def test_main_scan_writes_report(tmp_path):
+    names = _write_runs(tmp_path, _scan_runs())
+    out = tmp_path / "out"
+    report_main(["--scan", *names, "--results", str(tmp_path), "--out", str(out)])
+    md = (out / "report.md").read_text()
+    assert "## Scan" in md
+    level = next(line for line in md.splitlines() if "first level" in line.lower() and "T4" in line)
+    assert "3000" in level
+    assert set(json.loads((out / "report.json").read_text())) >= {
+        "scan",
+        "first_level",
+        "first_in_band",
+        "crossings",
+    }
+
+
+def test_main_scan_says_more_than_when_no_count_is_level(tmp_path):
+    runs = _scan_runs()
+    runs[3000]["test"]["U0xT4|0.0"]["metrics"]["oracle_task_views_n3000"] = _m(0.60, 0.2)
+    names = _write_runs(tmp_path, runs)
+    report_main(["--scan", *names, "--results", str(tmp_path), "--out", str(tmp_path / "out")])
+    assert "more than 3000" in (tmp_path / "out" / "report.md").read_text()
+
+
+def test_main_select_and_width_write_json_and_one_mode_is_required(tmp_path, capsys):
+    sel = _run({"T4": {f"oracle_task_views_{r}": _m(0.3) for r in ("base", "span1", "nomask", "noaffine")}})
+    wid = _run({"T4": {"oracle_task_views_base": _m(0.4), "oracle_task_views_full": _m(0.4)}})
+    for name, run in (("sel", sel), ("wid", wid)):
+        d = tmp_path / "sim" / "sweeps" / name
+        d.mkdir(parents=True)
+        (d / "test.json").write_text(json.dumps(run))
+    out = tmp_path / "out"
+    report_main(["--select", "sel", "--results", str(tmp_path), "--out", str(out)])
+    report_main(["--width", "wid", "--results", str(tmp_path), "--out", str(out)])
+    assert json.loads((out / "select.json").read_text())["adopted"] == []
+    assert json.loads((out / "width.json").read_text())["ok"] is True
+    with pytest.raises(SystemExit):
+        report_main(["--results", str(tmp_path), "--out", str(out)])
+    with pytest.raises(SystemExit):
+        report_main(["--select", "sel", "--width", "wid", "--results", str(tmp_path), "--out", str(out)])

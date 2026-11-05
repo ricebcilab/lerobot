@@ -1,0 +1,22 @@
+# Stage A of the two-view image modules, width check (T4 only), at 300 demonstrations: the base recipe (reduced token width)
+# against the full-width run (full). Rule: the reduced run may trail the full-width run by at most 5 points of hits
+# (exactly 5 is ok). Report: report_grid_image.py --width <run>.
+#   python run_sweep.py --sweep grid_task_check_views_width
+name: grid_task_check_views_width
+agent: expert_chunk
+arm: condition_grid.yaml
+methods:
+  oracle_task: {mode: teleop, readout: off, reversal_adapter: {task: cell}}
+  oracle_task_views_base: {mode: teleop, readout: off, reversal_adapter: {task: {T4: image/task_ring_goal_n300_s0_with_rot60_views_base}}}
+  oracle_task_views_full: {mode: teleop, readout: off, reversal_adapter: {task: {T4: image/task_ring_goal_n300_s0_with_rot60_views_full}}}
+tune: {frs: {n_reverse_steps: [10]}}
+grid:
+  users:
+    U0: {corruption: null, adapter: null}
+  tasks:
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: task_ring_goal_n300_s0_with_rot60}
+  noises: [0.0]
+trials: {tune: 20, test: 500}
+focus: oracle_task_views_base
+against: [oracle_task]
+seed: 821

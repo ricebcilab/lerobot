@@ -19,6 +19,9 @@ from pathlib import Path
 import numpy as np
 
 MARGIN = 0.10  # gate: hits may trail the parametric module, collisions and hidden hits may exceed theirs, by this much
+LEVEL = 0.03  # scan: "level" with the parametric module is hits and collisions within this much of its
+ADOPT = 0.03  # recipe choice: a change is adopted when its mean hits beat the base's by more than this
+WIDTH_DROP = 0.05  # width check: the reduced run may trail the full-width run by at most this much
 
 
 def _context(key: str) -> str | None:
@@ -84,6 +87,117 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
                 )
             )
     return sorted(rows, key=lambda r: (r["context"], r["arm"]))
+
+
+def _context_means(run: dict, method: str) -> dict[str, dict[str, float]]:
+    """Per context, the mean of ``success`` and ``collision`` of ``method`` over the run's cells that have it."""
+    by_ctx: dict[str, list[dict]] = {}
+    for key, cell in sorted(run.get("test", {}).items()):
+        ctx = _context(key)
+        if ctx is not None and method in cell.get("metrics", {}):
+            by_ctx.setdefault(ctx, []).append(cell["metrics"][method])
+    return {
+        ctx: {k: float(np.mean([m[k] for m in ms])) for k in ("success", "collision")}
+        for ctx, ms in by_ctx.items()
+    }
+
+
+def scan_rows(runs: dict[int, dict]) -> list[dict]:
+    """Per context and demonstration count, how the two-view module compares with the parametric one.
+
+    ``runs`` maps a count N to that count's run; the view rows are its ``oracle_task_views_n<N>`` and
+    ``policy_task_views_n<N>`` methods, the reference ``oracle_task`` / ``policy_task``. ``level`` = hits >=
+    ref_hits - LEVEL and collision <= ref_collision + LEVEL; ``in_band`` the same with MARGIN; ``flag`` as in
+    ``gate_table``. Raises ValueError when a context's ``oracle_task`` metrics differ between runs (different layouts).
+    """
+    refs: dict[str, dict] = {}
+    rows = []
+    for n, run in sorted(runs.items()):
+        for ctx, ref in _context_means(run, "oracle_task").items():
+            if ctx in refs and any(abs(refs[ctx][k] - ref[k]) > 1e-9 for k in ref):
+                raise ValueError(f"oracle_task differs between runs for {ctx}: the runs used different layouts")
+            refs[ctx] = ref
+        views = _context_means(run, f"oracle_task_views_n{n}")
+        hidden = _context_means(run, f"policy_task_views_n{n}")
+        ref_hidden = _context_means(run, "policy_task")
+        for ctx, v in views.items():
+            ref = refs.get(ctx)
+            if ref is None:
+                continue
+            h, rh = hidden.get(ctx, {}).get("success"), ref_hidden.get(ctx, {}).get("success")
+            ok = lambda margin: _within(v["success"], ref["success"] - margin) and _within(  # noqa: E731
+                ref["collision"] + margin, v["collision"]
+            )
+            rows.append(
+                dict(
+                    context=ctx,
+                    demos=n,
+                    hits=v["success"],
+                    collision=v["collision"],
+                    ref_hits=ref["success"],
+                    ref_collision=ref["collision"],
+                    level=ok(LEVEL),
+                    in_band=ok(MARGIN),
+                    hidden_hits=h,
+                    ref_hidden_hits=rh,
+                    flag=bool(h is not None and rh is not None and h > rh + MARGIN),
+                )
+            )
+    return sorted(rows, key=lambda r: (r["context"], r["demos"]))
+
+
+def first_count(rows: list[dict], key: str) -> dict[str, int | None]:
+    """Per context, the smallest demonstration count whose row has ``key`` true (None when none does)."""
+    out: dict[str, int | None] = {}
+    for r in rows:
+        out.setdefault(r["context"], None)
+        if r[key] and (out[r["context"]] is None or r["demos"] < out[r["context"]]):
+            out[r["context"]] = r["demos"]
+    return out
+
+
+def crossing(counts: list[int], values: list[float], threshold: float) -> tuple[float | None, bool]:
+    """Where the curve of ``values`` over ``counts``, linear in log10(count), first reaches ``threshold``.
+
+    The first count when the curve starts at or above it. Past the last count the last segment is continued when
+    it rises, and the result is marked True (an extrapolation). ``(None, False)`` when it never gets there.
+    """
+    x = [float(np.log10(c)) for c in counts]
+    for i, v in enumerate(values):
+        if _within(v, threshold):
+            if i == 0:
+                return float(counts[0]), False
+            frac = (threshold - values[i - 1]) / (v - values[i - 1])
+            return float(10 ** (x[i - 1] + frac * (x[i] - x[i - 1]))), False
+    if len(values) >= 2 and values[-1] > values[-2]:
+        slope = (values[-1] - values[-2]) / (x[-1] - x[-2])
+        return float(10 ** (x[-1] + (threshold - values[-1]) / slope)), True
+    return None, False
+
+
+def _arm_means(check: dict, arms: list[str]) -> dict[str, float]:
+    """Mean hits of ``oracle_task_views_<arm>`` over the contexts (each context's mean over its cells)."""
+    out = {}
+    for arm in arms:
+        per_ctx = _context_means(check, f"oracle_task_views_{arm}")
+        out[arm] = float(np.mean([m["success"] for m in per_ctx.values()]))
+    return out
+
+
+def select_recipe(
+    check: dict, base: str = "base", changes: tuple[str, ...] = ("span1", "nomask", "noaffine")
+) -> dict:
+    """Mean hits of each recipe over the contexts, and the changes whose mean beats the base's by more than ADOPT."""
+    means = _arm_means(check, [base, *changes])
+    adopted = [c for c in changes if round(means[c] - means[base] - ADOPT, 9) > 0]
+    return dict(means=means, adopted=adopted)
+
+
+def width_check(check: dict, reduced: str = "base", full: str = "full", context: str = "T4") -> dict:
+    """The reduced-width run's hits against the full-width run's, in ``context``; ok within WIDTH_DROP."""
+    r = _context_means(check, f"oracle_task_views_{reduced}")[context]["success"]
+    f = _context_means(check, f"oracle_task_views_{full}")[context]["success"]
+    return dict(reduced_hits=r, full_hits=f, ok=_within(r, f - WIDTH_DROP))
 
 
 def join_ft(grid_run: dict, ft_run: dict, arm: str = "ft_mars_user") -> dict:
@@ -159,9 +273,67 @@ def _methods(run: dict) -> list[str]:
     return seen
 
 
+def _scan_report(a) -> None:
+    runs = {}
+    for name in a.scan:
+        run = _load(a.results, name)
+        counts = {int(m.group(1)) for m in map(re.compile(r"oracle_task_views_n(\d+)$").match, _methods(run)) if m}
+        if len(counts) != 1:
+            raise SystemExit(f"{name}: expected exactly one oracle_task_views_n<N> method, found {sorted(counts)}")
+        runs[counts.pop()] = run
+    rows = scan_rows(runs)
+    largest = max(runs)
+    first_level, first_band = first_count(rows, "level"), first_count(rows, "in_band")
+    crossings = {}
+    for ctx in sorted(first_level):
+        cr = [r for r in rows if r["context"] == ctx]
+        ref = cr[0]["ref_hits"]
+        crossings[ctx] = {}
+        for name, bar in (("level", ref - LEVEL), ("in_band", ref - MARGIN)):
+            n, extra = crossing([r["demos"] for r in cr], [r["hits"] for r in cr], bar)
+            crossings[ctx][name] = dict(demos=n, extrapolated=extra)
+
+    def show(n):
+        return f"more than {largest}" if n is None else str(n)
+
+    def show_cross(c):
+        if c["demos"] is None:
+            return f"more than {largest}"
+        return f"{c['demos']:.0f}" + (" (extrapolated)" if c["extrapolated"] else "")
+
+    md = ["# Image task modules: demonstration scan", "", "## Scan (success and collision in %)", ""]
+    md += _table(
+        ["context", "demos", "hits", "ref hits", "collision", "ref collision", "level", "in band", "hidden hits",
+         "ref hidden", "flag"],
+        [
+            [r["context"], r["demos"], _fmt(r["hits"]), _fmt(r["ref_hits"]), _fmt(r["collision"]),
+             _fmt(r["ref_collision"]), "yes" if r["level"] else "no", "yes" if r["in_band"] else "no",
+             _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]), "FLAG" if r["flag"] else "ok"]
+            for r in rows
+        ],
+    )
+    for ctx in sorted(first_level):
+        md += [
+            f"- {ctx}: first level count {show(first_level[ctx])}; first in-band count {show(first_band[ctx])}; "
+            f"crossing of the level bar {show_cross(crossings[ctx]['level'])}; "
+            f"crossing of the in-band bar {show_cross(crossings[ctx]['in_band'])}",
+        ]
+    a.out.mkdir(parents=True, exist_ok=True)
+    (a.out / "report.md").write_text("\n".join(md) + "\n")
+    (a.out / "report.json").write_text(
+        json.dumps(
+            dict(scan=rows, first_level=first_level, first_in_band=first_band, crossings=crossings), indent=2
+        )
+    )
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--check", required=True, help="gate run name")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", help="gate run name")
+    mode.add_argument("--select", metavar="RUN", help="recipe-choice run name")
+    mode.add_argument("--width", metavar="RUN", help="width-check run name")
+    mode.add_argument("--scan", nargs="+", metavar="RUN", help="demonstration-scan run names, one per count")
     ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
     ap.add_argument("--ft", nargs="*", default=[], help="fine-tuned run names, paired with --grid by position")
     ap.add_argument("--results", type=Path, required=True)
@@ -171,6 +343,15 @@ def main(argv=None):
         ap.error("--ft needs --grid: it pairs with the grid runs by position")
     if a.ft and len(a.ft) != len(a.grid):
         ap.error("--ft must pair with --grid by position")
+
+    if a.select or a.width:
+        out = select_recipe(_load(a.results, a.select)) if a.select else width_check(_load(a.results, a.width))
+        print(json.dumps(out, indent=2))
+        a.out.mkdir(parents=True, exist_ok=True)
+        (a.out / ("select.json" if a.select else "width.json")).write_text(json.dumps(out, indent=2))
+        return
+    if a.scan:
+        return _scan_report(a)
 
     check = _load(a.results, a.check)
     grids = [_load(a.results, n) for n in a.grid]
