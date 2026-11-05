@@ -282,8 +282,8 @@ class LearnedTaskModule(nn.Module):
                     f"token_source 'cnn' needs an image_size that is a multiple of 16, got {image_size}"
                 )
             scene_tokens = (image_size // 16) ** 2
-        grid = math.isqrt(scene_tokens) if token_geometry == "relative" else 0
-        if token_geometry == "relative" and grid * grid != scene_tokens:
+        grid = math.isqrt(scene_tokens) if token_geometry == "relative" else 0  # nosec B105
+        if token_geometry == "relative" and grid * grid != scene_tokens:  # nosec B105
             raise ValueError(f"relative token_geometry needs a square token grid, got {scene_tokens} tokens")
         self.config = {
             "horizon": horizon,
@@ -301,7 +301,7 @@ class LearnedTaskModule(nn.Module):
                 "scene_tokens": scene_tokens,
                 "image_size": image_size,
             }
-        if token_geometry == "relative":
+        if token_geometry == "relative":  # nosec B105
             self.config["token_geometry"] = token_geometry
         self.token_geometry = token_geometry
         self.horizon, self.tdim, self.scale, self.n_dims = horizon, tdim, scale, n_dims
@@ -340,7 +340,7 @@ class LearnedTaskModule(nn.Module):
                 if i < 3:
                     convs.append(nn.GELU())
             self.cnn = nn.Sequential(*convs)
-        if token_geometry == "relative":
+        if token_geometry == "relative":  # nosec B105
             # token k = (row, col) = divmod(k, grid); x to the right (col), y down (row)
             rows, cols = torch.meshgrid(torch.arange(grid), torch.arange(grid), indexing="ij")
             centres = torch.stack([(cols.flatten() + 0.5) / grid, (rows.flatten() + 0.5) / grid], -1)
@@ -364,7 +364,7 @@ class LearnedTaskModule(nn.Module):
                 scene = self.cnn(x.float() / 255).flatten(2).transpose(1, 2)
             else:
                 scene = self.scene_in(x.float())
-            if self.token_geometry == "relative":
+            if self.token_geometry == "relative":  # nosec B105
                 pos = obs.get("pos")
                 if pos is None:
                     raise ValueError("task module with relative token_geometry needs obs['pos']")

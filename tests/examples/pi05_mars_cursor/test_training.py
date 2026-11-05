@@ -371,7 +371,7 @@ def _tiny_teacher(ckpt_dir):
                                                   "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON]))
 
 
-def test_teacher_demonstrations_are_the_teachers_hits_at_the_policys_step_rate(ckpt_dir):
+def test_teacher_demonstrations_are_the_teachers_hits_at_the_policy_step_rate(ckpt_dir):
     _tiny_teacher(ckpt_dir)
     args = train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "s", "--user-module", "u",
                                      "--corruption", "{rotation_deg: 60}", "--teacher", "t", "--teacher-chunk", "8", *COMMON])
