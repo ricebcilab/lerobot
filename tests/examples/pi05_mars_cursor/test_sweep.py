@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from _view_stub import ViewStub
 from cursor_sa import config
 from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.readout import Readout
@@ -570,3 +571,50 @@ def test_view_sweep_configs_resolve_every_arm():
         assert method_arm(scan, f"oracle_task_views_n{n}", "U0xT2")["learned_adapter"]["task"] == f"image/task_disc_large_n{n}_s0_with_gain025y_views"
         assert method_arm(scan, f"policy_task_views_n{n}", "U0xT4")["learned_adapter"]["task"] == f"image/task_ring_goal_n{n}_s0_with_rot60_views"
         assert ("oracle_task_teach_rel" in scan["methods"]) == (n == 300)
+
+
+def _view_sweep(tmp_path, monkeypatch):
+    """Two vlm_views task modules at spans 0.5 and 1.0 in the temp adapter folder, and a tiny sweep playing them."""
+    import cursor_sa.session as session_mod
+
+    monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
+    for name, span in (("image/v05", 0.5), ("image/v10", 1.0)):
+        save_adapter_module(LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=2048, scene_tokens=512, image_size=56,
+                                              wrist_span=span, scene_rank=2), tmp_path / "ckpt" / "adapters" / name / "adapter.pt", "task")
+    (tmp_path / "tiny.yaml").write_text(
+        "name: tiny_views\nagent: expert_chunk\narm: condition_grid.yaml\nmethods:\n"
+        "  oracle_a: {mode: teleop, readout: off, reversal_adapter: {task: image/v05}}\n"
+        "  policy_b: {mode: policy, reversal_adapter: {task: image/v10}}\n"
+        "tune: {frs: {n_reverse_steps: [10]}}\ngrid:\n  users: {U0: {corruption: null, adapter: null}}\n"
+        "  tasks: {T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5}, adapter: null}}\n  noises: [0.0]\nfocus: oracle_a\nseed: 3\n"
+    )
+    return tmp_path / "tiny.yaml"
+
+
+def test_tiny_sweep_runs_two_view_modules_at_their_own_spans(tmp_path, monkeypatch):
+    import cursor_sa.steering as steering_mod
+
+    sweep = _view_sweep(tmp_path, monkeypatch)
+    rendered, real, ViewStub.made = [], steering_mod.render_views, 0
+
+    def spy(layouts, pos, span, size, **k):
+        rendered.append((span, size))
+        return real(layouts, pos, span, size, **k)
+
+    monkeypatch.setattr(steering_mod, "render_views", spy)
+    monkeypatch.setattr(run_sweep, "SceneEncoder", ViewStub)
+    args = ["--sweep", str(sweep), "--results", str(tmp_path), "--scene-cache", str(tmp_path / "scene")]
+    sweep_main([*args, "--out", "pre", "--precompute-scene"])
+    assert ViewStub.made == 0 and not rendered  # nothing to precompute for per-step views
+    sweep_main([*args, "--out", "tiny_views", "--tune-trials", "2", "--test-trials", "3"])
+    assert {span for span, _ in rendered} == {0.5, 1.0} and {size for _, size in rendered} == {56} and ViewStub.made == 1
+    assert not list((tmp_path / "scene").glob("*.npy"))
+    test_json = tmp_path / "sim" / "sweeps" / "tiny_views" / "test.json"
+    assert set(json.loads(test_json.read_text())["test"]["U0xT2|0.0"]["metrics"]) == {"oracle_a", "policy_b"}
+
+
+def test_run_trials_refuses_a_view_module_without_an_encoder(tmp_path, monkeypatch):
+    arm = method_arm(load_sweep(_view_sweep(tmp_path, monkeypatch)), "policy_b", "U0xT2")
+    policies, adapters = load_checkpoints({"policy_b": arm}, "cpu")
+    with pytest.raises(ValueError, match="scene_encoder"):
+        run_trials(arm, _lay(), ExpertChunkAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")

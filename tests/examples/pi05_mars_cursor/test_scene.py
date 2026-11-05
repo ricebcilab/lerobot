@@ -3,6 +3,7 @@ import hashlib
 import numpy as np
 import pytest
 import torch
+from _view_stub import ViewStub
 from cursor_sa.demos import DemoSampler, frame_steps, make_demos
 from cursor_sa.env import (
     RENDER_CURSOR,
@@ -18,7 +19,9 @@ from cursor_sa.env import (
     sample_layouts,
 )
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import SharedController, hide_goal, observation
+from cursor_sa.steering import SharedController, hide_goal, observation, view_scene_fn
+
+from lerobot.policies.steering import LearnedTaskModule, encode_views
 
 
 def _layouts(n=3, spec=None, seed=4):
@@ -237,3 +240,41 @@ def test_the_sampler_reads_each_samples_own_frame():
             "cpu",
             frames={"a": (tokens, start, 2), "b": (tokens, start, 4)},
         )
+
+
+def test_a_controller_asks_its_scene_provider_once_per_position():
+    lay, calls = sample_layouts(np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5)), []
+
+    def scene_fn(layouts, pos, active):
+        calls.append(None if active is None else active.copy())
+        return {"vlm_views": torch.full((len(layouts), 2, 3), float(len(calls)))}
+
+    ctl = SharedController(FlowPolicy(), lay, "policy", scene_fn=scene_fn)
+    a, b = ctl.observation(), ctl.observation(goal_given=True)
+    assert (
+        len(calls) == 1 and torch.equal(a["scene"]["vlm_views"], b["scene"]["vlm_views"]) and calls[0] is None
+    )
+    ctl.pos = ctl.pos + 0.01
+    assert float(ctl.observation()["scene"]["vlm_views"][0, 0, 0]) == 2.0 and len(calls) == 2
+    ctl.active = np.array([True, False, True, True])
+    ctl.observation()
+    assert len(calls) == 3 and calls[2].tolist() == [True, False, True, True]
+    assert "scene" not in SharedController(FlowPolicy(), lay, "policy").observation()
+
+
+def test_view_scene_fn_encodes_the_running_trials_views_at_their_positions():
+    lay = sample_layouts(np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5))
+    module = LearnedTaskModule(
+        horizon=16, token_source="vlm_views", scene_dim=2048, scene_tokens=512, image_size=56, wrist_span=0.5
+    )
+    enc, pos = ViewStub(), lay.start + 0.05
+    fn = view_scene_fn(module, enc)
+    rng = torch.get_rng_state()
+    full = fn(lay, pos, None)["vlm_views"]
+    assert torch.equal(torch.get_rng_state(), rng)  # the encoder draws on forked streams
+    assert full.shape == (4, 512, 2048) and full.dtype == torch.float16 and enc.images == 8
+    assert torch.equal(full, encode_views(render_views(lay, pos, 0.5, 56), ViewStub()))
+    active = np.array([True, False, True, False])
+    part = fn(lay, pos, active)["vlm_views"]
+    assert enc.images == 12 and torch.equal(part[active], full[active]) and not part[~active].any()
+    assert fn(lay, pos, np.zeros(4, bool))["vlm_views"].shape == (4, 512, 2048) and enc.images == 12

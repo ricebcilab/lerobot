@@ -57,7 +57,10 @@ digest covers the layouts drawn, the render spec and, for vlm_*, --vlm and the p
 never reads an old file; the module's training seed is not in it, so every seed reuses the files). The cache is --scene-cache, by default
 checkpoints/scene/<sweep name>; the showcase reaches of --traces are cached under its showcase/ folder.
 --precompute-scene fills the cache for every cell in one process (the vlm_* tokens need the pi0.5 encoder, loaded
-once), whatever --resume would skip, and exits before any trial runs, writing nothing under --out.
+once), whatever --resume would skip, and exits before any trial runs, writing nothing under --out. Task modules that
+read two camera views (token_source vlm_views) get their tokens at every observation, the running trials' views at
+their current cursor positions encoded by the run's encoder (built once, only if such a module plays), and are never
+cached: --precompute-scene has nothing to do for them.
 """
 
 
@@ -309,13 +312,15 @@ def parse_setting(key):
     return {k: yaml.safe_load(v) for k, v in (item.split("=") for item in key.split(","))}
 
 
-def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed):
-    """One method at one setting over all noises of a level at once; per-noise records."""
+def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed, scene_encoder=None):
+    """One method at one setting over all noises of a level at once; per-noise records. `scene_encoder` (an encoder
+    or a factory of one) goes to `run_trials`, which needs it for a vlm_views task module."""
     n = len(layouts)
     off = sweep["methods"][method].get("readout") in ("off", False)  # YAML reads `off` as False
     readout = readout_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)
     torch.manual_seed(seed)
-    records = run_trials(arm, layouts.tile(len(noises)), agent, readout, policy, adapters, device)
+    records = run_trials(arm, layouts.tile(len(noises)), agent, readout, policy, adapters, device,
+                         scene_encoder=scene_encoder)
     return {str(s): records[i * n:(i + 1) * n] for i, s in enumerate(noises)}
 
 
@@ -748,11 +753,12 @@ def fig_showcase(sweep, test, key, out):
 
 
 def scene_sources(adapters):
-    """The scene arrays the loaded task modules read: source -> image size (discs-only modules need none)."""
+    """The scene arrays the loaded task modules read: source -> image size (discs-only modules need none, and nor do
+    vlm_views modules, whose tokens are made at every observation, see `run_trials`)."""
     sources = {}
     for name, adapter in (adapters or {}).items():
         task = adapter.task
-        if task is None or task.token_source == "discs":
+        if task is None or task.token_source in ("discs", "vlm_views"):
             continue
         if sources.setdefault(task.token_source, task.image_size) != task.image_size:
             raise ValueError(f"task modules read {task.token_source} at two image sizes "
@@ -911,7 +917,7 @@ def main(argv=None):
                 log.write(f"=== {part}\n{src.read_text()}")
         encoders = []
 
-        def encoder_factory():  # one encoder for the whole run, made when a vlm_* source first needs computing
+        def encoder_factory():  # one encoder for the whole run, made at the first vlm_* source to compute or vlm_views module to play
             if not encoders:
                 encoders.append(SceneEncoder(args.vlm, device="cpu" if args.cpu or not torch.cuda.is_available() else "cuda"))
             return encoders[0]
@@ -1046,7 +1052,8 @@ def run(args, sweep, out, encoder_factory=None):
                 arm = method_arm(sweep, m, level, axes)
                 for d in (settings_for(sweep, arm["mode"], m) if is_tuned(arm) else [None]):
                     per_noise = run_cell_batch(sweep, arm if d is None else with_setting(arm, d), m, tune_layouts, noises,
-                                               agent, policies[arm["model"]], adapters, device, sweep["seed"] + 1)
+                                               agent, policies[arm["model"]], adapters, device, sweep["seed"] + 1,
+                                               scene_encoder=encoder_factory)
                     for s, recs in per_noise.items():
                         tuning[keys[float(s)]][m][setting_key(d)] = summarize(recs)
             settings = {s: tuned_settings(tuning[keys[s]]) for s in noises}
@@ -1060,7 +1067,8 @@ def run(args, sweep, out, encoder_factory=None):
                 by_setting.setdefault(setting_key(settings[s][m]), (settings[s][m], []))[1].append(s)
             for d, ss in by_setting.values():
                 per_noise = run_cell_batch(sweep, arm if d is None else with_setting(arm, d), m, test_layouts, ss, agent,
-                                           policies[arm["model"]], adapters, device, sweep["seed"] + 11)
+                                           policies[arm["model"]], adapters, device, sweep["seed"] + 11,
+                                           scene_encoder=encoder_factory)
                 for s, recs in per_noise.items():
                     hit[float(s)][m] = np.array([r["outcome"] == "hit" for r in recs])
                     records[float(s)][m] = recs

@@ -58,9 +58,10 @@ import torch
 import torch.nn as nn
 
 from lerobot.policies.steering import (AdaptedField, FlowControlPolicy, FlowReversalSteeringPolicy,
-                                             LearnedTaskModule, LearnedUserModule, integrate, load_adapter_module,
-                                             task_velocity_hook)
+                                             LearnedTaskModule, LearnedUserModule, encode_views, integrate,
+                                             load_adapter_module, task_velocity_hook)
 
+from .env import render_views
 from .readout import DEADBAND, corrupt_chunk, is_active
 
 MODES = ("policy", "teleop", "flow_control", "frs")
@@ -98,17 +99,44 @@ def _f32(a, device):
     return torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
 
 
-def observation(layouts, pos, hist, device="cpu", goal_given=False):
+def observation(layouts, pos, hist, device="cpu", goal_given=False, scene=None):
     """The policy's observation of a batch of trials: cursor positions [B, 2], their last
     displacements [B, h, 2], the targets, the goal flags (all False unless goal_given), and the
-    task's obstacles (which the policy ignores and a task module reads) and, when the layouts have one, their scene."""
+    task's obstacles (which the policy ignores and a task module reads) and, when the layouts have one, their scene;
+    `scene` (source -> array, e.g. a scene provider's tokens of this step) joins the layouts' own."""
     goal = layouts.goal_mask() if goal_given else np.zeros(layouts.mask.shape, dtype=bool)
     obs = dict(pos=_f32(pos, device), hist=_f32(hist, device), targets=_f32(layouts.targets, device),
                mask=torch.as_tensor(layouts.mask, device=device), goal=torch.as_tensor(goal, device=device),
                obstacles=_f32(layouts.obstacles, device), obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
-    if layouts.scene is not None:  # the scene arrays keep their dtype (uint8 render, float16 tokens)
-        obs["scene"] = {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()}
+    if layouts.scene is not None or scene is not None:  # the scene arrays keep their dtype (uint8 render, float16 tokens)
+        obs["scene"] = {k: torch.as_tensor(v, device=device) for k, v in {**(layouts.scene or {}), **(scene or {})}.items()}
     return obs
+
+
+def view_scene_fn(module, encoder):
+    """The scene provider (`SharedController(scene_fn=...)`) of a vlm_views task module: (layouts, pos [B, 2], active
+    [B] bool or None = all) -> {"vlm_views": float16 [B, 512, 2048]} on the encoder's device, the running trials'
+    two views at their positions (`render_views` at the module's wrist_span and image_size) encoded by `encoder`
+    (`encode_views`; the module applies its own reduction to these raw tokens), zeros for the finished rows, nothing
+    rendered when none runs. Leaves torch's CPU and CUDA generators as it found them (the encoder's lazy first load
+    builds a model from them)."""
+
+    def scene(layouts, pos, active=None):
+        rows = np.arange(len(layouts)) if active is None else np.flatnonzero(active)
+        if not len(rows):
+            return {"vlm_views": torch.zeros(len(layouts), module.scene_tokens, module.scene_dim, dtype=torch.float16,
+                                             device=getattr(encoder, "device", "cpu"))}
+        with torch.random.fork_rng(devices=range(torch.cuda.device_count())):
+            views = render_views(layouts if active is None else layouts[rows], np.asarray(pos)[rows], module.wrist_span,
+                                 module.image_size)
+            tokens = encode_views(views, encoder)
+        if len(rows) == len(layouts):
+            return {"vlm_views": tokens}
+        out = torch.zeros(len(layouts), *tokens.shape[1:], dtype=tokens.dtype, device=tokens.device)
+        out[torch.as_tensor(rows, device=tokens.device)] = tokens
+        return {"vlm_views": out}
+
+    return scene
 
 
 def hide_goal(obs):
@@ -295,12 +323,15 @@ class SharedController:
     reversal adapter (see `as_adapter`), or None; its task module shapes every
     chunk, its user module the reversals of frs. `ic_gain` is flow_control's
     scale of the command in the noise prior, `lam` the Euler steps it is written at,
-    `pinned_steps` the chunk steps frs's reference steers (None = all).
+    `pinned_steps` the chunk steps frs's reference steers (None = all). `scene_fn` (layouts, pos, active) -> scene
+    arrays (e.g. `view_scene_fn`) adds a scene of the current positions to every observation, asked for again only
+    when the positions or `active` (None, or a bool [B] of the trials still running, which the caller sets) have
+    changed, so observations at one position share it.
     """
 
     def __init__(self, policy, layouts, mode, tau=5, n_reverse_steps=None, steps=10, execute=8,
                  dt=0.02, max_speed=MAX_SPEED, speed_gain=1.0, adapter=None, device="cpu", gain_mode="step",
-                 ic_gain=1.0, lam=1, pinned_steps=None):
+                 ic_gain=1.0, lam=1, pinned_steps=None, scene_fn=None):
         assert mode in MODES, mode
         assert speed_gain > 0, speed_gain
         assert gain_mode in GAIN_MODES, gain_mode
@@ -322,6 +353,8 @@ class SharedController:
         self.sampler = CursorSampler(policy, steps, execute)  # lerobot's wrapper for the mode drives the policy
         self.wrapper = steering_wrapper(self.sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam,
                                         pinned_steps)
+        self.scene_fn, self.active = scene_fn, None
+        self._scene = None                    # the last scene asked for: (positions, active, arrays)
 
     def steps_of(self, t):
         """The planned steps control step t of a chunk plays, as (index, share of the step) pairs: in mode
@@ -335,8 +368,16 @@ class SharedController:
         return [(i, s) for i, s in shares if s > 1e-9]
 
     def observation(self, goal_given=False):
-        """The policy's observation of the current state; the goal is hidden unless asked for."""
-        return observation(self.layouts, self.pos, self.hist, self.device, goal_given)
+        """The policy's observation of the current state; the goal is hidden unless asked for. With a `scene_fn` its
+        scene of these positions joins it, reused while the positions and `active` are unchanged."""
+        if self.scene_fn is None:
+            return observation(self.layouts, self.pos, self.hist, self.device, goal_given)
+        cached = self._scene
+        if (cached is None or not np.array_equal(cached[0], self.pos) or (cached[1] is None) != (self.active is None)
+                or (self.active is not None and not np.array_equal(cached[1], self.active))):
+            active = None if self.active is None else np.array(self.active, copy=True)
+            cached = self._scene = (self.pos.copy(), active, self.scene_fn(self.layouts, self.pos, self.active))
+        return observation(self.layouts, self.pos, self.hist, self.device, goal_given, cached[2])
 
     @torch.no_grad()
     def sample_chunk(self, obs, z=None):

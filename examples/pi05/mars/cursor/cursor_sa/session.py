@@ -25,7 +25,7 @@ from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import FlowPolicy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
                       outcome_of, read_manifest, read_records, rounded, trial_record, write_manifest)
-from .steering import ReversalAdapter, SharedController
+from .steering import ReversalAdapter, SharedController, view_scene_fn
 
 
 class Aborted(Exception):
@@ -134,22 +134,32 @@ def readout_for(arm, rng=None, input_noise=None, off=False):
     return Readout(arm["corruption_matrix"], noise, rng, curl=arm["corruption_curl"])
 
 
-def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None):
+def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None, scene_encoder=None):
     """Step len(layouts) trials in lockstep until all are done; return one record per trial.
 
     With a renderer the trials run in real time (one at a time: len(layouts) must
     be 1), with a ready gate before and feedback after. Raises Aborted if the
-    person quits.
+    person quits. When the arm's task module reads vlm_views, `scene_encoder` (an
+    encoder, or a zero-argument factory of one, called once) is required: the
+    running trials' two views are encoded at every observation (`view_scene_fn`).
     """
     task = arm_task(arm)
     B = len(layouts)
     if renderer is not None and B != 1:
         raise ValueError("real-time runs step one trial at a time")
+    adapter = arm_adapter(arm, adapters)
+    module = None if adapter is None else adapter.task
+    scene_fn = None
+    if getattr(module, "token_source", None) == "vlm_views":
+        if scene_encoder is None:
+            raise ValueError("the arm's task module reads vlm_views, made at every observation: run_trials needs a "
+                             "scene_encoder (an encoder, or a factory of one)")
+        scene_fn = view_scene_fn(module, scene_encoder if hasattr(scene_encoder, "encode") else scene_encoder())
     env = CursorEnv(layouts, task)
     ctl = SharedController(policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"],
-                           arm["execute"], task.dt, speed_gain=arm["speed_gain"], adapter=arm_adapter(arm, adapters),
+                           arm["execute"], task.dt, speed_gain=arm["speed_gain"], adapter=adapter,
                            device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"], lam=arm["lambda"],
-                           pinned_steps=arm["pinned_steps"])
+                           pinned_steps=arm["pinned_steps"], scene_fn=scene_fn)
     readout.reset(B)
     agent.reset(B, readout)
     ctx = dict(env=env, ctl=ctl, layouts=layouts, task=task, agent=agent, served=np.zeros((B, 2)), hud=hud or {})
@@ -161,6 +171,7 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
     aborted = False
     try:
         while not env.done.all():
+            ctl.active = ~env.done  # the trials still running, the ones a scene provider renders
             raw, served, reference = agent.step(env.pos, layouts, ctl)
             prev = env.pos.copy()
             env.step(ctl.act(served, reference))
