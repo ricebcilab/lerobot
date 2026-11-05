@@ -13,6 +13,7 @@ from cursor_sa.demos import DemoSampler, make_demos, replay
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
 from train import train_adapter
+from _view_stub import ViewStub
 
 COMMON = ["--n-demos", "60", "--val-demos", "40", "--steps", "4", "--log-every", "2", "--batch", "32"]
 
@@ -440,3 +441,115 @@ def test_an_image_module_is_refused_as_a_teacher(ckpt_dir):
     with pytest.raises(ValueError, match="discs"):
         train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "s",
                                                       "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON, "--teacher", "t_cnn", "--n-demos", "2", "--val-demos", "2"]))
+
+
+VIEW_TASK = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--corruption", "{rotation_deg: 60}"]
+VIEW_FLAGS = ["--token-source", "vlm_views", "--render-size", "56", "--scene-rank", "2", "--view-affine", "0.5", "--token-drop", "0.3",
+              "--frozen-noise", "--render-workers", "0"]
+
+
+def test_move_pictures_moves_a_share_and_fills_with_the_background():
+    images = np.full((200, 3, 32, 32), 255, np.uint8)
+    images[:, :, 12:20, 12:20] = 0                                         # a dark square on the picture's centre
+    out, moved = train_adapter.move_pictures(images, np.random.default_rng(0), 0.5)
+    assert out.shape == images.shape and out.dtype == np.uint8 and 60 < moved.sum() < 140
+    assert np.array_equal(out[~moved], images[~moved]) and not np.array_equal(out[moved], images[moved])
+    assert (out[:, :, 0, 0] == 255).all() and (out[:, :, -1, -1] == 255).all()   # the uncovered border is background
+    ys, xs = np.mgrid[:32, :32]
+    for img in out[moved][:20]:
+        w = 255.0 - img[0]
+        assert abs((w * ys).sum() / w.sum() - 15.5) <= 2.2 and abs((w * xs).sum() / w.sum() - 15.5) <= 2.2   # 5% of 32 px, and some blur
+    again, moved2 = train_adapter.move_pictures(images, np.random.default_rng(0), 0.5)
+    assert np.array_equal(again, out) and np.array_equal(moved2, moved)
+    assert not train_adapter.move_pictures(images, np.random.default_rng(0), 0.0)[1].any()
+
+
+def test_train_a_two_view_task_module_on_the_scripted_draws(ckpt_dir, monkeypatch):
+    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
+    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
+    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    splits = _record_splits(monkeypatch)
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_views", *VIEW_FLAGS, *COMMON]))
+    (views,) = splits
+    ckpt = torch.load(ckpt_dir / "t_views" / "adapter.pt")
+    cfg, meta = ckpt["config"], ckpt["meta"]
+    assert (cfg["token_source"], cfg["wrist_span"], cfg["scene_rank"], cfg["scene_tokens"]) == ("vlm_views", 0.5, 2, 512)
+    assert ckpt["state_dict"]["scene_basis"].abs().sum() > 0               # the fitted reduction, not the zeros it starts as
+    assert (meta["view_stride"], meta["token_drop"], meta["view_affine"], meta["wrist_span"], meta["scene_rank"]) == (2, 0.3, 0.5, 0.5, 2)
+    lengths = views["train"].sampler.lengths.cpu().numpy()
+    info = meta["views"]
+    assert info["train"]["frames"] == int(np.ceil(lengths / 2).sum()) and 0 < info["train"]["moved"] < 2 * info["train"]["frames"]
+    assert info["val"]["moved"] == 0 and 0 < info["train"]["kept"] <= 1 and info["val"]["kept"] is None
+    assert views["train"].sampler.sample(4)[0]["scene"]["vlm_views"].shape == (4, 512, 2)
+    log = json.loads((ckpt_dir / "t_views" / "train_log.json").read_text())["log"]
+    assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(log[-1])
+    assert ReversalAdapter.load(ckpt_dir / "t_views" / "adapter.pt").task.wrist_span == 0.5
+    splits.clear()                                                         # the same seed with another source: the same demonstrations
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_cnn", "--token-source", "cnn", "--render-size", "64", "--frozen-noise", *COMMON]))
+    (cnn,) = splits
+    for split in ("train", "val"):
+        for field in ("obstacles", "targets", "pos", "lengths"):
+            torch.testing.assert_close(getattr(views[split].sampler, field), getattr(cnn[split].sampler, field))
+    torch.testing.assert_close(views["train"].noise, cnn["train"].noise)
+
+
+def test_token_masking_reaches_the_flow_matching_loss_only(ckpt_dir, monkeypatch):
+    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
+    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
+    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    seen, real_fm, real_field = {"fm": [], "field": []}, train_adapter.task_loss, train_adapter.field_loss
+
+    def fm(policy, task, obs, *a):
+        seen["fm"].append(obs.get("scene_keep"))
+        return real_fm(policy, task, obs, *a)
+
+    def field(policy, user, task, free, *a):
+        seen["field"].append("scene_keep" in free)
+        return real_field(policy, user, task, free, *a)
+
+    monkeypatch.setattr(train_adapter, "task_loss", fm)
+    monkeypatch.setattr(train_adapter, "field_loss", field)
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_mask", *VIEW_FLAGS, *COMMON]))
+    keeps = [k for k in seen["fm"] if k is not None]
+    assert len(keeps) == 4 and all(k.shape == (32, 512) and k.dtype == torch.bool for k in keeps)   # COMMON: 4 steps of batch 32
+    assert 0.6 < torch.stack(keeps).float().mean() < 0.8
+    assert any(k is None for k in seen["fm"])                              # validation sees every token
+    assert seen["field"] and not any(seen["field"])
+
+
+def test_full_width_views_and_the_flags_refusals(ckpt_dir, monkeypatch):
+    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_full", "--token-source", "vlm_views", "--render-size", "56", "--scene-rank", "0",
+                                                  "--view-stride", "8", "--render-workers", "0", *COMMON, "--n-demos", "6", "--val-demos", "4"]))
+    ckpt = torch.load(ckpt_dir / "t_full" / "adapter.pt")
+    assert "scene_rank" not in ckpt["config"] and "scene_basis" not in ckpt["state_dict"] and ckpt["meta"]["views"]["train"]["kept"] is None
+    assert ckpt["state_dict"]["scene_in.weight"].shape[1] == 2048 and ckpt["meta"]["views"]["train"]["moved"] == 0
+    v = ["--token-source", "vlm_views"]
+    for bad in ([*VIEW_TASK, "--name", "x", *v, "--token-geometry", "relative"], [*VIEW_TASK, "--name", "x", *v, "--teacher", "t"],
+                ["--kind", "task", "--pooled", "missing.yaml", "--name", "x", *v], [*VIEW_TASK, "--name", "x", "--token-drop", "0.3"],
+                [*VIEW_TASK, "--name", "x", "--token-source", "cnn", "--view-affine", "0.5"], [*VIEW_TASK, "--name", "x", *v, "--wrist-span", "0"],
+                [*VIEW_TASK, "--name", "x", *v, "--view-stride", "0"], [*VIEW_TASK, "--name", "x", *v, "--scene-rank", "2048"],
+                [*VIEW_TASK, "--name", "x", *v, "--token-drop", "1.0"], [*VIEW_TASK, "--name", "x", *v, "--view-affine", "1.5"]):
+        with pytest.raises(SystemExit):
+            train_adapter.parse_args(bad)
+
+
+def test_the_frame_table_is_the_same_rendered_in_a_process_pool(monkeypatch):
+    """--render-workers 2 renders the chunks in spawned processes: the same frame table as rendering in-process, the
+    pictures' moves and the reduction's sample drawn in the trainer either way."""
+    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 8)
+    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 16)
+    args = train_adapter.parse_args([*VIEW_TASK, "--name", "x", *VIEW_FLAGS, "--view-stride", "4"])
+    rng = np.random.default_rng(0)
+    layouts, task = train_adapter.layouts_for(args, args.obstacle, rng, 6, args.p_free)
+    actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
+    tables = {}
+    for workers in (2, 0):
+        args.render_workers = workers
+        tables[workers] = train_adapter.view_frames(args, layouts, actions, lengths, ViewStub(), "cpu", affine_rng=np.random.default_rng(1))
+    (pooled, start, info), (inline, start0, info0) = tables[2], tables[0]
+    assert info["frames"] == len(inline) > 2 * 8 and info["moved"] == info0["moved"] > 0   # several chunks through the pool
+    assert torch.equal(pooled, inline) and np.array_equal(start, start0) and pooled.shape[1:] == (512, 2)

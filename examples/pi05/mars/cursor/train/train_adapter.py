@@ -61,6 +61,20 @@ The student learns what the teacher's composed field does, with the teacher's ow
 The kept set's obstacle-free share drifts a point or two above `--p-free` (free layouts hit more often, and the last
 chunk is truncated from its tail, where `layouts_for` puts them).
 
+VIEWS: `--token-source vlm_views` (task, single context, scripted expert) reads two camera views of the scene, each
+through pi0.5's frozen vision model: the overhead view (the whole screen with the cursor's mark) and the wrist view (a
+window of `--wrist-span` screens centred on the cursor), 256 tokens each. The demonstrations are drawn as for any
+source; then every split gets a frame table (`view_frames`): a frame every `--view-stride` demo steps, its views drawn
+at the demonstration's position at that step, and the sampler floors every sampled step to its frame (the step's
+action chunk and the frame's tokens). `--view-affine p` moves a share p of the train split's stored pictures (each view
+on its own) by a small rotation and shift, drawn once and frozen in the table (`move_pictures`); the val split's are
+never moved. `--scene-rank r` (default 256; 0: full width) fits a PCA token reduction on `REDUCTION_SAMPLE` train
+frames, stores the reduced tokens and carries the reduction in the module (its `scene_mean`, `scene_basis`).
+`--token-drop p` hides a share p of the scene tokens, drawn anew every batch, from the flow-matching loss only; the
+field term and the validation see every token. The views pipeline draws from its own `default_rng([seed, 7])`, so the
+demonstrations and the frozen noise are those of any other source at the seed. The checkpoint's meta records the
+flags and every split's frames, moved pictures, variance kept and seconds (`views`).
+
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
 commands; `--frozen-noise` draws it once per demonstration step instead, as a recorded calibration has one
@@ -74,8 +88,12 @@ modules without a user.
 
 import argparse
 import json
+import multiprocessing
 import sys
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -88,16 +106,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
-from cursor_sa.demos import DemoConfig, DemoSampler, make_demos, plan_reach  # noqa: E402
-from cursor_sa.env import SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, sample_layouts  # noqa: E402
+from cursor_sa.demos import DemoConfig, DemoSampler, frame_steps, make_demos, plan_reach  # noqa: E402
+from cursor_sa.env import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
+                           sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
 from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, heading_cosine, load_adapter_module,
-                                       regenerate,  # noqa: E402
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, encode_views,  # noqa: E402
+                                       fit_token_reduction, heading_cosine, load_adapter_module, reduce_tokens, regenerate,
                                        save_adapter_module, scene_for, scene_spec, task_field_loss, train_module,
                                        user_field_loss)
 
@@ -209,12 +228,121 @@ def readout_core(push, corruption, curl):
     return push if corruption is None else np.clip(push @ np.asarray(corruption).T, -1.0, 1.0)
 
 
-class ExpertData:
-    """One split of expert calibration data: the demonstrations (a DemoSampler) and, at every demo step,
-    the expert's push and what the user's readout makes of it before noise."""
+VIEW_AFFINE_DEGREES = 5.0     # --view-affine: a moved picture turns by up to this many degrees about its centre
+VIEW_AFFINE_TRANSLATE = 0.05  # and shifts by up to this share of its side per axis
+REDUCTION_SAMPLE = 2000       # frames the token reduction is fitted on
+VIEW_CHUNK = 256              # frames rendered and encoded at a time
+VIEW_GPU_BYTES = 12 * 2**30   # a split's frame table above this stays in RAM
 
-    def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False):
-        self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
+
+def move_pictures(images, rng, p, block=64):
+    """Each uint8 picture [N, 3, S, S] independently, with probability p, turned about its centre by an angle in
+    +-VIEW_AFFINE_DEGREES and shifted by up to VIEW_AFFINE_TRANSLATE of S per axis (one uniform draw each), resampled
+    bilinearly with the uncovered border in the background's colour (not black: an obstacle is a dark disc). Every
+    draw is made before any picture moves (`block` pictures are resampled at a time). Returns the pictures and the
+    bool mask [N] of the moved ones."""
+    n, _, s, _ = images.shape
+    moved = rng.random(n) < p
+    out = np.array(images, dtype=np.uint8)
+    m = int(moved.sum())
+    if not m:
+        return out, moved
+    angle = np.deg2rad(rng.uniform(-VIEW_AFFINE_DEGREES, VIEW_AFFINE_DEGREES, m)).astype(np.float32)
+    shift = (rng.uniform(-VIEW_AFFINE_TRANSLATE, VIEW_AFFINE_TRANSLATE, (m, 2)) * s).astype(np.float32)   # (x, y) pixels
+    c, rows = (s - 1) / 2, np.flatnonzero(moved)
+    ys, xs = np.mgrid[:s, :s].astype(np.float32)
+    bg = np.asarray(RENDER_PALETTE["bg"], np.float32)[None, :, None, None]
+    for lo in range(0, m, block):
+        sl = slice(lo, lo + block)
+        cos, sin = np.cos(angle[sl])[:, None, None], np.sin(angle[sl])[:, None, None]
+        dx, dy = xs - c - shift[sl, 0, None, None], ys - c - shift[sl, 1, None, None]
+        # each output pixel's source: the inverse of q = R (p - c) + c + shift; beyond the picture lies the background
+        sx, sy = np.clip(cos * dx + sin * dy + c, -1, s), np.clip(-sin * dx + cos * dy + c, -1, s)
+        x0, y0 = np.clip(np.floor(sx), -1, s - 1), np.clip(np.floor(sy), -1, s - 1)
+        fx, fy = (sx - x0)[..., None], (sy - y0)[..., None]
+        padded = np.empty((len(sx), 3, s + 2, s + 2), np.float32)
+        padded[:] = bg
+        padded[:, :, 1:-1, 1:-1] = images[rows[sl]]
+        b, x0, y0 = np.arange(len(sx))[:, None, None], x0.astype(np.int64) + 1, y0.astype(np.int64) + 1
+        corner = lambda y, x: padded[b, :, y, x]                                               # [m, S, S, 3]
+        value = ((1 - fy) * ((1 - fx) * corner(y0, x0) + fx * corner(y0, x0 + 1))
+                 + fy * ((1 - fx) * corner(y0 + 1, x0) + fx * corner(y0 + 1, x0 + 1)))
+        out[rows[sl]] = np.clip(np.rint(value), 0, 255).astype(np.uint8).transpose(0, 3, 1, 2)
+    return out, moved
+
+
+def view_chunks(pool, workers, layouts, pos, demo, step, chunks, wrist_span, size):
+    """`render_views` of each chunk of frames (index arrays into demo, step), in order: in-process without a `pool`,
+    else in the pool's `workers` spawned processes (which run the env's rendering only and never touch CUDA), at most
+    two chunks per process in flight."""
+    job = lambda rows: (layouts[demo[rows]], pos[demo[rows], step[rows]], wrist_span, size)
+    if pool is None:
+        for rows in chunks:
+            yield render_views(*job(rows))
+        return
+    pending = deque()
+    for rows in chunks:
+        pending.append(pool.submit(render_views, *job(rows)))
+        if len(pending) > 2 * workers:
+            yield pending.popleft().result()
+    while pending:
+        yield pending.popleft().result()
+
+
+def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None, affine_rng=None):
+    """The frame table of one split for --token-source vlm_views: a frame every --view-stride steps of every
+    demonstration (`frame_steps`), its two views (`render_views`, overhead and wrist at --wrist-span) drawn at the
+    demonstration's position at that step, rendered VIEW_CHUNK frames at a time (--render-workers processes, 0:
+    in-process), with `affine_rng` every picture moved (`move_pictures` at --view-affine, the two views independently),
+    encoded (`encode_views`). With --scene-rank the tokens are reduced by `reduction` (mean, basis) or, when it is None,
+    by a PCA (`fit_token_reduction`, streamed) of up to REDUCTION_SAMPLE frames chosen with `affine_rng` (or a
+    default_rng([seed, 7])), whose pictures are rendered, moved and encoded for the fit first. Draws from no other
+    generator. Returns float16 tokens [F, 512, rank or 2048] (on `device` when at most VIEW_GPU_BYTES, else on the
+    CPU), start (demo i's frames from row start[i]) and info: frames, moved (pictures in the table), kept (the
+    variance share when fitted here, else None), reduction (the one used, or None) and seconds."""
+    tic = time.time()
+    demo, step, start = frame_steps(lengths, args.view_stride)
+    pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+    spec = scene_spec("vlm_views", args.render_size, wrist_span=args.wrist_span)
+    rng = affine_rng if affine_rng is not None else np.random.default_rng([args.seed, 7])
+    workers = args.render_workers
+
+    def encoded(frames, pool):
+        """(rows, tokens on the encoder's device, pictures moved) for every chunk of `frames`, in order."""
+        chunks = [frames[i:i + VIEW_CHUNK] for i in range(0, len(frames), VIEW_CHUNK)]
+        for rows, views in zip(chunks, view_chunks(pool, workers, layouts, pos, demo, step, chunks, args.wrist_span,
+                                                    args.render_size)):
+            hits = 0
+            if affine_rng is not None:
+                flat, hit = move_pictures(views.reshape(-1, *views.shape[2:]), affine_rng, args.view_affine)
+                views, hits = flat.reshape(views.shape), int(hit.sum())
+            yield rows, encode_views(views, encoder), hits
+
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) if workers else nullcontext() as pool:
+        kept = None
+        if args.scene_rank and reduction is None:
+            sample = np.sort(rng.choice(len(demo), min(len(demo), REDUCTION_SAMPLE), replace=False))
+            mean, basis, kept = fit_token_reduction((t for _, t, _ in encoded(sample, pool)), args.scene_rank)
+            reduction = (mean, basis)
+        shape = (len(demo), spec["scene_tokens"], args.scene_rank or spec["scene_dim"])
+        on_device = int(np.prod(shape)) * 2 <= VIEW_GPU_BYTES
+        tokens = torch.empty(shape, dtype=torch.float16, device=device if on_device else "cpu")
+        moved = 0
+        for rows, t, hits in encoded(np.arange(len(demo)), pool):
+            if args.scene_rank:
+                t = reduce_tokens(t, reduction[0].to(t.device), reduction[1].to(t.device))
+            tokens[rows[0]:rows[-1] + 1] = t.to(tokens.device)
+            moved += hits
+    return tokens, start, dict(frames=len(demo), moved=moved, kept=kept, reduction=reduction if args.scene_rank else None,
+                               seconds=time.time() - tic)
+
+
+class ExpertData:
+    """One split of expert calibration data: the demonstrations (a DemoSampler; `frames` its frame table, see
+    `DemoSampler`) and, at every demo step, the expert's push and what the user's readout makes of it before noise."""
+
+    def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False, frames=None):
+        self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device, frames)
         pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
         push = expert_pushes(layouts, pos)
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
@@ -236,10 +364,15 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
     --demo-seconds as many as fit in that much demonstrating (`budget_demos`; args.n_demos becomes their count).
     With --teacher both splits are the teacher's hits instead (`teacher_demos`; their counts go to
     args.teacher_demos). With an image --token-source each split's layouts carry that source's scene arrays (`encoder` for vlm_*; the
-    caller closes it)."""
+    caller closes it). With vlm_views each split gets a frame table instead (`view_frames`, after its demonstrations are
+    drawn as for any source): the train split's fits the reduction and moves pictures with default_rng([seed, 7]), the val
+    split's reuses that reduction and moves none; args.view_info gets each split's info (without the reduction) and
+    args.view_reduction the reduction."""
     out = {}
     if args.teacher:
         args.teacher_demos = {}
+    if args.token_source == "vlm_views":
+        args.view_info, args.view_reduction = {}, None
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
         if args.teacher:
             tic = time.time()
@@ -253,10 +386,22 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             layouts, task = layouts_for(args, obstacle, rng, n, p_free)
             tic = time.time()
             actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
-        if args.token_source != "discs":
+        frames = None
+        if args.token_source == "vlm_views":
+            train = split == "train"
+            tokens, start, info = view_frames(args, layouts, actions, lengths, encoder, device, args.view_reduction,
+                                              np.random.default_rng([args.seed, 7]) if train else None)
+            if train:
+                args.view_reduction = info["reduction"]
+            args.view_info[split] = {k: v for k, v in info.items() if k != "reduction"}
+            frames = {"vlm_views": (tokens, start, args.view_stride)}
+            kept = "" if info["kept"] is None else f", {100 * info['kept']:.1f}% of the token variance kept"
+            print(f"{split}: {info['frames']} frames of two views, {info['moved']} pictures moved{kept} "
+                  f"({info['seconds']:.0f}s)", flush=True)
+        elif args.token_source != "discs":
             layouts.scene = {args.token_source: scene_for(layouts, args.token_source, args.render_size, encoder)}
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
-                                frozen_noise=split == "train" and args.frozen_noise)
+                                frozen_noise=split == "train" and args.frozen_noise, frames=frames)
         print(f"{split}: {n} demonstrations ({lengths.sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
               f"({time.time() - tic:.0f}s)", flush=True)
     return out
@@ -449,15 +594,21 @@ def train_task(args, policy, device, rng):
     finally:
         if encoder is not None:
             encoder.close()
+    views = dict(wrist_span=args.wrist_span, scene_rank=args.scene_rank or None) if args.token_source == "vlm_views" else {}
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
-                      **scene_spec(args.token_source, args.render_size)).to(device)
+                      **scene_spec(args.token_source, args.render_size, **views)).to(device)
+    if views.get("scene_rank"):
+        task.set_reduction(*args.view_reduction)
     adapted = ReversalAdapter(task=task)
 
     def batch_loss(step):
         data, user = pairs[step % len(pairs)]
         obs, chunk, push, core, i, k = data["train"].sample(args.batch, args.goal_dropout)
         z, t = torch.randn_like(chunk), torch.rand(args.batch, device=device)
-        loss, _ = task_loss(policy, task, obs, chunk, z, t, args.lambda_id)
+        seen = obs
+        if args.token_drop:  # the flow matching alone sees a share of the scene tokens hidden
+            seen = {**obs, "scene_keep": torch.rand(args.batch, task.scene_tokens, device=device) >= args.token_drop}
+        loss, _ = task_loss(policy, task, seen, chunk, z, t, args.lambda_id)
         if args.lambda_field:  # the user's commands, through the frozen user module and this task module
             free = hide_goal(obs)
             latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps, adapted)
@@ -532,12 +683,16 @@ def save(args, kind, module, log):
     """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     out = adapter_dir(args.name)
-    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle, pooled=args.pooled,
+    saved = {k: v for k, v in vars(args).items() if k != "view_reduction"}   # the reduction travels in the module's buffers
+    path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
-                                                              teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None)))
+                                                              teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None),
+                                                              wrist_span=args.wrist_span, view_stride=args.view_stride,
+                                                              scene_rank=args.scene_rank, view_affine=args.view_affine,
+                                                              token_drop=args.token_drop, views=getattr(args, "view_info", None)))
     with open(out / "train_log.json", "w") as f:
-        json.dump(dict(args=vars(args), log=log), f, indent=1)
+        json.dump(dict(args=saved, log=log), f, indent=1)
     print(f"saved {path}")
 
 
@@ -586,7 +741,18 @@ def parse_args(argv=None):
     p.add_argument("--lambda-id", type=float, default=1e-3, help="task: pull of A, b toward the identity")
     p.add_argument("--token-source", choices=SCENE_SOURCES, default="discs",
                    help="task: what the module reads the obstacles from: the disc parameters, or the rendered scene "
-                        "through pi0.5's vision tokens (vlm_image, vlm_prefix) or a CNN trained with the module (cnn)")
+                        "through pi0.5's vision tokens (vlm_image, vlm_prefix; vlm_views: two views per demo frame) or a CNN "
+                        "trained with the module (cnn)")
+    p.add_argument("--wrist-span", type=float, default=0.5, help="task, vlm_views: the wrist view's side, in screens")
+    p.add_argument("--view-stride", type=int, default=2, help="task, vlm_views: a frame every this many demo steps")
+    p.add_argument("--scene-rank", type=int, default=256, help="task, vlm_views: width of the PCA token reduction fitted "
+                   "on the train split's frames (0: full width, 2048)")
+    p.add_argument("--view-affine", type=float, default=0.0, help="task, vlm_views: the probability a stored training "
+                   "picture is moved (a small rotation and shift, frozen in the frame table)")
+    p.add_argument("--token-drop", type=float, default=0.0, help="task, an image source: the share of scene tokens hidden "
+                   "from the flow-matching loss, drawn anew every batch")
+    p.add_argument("--render-workers", type=int, default=16, help="task, vlm_views: processes rendering the views "
+                   "(0: in-process)")
     p.add_argument("--token-geometry", choices=TOKEN_GEOMETRIES, default="absolute",
                    help="task: relative puts each scene token's offset from the cursor into the token (vlm_image, cnn) "
                         "instead of a learned position")
@@ -625,6 +791,27 @@ def parse_args(argv=None):
         p.error("--teacher draws --n-demos hits: a --demo-seconds budget is the scripted expert's")
     if args.token_geometry == "relative" and args.token_source in ("discs", "vlm_prefix"):
         p.error("--token-geometry relative needs screen tokens: --token-source vlm_image or cnn")
+    if args.token_source == "vlm_views":
+        if args.token_geometry == "relative":
+            p.error("vlm_views: nothing derived from the cursor's position enters the scene tokens: no --token-geometry relative")
+        if args.teacher:
+            p.error("vlm_views trains on the scripted expert's demonstrations: no --teacher")
+        if args.pooled:
+            p.error("vlm_views is a single-context run: no --pooled")
+    if args.token_source == "discs" and (args.token_drop > 0 or args.view_affine > 0):
+        p.error("--token-drop and --view-affine act on scene tokens: not with --token-source discs")
+    if args.view_affine > 0 and args.token_source != "vlm_views":
+        p.error("--view-affine moves the stored pictures of --token-source vlm_views")
+    if args.wrist_span <= 0:
+        p.error("--wrist-span must be positive")
+    if args.view_stride < 1:
+        p.error("--view-stride must be at least 1")
+    if not 0 <= args.scene_rank <= 2047:
+        p.error("--scene-rank must be in 0..2047 (0: full width)")
+    if not 0 <= args.token_drop < 1:
+        p.error("--token-drop must be in [0, 1)")
+    if not 0 <= args.view_affine <= 1:
+        p.error("--view-affine must be in [0, 1]")
     if args.pooled:
         if args.kind != "task":
             p.error("--pooled is for --kind task")
