@@ -40,6 +40,7 @@ from .configuration_steering import (
     OPERATOR_DIM_GROUPS,
     PI05_TOKENIZER,
     SCENE_SOURCES,
+    TOKEN_GEOMETRIES,
     VLM_SCENE_DIM,
     VLM_SCENE_TOKENS,
     MatrixHolder,
@@ -245,7 +246,9 @@ class LearnedTaskModule(nn.Module):
     tokens, ``obs["scene"][source]`` (B, ``scene_tokens``, ``scene_dim``), through a linear projection;
     ``cnn`` the rendered image, ``obs["scene"]["cnn"]`` (B, 3, S, S) uint8 with S = ``image_size``,
     through a small CNN trained with the module (stride 16: ``(S / 16) ** 2`` tokens). The image
-    sources add a learned position per token."""
+    sources add a learned position per token (``token_geometry="absolute"``), or, with ``"relative"``
+    (``vlm_image`` / ``cnn`` only), the offset of the token's patch centre from the cursor through the
+    disc-token MLP and no learned position."""
 
     def __init__(  # nosec B107 (token_source is not a password)
         self,
@@ -260,8 +263,15 @@ class LearnedTaskModule(nn.Module):
         scene_dim: int | None = None,
         scene_tokens: int | None = None,
         image_size: int | None = None,
+        token_geometry: str = "absolute",
     ):
         super().__init__()
+        if token_geometry not in TOKEN_GEOMETRIES:
+            raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {token_geometry!r}")
+        if token_geometry == "relative" and token_source not in ("vlm_image", "cnn"):  # nosec B105
+            raise ValueError(
+                f"relative token_geometry needs token_source vlm_image or cnn, got {token_source!r}"
+            )
         if token_source not in SCENE_SOURCES:
             raise ValueError(f"token_source must be one of {SCENE_SOURCES}, got {token_source!r}")
         if token_source.startswith("vlm") and (scene_dim is None or scene_tokens is None):
@@ -272,6 +282,9 @@ class LearnedTaskModule(nn.Module):
                     f"token_source 'cnn' needs an image_size that is a multiple of 16, got {image_size}"
                 )
             scene_tokens = (image_size // 16) ** 2
+        grid = math.isqrt(scene_tokens) if token_geometry == "relative" else 0
+        if token_geometry == "relative" and grid * grid != scene_tokens:
+            raise ValueError(f"relative token_geometry needs a square token grid, got {scene_tokens} tokens")
         self.config = {
             "horizon": horizon,
             "d": d,
@@ -288,6 +301,9 @@ class LearnedTaskModule(nn.Module):
                 "scene_tokens": scene_tokens,
                 "image_size": image_size,
             }
+        if token_geometry == "relative":
+            self.config["token_geometry"] = token_geometry
+        self.token_geometry = token_geometry
         self.horizon, self.tdim, self.scale, self.n_dims = horizon, tdim, scale, n_dims
         self.token_source, self.scene_dim, self.scene_tokens, self.image_size = (
             token_source,
@@ -324,7 +340,13 @@ class LearnedTaskModule(nn.Module):
                 if i < 3:
                     convs.append(nn.GELU())
             self.cnn = nn.Sequential(*convs)
-        if token_source != "discs":  # nosec B105
+        if token_geometry == "relative":
+            # token k = (row, col) = divmod(k, grid); x to the right (col), y down (row)
+            rows, cols = torch.meshgrid(torch.arange(grid), torch.arange(grid), indexing="ij")
+            centres = torch.stack([(cols.flatten() + 0.5) / grid, (rows.flatten() + 0.5) / grid], -1)
+            self.register_buffer("token_centres", centres, persistent=False)
+            self.token_half = 0.5 / grid
+        elif token_source != "discs":  # nosec B105
             self.scene_pos = nn.Parameter(0.02 * torch.randn(scene_tokens, d))
 
     def tokens(self, obs: dict | None, b: int) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -342,7 +364,17 @@ class LearnedTaskModule(nn.Module):
                 scene = self.cnn(x.float() / 255).flatten(2).transpose(1, 2)
             else:
                 scene = self.scene_in(x.float())
-            return torch.cat([null, scene + self.scene_pos], 1), None
+            if self.token_geometry == "relative":
+                pos = obs.get("pos")
+                if pos is None:
+                    raise ValueError("task module with relative token_geometry needs obs['pos']")
+                rel = (self.token_centres[None] - pos[:, None]) / self.scale
+                half = torch.full_like(rel[..., :1], self.token_half / self.scale)
+                feats = torch.cat([rel, half, rel.norm(dim=-1, keepdim=True)], -1)
+                scene = scene + self.token_in(feats)
+            else:
+                scene = scene + self.scene_pos
+            return torch.cat([null, scene], 1), None
         obstacles = None if obs is None else obs.get("obstacles")
         if obstacles is None or obstacles.shape[1] == 0:
             return null, None

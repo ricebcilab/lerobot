@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from lerobot.policies.steering import LearnedTaskModule, load_adapter_module, save_adapter_module
+from lerobot.policies.steering import (
+    TOKEN_GEOMETRIES,
+    LearnedTaskModule,
+    load_adapter_module,
+    save_adapter_module,
+)
 from lerobot.policies.steering.modeling_steering import SCENE_SOURCES
 
 
@@ -19,10 +24,11 @@ def _scene(b=3):
     }
 
 
-def _module(src):
+def _module(src, geometry="absolute"):
     return LearnedTaskModule(
         horizon=16,
         token_source=src,
+        token_geometry=geometry,
         scene_dim=32 if src.startswith("vlm") else None,
         scene_tokens=16 if src.startswith("vlm") else None,
         image_size=64 if src == "cnn" else None,
@@ -107,10 +113,10 @@ def test_cnn_tokens_change_with_the_image_and_vlm_tokens_with_the_scene():
     assert SCENE_SOURCES == ("discs", "vlm_image", "vlm_prefix", "cnn")
 
 
-def _live(src):
+def _live(src, geometry="absolute"):
     """A module with a non-zero head (so its output depends on the tokens) and its observation."""
     torch.manual_seed(0)
-    m = _module(src).eval()
+    m = _module(src, geometry).eval()
     with torch.no_grad():
         torch.nn.init.normal_(m.out.weight, std=0.3)
     obs = _scene()
@@ -122,9 +128,19 @@ def _live(src):
     return m, obs
 
 
-@pytest.mark.parametrize("src", ["discs", "vlm_image", "vlm_prefix", "cnn"])
-def test_a_bound_call_equals_the_unbound_call(src):
-    m, obs = _live(src)
+@pytest.mark.parametrize(
+    "src, geometry",
+    [
+        ("discs", "absolute"),
+        ("vlm_image", "absolute"),
+        ("vlm_prefix", "absolute"),
+        ("cnn", "absolute"),
+        ("vlm_image", "relative"),
+        ("cnn", "relative"),
+    ],
+)
+def test_a_bound_call_equals_the_unbound_call(src, geometry):
+    m, obs = _live(src, geometry)
     x, v, t = _xvt()
     bound = m.bind(obs)
     for _ in range(3):  # the first call computes the tokens, the others reuse them
@@ -189,3 +205,71 @@ def test_gradients_reach_the_cnn_through_the_cached_tokens():
     ref_loss.backward()
     for p, q in zip(m.cnn.parameters(), reference.cnn.parameters(), strict=True):
         torch.testing.assert_close(p.grad, q.grad, rtol=1e-3, atol=1e-3)  # summed in another order
+
+
+def _centres(g):  # token k = (row, col) = divmod(k, g); x right (col), y down (row)
+    rows, cols = torch.meshgrid(torch.arange(g), torch.arange(g), indexing="ij")
+    return torch.stack([(cols.flatten() + 0.5) / g, (rows.flatten() + 0.5) / g], -1)
+
+
+@pytest.mark.parametrize("src", ["vlm_image", "cnn"])
+def test_relative_geometry_round_trips_and_absolute_stays_the_default_without_a_key(src, tmp_path):
+    assert TOKEN_GEOMETRIES == ("absolute", "relative")
+    rel, ab = _module(src, "relative"), _module(src)
+    assert rel.config["token_geometry"] == "relative" and "token_geometry" not in ab.config
+    assert "scene_pos" not in rel.state_dict() and "scene_pos" in ab.state_dict()
+    assert LearnedTaskModule(**ab.config).token_geometry == "absolute"  # a round-1 config
+    obs, (x, v, t) = _scene(), _xvt()
+    save_adapter_module(rel, tmp_path / "rel.pt", "task")
+    back, kind, _ = load_adapter_module(tmp_path / "rel.pt")
+    assert kind == "task" and back.token_geometry == "relative"
+    a, b = rel(x, t, v, obs), back(x, t, v, obs)
+    assert torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1])
+
+
+@pytest.mark.parametrize("src", ["vlm_image", "cnn"])
+def test_relative_tokens_are_the_projection_plus_the_cursor_relative_geometry(src):
+    m, obs = _module(src, "relative"), _scene()
+    x = obs["scene"][src]
+    rel = (_centres(4)[None] - obs["pos"][:, None]) / m.scale
+    feats = torch.cat(
+        [rel, torch.full_like(rel[..., :1], (0.5 / 4) / m.scale), rel.norm(dim=-1, keepdim=True)], -1
+    )
+    content = (
+        m.scene_in(x.float()) if src == "vlm_image" else m.cnn(x.float() / 255).flatten(2).transpose(1, 2)
+    )
+    tokens, pad = m.tokens(obs, 3)
+    assert pad is None and tokens.shape == (3, 17, 128)
+    assert torch.allclose(tokens[:, 1:], content + m.token_in(feats), atol=1e-6)
+    assert torch.equal(m.token_centres, _centres(4)) and m.token_half == 0.5 / 4
+
+
+def test_relative_geometry_is_refused_where_tokens_have_no_screen_position():
+    for src in ("discs", "vlm_prefix"):
+        with pytest.raises(ValueError, match="relative"):
+            _module(src, "relative")
+    with pytest.raises(ValueError, match="square"):
+        LearnedTaskModule(token_source="vlm_image", token_geometry="relative", scene_dim=32, scene_tokens=15)
+    with pytest.raises(ValueError, match="token_geometry"):
+        _module("vlm_image", "polar")
+    obs = _scene()
+    del obs["pos"]
+    with pytest.raises(ValueError, match="pos"):
+        _module("vlm_image", "relative").tokens(obs, 3)
+
+
+def test_relative_tokens_shift_with_the_cursor_by_whole_tokens():
+    # vlm_image only: its content can be made identical per token; the CNN's zero-padded borders cannot. The centres
+    # buffer is shared, so this pins the row/col convention for both sources.
+    src = "vlm_image"
+    m, obs = _module(src, "relative"), _scene()
+    x = obs["scene"][src]
+    obs["scene"][src] = x[:, :1].expand_as(x).clone()  # every token the same
+    p = torch.tensor([[0.3, 0.4]]).expand(3, -1)
+    tp = m.tokens({**obs, "pos": p}, 3)[0][:, 1:].view(3, 4, 4, -1)  # [b, row, col, d]
+    tx = m.tokens({**obs, "pos": p + torch.tensor([0.25, 0.0])}, 3)[0][:, 1:].view(3, 4, 4, -1)
+    ty = m.tokens({**obs, "pos": p + torch.tensor([0.0, 0.25])}, 3)[0][:, 1:].view(3, 4, 4, -1)
+    assert torch.allclose(
+        tx[:, :, 1:], tp[:, :, :-1], atol=1e-5
+    )  # a cursor one column right sees the same offsets
+    assert torch.allclose(ty[:, 1:, :], tp[:, :-1, :], atol=1e-5)  # one row down likewise

@@ -252,6 +252,9 @@ def parse_adapter_spec(
 
 
 SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn")
+# absolute: a learned position per image token (round 1); relative: the token centre's offset from the cursor
+# through the disc-token MLP
+TOKEN_GEOMETRIES: tuple[str, ...] = ("absolute", "relative")
 VLM_SCENE_TOKENS = 256  # SigLIP's patches of the 224 px input every render is resized to
 VLM_SCENE_DIM = 2048  # the width of pi0.5's prefix (SigLIP after the multimodal projector, and Gemma's)
 CNN_PATCH = 16  # the task module's CNN stem downsamples by 16
