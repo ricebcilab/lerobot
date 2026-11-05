@@ -39,6 +39,18 @@ def _within(a: float, b: float) -> bool:
     return round(a - b, 9) >= 0
 
 
+def _hidden_flag(hidden: float | None, ref: float | None) -> bool:
+    """Goal-hidden hits strictly more than the reference's + MARGIN, without float noise; False when either is missing."""
+    return hidden is not None and ref is not None and not _within(ref + MARGIN, hidden)
+
+
+def _flag_cell(r: dict) -> str:
+    """The flag column: n/a when the goal-hidden row or its reference was not measured."""
+    if r["hidden_hits"] is None or r["ref_hidden_hits"] is None:
+        return "n/a"
+    return "FLAG" if r["flag"] else "ok"
+
+
 def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
     """Per context (from the cell key ``U0xT<k>|...``) and image arm, the gate verdict.
 
@@ -47,8 +59,8 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
     parametric module); ft_hits from ``oracle_ft`` (the fine-tuned policy, None when the run has no such row).
     ``collisions_ok`` = collision <= ref_collision + 0.10. ``pass`` = hits >= ref_hits - 0.10 and collisions_ok.
     Else ``marginal`` = hits > ft_hits and collisions_ok, else ``FAIL``; pass wins where it overlaps the floor.
-    Without an ``oracle_ft`` row no arm is marginal. ``flag`` = hidden_hits > ref_hidden_hits + 0.10, with
-    hidden_hits from ``policy_task_<x>`` and ref_hidden_hits from ``policy_task``.
+    Without an ``oracle_ft`` row no arm is marginal. ``flag`` = hidden_hits > ref_hidden_hits + 0.10 (``_hidden_flag``),
+    with hidden_hits from ``policy_task_<x>`` and ref_hidden_hits from ``policy_task``; False when either is missing.
     """
     rows = []
     for key, cell in sorted(check.get("test", {}).items()):
@@ -83,7 +95,7 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
                     **{"pass": verdict == "pass"},
                     hidden_hits=hidden,
                     ref_hidden_hits=ref_h,
-                    flag=bool(hidden is not None and ref_h is not None and hidden > ref_h + MARGIN),
+                    flag=_hidden_flag(hidden, ref_h),
                 )
             )
     return sorted(rows, key=lambda r: (r["context"], r["arm"]))
@@ -145,7 +157,7 @@ def scan_rows(runs: dict[int, dict]) -> list[dict]:
                     in_band=ok(MARGIN),
                     hidden_hits=h,
                     ref_hidden_hits=rh,
-                    flag=bool(h is not None and rh is not None and h > rh + MARGIN),
+                    flag=_hidden_flag(h, rh),
                 )
             )
     return sorted(rows, key=lambda r: (r["context"], r["demos"]))
@@ -165,7 +177,8 @@ def crossing(counts: list[int], values: list[float], threshold: float) -> tuple[
     """Where the curve of ``values`` over ``counts``, linear in log10(count), first reaches ``threshold``.
 
     The first count when the curve starts at or above it. Past the last count the last segment is continued when
-    it rises, and the result is marked True (an extrapolation). ``(None, False)`` when it never gets there.
+    it rises, and the result is marked True (an extrapolation). ``(None, False)`` when it never gets there, or when
+    the extrapolated count is more than 10 times the largest count given (a nearly flat last segment).
     """
     x = [float(np.log10(c)) for c in counts]
     for i, v in enumerate(values):
@@ -176,8 +189,26 @@ def crossing(counts: list[int], values: list[float], threshold: float) -> tuple[
             return float(10 ** (x[i - 1] + frac * (x[i] - x[i - 1]))), False
     if len(values) >= 2 and values[-1] > values[-2]:
         slope = (values[-1] - values[-2]) / (x[-1] - x[-2])
-        return float(10 ** (x[-1] + (threshold - values[-1]) / slope)), True
+        n = float(10 ** min(x[-1] + (threshold - values[-1]) / slope, 300.0))  # the cap keeps a flat slope finite
+        return (n, True) if round(10 * max(counts) - n, 6) >= 0 else (None, False)
     return None, False
+
+
+def joint_crossing(
+    counts: list[int], hits: list[float], collisions: list[float], hits_bar: float, collision_bar: float
+) -> tuple[float | None, bool]:
+    """Where both the hits curve has risen to ``hits_bar`` and the collisions curve has fallen to ``collision_bar``.
+
+    Each from ``crossing`` (collisions negated); the later of the two counts, marked extrapolated when that one is
+    (on a tie when either is). ``(None, False)`` when either curve does not get there on its trend.
+    """
+    h = crossing(counts, hits, hits_bar)
+    c = crossing(counts, [-v for v in collisions], -collision_bar)
+    if h[0] is None or c[0] is None:
+        return None, False
+    if h[0] == c[0]:
+        return h[0], h[1] or c[1]
+    return max(h, c, key=lambda t: t[0])
 
 
 def _arm_means(check: dict, arms: list[str]) -> dict[str, float]:
@@ -198,10 +229,20 @@ def _arm_means(check: dict, arms: list[str]) -> dict[str, float]:
 def select_recipe(
     check: dict, base: str = "base", changes: tuple[str, ...] = ("span1", "nomask", "noaffine")
 ) -> dict:
-    """Mean hits of each recipe over the contexts, and the changes whose mean beats the base's by more than ADOPT."""
+    """Mean hits of each recipe over the contexts, and the changes whose mean beats the base's by more than ADOPT.
+
+    ``per_context`` holds the rows behind the means: ``{arm: {context: {"hits": .., "collision": ..}}}``.
+    """
     means = _arm_means(check, [base, *changes])
     adopted = [c for c in changes if round(means[c] - means[base] - ADOPT, 9) > 0]
-    return dict(means=means, adopted=adopted)
+    per_context = {
+        arm: {
+            ctx: dict(hits=m["success"], collision=m["collision"])
+            for ctx, m in sorted(_context_means(check, f"oracle_task_views_{arm}").items())
+        }
+        for arm in (base, *changes)
+    }
+    return dict(means=means, adopted=adopted, per_context=per_context)
 
 
 def width_check(check: dict, reduced: str = "base", full: str = "full", context: str = "T4") -> dict:
@@ -289,24 +330,30 @@ def _methods(run: dict) -> list[str]:
     return seen
 
 
-def _scan_report(a) -> None:
-    runs = {}
+def _scan_report(a, ap: argparse.ArgumentParser) -> None:
+    runs, names = {}, {}
     for name in a.scan:
         run = _load(a.results, name)
         counts = {int(m.group(1)) for m in map(re.compile(r"oracle_task_views_n(\d+)$").match, _methods(run)) if m}
         if len(counts) != 1:
             raise SystemExit(f"{name}: expected exactly one oracle_task_views_n<N> method, found {sorted(counts)}")
-        runs[counts.pop()] = run
+        n = counts.pop()
+        if n in runs:
+            ap.error(f"--scan: two runs ({names[n]} and {name}) are for {n} demonstrations; give one run per count")
+        runs[n], names[n] = run, name
     rows = scan_rows(runs)
     largest = max(runs)
     first_level, first_band = first_count(rows, "level"), first_count(rows, "in_band")
     crossings = {}
     for ctx in sorted(first_level):
         cr = [r for r in rows if r["context"] == ctx]
-        ref = cr[0]["ref_hits"]
+        ref, ref_c = cr[0]["ref_hits"], cr[0]["ref_collision"]
         crossings[ctx] = {}
-        for name, bar in (("level", ref - LEVEL), ("in_band", ref - MARGIN)):
-            n, extra = crossing([r["demos"] for r in cr], [r["hits"] for r in cr], bar)
+        for name, margin in (("level", LEVEL), ("in_band", MARGIN)):
+            n, extra = joint_crossing(
+                [r["demos"] for r in cr], [r["hits"] for r in cr], [r["collision"] for r in cr], ref - margin,
+                ref_c + margin,
+            )
             crossings[ctx][name] = dict(demos=n, extrapolated=extra)
 
     def show(n):
@@ -314,7 +361,7 @@ def _scan_report(a) -> None:
 
     def show_cross(c):
         if c["demos"] is None:
-            return f"more than {largest}"
+            return "not reached on this trend"
         return f"{c['demos']:.0f}" + (" (extrapolated)" if c["extrapolated"] else "")
 
     md = ["# Image task modules: demonstration scan", "", "## Scan (success and collision in %)", ""]
@@ -324,15 +371,15 @@ def _scan_report(a) -> None:
         [
             [r["context"], r["demos"], _fmt(r["hits"]), _fmt(r["ref_hits"]), _fmt(r["collision"]),
              _fmt(r["ref_collision"]), "yes" if r["level"] else "no", "yes" if r["in_band"] else "no",
-             _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]), "FLAG" if r["flag"] else "ok"]
+             _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]), _flag_cell(r)]
             for r in rows
         ],
     )
     for ctx in sorted(first_level):
         md += [
             f"- {ctx}: first level count {show(first_level[ctx])}; first in-band count {show(first_band[ctx])}; "
-            f"crossing of the level bar {show_cross(crossings[ctx]['level'])}; "
-            f"crossing of the in-band bar {show_cross(crossings[ctx]['in_band'])}",
+            f"crossing of the level bar on hits and collisions {show_cross(crossings[ctx]['level'])}; "
+            f"crossing of the in-band bar on hits and collisions {show_cross(crossings[ctx]['in_band'])}",
         ]
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "report.md").write_text("\n".join(md) + "\n")
@@ -350,6 +397,8 @@ def main(argv=None):
     mode.add_argument("--select", metavar="RUN", help="recipe-choice run name")
     mode.add_argument("--width", metavar="RUN", help="width-check run name")
     mode.add_argument("--scan", nargs="+", metavar="RUN", help="demonstration-scan run names, one per count")
+    ap.add_argument("--reduced", default="base", help="--width: the reduced-width arm (oracle_task_views_<arm>)")
+    ap.add_argument("--full", default="full", help="--width: the full-width arm (oracle_task_views_<arm>)")
     ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
     ap.add_argument("--ft", nargs="*", default=[], help="fine-tuned run names, paired with --grid by position")
     ap.add_argument("--results", type=Path, required=True)
@@ -361,13 +410,16 @@ def main(argv=None):
         ap.error("--ft must pair with --grid by position")
 
     if a.select or a.width:
-        out = select_recipe(_load(a.results, a.select)) if a.select else width_check(_load(a.results, a.width))
+        if a.select:
+            out = select_recipe(_load(a.results, a.select))
+        else:
+            out = width_check(_load(a.results, a.width), reduced=a.reduced, full=a.full)
         print(json.dumps(out, indent=2))
         a.out.mkdir(parents=True, exist_ok=True)
         (a.out / ("select.json" if a.select else "width.json")).write_text(json.dumps(out, indent=2))
         return
     if a.scan:
-        return _scan_report(a)
+        return _scan_report(a, ap)
 
     check = _load(a.results, a.check)
     grids = [_load(a.results, n) for n in a.grid]
@@ -390,7 +442,7 @@ def main(argv=None):
                 [r["context"], r["arm"], _fmt(r["hits"]), _fmt(r["ref_hits"], none="n/a"),
                  _fmt(r["ft_hits"], none="n/a"), _fmt(r["collision"]), _fmt(r["ref_collision"]),
                  r["verdict"], _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]),
-                 "FLAG" if r["flag"] else "ok"]
+                 _flag_cell(r)]
                 for r in gate
             ],
         )

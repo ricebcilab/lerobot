@@ -403,3 +403,144 @@ def test_rules_refuse_a_run_that_lacks_a_row():
         width_check(width)
     with pytest.raises(ValueError, match="oracle_task_views_base has no row for context T2"):
         width_check(width, context="T2")
+
+
+def _review_runs():
+    """The review's example: parametric 92.8 / 3.4, the view module at 60 / 38, 84 / 15, 90 / 9."""
+    ref = {"oracle_task": _m(0.928, 0.034), "policy_task": _m(0.764)}
+    views = {300: (0.60, 0.38), 1000: (0.84, 0.15), 3000: (0.90, 0.09)}
+    return {
+        n: _run({"T4": {**ref, f"oracle_task_views_n{n}": _m(h, c), f"policy_task_views_n{n}": _m(0.7)}})
+        for n, (h, c) in views.items()
+    }
+
+
+def test_the_scan_crossings_need_hits_and_collisions(tmp_path):
+    names = _write_runs(tmp_path, _review_runs())
+    report_main(["--scan", *names, "--results", str(tmp_path), "--out", str(tmp_path / "out")])
+    line = next(r for r in (tmp_path / "out" / "report.md").read_text().splitlines() if r.startswith("- T4"))
+    assert "first level count more than 3000" in line and "hits and collisions" in line
+    level = re.search(r"crossing of the level bar[^;]*? (\d+)( \(extrapolated\))?;", line)
+    assert level and level.group(2) and int(level.group(1)) >= 3000, (
+        line
+    )  # hits alone would give 2892, inside
+    cross = json.loads((tmp_path / "out" / "report.json").read_text())["crossings"]["T4"]
+    assert cross["level"]["extrapolated"] and cross["level"]["demos"] >= 3000
+    # in band: hits reach 82.8 between 300 and 1000, collisions 13.4 between 1000 and 3000: the later one, inside
+    col = 10 ** (np.log10(1000) + (0.134 - 0.15) / (0.09 - 0.15) * (np.log10(3000) - np.log10(1000)))
+    assert not cross["in_band"]["extrapolated"] and abs(cross["in_band"]["demos"] - col) < 1e-6
+
+
+def test_a_crossing_not_reached_on_either_curve_is_none(tmp_path):
+    runs = _review_runs()
+    runs[3000]["test"]["U0xT4|0.0"]["metrics"]["oracle_task_views_n3000"] = _m(0.90, 0.20)  # collisions rise
+    names = _write_runs(tmp_path, runs)
+    report_main(["--scan", *names, "--results", str(tmp_path), "--out", str(tmp_path / "out")])
+    cross = json.loads((tmp_path / "out" / "report.json").read_text())["crossings"]["T4"]
+    assert cross["level"] == dict(demos=None, extrapolated=False)
+    assert (
+        "crossing of the level bar on hits and collisions not reached on this trend"
+        in (tmp_path / "out" / "report.md").read_text()
+    )
+
+
+def test_crossing_refuses_an_extrapolation_past_ten_times_the_largest_count():
+    assert crossing([300, 1000, 3000], [0.5, 0.6, 0.602], 0.898) == (None, False)  # was 1.2e74
+    n, extra = crossing([300, 3000], [0.5, 0.6], 0.7)  # exactly ten times 3000
+    assert extra and abs(n - 30000) < 1e-6
+    assert crossing([300, 3000], [0.5, 0.6], 0.701) == (None, False)
+
+
+def test_two_scan_runs_with_the_same_count_are_refused(tmp_path, capsys):
+    runs = _scan_runs()
+    names = _write_runs(tmp_path, runs)
+    d = tmp_path / "sim" / "sweeps" / "again300"
+    d.mkdir(parents=True)
+    (d / "test.json").write_text(json.dumps(runs[300]))
+    with pytest.raises(SystemExit):
+        report_main(
+            ["--scan", *names, "again300", "--results", str(tmp_path), "--out", str(tmp_path / "out")]
+        )
+    assert "300" in capsys.readouterr().err
+
+
+def test_the_goal_hidden_flag_needs_more_than_ten_points():
+    # references where the raw ``hidden > ref + 0.10`` fires at exactly +10 points (0.236 + 0.1 > 0.336 in floats)
+    for ref, hidden, flagged in (
+        (0.70, 0.80, False),
+        (0.236, 0.336, False),
+        (0.70, 0.802, True),
+        (0.236, 0.338, True),
+    ):
+        cell = {
+            "oracle_task": _m(0.9, 0.05),
+            "oracle_task_rel": _m(0.9, 0.05),
+            "policy_task": _m(ref),
+            "policy_task_rel": _m(hidden),
+        }
+        assert gate_table(_run({"T2": cell}), ["rel"])[0]["flag"] is flagged, (ref, hidden)
+        run = _run(
+            {
+                "T2": {
+                    "oracle_task": _m(0.9, 0.05),
+                    "policy_task": _m(ref),
+                    "oracle_task_views_n300": _m(0.9, 0.05),
+                    "policy_task_views_n300": _m(hidden),
+                }
+            }
+        )
+        assert scan_rows({300: run})[0]["flag"] is flagged, (ref, hidden)
+
+
+def test_a_missing_goal_hidden_row_prints_n_a(tmp_path):
+    cell = {"oracle_task": _m(0.9, 0.05), "oracle_task_rel": _m(0.9, 0.05), "policy_task": _m(0.2)}
+    _write(tmp_path, check=_run({"T2": cell}))
+    report_main(["--check", "check", "--results", str(tmp_path), "--out", str(tmp_path / "rep")])
+    assert (
+        "| T2 | rel | 90.0 | 90.0 | n/a | 5.0 | 5.0 | pass | - | 20.0 | n/a |"
+        in (tmp_path / "rep" / "report.md").read_text()
+    )
+    gate = json.loads((tmp_path / "rep" / "report.json").read_text())["gate"][0]
+    assert gate["flag"] is False and gate["hidden_hits"] is None
+    runs = _scan_runs()
+    del runs[3000]["test"]["U0xT4|0.0"]["metrics"]["policy_task_views_n3000"]
+    names = _write_runs(tmp_path, runs)
+    report_main(["--scan", *names, "--results", str(tmp_path), "--out", str(tmp_path / "out")])
+    row = next(
+        r for r in (tmp_path / "out" / "report.md").read_text().splitlines() if r.startswith("| T4 | 3000")
+    )
+    assert row.endswith("| - | 76.4 | n/a |"), row
+    scan = json.loads((tmp_path / "out" / "report.json").read_text())["scan"][-1]
+    assert scan["flag"] is False and scan["hidden_hits"] is None
+
+
+def test_width_names_its_arms_and_select_writes_the_per_context_rows(tmp_path):
+    wid = _run({"T4": {"oracle_task_views_r512": _m(0.30), "oracle_task_views_raw": _m(0.40)}})
+    sel = _run(
+        {
+            "T2": {f"oracle_task_views_{r}": _m(0.5, 0.1) for r in ("base", "span1", "nomask", "noaffine")},
+            "T4": {f"oracle_task_views_{r}": _m(0.3, 0.2) for r in ("base", "span1", "nomask", "noaffine")},
+        }
+    )
+    _write(tmp_path, wid=wid, sel=sel)
+    out = tmp_path / "out"
+    report_main(
+        [
+            "--width",
+            "wid",
+            "--reduced",
+            "r512",
+            "--full",
+            "raw",
+            "--results",
+            str(tmp_path),
+            "--out",
+            str(out),
+        ]
+    )
+    width = json.loads((out / "width.json").read_text())
+    assert width["reduced_hits"] == 0.30 and width["full_hits"] == 0.40 and width["ok"] is False
+    report_main(["--select", "sel", "--results", str(tmp_path), "--out", str(out)])
+    per = json.loads((out / "select.json").read_text())["per_context"]
+    assert set(per) == {"base", "span1", "nomask", "noaffine"}
+    assert per["base"] == {"T2": {"hits": 0.5, "collision": 0.1}, "T4": {"hits": 0.3, "collision": 0.2}}
