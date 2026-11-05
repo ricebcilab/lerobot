@@ -546,10 +546,13 @@ def test_the_frame_table_is_the_same_rendered_in_a_process_pool(monkeypatch):
     rng = np.random.default_rng(0)
     layouts, task = train_adapter.layouts_for(args, args.obstacle, rng, 6, args.p_free)
     actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
-    tables = {}
+    tables, cuda = {}, torch.cuda.is_available()
     for workers in (2, 0):
         args.render_workers = workers
+        cpu_state, cuda_state = torch.get_rng_state(), torch.cuda.get_rng_state_all() if cuda else []
         tables[workers] = train_adapter.view_frames(args, layouts, actions, lengths, ViewStub(), "cpu", affine_rng=np.random.default_rng(1))
+        assert torch.equal(torch.get_rng_state(), cpu_state)                # the encoder's draws left torch's streams alone
+        assert all(torch.equal(a, b) for a, b in zip(torch.cuda.get_rng_state_all() if cuda else [], cuda_state, strict=True))
     (pooled, start, info), (inline, start0, info0) = tables[2], tables[0]
     assert info["frames"] == len(inline) > 2 * 8 and info["moved"] == info0["moved"] > 0   # several chunks through the pool
     assert torch.equal(pooled, inline) and np.array_equal(start, start0) and pooled.shape[1:] == (512, 2)

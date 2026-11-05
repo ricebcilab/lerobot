@@ -71,9 +71,10 @@ on its own) by a small rotation and shift, drawn once and frozen in the table (`
 never moved. `--scene-rank r` (default 256; 0: full width) fits a PCA token reduction on `REDUCTION_SAMPLE` train
 frames, stores the reduced tokens and carries the reduction in the module (its `scene_mean`, `scene_basis`).
 `--token-drop p` hides a share p of the scene tokens, drawn anew every batch, from the flow-matching loss only; the
-field term and the validation see every token. The views pipeline draws from its own `default_rng([seed, 7])`, so the
-demonstrations and the frozen noise are those of any other source at the seed. The checkpoint's meta records the
-flags and every split's frames, moved pictures, variance kept and seconds (`views`).
+field term and the validation see every token. The views pipeline draws from its own `default_rng([seed, 7])` and
+leaves torch's generators as it found them (the encoder's load included), so the demonstrations, the frozen noise and
+the module's initialisation are those of any other source at the seed. The checkpoint's meta records the flags and
+every split's frames, moved pictures, variance kept and seconds (`views`).
 
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
@@ -297,8 +298,9 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
     encoded (`encode_views`). With --scene-rank the tokens are reduced by `reduction` (mean, basis) or, when it is None,
     by a PCA (`fit_token_reduction`, streamed) of up to REDUCTION_SAMPLE frames chosen with `affine_rng` (or a
     default_rng([seed, 7])), whose pictures are rendered, moved and encoded for the fit first. Draws from no other
-    generator. Returns float16 tokens [F, 512, rank or 2048] (on `device` when at most VIEW_GPU_BYTES, else on the
-    CPU), start (demo i's frames from row start[i]) and info: frames, moved (pictures in the table), kept (the
+    generator, and leaves torch's CPU and CUDA generator states as it found them (the encoder runs inside `fork_rng`).
+    Returns float16 tokens [F, 512, rank or 2048] (on `device` when at most VIEW_GPU_BYTES, else on the CPU), start
+    (demo i's frames from row start[i]) and info: frames, moved (pictures in the table), kept (the
     variance share when fitted here, else None), reduction (the one used, or None) and seconds."""
     tic = time.time()
     demo, step, start = frame_steps(lengths, args.view_stride)
@@ -318,7 +320,9 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
                 views, hits = flat.reshape(views.shape), int(hit.sum())
             yield rows, encode_views(views, encoder), hits
 
-    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) if workers else nullcontext() as pool:
+    # the encoder (its lazy first load builds a model, initialised from torch's generators) runs on forked streams
+    with (torch.random.fork_rng(devices=range(torch.cuda.device_count())),
+          ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) if workers else nullcontext() as pool):
         kept = None
         if args.scene_rank and reduction is None:
             sample = np.sort(rng.choice(len(demo), min(len(demo), REDUCTION_SAMPLE), replace=False))
