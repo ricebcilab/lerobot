@@ -10,6 +10,7 @@
 #   pass      hits within 10 points of oracle_task, or above it, and collisions at most oracle_task's + 10 points
 #   marginal  more hits than oracle_ft but more than 10 points below oracle_task, collisions within the same +10 bar
 #   FAIL      hits at or below oracle_ft's, or collisions more than 10 points over oracle_task's
+# Pass wins where it overlaps the floor: an arm within 10 points of oracle_task is a pass even at or below oracle_ft's hits.
 # (On T5 the parametric module itself hits 74.2%, so "within 10 points" there is 64.2% or better.)
 # A goal-hidden policy_task_rel that hits more than 10 points above policy_task is flagged whatever the verdict
 # (the module is steering by something other than the obstacles).

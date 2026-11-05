@@ -3,7 +3,10 @@
 
 Reads ``<results>/sim/sweeps/<run>/test.json`` of the gate run (``grid_task_check_image``), the grid
 runs (``grid_image_s<k>``) and optionally the fine-tuned runs (``grid_ft_s<k>``), and writes
-``report.md`` and ``report.json`` to ``--out``. Without ``--grid`` only the gate is reported (the arms are the
+``report.md`` and ``report.json`` to ``--out``. The gate gives each image arm one of three verdicts against two
+reference rows of the check run, ``oracle_task`` (the parametric module) and ``oracle_ft`` (the fine-tuned policy,
+the floor): pass (within 10 points of parametric hits, collisions at most parametric's + 10 points), marginal
+(more hits than the fine-tuned policy but not a pass, collisions within the same bar) or FAIL. Without ``--grid`` only the gate is reported (the arms are the
 check run's ``oracle_task_<x>`` methods), so the gate can be read before the grid exists.
 """
 
@@ -15,8 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-HIT_MIN = 0.80  # gate: oracle_task_<x> must hit at least this often (metrics are fractions in [0, 1])
-MARGIN = 0.10  # gate: collision may exceed the reference by this much; hidden hits likewise
+MARGIN = 0.10  # gate: hits may trail the parametric module, collisions and hidden hits may exceed theirs, by this much
 
 
 def _context(key: str) -> str | None:
@@ -32,11 +34,13 @@ def _user(key: str) -> str | None:
 def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
     """Per context (from the cell key ``U0xT<k>|...``) and image arm, the gate verdict.
 
-    Reads ``metrics`` only. Metrics are fractions in [0, 1], so the rule is in fractions:
-    ``pass`` = hits >= 0.80 and collision <= ref_collision + 0.10, with hits and collision from
-    ``oracle_task_<x>`` and ref_collision from ``oracle_task`` (the same rule as 80 / +10 percent).
-    ``flag`` = hidden_hits > ref_hidden_hits + 0.10, with hidden_hits from ``policy_task_<x>`` and
-    ref_hidden_hits from ``policy_task``. Values are reported as the metrics give them.
+    Reads ``metrics`` only. Metrics are fractions in [0, 1], so the rule is in fractions (10 points = 0.10).
+    hits and collision are from ``oracle_task_<x>``; ref_hits and ref_collision from ``oracle_task`` (the
+    parametric module); ft_hits from ``oracle_ft`` (the fine-tuned policy, None when the run has no such row).
+    ``collisions_ok`` = collision <= ref_collision + 0.10. ``pass`` = hits >= ref_hits - 0.10 and collisions_ok.
+    Else ``marginal`` = hits > ft_hits and collisions_ok, else ``FAIL``; pass wins where it overlaps the floor.
+    Without an ``oracle_ft`` row no arm is marginal. ``flag`` = hidden_hits > ref_hidden_hits + 0.10, with
+    hidden_hits from ``policy_task_<x>`` and ref_hidden_hits from ``policy_task``.
     """
     rows = []
     for key, cell in sorted(check.get("test", {}).items()):
@@ -45,6 +49,8 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
         if ctx is None:
             continue
         ref_c = met.get("oracle_task", {}).get("collision")
+        ref_hits = met.get("oracle_task", {}).get("success")
+        ft_hits = met.get("oracle_ft", {}).get("success")
         ref_h = met.get("policy_task", {}).get("success")
         for arm in image_arms:
             o, p = met.get(f"oracle_task_{arm}"), met.get(f"policy_task_{arm}")
@@ -52,14 +58,21 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
                 continue
             hits, col = o["success"], o["collision"]
             hidden = p["success"] if p else None
+            collisions_ok = ref_c is not None and col <= ref_c + MARGIN
+            passes = ref_hits is not None and hits >= ref_hits - MARGIN and collisions_ok
+            above_floor = ft_hits is not None and hits > ft_hits
+            verdict = "pass" if passes else ("marginal" if above_floor and collisions_ok else "FAIL")
             rows.append(
                 dict(
                     context=ctx,
                     arm=arm,
                     hits=hits,
+                    ref_hits=ref_hits,
+                    ft_hits=ft_hits,
                     collision=col,
                     ref_collision=ref_c,
-                    **{"pass": bool(hits >= HIT_MIN and ref_c is not None and col <= ref_c + MARGIN)},
+                    verdict=verdict,
+                    **{"pass": verdict == "pass"},
                     hidden_hits=hidden,
                     ref_hidden_hits=ref_h,
                     flag=bool(hidden is not None and ref_h is not None and hidden > ref_h + MARGIN),
@@ -119,9 +132,9 @@ def _load(results: Path, name: str) -> dict:
     return json.loads((results / "sim" / "sweeps" / name / "test.json").read_text())
 
 
-def _fmt(v, pct=True):
+def _fmt(v, pct=True, none="-"):
     if v is None:
-        return "-"
+        return none
     return f"{100 * v:.1f}" if pct else f"{v:.1f}"
 
 
@@ -169,10 +182,12 @@ def main(argv=None):
     md = ["# Image task modules: gate and grid", "", "## Gate (success and collision in %)", ""]
     if gate:
         md += _table(
-            ["context", "arm", "hits", "collision", "ref collision", "pass", "hidden hits", "ref hidden", "flag"],
+            ["context", "arm", "hits", "ref hits", "ft hits", "collision", "ref collision", "verdict",
+             "hidden hits", "ref hidden", "flag"],
             [
-                [r["context"], r["arm"], _fmt(r["hits"]), _fmt(r["collision"]), _fmt(r["ref_collision"]),
-                 "pass" if r["pass"] else "FAIL", _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]),
+                [r["context"], r["arm"], _fmt(r["hits"]), _fmt(r["ref_hits"], none="n/a"),
+                 _fmt(r["ft_hits"], none="n/a"), _fmt(r["collision"]), _fmt(r["ref_collision"]),
+                 r["verdict"], _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]),
                  "FLAG" if r["flag"] else "ok"]
                 for r in gate
             ],
