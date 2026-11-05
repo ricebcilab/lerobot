@@ -173,7 +173,7 @@ judge. A module that fails the collision rule goes back to training (render abla
 then the fallback below) before it costs a sweep. The fallback is triggered from this gate,
 not from the sweep.
 
-**Fallback if the absolute view does not train.** Render per chunk, centered on the cursor
+**Fallback if the absolute view does not train.** *(Superseded 2026-11-04 by `2026-11-04-mars-image-round2-teacher-relative-design.md`: the gate failed, and the remedy chosen is teacher demonstrations plus relative token geometry, not the cursor-centred render below.)* Render per chunk, centered on the cursor
 (a window of fixed size in screen units), so the tokens are relative to the agent as the disc
 tokens were. Costs one VLM pass per chunk at test time and per demonstration step in training
 (precomputable: 300 demos × ~100 steps). Only if the static render fails the gate.
