@@ -112,7 +112,12 @@ def scan_rows(runs: dict[int, dict]) -> list[dict]:
     """
     refs: dict[str, dict] = {}
     rows = []
+    contexts = {c for run in runs.values() for c in map(_context, run.get("test", {})) if c}
     for n, run in sorted(runs.items()):
+        for method in ("oracle_task", f"oracle_task_views_n{n}"):
+            have = _context_means(run, method)
+            for ctx in sorted(contexts - set(have)):
+                raise ValueError(f"the run for {n} demonstrations has no {method} row for context {ctx}")
         for ctx, ref in _context_means(run, "oracle_task").items():
             if ctx in refs and any(abs(refs[ctx][k] - ref[k]) > 1e-9 for k in ref):
                 raise ValueError(f"oracle_task differs between runs for {ctx}: the runs used different layouts")
@@ -178,8 +183,14 @@ def crossing(counts: list[int], values: list[float], threshold: float) -> tuple[
 def _arm_means(check: dict, arms: list[str]) -> dict[str, float]:
     """Mean hits of ``oracle_task_views_<arm>`` over the contexts (each context's mean over its cells)."""
     out = {}
+    have = {arm: _context_means(check, f"oracle_task_views_{arm}") for arm in arms}
+    contexts = set().union(*have.values())
     for arm in arms:
-        per_ctx = _context_means(check, f"oracle_task_views_{arm}")
+        per_ctx = have[arm]
+        if not per_ctx:
+            raise ValueError(f"oracle_task_views_{arm} has no rows in the run")
+        for ctx in sorted(contexts - set(per_ctx)):
+            raise ValueError(f"oracle_task_views_{arm} has no row for context {ctx}")
         out[arm] = float(np.mean([m["success"] for m in per_ctx.values()]))
     return out
 
@@ -195,8 +206,13 @@ def select_recipe(
 
 def width_check(check: dict, reduced: str = "base", full: str = "full", context: str = "T4") -> dict:
     """The reduced-width run's hits against the full-width run's, in ``context``; ok within WIDTH_DROP."""
-    r = _context_means(check, f"oracle_task_views_{reduced}")[context]["success"]
-    f = _context_means(check, f"oracle_task_views_{full}")[context]["success"]
+    hits = []
+    for arm in (reduced, full):
+        met = _context_means(check, f"oracle_task_views_{arm}").get(context)
+        if met is None:
+            raise ValueError(f"oracle_task_views_{arm} has no row for context {context}")
+        hits.append(met["success"])
+    r, f = hits
     return dict(reduced_hits=r, full_hits=f, ok=_within(r, f - WIDTH_DROP))
 
 

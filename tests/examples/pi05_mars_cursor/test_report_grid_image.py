@@ -368,3 +368,38 @@ def test_main_select_and_width_write_json_and_one_mode_is_required(tmp_path, cap
         report_main(["--results", str(tmp_path), "--out", str(out)])
     with pytest.raises(SystemExit):
         report_main(["--select", "sel", "--width", "wid", "--results", str(tmp_path), "--out", str(out)])
+
+
+def test_rules_refuse_a_run_that_lacks_a_row():
+    runs = _scan_runs()
+    del runs[1000]["test"]["U0xT4|0.0"]["metrics"]["oracle_task"]
+    with pytest.raises(ValueError, match="oracle_task row for context T4"):
+        scan_rows(runs)
+    runs = _scan_runs()
+    runs[1000]["test"]["U0xT2|0.0"] = {
+        "metrics": {"oracle_task": _m(0.9), "oracle_task_views_n1000": _m(0.8)}
+    }
+    with pytest.raises(ValueError, match="300 demonstrations has no oracle_task row for context T2"):
+        scan_rows(runs)
+    runs = _scan_runs()
+    del runs[3000]["test"]["U0xT4|0.0"]["metrics"]["policy_task_views_n3000"]
+    assert scan_rows(runs)[-1]["hidden_hits"] is None and not scan_rows(runs)[-1]["flag"]
+
+    check = _run(
+        {
+            "T2": {f"oracle_task_views_{r}": _m(0.5) for r in ("base", "span1", "nomask", "noaffine")},
+            "T4": {f"oracle_task_views_{r}": _m(0.5) for r in ("base", "span1", "nomask")},
+        }
+    )
+    with pytest.raises(ValueError, match="oracle_task_views_noaffine has no row for context T4"):
+        select_recipe(check)
+    del check["test"]["U0xT2|0.0"]["metrics"]["oracle_task_views_span1"]
+    del check["test"]["U0xT4|0.0"]["metrics"]["oracle_task_views_span1"]
+    with pytest.raises(ValueError, match="oracle_task_views_span1 has no rows"):
+        select_recipe(check)
+
+    width = _run({"T4": {"oracle_task_views_base": _m(0.4)}})
+    with pytest.raises(ValueError, match="oracle_task_views_full has no row for context T4"):
+        width_check(width)
+    with pytest.raises(ValueError, match="oracle_task_views_base has no row for context T2"):
+        width_check(width, context="T2")
