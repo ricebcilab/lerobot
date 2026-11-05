@@ -217,6 +217,7 @@ def test_train_an_image_task_module_from_the_render(ckpt_dir):
                                                   "--render-size", "64", *COMMON]))
     ckpt = torch.load(ckpt_dir / "t_cnn" / "adapter.pt")
     assert ckpt["config"]["token_source"] == "cnn" and ckpt["config"]["image_size"] == 64 and ckpt["meta"]["token_source"] == "cnn"
+    assert ckpt["meta"]["teacher"] is None and ckpt["meta"]["teacher_demos"] is None
     assert ckpt["meta"]["token_geometry"] == "absolute" and "token_geometry" not in ckpt["config"]
     loaded = ReversalAdapter.load(ckpt_dir / "t_cnn" / "adapter.pt")
     assert loaded.task.token_source == "cnn"
@@ -387,6 +388,33 @@ def test_teacher_demonstrations_are_the_teachers_hits_at_the_policy_step_rate(ck
         assert np.allclose(np.abs(np.diff(path[::2], axis=0)).sum(), np.abs(np.diff(path, axis=0)).sum(), atol=2e-3)  # same travel, half the steps
     assert np.all(actions[np.arange(actions.shape[1])[None] >= lengths[:, None]] == 0)
     assert replay(actions, layouts, replace(task, cursor_noise=0.0)).success.all()        # a valid demonstration at the policy's rate
+
+
+def _teacher_args(*extra, obstacle="{kind: disc, radius: 0.03, along: 0.5}"):
+    return train_adapter.parse_args(["--kind", "task", "--obstacle", obstacle, "--name", "s", "--user-module", "u",
+                                     "--corruption", "{rotation_deg: 60}", "--teacher", "t", *extra, *COMMON])
+
+
+def test_the_teacher_loop_is_guarded(ckpt_dir, monkeypatch):
+    with pytest.raises(SystemExit):
+        _teacher_args("--teacher-chunk", "0")
+    _tiny_teacher(ckpt_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy = FlowPolicy.load(train_adapter.policy_path(train_adapter.config.load_arm("base.yaml")["model"]), device)
+    ring = _teacher_args("--teacher-chunk", "8", obstacle="{kind: ring, around: goal, gap_angle: [15, 30]}")
+    with pytest.raises(ValueError, match="obstacle"):          # the teacher was trained on a disc
+        train_adapter.teacher_demos(ring, ring.obstacle, policy, device, np.random.default_rng(0), 4, ring.p_free)
+    args = _teacher_args("--teacher-chunk", "8")
+    calls = []
+
+    def never_hits(arm, layouts, *a, **k):
+        calls.append(len(layouts))
+        return [dict(outcome="timeout", path=[[0.0, 0.0]]) for _ in range(len(layouts))]
+
+    monkeypatch.setattr(train_adapter, "run_trials", never_hits)
+    with pytest.raises(RuntimeError, match="hits"):
+        train_adapter.teacher_demos(args, args.obstacle, policy, device, np.random.default_rng(0), 4, args.p_free)
+    assert sum(calls) == 88                                      # 20 * 4 + 8 layouts drawn, then the cap
 
 
 def test_train_a_task_module_on_teacher_demonstrations(ckpt_dir):

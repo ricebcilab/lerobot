@@ -31,6 +31,11 @@ def _user(key: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _within(a: float, b: float) -> bool:
+    """``a >= b`` without float noise: fractions on 500 trials differ by multiples of 0.002, so nine places suffice."""
+    return round(a - b, 9) >= 0
+
+
 def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
     """Per context (from the cell key ``U0xT<k>|...``) and image arm, the gate verdict.
 
@@ -58,8 +63,8 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
                 continue
             hits, col = o["success"], o["collision"]
             hidden = p["success"] if p else None
-            collisions_ok = ref_c is not None and col <= ref_c + MARGIN
-            passes = ref_hits is not None and hits >= ref_hits - MARGIN and collisions_ok
+            collisions_ok = ref_c is not None and _within(ref_c + MARGIN, col)
+            passes = ref_hits is not None and _within(hits, ref_hits - MARGIN) and collisions_ok
             above_floor = ft_hits is not None and hits > ft_hits
             verdict = "pass" if passes else ("marginal" if above_floor and collisions_ok else "FAIL")
             rows.append(

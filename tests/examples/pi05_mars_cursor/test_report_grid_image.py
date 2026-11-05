@@ -25,40 +25,71 @@ def _cell(methods, hits, side=None, n=10, train_cell=False):
 
 def test_gate_verdicts_pass_marginal_fail_and_flag():
     def cell(ref, arm_hits, arm_col=0.10, ft=0.5, hidden=0.25):
-        m = {"oracle": dict(success=0.9, collision=0.5), "oracle_task": dict(success=ref, collision=0.05),
-             "oracle_task_rel": dict(success=arm_hits, collision=arm_col), "policy_task": dict(success=0.2, collision=0.1),
-             "policy_task_rel": dict(success=hidden, collision=0.1)}
+        m = {
+            "oracle": dict(success=0.9, collision=0.5),
+            "oracle_task": dict(success=ref, collision=0.05),
+            "oracle_task_rel": dict(success=arm_hits, collision=arm_col),
+            "policy_task": dict(success=0.2, collision=0.1),
+            "policy_task_rel": dict(success=hidden, collision=0.1),
+        }
         if ft is not None:
             m["oracle_ft"] = dict(success=ft, collision=0.2)
         return dict(metrics=m)
-    cells = {"U0xT2|0.0": cell(0.95, 0.86),                 # within 10 points of parametric: pass
-             "U0xT3|0.0": cell(0.95, 0.80),                 # above the fine-tuned floor, more than 10 under parametric: marginal
-             "U0xT4|0.0": cell(0.95, 0.50, hidden=0.5),     # at the floor: FAIL, and goal-hidden flag
-             "U0xT5|0.0": cell(0.742, 0.65),                # T5: parametric 74.2, so 65 passes
-             "U0xT6|0.0": cell(0.95, 0.90, arm_col=0.30),   # hits fine, collisions 25 points over: FAIL
-             "U0xT7|0.0": cell(0.95, 0.80, ft=None),        # no fine-tuned row: no marginal possible
-             "U0xT8|0.0": cell(0.95, 0.90, ft=0.92)}        # within 10 of parametric but under the floor: pass wins
+
+    cells = {
+        "U0xT2|0.0": cell(0.95, 0.86),  # within 10 points of parametric: pass
+        "U0xT3|0.0": cell(0.95, 0.80),  # above the fine-tuned floor, more than 10 under parametric: marginal
+        "U0xT4|0.0": cell(0.95, 0.50, hidden=0.5),  # at the floor: FAIL, and goal-hidden flag
+        "U0xT5|0.0": cell(0.742, 0.65),  # T5: parametric 74.2, so 65 passes
+        "U0xT6|0.0": cell(0.95, 0.90, arm_col=0.30),  # hits fine, collisions 25 points over: FAIL
+        "U0xT7|0.0": cell(0.95, 0.80, ft=None),  # no fine-tuned row: no marginal possible
+        "U0xT8|0.0": cell(0.95, 0.90, ft=0.92),  # within 10 of parametric but under the floor: pass wins
+        "U0xT9|0.0": cell(0.928, 0.828),  # exactly 10 points under parametric: pass
+        "U0xT10|0.0": cell(0.928, 0.826),  # 10.2 points under: not a pass
+        "U0xT11|0.0": cell(0.95, 0.90, arm_col=0.15),  # collisions exactly 10 points over: pass
+    }
     rows = {r["context"]: r for r in gate_table(dict(test=cells), ["rel"])}
     assert [rows[f"T{k}"]["verdict"] for k in (2, 3, 4, 5, 6, 7, 8)] == [
-        "pass", "marginal", "FAIL", "pass", "FAIL", "FAIL", "pass"]
-    assert rows["T2"]["pass"] and not rows["T3"]["pass"] and rows["T2"]["ref_hits"] == 0.95 and rows["T2"]["ft_hits"] == 0.5
+        "pass",
+        "marginal",
+        "FAIL",
+        "pass",
+        "FAIL",
+        "FAIL",
+        "pass",
+    ]
+    assert [rows[f"T{k}"]["verdict"] for k in (9, 10, 11)] == ["pass", "marginal", "pass"]
+    assert (
+        rows["T2"]["pass"]
+        and not rows["T3"]["pass"]
+        and rows["T2"]["ref_hits"] == 0.95
+        and rows["T2"]["ft_hits"] == 0.5
+    )
     assert rows["T4"]["flag"] and not rows["T2"]["flag"] and rows["T7"]["ft_hits"] is None
 
 
 def test_the_gate_markdown_has_the_three_verdicts_and_n_a_without_a_fine_tuned_row(tmp_path):
     def cell(ft):
-        m = {"oracle_task": dict(success=0.95, collision=0.05), "oracle_task_rel": dict(success=0.80, collision=0.10),
-             "policy_task": dict(success=0.2, collision=0.1)}
+        m = {
+            "oracle_task": dict(success=0.95, collision=0.05),
+            "oracle_task_rel": dict(success=0.80, collision=0.10),
+            "policy_task": dict(success=0.2, collision=0.1),
+        }
         if ft is not None:
             m["oracle_ft"] = dict(success=ft, collision=0.2)
         return dict(metrics=m)
+
     _write(tmp_path, check=dict(test={"U0xT2|0.0": cell(0.5), "U0xT3|0.0": cell(None)}))
     report_main(["--check", "check", "--results", str(tmp_path), "--out", str(tmp_path / "rep")])
     md = (tmp_path / "rep" / "report.md").read_text()
-    assert ("| context | arm | hits | ref hits | ft hits | collision | ref collision | verdict | hidden hits "
-            "| ref hidden | flag |") in md
+    assert (
+        "| context | arm | hits | ref hits | ft hits | collision | ref collision | verdict | hidden hits "
+        "| ref hidden | flag |"
+    ) in md
     assert "| T2 | rel | 80.0 | 95.0 | 50.0 | 10.0 | 5.0 | marginal |" in md
     assert "| T3 | rel | 80.0 | 95.0 | n/a | 10.0 | 5.0 | FAIL |" in md
+    report = json.loads((tmp_path / "rep" / "report.json").read_text())
+    assert {"verdict", "ref_hits", "ft_hits", "pass"} <= set(report["gate"][0])
 
 
 def test_join_ft_checks_the_trials_then_pools_over_seeds(tmp_path):

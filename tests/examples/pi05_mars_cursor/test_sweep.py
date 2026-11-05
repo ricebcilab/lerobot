@@ -320,13 +320,13 @@ def test_the_torch_twins_follow_the_shared_readout():
 
 
 
-def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn"):
+def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn", geometry="absolute"):
     # the policies stay where they are; only the adapters are read from the temp folder
     import cursor_sa.session as session_mod
 
     monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
     save_adapter_module(
-        LearnedTaskModule(horizon=16, token_source="cnn", image_size=64),
+        LearnedTaskModule(horizon=16, token_source="cnn", image_size=64, token_geometry=geometry),
         tmp_path / "ckpt" / "adapters" / name / "adapter.pt",
         "task",
     )
@@ -442,8 +442,9 @@ def test_a_vlm_source_makes_the_encoder_once_across_keys_and_matches_the_trainer
         assert np.array_equal(lay.scene["vlm_image"], trained)
 
 
-def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkeypatch):
-    name = _image_adapter(tmp_path, monkeypatch)
+@pytest.mark.parametrize("geometry", ["absolute", "relative"])
+def test_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monkeypatch, geometry):
+    name = _image_adapter(tmp_path, monkeypatch, geometry=geometry)
     (tmp_path / "tiny.yaml").write_text(
         "name: tiny_image\nagent: expert\narm: condition_grid.yaml\nmethods:\n  teleop: {mode: teleop}\n"
         f"  mars_cnn: {{mode: frs, reversal_adapter: {{task: {name}}}, tune: {{n_reverse_steps: [2]}}}}\n"

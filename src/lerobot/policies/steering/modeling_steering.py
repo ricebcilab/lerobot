@@ -236,7 +236,9 @@ class LearnedTaskModule(nn.Module):
     policy's chunk distribution toward a task. The chunk's steps attend (masked cross-attention) to a
     learned null token and, when the observation has them, one token per obstacle (position relative to
     the agent, radius, distance, in units of ``scale``). The head is zero-initialized: a fresh module is
-    the identity. ``obs`` is optional: ``pos`` (B, 2, the agent's position in [0, 1]; zeros when absent),
+    the identity. ``obs`` is optional: ``pos`` (B, 2, the agent's position in [0, 1];
+    required by the disc tokens and by relative geometry; the ``forward`` query, which has no observation, uses
+    zeros),
     ``obstacles`` (B, K, 3: center, radius) and ``obstacle_mask`` (B, K, True for real obstacles). Without
     it (pi0.5, which sees the scene through its own field) the module is called as ``(x_t, t, v)``; with
     it, ``bind(obs)`` gives that callable.
@@ -248,7 +250,10 @@ class LearnedTaskModule(nn.Module):
     through a small CNN trained with the module (stride 16: ``(S / 16) ** 2`` tokens). The image
     sources add a learned position per token (``token_geometry="absolute"``), or, with ``"relative"``
     (``vlm_image`` / ``cnn`` only), the offset of the token's patch centre from the cursor through the
-    disc-token MLP and no learned position."""
+    disc-token MLP and no learned position. For ``cnn`` the assumed cell centres are the stride grid's
+    ``((c + 0.5) * 16) / S``, while a 4-layer k3/s2/p1 stem's receptive field is centred near ``16c`` px, about
+    half a cell up and left: exact for ``vlm_image`` (SigLIP's patch grid), to be corrected before a ``cnn``
+    relative run."""
 
     def __init__(  # nosec B107 (token_source is not a password)
         self,

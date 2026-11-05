@@ -58,6 +58,8 @@ module's `oracle_task` rollouts (the gate's arm with a clean readout and the exp
 the task, their hits only. The rollout runs at half speed, two control steps per planned step, so its path is resampled
 to the planned steps (`planned_steps`), the policy's own step rate, which is the rate a module trained on them acts at.
 The student learns what the teacher's composed field does, with the teacher's own mistakes (non-hits) left out.
+The kept set's obstacle-free share drifts a point or two above `--p-free` (free layouts hit more often, and the last
+chunk is truncated from its tail, where `layouts_for` puts them).
 
 DATA: `--n-demos` demonstrations (one reach each) train a module; the default 20000 is as many as the base
 policy's own. Every batch draws the readout's noise anew, so even a few demonstrations give endless noisy
@@ -94,7 +96,8 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, heading_cosine, regenerate,  # noqa: E402
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, heading_cosine, load_adapter_module,
+                                       regenerate,  # noqa: E402
                                        save_adapter_module, scene_for, scene_spec, task_field_loss, train_module,
                                        user_field_loss)
 
@@ -125,6 +128,10 @@ def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
     planned steps, zero after each demonstration's length), the lengths [n] and info: drawn, kept, outcomes (counts
     over everything drawn) and records (the kept trials')."""
     adapter = ReversalAdapter.load(adapter_path(args.teacher), device)
+    taught = obstacle_spec(load_adapter_module(adapter_path(args.teacher))[2]["obstacle"])
+    if taught != obstacle_spec(obstacle):
+        raise ValueError(f"--teacher {args.teacher} was trained on the obstacle {taught}, not this run's "
+                         f"{obstacle_spec(obstacle)}: a teacher's rollouts are only demonstrations of its own obstacle")
     if adapter.task is None or adapter.task.token_source != "discs":
         raise ValueError(f"--teacher must be a parametric (discs) task module: {args.teacher} has "
                          f"{'no task module' if adapter.task is None else 'token source ' + adapter.task.token_source}")
@@ -137,6 +144,9 @@ def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
     assert arm_task(arm).obstacle == TaskConfig(obstacle=obstacle).obstacle, "the rollouts must run on the trainer's task"
     tic, parts, records, drawn, outcomes = time.time(), [], [], 0, {}
     while len(records) < n:
+        if drawn >= 20 * n + args.teacher_chunk:
+            raise RuntimeError(f"teacher {args.teacher}: {len(records)} hits in {drawn} rolled-out layouts (keep rate "
+                               f"{len(records) / drawn:.1%}), fewer than the {n} wanted; the teacher does not solve this task")
         layouts, task = layouts_for(args, obstacle, rng, args.teacher_chunk, p_free)
         trials = run_trials(arm, layouts, ExpertChunkAgent(), readout_for(arm, rng, off=True), policy, {args.teacher: adapter}, device)
         drawn += len(layouts)
@@ -227,7 +237,9 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
     With --teacher both splits are the teacher's hits instead (`teacher_demos`; their counts go to
     args.teacher_demos). With an image --token-source each split's layouts carry that source's scene arrays (`encoder` for vlm_*; the
     caller closes it)."""
-    out, args.teacher_demos = {}, {}
+    out = {}
+    if args.teacher:
+        args.teacher_demos = {}
     for split, n in [("train", args.n_demos), ("val", args.val_demos)]:
         if args.teacher:
             tic = time.time()
@@ -607,6 +619,8 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.teacher and (args.kind != "task" or args.pooled):
         p.error("--teacher is for a single-context --kind task (user modules calibrate on the open field; no pooled teacher run)")
+    if args.teacher_chunk <= 0:
+        p.error("--teacher-chunk must be positive")
     if args.teacher and args.demo_seconds is not None:
         p.error("--teacher draws --n-demos hits: a --demo-seconds budget is the scripted expert's")
     if args.token_geometry == "relative" and args.token_source in ("discs", "vlm_prefix"):
