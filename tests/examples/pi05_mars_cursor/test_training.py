@@ -216,10 +216,25 @@ def test_train_an_image_task_module_from_the_render(ckpt_dir):
                                                   "--render-size", "64", *COMMON]))
     ckpt = torch.load(ckpt_dir / "t_cnn" / "adapter.pt")
     assert ckpt["config"]["token_source"] == "cnn" and ckpt["config"]["image_size"] == 64 and ckpt["meta"]["token_source"] == "cnn"
+    assert ckpt["meta"]["token_geometry"] == "absolute" and "token_geometry" not in ckpt["config"]
     loaded = ReversalAdapter.load(ckpt_dir / "t_cnn" / "adapter.pt")
     assert loaded.task.token_source == "cnn"
     log = json.loads((ckpt_dir / "t_cnn" / "train_log.json").read_text())["log"]
     assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(log[-1])
+
+
+def test_train_a_relative_geometry_image_task_module(ckpt_dir):
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_rel",
+                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn",
+                                                  "--render-size", "64", "--token-geometry", "relative", *COMMON]))
+    ckpt = torch.load(ckpt_dir / "t_rel" / "adapter.pt")
+    assert ckpt["config"]["token_geometry"] == "relative" and ckpt["meta"]["token_geometry"] == "relative"
+    assert "scene_pos" not in ckpt["state_dict"]
+    assert ReversalAdapter.load(ckpt_dir / "t_rel" / "adapter.pt").task.token_geometry == "relative"
+    with pytest.raises(SystemExit):
+        train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "x", "--user-module", "u",
+                                  "--corruption", "{rotation_deg: 60}", "--token-geometry", "relative"])   # discs have no screen tokens
 
 
 def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):

@@ -40,7 +40,8 @@ adapted field, on the policy's own interpolation x_t = (1 - t) z + t a,
 with the policy's goal dropout, so the adapted field reproduces the detours with the goal given and
 hidden alike; a share `p_free` of the layouts has no obstacle, where the module should be the identity.
 With `--token-source` vlm_image / vlm_prefix / cnn the module reads the obstacles from the rendered scene
-(`--render-size` pixels) instead of the disc parameters: pi0.5's vision tokens (`--vlm`) or a CNN trained with it.
+(`--render-size` pixels) instead of the disc parameters: pi0.5's vision tokens (`--vlm`) or a CNN trained with it;
+`--token-geometry relative` (vlm_image, cnn) gives each scene token its offset from the cursor instead of a learned position.
 The user's frozen module is in the loop through lambda_field x the field regression above through both
 modules, on that user's commands around the obstacles (the layouts with the obstacle only):
 
@@ -87,7 +88,7 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, SceneEncoder, heading_cosine, regenerate,  # noqa: E402
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, heading_cosine, regenerate,  # noqa: E402
                                        save_adapter_module, scene_for, scene_spec, task_field_loss, train_module,
                                        user_field_loss)
 
@@ -379,7 +380,8 @@ def train_task(args, policy, device, rng):
     finally:
         if encoder is not None:
             encoder.close()
-    task = TaskModule(policy.horizon, d=args.d, layers=args.layers, **scene_spec(args.token_source, args.render_size)).to(device)
+    task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
+                      **scene_spec(args.token_source, args.render_size)).to(device)
     adapted = ReversalAdapter(task=task)
 
     def batch_loss(step):
@@ -462,7 +464,8 @@ def save(args, kind, module, log):
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     out = adapter_dir(args.name)
     path = save_adapter_module(module, out / "adapter.pt", kind, meta=dict(args=vars(args), obstacle=args.obstacle, pooled=args.pooled,
-                                                              token_source=args.token_source, render_size=args.render_size))
+                                                              token_source=args.token_source, render_size=args.render_size,
+                                                              token_geometry=args.token_geometry))
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), log=log), f, indent=1)
     print(f"saved {path}")
@@ -514,6 +517,9 @@ def parse_args(argv=None):
     p.add_argument("--token-source", choices=SCENE_SOURCES, default="discs",
                    help="task: what the module reads the obstacles from: the disc parameters, or the rendered scene "
                         "through pi0.5's vision tokens (vlm_image, vlm_prefix) or a CNN trained with the module (cnn)")
+    p.add_argument("--token-geometry", choices=TOKEN_GEOMETRIES, default="absolute",
+                   help="task: relative puts each scene token's offset from the cursor into the token (vlm_image, cnn) "
+                        "instead of a learned position")
     p.add_argument("--render-size", type=int, default=SCENE_SIZE, help="task: side of the rendered scene in pixels (cnn: a multiple of 16)")
     p.add_argument("--vlm", default="lerobot/pi05_base", help="task: the pi0.5 checkpoint whose vision tokens vlm_* sources use "
                                                               "(loaded offline from the HF cache)")
@@ -538,6 +544,8 @@ def parse_args(argv=None):
     p.add_argument("--log-every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.token_geometry == "relative" and args.token_source in ("discs", "vlm_prefix"):
+        p.error("--token-geometry relative needs screen tokens: --token-source vlm_image or cnn")
     if args.pooled:
         if args.kind != "task":
             p.error("--pooled is for --kind task")
