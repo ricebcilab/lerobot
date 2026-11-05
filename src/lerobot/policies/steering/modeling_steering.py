@@ -23,7 +23,7 @@ and specs are ``configuration_steering``'s; this folder's README describes the m
 import math
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -584,6 +584,44 @@ def scene_for(
     return np.asarray(tokens, dtype=np.float16)
 
 
+def encode_views(images: np.ndarray, encoder, batch: int = 256) -> torch.Tensor:
+    """The tokens of uint8 ``[B, V, 3, S, S]`` views, ``encoder.encode`` of each view's pictures joined view
+    by view (view 0's tokens first): float16 ``[B, V * 256, 2048]`` on the encoder's device."""
+    b, v = images.shape[:2]
+    tokens = encoder.encode(images.reshape(b * v, *images.shape[2:]), batch)
+    return tokens.reshape(b, v * tokens.shape[1], tokens.shape[2])
+
+
+def fit_token_reduction(
+    batches: Iterable[torch.Tensor], rank: int
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """A PCA of token batches ``[..., W]`` (leading dims flattened): the ``mean`` ``[W]``, the ``basis``
+    ``[W, rank]`` of orthonormal columns (largest variance first), both float32, and the share of the variance
+    the basis keeps. Sums are kept in float64 on the first batch's device. Raises ``ValueError`` unless
+    ``0 < rank < W``."""
+    total = second = None
+    count = 0
+    for batch in batches:
+        x = batch.reshape(-1, batch.shape[-1]).to(torch.float64)
+        if total is None:
+            width = x.shape[1]
+            if not 0 < rank < width:
+                raise ValueError(f"rank must satisfy 0 < rank < {width}, got {rank}")
+            total = torch.zeros(width, dtype=torch.float64, device=x.device)
+            second = torch.zeros(width, width, dtype=torch.float64, device=x.device)
+        total += x.sum(0)
+        second += x.T @ x
+        count += len(x)
+    if total is None or second is None or count < 2:
+        raise ValueError("fit_token_reduction needs at least two tokens")
+    mean = total / count
+    cov = (second - count * torch.outer(mean, mean)) / (count - 1)
+    values, vectors = torch.linalg.eigh(cov)  # ascending
+    values = values.clamp_min(0)
+    kept = float(values[-rank:].sum() / values.sum())
+    return mean.float(), vectors[:, -rank:].flip(1).float().contiguous(), kept
+
+
 SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
 SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
 
@@ -664,15 +702,22 @@ class SceneEncoder:
         return img.permute(0, 3, 1, 2) * 2.0 - 1.0
 
     @torch.no_grad()
-    def image_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:
-        """SigLIP's projected patch tokens of uint8 ``[B, 3, S, S]`` images: float16 ``[B, 256, 2048]``."""
+    def encode(self, images: np.ndarray, batch: int = 256) -> torch.Tensor:
+        """SigLIP's projected patch tokens of uint8 ``[B, 3, S, S]`` images, kept on the encoder's device:
+        float16 ``[B, 256, 2048]``."""
         policy = self._load()
         vlm = policy.model.paligemma_with_expert
         out = []
         for i in range(0, len(images), batch):
             pixels = self._pixels(images[i : i + batch], policy.config.image_resolution)
-            out.append(vlm.embed_image(pixels).to(torch.float16).cpu())
-        return torch.cat(out).numpy() if out else np.zeros((0, VLM_SCENE_TOKENS, VLM_SCENE_DIM), np.float16)
+            out.append(vlm.embed_image(pixels).to(torch.float16))
+        if not out:
+            return torch.zeros((0, VLM_SCENE_TOKENS, VLM_SCENE_DIM), dtype=torch.float16, device=self.device)
+        return torch.cat(out)
+
+    def image_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:
+        """``encode`` on the CPU as numpy: float16 ``[B, 256, 2048]``."""
+        return self.encode(images, batch).cpu().numpy()
 
     @torch.no_grad()
     def prefix_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:

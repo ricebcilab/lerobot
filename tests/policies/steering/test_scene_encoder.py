@@ -24,8 +24,15 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, sample_layouts
-from lerobot.policies.steering import LearnedTaskModule, SceneEncoder, scene_for, scene_spec
+from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, render_layouts, sample_layouts
+from lerobot.policies.steering import (
+    LearnedTaskModule,
+    SceneEncoder,
+    encode_views,
+    fit_token_reduction,
+    scene_for,
+    scene_spec,
+)
 
 
 class Stub:
@@ -118,6 +125,8 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
         tok.shape == (2, 256, 2048) and tok.dtype == np.float16 and np.isfinite(tok.astype(np.float32)).all()
     )
     assert pre.shape == (2, 256, 2048) and not np.array_equal(tok, pre)
+    images = render_layouts(_layouts(2), SCENE_SIZE)
+    assert np.array_equal(enc.encode(images).cpu().numpy(), enc.image_tokens(images))
     assert np.isfinite(pre.astype(np.float32)).all()
     # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
     other = scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, encoder=enc)
@@ -138,3 +147,44 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)
     enc.close()
+
+
+class _PatchEncoder:
+    """Tokens that depend on the picture: token j's first three dims are patch j's mean colour / 255."""
+
+    def encode(self, images, batch=256):
+        x = torch.as_tensor(images).float() / 255
+        pooled = torch.nn.functional.adaptive_avg_pool2d(x, 16).flatten(2).transpose(1, 2)
+        return torch.nn.functional.pad(pooled, (0, 2045)).to(torch.float16)
+
+
+def test_encode_views_keeps_the_view_order():
+    images = np.zeros((2, 2, 3, 32, 32), np.uint8)
+    images[:, 1] = 255
+    tokens = encode_views(images, _PatchEncoder())
+    assert tokens.shape == (2, 512, 2048) and tokens.dtype == torch.float16
+    assert float(tokens[:, :256, :3].max()) == 0.0 and float(tokens[:, 256:, :3].min()) == 1.0
+
+
+def test_token_reduction_keeps_the_top_directions():
+    g = torch.Generator().manual_seed(0)
+    true = torch.linalg.qr(torch.randn(16, 3, generator=g))[0]
+    x = (torch.randn(4000, 3, generator=g) * torch.tensor([5.0, 2.0, 1.0])) @ true.T + 0.7
+    mean, basis, kept = fit_token_reduction(iter(x.split(500)), 3)
+    assert (
+        mean.shape == (16,)
+        and basis.shape == (16, 3)
+        and mean.dtype == basis.dtype == torch.float32
+        and kept > 0.999
+    )
+    torch.testing.assert_close(basis.T @ basis, torch.eye(3), atol=1e-5, rtol=0)
+    torch.testing.assert_close(mean, x.mean(0), atol=1e-4, rtol=0)
+    assert float(((x - mean) @ basis @ basis.T + mean - x).abs().max()) < 1e-3
+    assert abs(float(basis[:, 0] @ true[:, 0])) > 0.99
+    assert 0.9 < fit_token_reduction(iter(x.split(500)), 2)[2] < 0.999  # 29 of 30 parts of the variance
+    torch.testing.assert_close(
+        fit_token_reduction(iter(x.reshape(8, 500, 16)), 3)[0], mean, atol=1e-5, rtol=0
+    )
+    for bad in (16, 0):
+        with pytest.raises(ValueError):
+            fit_token_reduction(iter(x.split(500)), bad)
