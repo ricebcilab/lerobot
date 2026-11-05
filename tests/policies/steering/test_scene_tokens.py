@@ -5,10 +5,11 @@ from lerobot.policies.steering import (
     TOKEN_GEOMETRIES,
     LearnedTaskModule,
     load_adapter_module,
+    reduce_tokens,
     save_adapter_module,
+    scene_spec,
 )
-from lerobot.policies.steering.configuration_steering import scene_spec
-from lerobot.policies.steering.modeling_steering import SCENE_SOURCES, reduce_tokens
+from lerobot.policies.steering.modeling_steering import SCENE_SOURCES
 
 
 def _xvt(b=3, h=16):

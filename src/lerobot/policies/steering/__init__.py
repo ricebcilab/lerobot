@@ -59,6 +59,7 @@ from .modeling_steering import (
     integrate,
     load_adapter_module,
     paired_chunks,
+    reduce_tokens,
     regenerate,
     reverse_flow,
     save_adapter_module,
