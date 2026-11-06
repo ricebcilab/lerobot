@@ -19,4 +19,4 @@ for path in (
 
 def pytest_configure(config):
     """The tests' tensors are tiny: many threads only contend (on a loaded machine, by two orders of magnitude)."""
-    torch.set_num_threads(int(os.environ.get("MARS_TEST_THREADS", min(8, os.cpu_count() or 8))))
+    torch.set_num_threads(int(os.environ.get("MARS_TEST_THREADS", min(16, os.cpu_count() or 16))))
