@@ -562,6 +562,15 @@ def test_image_sweep_configs_resolve_every_arm_per_cell():
             for m in ("oracle", "policy"):
                 assert method_arm(aug, f"{m}_task_rel{suffix}", cell)["learned_adapter"]["task"] == name + suffix
         assert method_arm(aug, "policy_task_rel_both", cell)["mode"] == "policy" and method_arm(aug, "oracle_task_rel_both", cell)["mode"] == "teleop"
+    rigid = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_rel_rigid.yaml")
+    leak = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_rel_leak.yaml")
+    assert set(leak["methods"]) == set(rigid["methods"]) - {"oracle_ft"} and leak["focus"] == "oracle_task_rel_rigid"
+    assert leak["against"] == ["oracle_task"] and (leak["seed"], leak["trials"]) == (820, {"tune": 20, "test": 500})
+    for cell in ("U0xT2", "U0xT4"):
+        assert method_arm(leak, "oracle_task", cell)["obstacle"] == dict(method_arm(rigid, "oracle_task", cell)["obstacle"], decoy=True)
+        for m in leak["methods"]:
+            assert method_arm(leak, m, cell)["learned_adapter"] == method_arm(rigid, m, cell)["learned_adapter"]
+            assert method_arm(leak, m, cell)["obstacle"]["decoy"] is True
 
 
 def test_precompute_scene_with_merge_is_rejected(tmp_path):

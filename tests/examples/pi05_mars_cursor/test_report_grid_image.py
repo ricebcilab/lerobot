@@ -623,3 +623,42 @@ def test_the_select_cli_passes_prefix_and_base(tmp_path):
         "rigid",
         "both",
     ]
+
+
+def test_the_gate_table_reports_wrong_targets(tmp_path):
+    def m(hits, col, wrong=None):
+        return dict(success=hits, collision=col, **({} if wrong is None else {"wrong": wrong}))
+
+    leak = {  # the goal-hidden module goes to the decoy far more often than the parametric one
+        "oracle_task": m(0.9, 0.05, 0.02),
+        "oracle_task_rel_rigid": m(0.88, 0.06, 0.04),
+        "policy_task": m(0.5, 0.1, 0.30),
+        "policy_task_rel_rigid": m(0.45, 0.1, 0.476),
+    }
+    # a run recorded without the wrong-target share
+    old = {k: {"success": v["success"], "collision": v["collision"]} for k, v in leak.items()}
+    _write(tmp_path, check=_run({"T2": leak, "T4": old}))
+    report_main(["--check", "check", "--results", str(tmp_path), "--out", str(tmp_path / "rep")])
+    rows = {r["context"]: r for r in gate_table(_run({"T2": leak, "T4": old}), ["rel_rigid"])}
+    assert (
+        rows["T2"]["wrong_target"],
+        rows["T2"]["hidden_wrong_target"],
+        rows["T2"]["ref_hidden_wrong_target"],
+    ) == (0.04, 0.476, 0.30)
+    assert all(
+        rows["T4"][k] is None for k in ("wrong_target", "hidden_wrong_target", "ref_hidden_wrong_target")
+    )
+    md = (tmp_path / "rep" / "report.md").read_text()
+    assert (
+        "| context | arm | hits | ref hits | ft hits | collision | ref collision | verdict | hidden hits "
+        "| ref hidden | flag | wrong target | hidden wrong | ref hidden wrong |"
+    ) in md
+    assert (
+        "| T2 | rel_rigid | 88.0 | 90.0 | n/a | 6.0 | 5.0 | pass | 45.0 | 50.0 | ok | 4.0 | 47.6 | 30.0 |"
+        in md
+    )
+    assert (
+        "| T4 | rel_rigid | 88.0 | 90.0 | n/a | 6.0 | 5.0 | pass | 45.0 | 50.0 | ok | n/a | n/a | n/a |" in md
+    )
+    gate = {r["context"]: r for r in json.loads((tmp_path / "rep" / "report.json").read_text())["gate"]}
+    assert gate["T2"]["hidden_wrong_target"] == 0.476 and gate["T4"]["wrong_target"] is None

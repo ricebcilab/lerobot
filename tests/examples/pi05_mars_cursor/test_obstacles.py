@@ -61,7 +61,7 @@ def test_layouts_carry_obstacles_through_indexing_tile_and_concat():
 def test_obstacle_specs_place_discs_and_walls_relative_to_the_reach():
     assert obstacle_spec(None) is None
     disc = obstacle_spec(DISC)
-    assert disc == {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.05, "side": "random"}
+    assert disc == {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.05, "side": "random", "decoy": False}
     wall = obstacle_spec(WALL)
     assert wall["radius"] == 0.03 and wall["extent"] == 0.25 and wall["side"] == "random"
     for bad in ({"kind": "square"}, {"kind": "disc", "radius": -1, "along": 0.5}, {"kind": "wall", "along": 1.5, "gap": 0.1}):
@@ -200,7 +200,8 @@ def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records(tmp_
     from run_experiment import parse_args
     arm = config.load_arm("teleop.yaml", {"obstacle": {"kind": "disc", "radius": 0.04, "along": 0.5}, "targets": [4, 4],
                                           "reach": [0.35, 0.5]})
-    assert arm["obstacle"] == {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.0, "side": "random"}
+    assert arm["obstacle"] == {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.0, "side": "random",
+                               "decoy": False}
     assert arm_task(arm).obstacle == arm["obstacle"] and arm_task(config.load_arm("base.yaml")).obstacle is None
     assert arm_fields(arm)["obstacle"] == arm["obstacle"]
     with pytest.raises(ValueError, match="task.obstacle"):
@@ -259,3 +260,63 @@ def test_layouts_redraw_the_targets_when_no_start_fits_them():
     with pytest.raises(ValueError, match="cannot place a start"):
         _layout(np.random.default_rng(0), 2, 0, cfg, max_tries=20, rounds=1)
     assert _layout(np.random.default_rng(0), 2, 0, cfg, max_tries=20, rounds=500)[0].shape == (2,)
+
+
+DECOY_RING = {"kind": "ring", "around": "goal", "gap_angle": [15, 30]}
+
+
+def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
+    spec = obstacle_spec({"kind": "disc", "radius": 0.05, "along": 0.5, "decoy": True})
+    assert spec["decoy"] is True and obstacle_spec(DISC)["decoy"] is False and obstacle_spec(WALL)["decoy"] is False
+    with pytest.raises(ValueError, match="decoy"):
+        obstacle_spec(dict(DISC, decoy="yes"))
+    lay = sample_layouts(np.random.default_rng(0), 40, 4, TaskConfig(**STUDY, obstacle=spec))
+    for b in range(40):
+        start, goal, disc = lay.start[b], lay.goal_pos[b], lay.real_obstacles(b)[0, :2]
+        others = lay.targets[b][lay.mask[b] & ~lay.goal_mask()[b]]
+        # the disc centre is at `along` of the reach to exactly one non-goal target (offset 0), never to the goal
+        on = [np.allclose(disc, start + 0.5 * (t - start), atol=1e-6) for t in others]
+        assert sum(on) == 1 and not np.allclose(disc, start + 0.5 * (goal - start), atol=1e-6)
+        assert np.linalg.norm(goal - start) >= 0.35 - 1e-9  # the reach rule is still about the goal
+    ring = sample_layouts(np.random.default_rng(1), 20, 4, TaskConfig(**STUDY, obstacle=obstacle_spec(
+        dict(DECOY_RING, decoy=True))))
+    for b in range(20):  # the ring is round a non-goal target
+        centre = ring.real_obstacles(b)[:, :2].mean(0)
+        d = np.linalg.norm(ring.targets[b][ring.mask[b]] - centre, axis=1)
+        assert np.argmin(d) != ring.goal[b] and d.min() < 0.14
+
+
+def test_layouts_without_decoy_are_bit_identical_to_before():
+    import hashlib
+
+    # digests recorded at 2f3e3ce7, before the decoy key existed: the key absent, False, or dropped from a
+    # normalized spec (as one stored before it) all give those layouts, bit for bit
+    recorded = {"disc": "935f889dae666006", "ring": "4afdd3668314bb52"}
+    fields = ("start", "targets", "mask", "goal", "obstacles", "obstacle_mask")
+    for spec in (DISC, DECOY_RING):
+        bare = {k: v for k, v in obstacle_spec(spec).items() if k != "decoy"}
+        variants = [obstacle_spec(spec), obstacle_spec(dict(spec, decoy=False)), bare]
+        digests = [hashlib.sha256(), hashlib.sha256(), hashlib.sha256()]
+        for seed in (0, 1, 2):
+            lays = [sample_layouts(np.random.default_rng(seed), 6, (2, 4), TaskConfig(**STUDY, obstacle=v))
+                    for v in variants]
+            for lay, h in zip(lays, digests):
+                assert all(np.array_equal(getattr(lay, f), getattr(lays[0], f)) for f in fields)
+                for f in fields:
+                    h.update(np.ascontiguousarray(getattr(lay, f)).tobytes())
+        assert {h.hexdigest()[:16] for h in digests} == {recorded[spec["kind"]]}
+
+
+def test_decoy_needs_two_targets():
+    with pytest.raises(ValueError, match="decoy needs at least two targets"):
+        sample_layouts(np.random.default_rng(0), 2, 1, TaskConfig(**STUDY, obstacle=obstacle_spec(dict(DISC, decoy=True))))
+
+
+@pytest.mark.parametrize("spec", [dict(DISC, radius=0.08, offset=[0.012, 0.024]), DECOY_RING])
+def test_decoy_layouts_still_admit_a_demonstration(spec):
+    task = TaskConfig(**STUDY, obstacle=obstacle_spec(dict(spec, decoy=True)))
+    rng = np.random.default_rng(4)
+    layouts = sample_layouts(rng, 20, 4, task)
+    actions, lengths = make_demos(rng, layouts, task)
+    env = replay(actions, layouts, task)
+    assert (lengths > 0).all() and env.success.all() and not env.collided.any()

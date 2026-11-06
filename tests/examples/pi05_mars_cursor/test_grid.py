@@ -31,7 +31,7 @@ def _lateral(points, start, goal):
 def test_ring_specs_place_an_arc_open_away_from_the_reach():
     ring = obstacle_spec(RING_GOAL)
     assert ring == {"kind": "ring", "around": "goal", "ring_radius": 0.14, "radius": 0.02, "gap": 0.16,
-                    "gap_angle": [15.0, 30.0], "side": "random"}
+                    "gap_angle": [15.0, 30.0], "side": "random", "decoy": False}
     assert obstacle_spec(DISC)["offset"] == [0.012, 0.024] and obstacle_spec({"kind": "disc", "radius": 0.04, "along": 0.5})["offset"] == 0.0
     for bad in ({"kind": "ring"}, {"kind": "ring", "around": "target"}, {"kind": "ring", "around": "goal", "gap": 0.3},
                 {"kind": "ring", "around": "goal", "gap_angle": -5}, {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": [0.03, 0.01]},

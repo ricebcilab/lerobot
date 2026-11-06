@@ -65,6 +65,9 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
     Else ``marginal`` = hits > ft_hits and collisions_ok, else ``FAIL``; pass wins where it overlaps the floor.
     Without an ``oracle_ft`` row no arm is marginal. ``flag`` = hidden_hits > ref_hidden_hits + 0.10 (``_hidden_flag``),
     with hidden_hits from ``policy_task_<x>`` and ref_hidden_hits from ``policy_task``; False when either is missing.
+    The wrong-target shares (the metrics' ``wrong``; None when the row or the metric is missing): wrong_target from
+    ``oracle_task_<x>`` (goal given), hidden_wrong_target from ``policy_task_<x>`` and ref_hidden_wrong_target from
+    ``policy_task`` (goal hidden).
     """
     rows = []
     for key, cell in sorted(check.get("test", {}).items()):
@@ -76,6 +79,7 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
         ref_hits = met.get("oracle_task", {}).get("success")
         ft_hits = met.get("oracle_ft", {}).get("success")
         ref_h = met.get("policy_task", {}).get("success")
+        ref_hw = met.get("policy_task", {}).get("wrong")
         for arm in image_arms:
             o, p = met.get(f"oracle_task_{arm}"), met.get(f"policy_task_{arm}")
             if o is None:
@@ -100,6 +104,9 @@ def gate_table(check: dict, image_arms: list[str]) -> list[dict]:
                     hidden_hits=hidden,
                     ref_hidden_hits=ref_h,
                     flag=_hidden_flag(hidden, ref_h),
+                    wrong_target=o.get("wrong"),
+                    hidden_wrong_target=p.get("wrong") if p else None,
+                    ref_hidden_wrong_target=ref_hw,
                 )
             )
     return sorted(rows, key=lambda r: (r["context"], r["arm"]))
@@ -458,12 +465,13 @@ def main(argv=None):
     if gate:
         md += _table(
             ["context", "arm", "hits", "ref hits", "ft hits", "collision", "ref collision", "verdict",
-             "hidden hits", "ref hidden", "flag"],
+             "hidden hits", "ref hidden", "flag", "wrong target", "hidden wrong", "ref hidden wrong"],
             [
                 [r["context"], r["arm"], _fmt(r["hits"]), _fmt(r["ref_hits"], none="n/a"),
                  _fmt(r["ft_hits"], none="n/a"), _fmt(r["collision"]), _fmt(r["ref_collision"]),
                  r["verdict"], _fmt(r["hidden_hits"]), _fmt(r["ref_hidden_hits"]),
-                 _flag_cell(r)]
+                 _flag_cell(r), _fmt(r["wrong_target"], none="n/a"), _fmt(r["hidden_wrong_target"], none="n/a"),
+                 _fmt(r["ref_hidden_wrong_target"], none="n/a")]
                 for r in gate
             ],
         )

@@ -245,13 +245,17 @@ def obstacle_spec(spec, where="task.obstacle"):
     (between the discs' edges) on the side facing away from the reach, behind the goal or behind the
     start, turned by `gap_angle` degrees toward the drawn side. A disc's `offset` and a ring's
     `gap_angle` may be a range [lo, hi], drawn per trial: an off-center disc or a turned gap makes one
-    way round shorter, so the side to pass is part of the scene."""
+    way round shorter, so the side to pass is part of the scene.
+
+    `decoy: true` (any kind, default false) places the obstacle on a decoy reach instead: from the start to a
+    non-goal target drawn per trial (`_layout`), so the obstacle no longer points at the goal; whether the layout
+    is passable, and everything else, is still about the goal."""
     if spec is None:
         return None
     if not isinstance(spec, dict) or spec.get("kind") not in OBSTACLE_KINDS:
         raise ValueError(f"{where}: kind must be one of {OBSTACLE_KINDS}, got {spec!r}")
     defaults = {
-        "disc": {"radius": None, "along": None, "offset": 0.0, "side": "random"},
+        "disc": {"radius": None, "along": None, "offset": 0.0, "side": "random", "decoy": False},
         "wall": {
             "along": None,
             "gap": None,
@@ -259,6 +263,7 @@ def obstacle_spec(spec, where="task.obstacle"):
             "radius": 0.03,
             "extent": 0.25,
             "side": "random",
+            "decoy": False,
         },
         "ring": {
             "around": None,
@@ -267,6 +272,7 @@ def obstacle_spec(spec, where="task.obstacle"):
             "gap": 0.16,
             "gap_angle": 0.0,
             "side": "random",
+            "decoy": False,
         },
     }[spec["kind"]]
     unknown = set(spec) - set(defaults) - {"kind"}
@@ -276,6 +282,8 @@ def obstacle_spec(spec, where="task.obstacle"):
     for key, value in out.items():
         if value is None:
             raise ValueError(f"{where}: {key} is required for kind {spec['kind']}")
+    if not isinstance(out["decoy"], bool):
+        raise ValueError(f"{where}: decoy must be true or false, got {out['decoy']!r}")
     if out["side"] not in ("random", "fixed"):
         raise ValueError(f"{where}: side must be random or fixed, got {out['side']!r}")
     if "around" in out and out["around"] not in ("goal", "start"):
@@ -549,7 +557,13 @@ def _layout(rng, n, goal, cfg, max_tries=20_000, rounds=20):
                 continue
             reach_ok += 1
             if cfg.obstacle is not None:
-                obstacles, mask, sign = place_obstacles(rng, s, pts[goal], cfg.obstacle)
+                toward = goal  # the target the obstacle is placed for: the goal, or a decoy drawn here
+                if cfg.obstacle.get("decoy"):
+                    if n < 2:
+                        raise ValueError("decoy needs at least two targets")
+                    d = int(rng.integers(n - 1))
+                    toward = d if d < goal else d + 1
+                obstacles, mask, sign = place_obstacles(rng, s, pts[toward], cfg.obstacle)
                 if not _passable(obstacles, mask, s, pts, goal, sign, cfg):
                     refused += 1
                     if refused >= RING_PATIENCE and cfg.obstacle["kind"] == "ring":
