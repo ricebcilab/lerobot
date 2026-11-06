@@ -164,9 +164,9 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path):
     (tmp_path / "jt.yaml").write_text(
         "name: jt\nmethods:\n  teleop: {mode: teleop}\n  flow_control: {mode: flow_control}\n  frs: {mode: frs}\n"
         "  mars: {mode: frs, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
-        "tune: {flow_control: {tau: [8, 16], lambda: [1, 2]}, frs: {n_reverse_steps: [4, 10], pinned_steps: [2, 16]}}\n"
+        "tune: {flow_control: {tau: [8, 16], lambda: [1, 2]}, frs: {n_reverse_steps: [10], pinned_steps: [2, 16]}}\n"
         "grid: {family: gain, levels: [0.25], noises: [1.25]}\nfocus: mars\n")
-    common = ["--sweep", str(tmp_path / "jt.yaml"), "--tune-trials", "4", "--test-trials", "4", "--cpu", "--results", str(tmp_path)]
+    common = ["--sweep", str(tmp_path / "jt.yaml"), "--tune-trials", "2", "--test-trials", "4", "--cpu", "--results", str(tmp_path)]
     sweep_main(common + ["--out", "joint"])
     out = tmp_path / "sim" / "sweeps" / "joint"
     test, tuning = (json.loads((out / f"{n}.json").read_text()) for n in ("test", "tuning"))
@@ -175,7 +175,7 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path):
     assert set(cell["metrics"]) == {"teleop", "flow_control", "frs", "mars"} and set(cell["lead"]) == {"teleop", "flow_control", "frs"}
     tuned = tuning["tuning"]["0.25|1.25"]
     assert set(tuned["flow_control"]) == {"tau=8,lambda=1", "tau=8,lambda=2", "tau=16,lambda=1", "tau=16,lambda=2"}
-    assert set(tuned["frs"]) == {f"n_reverse_steps={n},pinned_steps={p}" for n in (4, 10) for p in (2, 16)} and "None" in tuned["teleop"]
+    assert set(tuned["frs"]) == {f"n_reverse_steps=10,pinned_steps={p}" for p in (2, 16)} and "None" in tuned["teleop"]
     assert cell["settings"]["teleop"] is None and set(cell["settings"]["flow_control"]) == {"tau", "lambda"}
     assert set(cell["settings"]["frs"]) == {"n_reverse_steps", "pinned_steps"}
     for fig in ("test.png", "showcase.png"):

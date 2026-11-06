@@ -418,7 +418,6 @@ ignore = [
 "tests/examples/pi05_mars_cursor/test_cursor_flow.py" = ["C408", "E731", "I001", "N803", "N806"]
 "tests/examples/pi05_mars_cursor/test_figures.py" = ["B905", "C408", "E741", "I001", "N806"]
 "tests/examples/pi05_mars_cursor/test_grid.py" = ["B905", "C408", "I001", "SIM300"]
-"tests/examples/pi05_mars_cursor/test_grid_sweep.py" = ["B905", "C408", "I001"]
 "tests/examples/pi05_mars_cursor/test_obstacles.py" = ["B905", "C408", "I001"]
 "tests/examples/pi05_mars_cursor/test_session.py" = ["C408", "I001", "SIM300"]
 "tests/examples/pi05_mars_cursor/test_sweep.py" = ["B905", "C408", "F401", "I001", "N803"]
@@ -441,7 +440,6 @@ exclude = [
     "tests/examples/pi05_mars_cursor/test_cursor_flow.py",
     "tests/examples/pi05_mars_cursor/test_figures.py",
     "tests/examples/pi05_mars_cursor/test_grid.py",
-    "tests/examples/pi05_mars_cursor/test_grid_sweep.py",
     "tests/examples/pi05_mars_cursor/test_obstacles.py",
     "tests/examples/pi05_mars_cursor/test_session.py",
     "tests/examples/pi05_mars_cursor/test_sweep.py",

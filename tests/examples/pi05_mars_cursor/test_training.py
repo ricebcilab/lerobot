@@ -11,11 +11,11 @@ import pytest
 import torch
 
 from cursor_sa import config
-from cursor_sa.readout import corruption_spec
+from cursor_sa.readout import corruption_spec, curl_commands
 from cursor_sa.env import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import ReversalAdapter, TaskModule
+from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
 from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
 from train import train_adapter
 from _view_stub import ViewStub
@@ -81,6 +81,27 @@ def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
     served = train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k))
     torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))  # one draw per step
     assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
+    # a curl's core is its velocity driven from rest by the pushes in turn (the trainer's readout_core), not M @ push
+    args = _args("--name", "x", "--corruption", "{curl: 20, tau: 0.1}", "--n-demos", "10", "--val-demos", "4")
+    _, curl = corruption_spec(args.corruption)
+    curled = train_adapter.expert_splits(args, None, policy, "cpu", np.random.default_rng(0), None, curl)["train"]
+    torch.testing.assert_close(curled.core, torch.as_tensor(curl_commands(curled.push.numpy(), curl), dtype=torch.float32))
+    assert not torch.allclose(curled.core, curled.push, atol=1e-2)
+
+
+def test_the_field_loss_trains_the_task_module_through_the_frozen_user_module():
+    """field_loss's gradient reaches the task module (bound to the observation) through the frozen user module."""
+    policy, user, task = FlowPolicy().eval().requires_grad_(False), UserModule().requires_grad_(False), TaskModule()
+    torch.nn.init.normal_(user.net[-1].weight, std=0.05)
+    torch.nn.init.normal_(task.out.weight, std=0.05)
+    B, g = 4, torch.Generator().manual_seed(0)
+    free = dict(pos=torch.rand(B, 2, generator=g), hist=torch.zeros(B, policy.hist, 2), targets=torch.rand(B, 3, 2, generator=g),
+                mask=torch.ones(B, 3, dtype=torch.bool), goal=torch.zeros(B, 3, dtype=torch.bool),
+                obstacles=torch.rand(B, 2, 3, generator=g) * 0.1, obstacle_mask=torch.ones(B, 2, dtype=torch.bool))
+    latent, bci = torch.randn(B, policy.horizon, 2, generator=g), torch.randn(B, policy.horizon, 2, generator=g)
+    loss = train_adapter.field_loss(policy, user, task, free, latent, bci, torch.tensor([1.0, 0.0, 1.0, 1.0]))
+    loss.backward()
+    assert task.out.weight.grad is not None and task.out.weight.grad.abs().sum() > 0
 
 
 def test_a_time_budget_keeps_the_demonstrations_that_fit_in_it():
@@ -273,7 +294,8 @@ def test_a_task_module_trains_on_the_teachers_hits(trained, monkeypatch):
     """--teacher: the teacher's hit rollouts as demonstrations, resampled to the policy's step rate (`planned_steps`:
     every second position of a half-speed path, an odd final control step dropped)."""
     path = np.cumsum(np.repeat([[0.01, 0.0]], 6, axis=0), axis=0)  # 6 positions: 5 control steps
-    assert np.allclose(train_adapter.planned_steps(path), [[0.02, 0.0], [0.02, 0.0]])  # control steps 0-1 and 2-3
+    assert train_adapter.planned_steps(path).shape == (2, 2)  # control steps 0-1 and 2-3; the 5th is half a step
+    assert np.allclose(train_adapter.planned_steps(path), [[0.02, 0.0], [0.02, 0.0]])
     assert train_adapter.planned_steps(np.vstack([path, path[-1:] + [0.01, 0.0]])).shape == (3, 2)
     made, _ = _recording(monkeypatch, "teacher_demos")
     train_adapter.train(_args(*TASK, "--obstacle", DISC, "--name", "s", "--teacher", "t", "--teacher-chunk", "8", *COMMON, "--n-demos", "4",
@@ -377,12 +399,13 @@ VIEWS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x", "--token-source", "vlm_
 DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
 
 
-@pytest.mark.parametrize("argv, refused", [
+@pytest.mark.parametrize("argv, outcome", [  # True: refused; else the parsed values
     (["--kind", "task", "--obstacle", IMAGE, *ROT, "--name", "x"], True),            # a task module needs its user module
     (["--kind", "user", "--obstacle", IMAGE, *ROT, "--name", "x"], True),           # a user module calibrates on the open field
     (["--kind", "user", *ROT, "--name", "x", "--frozen-noise", "--closed-loop", "u"], True),
     (["--kind", "user", *ROT, "--name", "x", "--cross-step-dims", "0"], True),     # needs --cross-step-rank
-    (["--kind", "user", *ROT, "--name", "x", "--cross-step-rank", "2", "--cross-step-dims", "1"], False),
+    (["--kind", "user", *ROT, "--name", "x", "--cross-step-rank", "2", "--cross-step-dims", "1"], {"cross_step_dims": [1], "step_rank": None}),
+    (["--kind", "user", *ROT, "--name", "x"], {"cross_step_dims": None, "step_rank": None}),
     ([*DISCS_TASK, "--token-geometry", "relative"], True),                         # discs have no screen tokens
     ([*POOLED, "--obstacle", IMAGE], True),                                        # --pooled carries its own obstacles
     ([*DISCS_TASK, "--save-every", "3"], True),                                    # not a multiple of COMMON's --log-every 2
@@ -393,11 +416,11 @@ DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
     ([*VIEWS_TASK, "--jitter", "0.02"], True),                                     # the picture would show the cursor elsewhere
     ([*VIEWS_TASK, "--rigid-motions", "2"], True),
     ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--rigid-motions", "2"], True),  # a curl does not mirror
-    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--jitter", "0.02"], False),
+    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--jitter", "0.02"], {"jitter": 0.02}),
     (["--kind", "task", "--pooled", "CURLED_POOL", "--name", "x", "--rigid-motions", "2"], True),
-    ([*POOLED, "--jitter", "0.02"], False),
+    ([*POOLED, "--jitter", "0.02"], {"jitter": 0.02}),
     ([*DISCS_TASK, "--teacher", "t", "--rigid-motions", "2"], True),               # a teacher's demonstrations are rollouts
-    ([*DISCS_TASK, "--teacher", "t", "--jitter", "0.02"], False),
+    ([*DISCS_TASK, "--teacher", "t", "--jitter", "0.02"], {"jitter": 0.02}),
     ([*DISCS_TASK, "--jitter", "-0.1"], True), ([*DISCS_TASK, "--jitter-steps", "0"], True), ([*DISCS_TASK, "--rigid-motions", "-1"], True),
     (["--kind", "user", *ROT, "--name", "x", "--jitter", "0.02"], True),            # the task module's
     (["--kind", "user", *ROT, "--name", "x", "--rigid-motions", "2"], True),
@@ -408,13 +431,14 @@ DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
     ([*VIEWS_TASK, "--token-drop", "1.0"], True), ([*VIEWS_TASK, "--view-affine", "1.5"], True),
     ([*VIEWS_TASK, "--scene-center", "no", "--scene-rank", "0"], True), ([*DISCS_TASK, *CNN, "--scene-center", "no"], True),
 ])
-def test_the_parser_refuses_what_makes_no_sense(argv, refused, tmp_path):
+def test_the_parser_refuses_what_makes_no_sense(argv, outcome, tmp_path):
     entries = {"POOLED": ROT[1], "CURLED_POOL": CURLED}
     for name, corruption in entries.items():
         (tmp_path / f"{name}.yaml").write_text(f"entries:\n  - {{obstacle: {IMAGE}, user_module: u, corruption: {corruption}}}\n")
     argv = [str(tmp_path / f"{a}.yaml") if a in entries else a for a in argv]
-    if refused:
+    if outcome is True:
         with pytest.raises(SystemExit):
             _args(*argv, *COMMON)
     else:
-        _args(*argv, *COMMON)
+        args = _args(*argv, *COMMON)
+        assert {k: getattr(args, k) for k in outcome} == outcome

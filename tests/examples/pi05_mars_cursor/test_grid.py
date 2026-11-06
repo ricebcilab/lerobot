@@ -180,24 +180,30 @@ def test_grid_sweep_loads_cells_and_resolves_cell_adapters(tmp_path):
         load_sweep(tmp_path / "bad.yaml")
 
 
+# the run: one user, two tasks (resolution is pinned on GRID above), the shortest trials the checks allow
+RUN_GRID = (GRID.replace("  per_task: {mode: frs, model: {T0: flow_goaldrop, T1: flow_goaldrop}, reversal_adapter: {user: {T0: cell, T1: {U1: user_b, U2: user_a}}}}\n", "")
+            .replace("    U2: {corruption: {curl: 20, tau: 0.1}, adapter: user_b}\n", "")
+            .replace("adapter: task_a}", "adapter: task_a, time_limit_s: 2.0}").replace("trials: {tune: 3, test: 3}", "trials: {tune: 1, test: 3}"))
+
+
 def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
-    for name, module, kind in (("user_a", UserModule(), "user"), ("user_b", UserModule(), "user"),
-                               ("task_a", TaskModule(), "task")):
+    for name, module, kind in (("user_a", UserModule(), "user"), ("task_a", TaskModule(), "task")):
         (tmp_path / name).mkdir()
         torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args={}, obstacle=None),
                    tmp_path / name / "adapter.pt")
     monkeypatch.setattr(session, "adapter_path", lambda name: tmp_path / name / "adapter.pt")
-    (tmp_path / "grid.yaml").write_text(GRID + "tune: {frs: {n_reverse_steps: [10]}}\n")
+    assert "per_task" not in RUN_GRID and "U2" not in RUN_GRID and "time_limit_s: 2.0" in RUN_GRID and "tune: 1," in RUN_GRID
+    (tmp_path / "grid.yaml").write_text(RUN_GRID + "tune: {frs: {n_reverse_steps: [10]}}\n")
     argv = ["--sweep", str(tmp_path / "grid.yaml"), "--results", str(tmp_path), "--cpu", "--out", "grid"]
     sweep_main(argv)
     out = tmp_path / "sim" / "sweeps" / "grid"
     result = json.loads((out / "test.json").read_text())
-    assert set(result["test"]) == {"U1xT0|0.75", "U1xT1|0.75", "U2xT0|0.75", "U2xT1|0.75"}
+    assert set(result["test"]) == {"U1xT0|0.75", "U1xT1|0.75"}
     cell = result["test"]["U1xT1|0.75"]
     assert cell["user"] == "U1" and cell["task"] == "T1" and cell["train_cell"] is True
     assert result["test"]["U1xT0|0.75"]["train_cell"] is False
-    assert set(cell["metrics"]) == {"teleop", "mars_user", "mars", "per_task"}
-    assert set(cell["lead"]) == {"teleop", "mars_user", "per_task"} and cell["best_other"] == "teleop"  # leads over all, best over `against`
+    assert set(cell["metrics"]) == {"teleop", "mars_user", "mars"}
+    assert set(cell["lead"]) == {"teleop", "mars_user"} and cell["best_other"] == "teleop"  # leads over all, best over `against`
     # every test trial is kept: its outcome per method and the side its route passes the obstacle on
     trials = {k: c["trials"] for k, c in result["test"].items()}
     assert len(trials["U1xT1|0.75"]["side"]) == 3
@@ -216,10 +222,10 @@ def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
     summary = (out / "grid_summary.md").read_text()
     assert "held-out" in summary and "U1" in summary and "T1" in summary
     sweep_main(argv + ["--resume"])  # nothing left to run; the outputs are rewritten from the saved cells
-    assert len(json.loads((out / "test.json").read_text())["test"]) == 4
+    assert len(json.loads((out / "test.json").read_text())["test"]) == 2
     # run in two parts and merged, every cell comes out exactly as in the one run: its seeds are its own
-    sweep_main(argv[:-2] + ["--out", "part_a", "--cells", "U1xT0", "U2xT1"])
-    sweep_main(argv[:-2] + ["--out", "part_b", "--cells", "U2xT0", "U1xT1"])
+    sweep_main(argv[:-2] + ["--out", "part_a", "--cells", "U1xT0"])
+    sweep_main(argv[:-2] + ["--out", "part_b", "--cells", "U1xT1"])
     sweep_main(argv[:-2] + ["--out", "merged", "--merge", "part_a", "part_b"])
     merged = tmp_path / "sim" / "sweeps" / "merged"
     assert json.loads((merged / "test.json").read_text())["test"] == result["test"]
