@@ -240,6 +240,99 @@ def test_train_a_relative_geometry_image_task_module(ckpt_dir):
                                   "--corruption", "{rotation_deg: 60}", "--token-geometry", "relative"])   # discs have no screen tokens
 
 
+RELATIVE_TASK = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--corruption", "{rotation_deg: 60}",
+                 "--token-source", "cnn", "--render-size", "64", "--token-geometry", "relative"]
+
+
+def _train_user(*extra):
+    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON, *extra]))
+
+
+def test_train_with_jitter_and_rigid_motions_records_them(ckpt_dir, monkeypatch):
+    _train_user()
+    splits, made, real = _record_splits(monkeypatch), [], train_adapter.augment_demos
+
+    def recording(*a, **k):
+        made.append(real(*a, **k))
+        return made[-1]
+
+    monkeypatch.setattr(train_adapter, "augment_demos", recording)
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--jitter", "0.02", "--jitter-steps", "3", "--rigid-motions", "2", *COMMON]))
+    meta = torch.load(ckpt_dir / "t_aug" / "adapter.pt")["meta"]
+    assert meta["jitter"] == 0.02 and meta["jitter_steps"] == 3 and meta["rigid_motions"] == 2
+    assert 0 < meta["rigid_kept"] <= 2 * 60
+    json.dumps(meta["rigid_kept"])                                         # a plain int: the train log carries it too
+    train, val = splits[-1]["train"], splits[-1]["val"]
+    assert train.sampler.jitter == 0.02 and train.sampler.jitter_steps == 3 and val.sampler.jitter == 0.0
+    assert len(train.sampler.lengths) == 60 + meta["rigid_kept"] and len(val.sampler.lengths) == 40
+    assert len(train.sampler.scene["cnn"]) == 60 + meta["rigid_kept"]      # every copy is rendered
+    (layouts, actions, _, kept, _), = made                                 # the val split never augments
+    assert kept.sum() == meta["rigid_kept"]
+    push = train.push.numpy()
+    origin, dots = np.repeat(np.arange(60), kept), (push * actions).sum(-1)
+    assert (np.abs(dots[60:]).sum(1) > 0).all() and np.allclose(dots[60:], dots[origin], atol=1e-6)   # a rigid motion keeps push . action
+    pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+    fresh = train_adapter.expert_pushes(layouts, pos)
+    assert np.allclose(push[:60], fresh[:60], atol=1e-6)                   # the originals' are the expert's
+    assert not np.allclose(push[60:], fresh[60:], atol=1e-3)               # a copy's are its original's moved
+
+
+def test_the_pushes_of_a_copy_are_not_recomputed(ckpt_dir, monkeypatch):
+    _train_user()
+    sizes, real = [], train_adapter.expert_pushes
+
+    def recording(layouts, pos):
+        sizes.append(len(layouts))
+        return real(layouts, pos)
+
+    monkeypatch.setattr(train_adapter, "expert_pushes", recording)
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--rigid-motions", "2", *COMMON]))
+    assert sizes == [60, 40]                                               # train's originals, then val
+
+
+def test_the_new_flags_default_off_and_leave_the_meta_explicit(ckpt_dir, monkeypatch):
+    _train_user()
+    meta = torch.load(ckpt_dir / "u" / "adapter.pt")["meta"]
+    assert [meta[k] for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")] == [None] * 4
+    calls = []
+    monkeypatch.setattr(train_adapter, "augment_demos", lambda *a, **k: calls.append(a))
+    splits = _record_splits(monkeypatch)
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_plain", *COMMON]))
+    meta = torch.load(ckpt_dir / "t_plain" / "adapter.pt")["meta"]
+    assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"], meta["rigid_kept"]) == (0.0, 4, 0, None)
+    assert not calls and splits[-1]["train"].sampler.jitter == 0.0 and len(splits[-1]["train"].sampler.lengths) == 60
+
+
+def test_a_pooled_run_counts_the_rigid_copies_of_every_entry(pooled_fixture, ckpt_dir, monkeypatch):
+    splits = _record_splits(monkeypatch)
+    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", "--token-source", "cnn",
+                                                  "--render-size", "64", "--rigid-motions", "1", *COMMON]))
+    meta = torch.load(ckpt_dir / "t_all" / "adapter.pt")["meta"]
+    assert len(splits) == 2 and 0 < meta["rigid_kept"] == sum(len(s["train"].sampler.lengths) - 60 for s in splits)
+    assert all(len(s["train"].sampler.lengths) > 60 for s in splits)
+
+
+def test_jitter_and_rigid_motions_are_refused_where_they_make_no_sense(tmp_path):
+    task = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--name", "x"]
+    rotation = [*task, "--corruption", "{rotation_deg: 60}"]
+    curled = "{curl: 2.0, tau: 0.1}"
+    (tmp_path / "pooled.yaml").write_text(f"entries:\n  - {{obstacle: {{kind: disc, radius: 0.08, along: 0.5}}, user_module: u, corruption: {curled}}}\n")
+    for bad in ([*rotation, "--token-source", "vlm_views", "--jitter", "0.02"],     # the picture would show the cursor elsewhere
+                [*rotation, "--token-source", "vlm_views", "--rigid-motions", "2"],
+                [*task, "--corruption", curled, "--rigid-motions", "2"],             # a curl is not mirror-invariant
+                ["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "x", "--rigid-motions", "2"],
+                [*rotation, "--teacher", "t", "--rigid-motions", "2"],               # a teacher's demonstrations are rollouts
+                [*rotation, "--jitter", "-0.1"], [*rotation, "--jitter-steps", "0"], [*rotation, "--rigid-motions", "-1"],
+                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--jitter", "0.02"],   # the task module's
+                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--rigid-motions", "2"]):
+        with pytest.raises(SystemExit):
+            train_adapter.parse_args(bad)
+    assert train_adapter.parse_args([*task, "--corruption", curled, "--jitter", "0.02"]).jitter == 0.02    # the jitter alone is fine with a curl
+    assert train_adapter.parse_args([*rotation, "--teacher", "t", "--jitter", "0.02"]).jitter == 0.02      # and with a teacher
+    args = train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "x", "--jitter", "0.02"])
+    assert args.jitter == 0.02
+
+
 def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):
     calls = []
     class Stub:

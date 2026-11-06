@@ -42,6 +42,9 @@ hidden alike; a share `p_free` of the layouts has no obstacle, where the module 
 With `--token-source` vlm_image / vlm_prefix / cnn the module reads the obstacles from the rendered scene
 (`--render-size` pixels) instead of the disc parameters: pi0.5's vision tokens (`--vlm`) or a CNN trained with it;
 `--token-geometry relative` (vlm_image, cnn) gives each scene token its offset from the cursor instead of a learned position.
+`--jitter s` moves every training sample's position off the path by N(0, s^2 I) and has the first `--jitter-steps` steps of
+its chunk take the move back out (a recovery label). `--rigid-motions k` adds up to k copies of every training demonstration
+under random rigid motions of the screen (`augment_demos`), the expert's pushes moved with them; neither touches the val split.
 The user's frozen module is in the loop through lambda_field x the field regression above through both
 modules, on that user's commands around the obstacles (the layouts with the obstacle only):
 
@@ -111,7 +114,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
-from cursor_sa.demos import DemoConfig, DemoSampler, frame_steps, make_demos, plan_reach  # noqa: E402
+from cursor_sa.demos import DemoConfig, DemoSampler, augment_demos, frame_steps, make_demos, plan_reach  # noqa: E402
 from cursor_sa.env import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
                            sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
@@ -347,13 +350,17 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
 
 
 class ExpertData:
-    """One split of expert calibration data: the demonstrations (a DemoSampler; `frames` its frame table, see
-    `DemoSampler`) and, at every demo step, the expert's push and what the user's readout makes of it before noise."""
+    """One split of expert calibration data: the demonstrations (a DemoSampler; `frames` its frame table, `jitter` and
+    `jitter_steps` its recovery labels, see `DemoSampler`) and, at every demo step, the expert's push (`push` [B, L, 2]
+    when given, else `expert_pushes`) and what the user's readout makes of it before noise."""
 
-    def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False, frames=None):
-        self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device, frames)
-        pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
-        push = expert_pushes(layouts, pos)
+    def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False, frames=None, push=None,
+                 jitter=0.0, jitter_steps=4):
+        self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device, frames, jitter=jitter,
+                                   jitter_steps=jitter_steps)
+        if push is None:
+            pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+            push = expert_pushes(layouts, pos)
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
         self.push, self.core = f32(push), f32(readout_core(push, corruption, curl))
         self.noise = torch.randn_like(self.core) if frozen_noise else None  # one draw per demo step, or fresh ones
@@ -376,7 +383,9 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
     caller closes it). With vlm_views each split gets a frame table instead (`view_frames`, after its demonstrations are
     drawn as for any source): the train split's fits the reduction and moves pictures with default_rng([seed, 7]), the val
     split's reuses that reduction and moves none; args.view_info gets each split's info (without the reduction) and
-    args.view_reduction the reduction."""
+    args.view_reduction the reduction. With --rigid-motions the train split gains its demonstrations' moved copies
+    (`augment_demos` on the expert's pushes, drawing from default_rng([seed, 11])) before anything is rendered; the count
+    is added to args.rigid_kept. --jitter goes to the train split's sampler."""
     out = {}
     if args.teacher:
         args.teacher_demos = {}
@@ -395,7 +404,15 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             layouts, task = layouts_for(args, obstacle, rng, n, p_free)
             tic = time.time()
             actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
-        frames = None
+        frames, push = None, None
+        if split == "train" and args.rigid_motions:  # before any scene: `Layouts.concat` refuses layouts that carry one
+            pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+            push = expert_pushes(layouts, pos)
+            layouts, actions, lengths, kept, push = augment_demos(np.random.default_rng([args.seed, 11]), layouts, actions, lengths,
+                                                                  args.rigid_motions, task, push=push)
+            args.rigid_kept += int(kept.sum())
+            print(f"train: {len(kept)} demonstrations and {kept.sum()} moved copies ({kept.min()}-{kept.max()} per demonstration)",
+                  flush=True)
         if args.token_source == "vlm_views":
             train = split == "train"
             tokens, start, info = view_frames(args, layouts, actions, lengths, encoder, device, args.view_reduction,
@@ -411,7 +428,8 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
         elif args.token_source != "discs":
             layouts.scene = {args.token_source: scene_for(layouts, args.token_source, args.render_size, encoder)}
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
-                                frozen_noise=split == "train" and args.frozen_noise, frames=frames)
+                                frozen_noise=split == "train" and args.frozen_noise, frames=frames, push=push,
+                                jitter=args.jitter if split == "train" else 0.0, jitter_steps=args.jitter_steps)
         print(f"{split}: {n} demonstrations ({lengths.sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
               f"({time.time() - tic:.0f}s)", flush=True)
     return out
@@ -592,6 +610,7 @@ def train_task(args, policy, device, rng):
     demonstrations together."""
     encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
     entries = entries_of(args)
+    args.rigid_kept = 0 if args.rigid_motions else None
     try:
         pairs = []
         for j, e in enumerate(entries):
@@ -716,6 +735,7 @@ def save_module(args, kind, module, name, **extra):
     returns its path and the saved arguments."""
     saved = {k: v for k, v in vars(args).items() if k != "view_reduction"}   # the reduction travels in the module's buffers
     center = args.scene_center if args.token_source == "vlm_views" else None
+    augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")}
     path = save_adapter_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
@@ -723,7 +743,7 @@ def save_module(args, kind, module, name, **extra):
                                                               wrist_span=args.wrist_span, view_stride=args.view_stride,
                                                               scene_rank=args.scene_rank, view_affine=args.view_affine,
                                                               token_drop=args.token_drop, views=getattr(args, "view_info", None),
-                                                              scene_center=center, **extra))
+                                                              scene_center=center, **augmented, **extra))
     return path, saved
 
 
@@ -743,6 +763,9 @@ def dim_indices(text):
         return [int(i) for i in text.split(",") if i.strip()]
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected a comma list of dim indices, got {text!r}") from None
+
+
+NO_CURL_COPIES = "--rigid-motions mirrors demonstrations and a curl's handedness does not mirror: no curl corruption"
 
 
 def parse_args(argv=None):
@@ -789,6 +812,11 @@ def parse_args(argv=None):
     p.add_argument("--token-geometry", choices=TOKEN_GEOMETRIES, default="absolute",
                    help="task: relative puts each scene token's offset from the cursor into the token (vlm_image, cnn) "
                         "instead of a learned position")
+    p.add_argument("--jitter", type=float, default=0.0, help="task: std of a training sample's move off the path (a recovery "
+                   "label takes it back out; 0: off)")
+    p.add_argument("--jitter-steps", type=int, default=4, help="task: the steps of the chunk that take that move back out")
+    p.add_argument("--rigid-motions", type=int, default=0, help="task: up to this many copies of every training demonstration "
+                   "under random rigid motions of the screen, their pushes moved with them (0: off)")
     p.add_argument("--teacher", help="task: demonstrations are this parametric task module's oracle_task rollouts (hits only, "
                    "resampled to the policy's step rate) instead of the scripted expert's")
     p.add_argument("--teacher-chunk", type=int, default=500, help="task: layouts per teacher rollout batch")
@@ -833,6 +861,8 @@ def parse_args(argv=None):
             p.error("vlm_views trains on the scripted expert's demonstrations: no --teacher")
         if args.pooled:
             p.error("vlm_views is a single-context run: no --pooled")
+        if args.jitter > 0 or args.rigid_motions > 0:
+            p.error("vlm_views: a frame's pictures show the demonstration's own position: no --jitter or --rigid-motions")
     if args.token_source == "discs" and (args.token_drop > 0 or args.view_affine > 0):
         p.error("--token-drop and --view-affine act on scene tokens: not with --token-source discs")
     if args.view_affine > 0 and args.token_source != "vlm_views":
@@ -851,6 +881,16 @@ def parse_args(argv=None):
         p.error("--token-drop must be in [0, 1)")
     if not 0 <= args.view_affine <= 1:
         p.error("--view-affine must be in [0, 1]")
+    if args.jitter < 0:
+        p.error("--jitter must not be negative")
+    if args.jitter_steps < 1:
+        p.error("--jitter-steps must be at least 1")
+    if args.rigid_motions < 0:
+        p.error("--rigid-motions must not be negative")
+    if args.kind != "task" and (args.jitter or args.rigid_motions):
+        p.error("--jitter and --rigid-motions are for --kind task")
+    if args.rigid_motions and args.teacher:
+        p.error("--rigid-motions moves the scripted expert's demonstrations: no --teacher")
     if args.pooled:
         if args.kind != "task":
             p.error("--pooled is for --kind task")
@@ -861,10 +901,14 @@ def parse_args(argv=None):
         for e in args.pooled:
             if not {"obstacle", "user_module", "corruption"} <= set(e):
                 p.error("--pooled: every entry needs obstacle, user_module and corruption")
+            if args.rigid_motions and corruption_spec(e["corruption"])[1] is not None:
+                p.error(NO_CURL_COPIES)
         args.obstacle = None
         return args
     if args.corruption is None:
         p.error("--corruption is required")
+    if args.rigid_motions and corruption_spec(args.corruption)[1] is not None:
+        p.error(NO_CURL_COPIES)
     if args.kind == "task" and (args.obstacle is None or args.user_module is None):
         p.error("--kind task needs the task's --obstacle and the user's --user-module")
     if args.frozen_noise and args.closed_loop:
