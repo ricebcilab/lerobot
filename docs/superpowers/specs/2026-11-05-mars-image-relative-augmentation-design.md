@@ -190,3 +190,37 @@ shift=0.25, tries=20) -> (layouts, actions, lengths, kept, push)` (the originals
 The exact form of the jitter's chunk correction when the chunk is shorter than `m` (correct over what there is); how
 `augment_demos` batches `replay` (500 rows at a time, like `make_demos`); the diagnostic's arm construction (reuse
 `run_sweep.py`'s loaders and `run_trials`); test values.
+
+## Addendum (2026-11-06): stage 2, the goal-leak check and the clean-up
+
+The 300-point gate (seed 820, 500 fresh layouts) gave rel300 55.2 / 38.2 and 35.6 / 62.0, jitter 23.6 / 69.0 and 14.6 /
+85.4, rigid 98.4 / 1.0 and 88.2 / 11.6, both 87.2 / 9.0 and 76.8 / 21.4 (hits / collisions %, T2 and T4; parametric
+99.6 / 0.0 and 92.8 / 3.4). Rigid is the recipe (level on T2, in band on T4). The user then asked for stage 2, seeds
+1-2, the goal-leak check and the clean-up, plus an archive of abandoned artifacts and a rename of the kept ones.
+
+**Stage 2 and seeds (controller).** The rigid recipe at 1,000 (9 copies) and 3,000 (2 copies) demonstrations, scenes
+held near 10,000; seeds 1 and 2 at 300 with 32 copies (user modules, parametric references and fine-tuned policies at
+those seeds exist; the sweep's `--module-seed` swaps every `_n300_s0` name). Sweeps `grid_task_check_rel_n{300,1000,
+3000}` and `grid_task_check_rel_rigid` (committed); reports `--scan --prefix rel` and `--check`.
+
+**The goal-leak check (decoy reach).** The flag on T2 (goal-hidden hits 74.4 with the rigid module against the
+parametric module's 59.0) suggests the picture leaks the goal: every obstacle is placed relative to the reach from the
+start to the goal, so where the obstacle is says where the goal is. The check places the obstacle relative to a decoy
+reach instead: the obstacle spec gains `decoy: false` (default; `true` places the obstacle on the line from the start
+to one real non-goal target drawn uniformly, with one extra draw from the layout generator only when `decoy` is set,
+so every existing layout is unchanged); the passability check stays about the true goal; demonstrations and routes
+still go to the true goal. A sweep `grid_task_check_rel_leak` plays T2 and T4 with `decoy: true` for the bare policy,
+the parametric module and the rigid module, goal given and goal hidden. The gate table gains a `wrong target` column.
+Reading: with the goal hidden, a module that infers the goal from the obstacle sends the policy to the decoy (wrong
+target well above the parametric module's); with the goal given, hits on decoy layouts say whether the module still
+avoids an obstacle that is not on its reach.
+
+**Clean-up (user).** Scripts: only the two entry points stay at the top of `examples/pi05/mars/cursor`;
+`analyze_results.py`, `convert_checkpoints.py`, `hub.py`, `diag_layouts.py` move to `tools/`, `report_grid_image.py`
+to `reports/`; the test path setup, the README and the run-folder scripts follow. Tests: cut to about half the lines
+and under ten minutes on an idle CPU, one behaviour test per feature, one tiny training per end-to-end path, the
+per-round files folded into the existing ones; the equivalence tests and their reference files stay (they pin
+agreement with the earlier cursor code; my call, reversible). Archive: artifacts of abandoned branches (round 1's
+absolute and cnn modules, round 3's two-view modules and sweeps, round 4's jitter arms, and their run-folder scripts,
+reports and scene caches) move to `old/<round>/` folders beside where they were, with an index; nothing is deleted.
+Rename of the kept artifacts to a simpler convention: proposed to the user and done only on their approval.
