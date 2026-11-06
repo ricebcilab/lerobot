@@ -8,7 +8,7 @@ Three sets of layouts of the context's task (the sweep's users x tasks cell of t
 `train`, the layouts the trainer drew for the module's train split (`rebuild_layouts` with the module's --seed,
 --n-demos and --p-free; only the rows with the obstacle), `fresh`, as many new ones drawn from --fresh-seed, all
 with the obstacle, and `moved`, the `train` rows each under one random rigid motion that keeps it on screen
-(`moved_layouts`, drawing from default_rng([seed, 11])). Each set is cut to its first --trials rows. On every set
+(`moved_layouts`, drawing from default_rng([seed, 12]), a stream disjoint from the trainer's rigid copies). Each set is cut to its first --trials rows. On every set
 `oracle` (the bare policy), `oracle_task` (the parametric module) and --method (the image module) run once at
 noise 0.0 with the sweep's seed, the scene arrays cached under --scene-cache. A module that hits on `train` but not
 on `fresh` or `moved` has learned its training layouts rather than the obstacle.
@@ -125,7 +125,7 @@ def main(argv=None):
     rebuilt = rebuild_layouts(args.seed, args.n_demos, args.p_free, obstacle)
     train = rebuilt[np.flatnonzero(rebuilt.obstacle_mask.any(1))]
     sets = dict(train=train, fresh=rebuild_layouts(args.fresh_seed, len(train), 0.0, obstacle),
-                moved=moved_layouts(train, np.random.default_rng([args.seed, 11])))
+                moved=moved_layouts(train, np.random.default_rng([args.seed, 12])))
     sets = {name: layouts[: args.trials] for name, layouts in sets.items()}
 
     arms = {m: method_arm(sweep, m, cell) for m in methods}
