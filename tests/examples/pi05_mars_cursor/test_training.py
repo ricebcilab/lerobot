@@ -18,7 +18,7 @@ from cursor_sa.policy import FlowPolicy
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
 from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
 from train import train_adapter
-from _view_stub import ViewStub
+from _view_stub import TokenStub, ViewStub
 
 COMMON = ["--n-demos", "60", "--val-demos", "40", "--steps", "4", "--log-every", "2", "--batch", "32"]
 ROT = ["--corruption", "{rotation_deg: 60}"]
@@ -204,6 +204,7 @@ def test_an_image_module_trains_on_jittered_and_moved_copies(trained, monkeypatc
     cfg, meta = ckpt["config"], ckpt["meta"]
     assert (cfg["token_source"], cfg["image_size"], cfg["token_geometry"]) == ("cnn", 64, "relative") and "scene_pos" not in ckpt["state_dict"]
     assert (meta["token_source"], meta["token_geometry"], meta["teacher"], meta["teacher_demos"], meta["scene_center"]) == ("cnn", "relative", None, None, None)
+    assert (meta["scene_store"], meta["scene_rank"], meta["args"]["scene_rank"]) == (None, None, None) and "scene_rank" not in cfg
     assert ReversalAdapter.load(trained / "t_aug" / "adapter.pt").task.token_geometry == "relative"
     assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(_log(trained, "t_aug")[-1])
     assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"]) == (0.02, 3, 2) and type(meta["rigid_kept"]) is int
@@ -359,6 +360,54 @@ def test_a_two_view_module_trains_on_the_scripted_draws(trained, monkeypatch):
     torch.testing.assert_close(views["train"].noise, cnn["train"].noise)
 
 
+STORED = ["--token-source", "vlm_image", "--render-size", "32", "--rigid-motions", "1", *COMMON]
+
+
+def test_a_stored_run_equals_the_resident_run(trained, tmp_path, monkeypatch, capsys):
+    """--scene-store keeps the tokens in a disk store gathered per batch: the same module and log as the run whose
+    layouts carry their tokens, the moved copies and the val split included."""
+    monkeypatch.setattr(train_adapter, "SceneEncoder", TokenStub)
+    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_resident", *STORED))
+    capsys.readouterr()
+    splits, _ = _recording(monkeypatch, "expert_splits")
+    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_stored", *STORED, "--scene-store", str(tmp_path / "store")))
+    out = capsys.readouterr().out.splitlines()
+    resident, stored = (torch.load(trained / n / "adapter.pt") for n in ("t_resident", "t_stored"))
+    assert resident["config"] == stored["config"] and resident["state_dict"].keys() == stored["state_dict"].keys()
+    assert all(torch.equal(v, stored["state_dict"][k]) for k, v in resident["state_dict"].items())
+    assert _log(trained, "t_resident") == _log(trained, "t_stored")
+    (folder,) = (p.name for p in (tmp_path / "store").iterdir())
+    assert folder.startswith("vlm_image_32_") and stored["meta"]["scene_store"] == folder and resident["meta"]["scene_store"] is None
+    assert (stored["meta"]["scene_rank"], stored["meta"]["scene_center"]) == (None, None)
+    (data,) = splits
+    train = data["train"].sampler
+    n = len(train.lengths)
+    assert train.scene is None and n > 60 and f"train: {n} scenes, {n} newly encoded" in "\n".join(out)
+    assert any(line.startswith("val: 40 scenes, 40 newly encoded") and line.endswith(f"store {tmp_path / 'store' / folder}")
+               for line in out), out
+
+
+def test_a_reduced_image_module_trains_from_the_store_and_carries_its_basis(trained, tmp_path, monkeypatch):
+    """--scene-rank with vlm_image: the PCA is fitted on the train split's stored rows, the sampler feeds the reduced
+    tokens and the module carries the reduction (relative geometry added after the projection)."""
+    monkeypatch.setattr(train_adapter, "SceneEncoder", TokenStub)
+    splits, _ = _recording(monkeypatch, "expert_splits")
+    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_reduced", *STORED, "--token-geometry", "relative",
+                              "--scene-rank", "8", "--scene-store", str(tmp_path / "store")))
+    ckpt = torch.load(trained / "t_reduced" / "adapter.pt")
+    cfg, meta, state = ckpt["config"], ckpt["meta"], ckpt["state_dict"]
+    assert (cfg["scene_rank"], cfg["token_geometry"], meta["scene_rank"], meta["scene_center"]) == (8, "relative", 8, "yes")
+    assert state["scene_basis"].shape == (2048, 8) and state["scene_basis"].abs().sum() > 0 and state["scene_mean"].any()
+    task = ReversalAdapter.load(trained / "t_reduced" / "adapter.pt").task
+    assert task.scene_in.in_features == 8 and task.scene_rank == 8
+    (data,) = splits
+    for split in ("train", "val"):
+        obs, _ = data[split].sampler.sample(4)
+        assert obs["scene"]["vlm_image"].shape == (4, 256, 8) and obs["scene"]["vlm_image"].dtype == torch.float16
+        torch.testing.assert_close(data[split].sampler.reduction[1], state["scene_basis"])  # val reuses train's
+    assert {"val_fm", "collide_composed"} <= set(_log(trained, "t_reduced")[-1])
+
+
 def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, monkeypatch):
     """train_policy.py --init fine-tunes a trained policy for an obstacle task (its architecture and units, an obstacle
     head added); --demo_seconds draws the demonstrations as the adapter trainer does (a task module given the same
@@ -430,6 +479,13 @@ DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
     ([*VIEWS_TASK, "--view-stride", "0"], True), ([*VIEWS_TASK, "--scene-rank", "2048"], True),
     ([*VIEWS_TASK, "--token-drop", "1.0"], True), ([*VIEWS_TASK, "--view-affine", "1.5"], True),
     ([*VIEWS_TASK, "--scene-center", "no", "--scene-rank", "0"], True), ([*DISCS_TASK, *CNN, "--scene-center", "no"], True),
+    ([*DISCS_TASK, "--scene-rank", "8"], True), ([*DISCS_TASK, *CNN, "--scene-rank", "8"], True),  # discs have no tokens; cnn's are not 2048 wide
+    ([*DISCS_TASK, "--scene-store", "s"], True), ([*VIEWS_TASK, "--scene-store", "s"], True),     # no scene; the views' frame table
+    ([*DISCS_TASK, "--token-source", "vlm_image", "--scene-center", "no"], True),                 # no reduction to centre
+    ([*DISCS_TASK, "--token-source", "vlm_image"], {"scene_rank": None, "scene_store": None}),
+    ([*DISCS_TASK, "--token-source", "vlm_prefix", "--scene-rank", "8", "--scene-center", "no", "--scene-store", "s"],
+     {"scene_rank": 8, "scene_center": "no", "scene_store": "s"}),
+    ([*VIEWS_TASK], {"scene_rank": 256}), ([*DISCS_TASK], {"scene_rank": None}),
 ])
 def test_the_parser_refuses_what_makes_no_sense(argv, outcome, tmp_path):
     entries = {"POOLED": ROT[1], "CURLED_POOL": CURLED}

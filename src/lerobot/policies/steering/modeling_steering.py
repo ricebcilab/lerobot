@@ -231,7 +231,7 @@ class _BoundTaskModule:
 
 
 def reduce_tokens(tokens: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-    """The fixed linear token reduction of a ``vlm_views`` module: ``(tokens - mean) @ basis`` in float32,
+    """The fixed linear token reduction of a reduced ``vlm_*`` module: ``(tokens - mean) @ basis`` in float32,
     stored as float16. ``tokens`` (..., scene_dim), ``mean`` (scene_dim,), ``basis`` (scene_dim, rank)."""
     return ((tokens.float() - mean) @ basis).to(torch.float16)
 
@@ -264,13 +264,16 @@ class LearnedTaskModule(nn.Module):
     ``vlm_views`` reads the frozen VLM's vision tokens of two camera views, ``obs["scene"]["vlm_views"]``
     (B, ``scene_tokens``, ``scene_dim``): the overhead view's tokens, then the wrist view's (512 in all);
     ``wrist_span`` (> 0, required) records how much of the scene the wrist view spans. Nothing derived from
-    the cursor's position enters these tokens, so ``relative`` geometry is refused. With ``scene_rank`` the
+    the cursor's position enters these tokens, so ``relative`` geometry is refused. ``wrist_span`` is a config
+    key of ``vlm_views`` only.
+
+    With ``scene_rank`` (any ``vlm_*`` source; not ``discs`` or ``cnn``, which have no 2048-wide tokens) the
     module carries a fixed linear reduction (``scene_mean`` (scene_dim,), ``scene_basis`` (scene_dim,
     scene_rank), zeros until ``set_reduction``; persistent, so they travel in the checkpoint) and
     ``scene_in`` reads ``scene_rank`` wide tokens: ``tokens`` reduces a full-width input with
-    ``reduce_tokens`` and takes a ``scene_rank``-wide one as stored; any other width raises. ``scene_rank``
-    and ``wrist_span`` are config keys of ``vlm_views`` only (``scene_rank`` only when set), so the other
-    sources' configs and weights are unchanged.
+    ``reduce_tokens`` and takes a ``scene_rank``-wide one as stored; any other width raises. Relative
+    geometry is added after the projection, as at full width. ``scene_rank`` is a config key only when set,
+    so a module without it has the config and weights it always had.
 
     ``obs["scene_keep"]`` (B, ``scene_tokens``, bool; any image source, optional) marks the scene tokens the
     attention may see; the others are padded out of it. The null token is never hidden. Without it every
@@ -308,8 +311,10 @@ class LearnedTaskModule(nn.Module):
             raise ValueError(f"token_source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
         if token_source != "vlm_views" and wrist_span is not None:  # nosec B105
             raise ValueError(f"wrist_span belongs to token_source 'vlm_views', not {token_source!r}")
-        if scene_rank is not None and token_source != "vlm_views":  # nosec B105
-            raise ValueError(f"scene_rank belongs to token_source 'vlm_views', not {token_source!r}")
+        if scene_rank is not None and not token_source.startswith("vlm"):
+            raise ValueError(
+                f"scene_rank reduces the vlm_* sources' tokens, not token_source {token_source!r}'s"
+            )
         if scene_rank is not None and not 1 <= scene_rank < scene_dim:
             raise ValueError(f"scene_rank must be in 1..{scene_dim - 1}, got {scene_rank}")
         if token_source == "cnn":  # nosec B105
@@ -339,8 +344,8 @@ class LearnedTaskModule(nn.Module):
             }
         if token_source == "vlm_views":  # nosec B105
             self.config["wrist_span"] = wrist_span
-            if scene_rank is not None:
-                self.config["scene_rank"] = scene_rank
+        if scene_rank is not None:
+            self.config["scene_rank"] = scene_rank
         if token_geometry == "relative":  # nosec B105
             self.config["token_geometry"] = token_geometry
         self.wrist_span, self.scene_rank = wrist_span, scene_rank

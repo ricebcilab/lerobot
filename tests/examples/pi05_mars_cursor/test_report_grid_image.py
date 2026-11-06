@@ -335,3 +335,22 @@ def test_rules_refuse_a_run_that_lacks_a_row(tmp_path, capsys):
         with pytest.raises(SystemExit):
             report_main([*argv, "--results", str(tmp_path), "--out", str(tmp_path / "x")])
     assert "300" in capsys.readouterr().err
+
+
+def test_width_reads_a_prefix(tmp_path):
+    """--width --prefix rel: the reduced and full rows are oracle_task_rel_<arm> (an arm named like the prefix reads the
+    bare row), in --context."""
+    rel = _run(
+        {
+            c: {"oracle_task_rel": _m(h), "oracle_task_rel_full": _m(0.60)}
+            for c, h in (("T2", 0.50), ("T4", 0.58))
+        }
+    )
+    assert width_check(rel, reduced="rel", prefix="rel") == dict(reduced_hits=0.58, full_hits=0.60, ok=True)
+    assert not width_check(rel, reduced="rel", prefix="rel", context="T2")["ok"]  # 10 points under
+    with pytest.raises(ValueError, match="oracle_task_views_base has no row"):
+        width_check(rel)  # the default prefix is views
+    _write(tmp_path, wid=rel)
+    out, where = tmp_path / "out", ["--results", str(tmp_path), "--out", str(tmp_path / "out")]
+    report_main(["--width", "wid", "--prefix", "rel", "--reduced", "rel", "--context", "T2", *where])
+    assert json.loads((out / "width.json").read_text()) == dict(reduced_hits=0.50, full_hits=0.60, ok=False)

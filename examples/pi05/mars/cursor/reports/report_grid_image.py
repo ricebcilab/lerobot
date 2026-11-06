@@ -267,13 +267,17 @@ def select_recipe(
     return dict(means=means, adopted=adopted, per_context=per_context)
 
 
-def width_check(check: dict, reduced: str = "base", full: str = "full", context: str = "T4") -> dict:
-    """The reduced-width run's hits against the full-width run's, in ``context``; ok within WIDTH_DROP."""
+def width_check(
+    check: dict, reduced: str = "base", full: str = "full", context: str = "T4", prefix: str = "views"
+) -> dict:
+    """The reduced-width run's hits against the full-width run's, in ``context``; ok within WIDTH_DROP. The rows are
+    ``oracle_task_<prefix>_<arm>`` (``_arm_method``: an arm named like the prefix reads the bare row)."""
     hits = []
     for arm in (reduced, full):
-        met = _context_means(check, f"oracle_task_views_{arm}").get(context)
+        method = _arm_method(arm, prefix)
+        met = _context_means(check, method).get(context)
         if met is None:
-            raise ValueError(f"oracle_task_views_{arm} has no row for context {context}")
+            raise ValueError(f"{method} has no row for context {context}")
         hits.append(met["success"])
     r, f = hits
     return dict(reduced_hits=r, full_hits=f, ok=_within(r, f - WIDTH_DROP))
@@ -422,9 +426,11 @@ def main(argv=None):
     mode.add_argument("--select", metavar="RUN", help="recipe-choice run name")
     mode.add_argument("--width", metavar="RUN", help="width-check run name")
     mode.add_argument("--scan", nargs="+", metavar="RUN", help="demonstration-scan run names, one per count")
-    ap.add_argument("--reduced", default="base", help="--width: the reduced-width arm (oracle_task_views_<arm>)")
-    ap.add_argument("--full", default="full", help="--width: the full-width arm (oracle_task_views_<arm>)")
-    ap.add_argument("--prefix", default="views", help="--select, --scan: the arm rows' prefix (oracle_task_<prefix>_<arm>)")
+    ap.add_argument("--reduced", default="base", help="--width: the reduced-width arm (oracle_task_<prefix>_<arm>)")
+    ap.add_argument("--full", default="full", help="--width: the full-width arm (oracle_task_<prefix>_<arm>)")
+    ap.add_argument("--context", default="T4", help="--width: the context the two arms are compared in")
+    ap.add_argument("--prefix", default="views", help="--select, --scan, --width: the arm rows' prefix "
+                    "(oracle_task_<prefix>_<arm>)")
     ap.add_argument("--base", default="base", help="the base arm of --select; an arm named like --prefix reads the bare "
                     "oracle_task_<prefix> row")
     ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
@@ -441,7 +447,7 @@ def main(argv=None):
         if a.select:
             out = select_recipe(_load(a.results, a.select), base=a.base, prefix=a.prefix)
         else:
-            out = width_check(_load(a.results, a.width), reduced=a.reduced, full=a.full)
+            out = width_check(_load(a.results, a.width), reduced=a.reduced, full=a.full, context=a.context, prefix=a.prefix)
         print(json.dumps(out, indent=2))
         a.out.mkdir(parents=True, exist_ok=True)
         (a.out / ("select.json" if a.select else "width.json")).write_text(json.dumps(out, indent=2))

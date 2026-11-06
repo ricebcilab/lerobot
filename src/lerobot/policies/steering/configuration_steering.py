@@ -269,12 +269,19 @@ def scene_spec(
     the source; ``vlm_*`` read 256 tokens of width 2048 whatever the size (the encoder resizes every render
     to 224 for SigLIP; ``size`` is only what is drawn and cached); ``cnn`` reads the render itself,
     ``(size // 16) ** 2`` tokens (size a multiple of 16); ``vlm_views`` reads both views' tokens (512 of
-    width 2048) and needs the wrist view's ``wrist_span`` (> 0), plus optionally the ``scene_rank`` (1..2047)
-    of the carried token reduction; the two keywords belong to ``vlm_views`` alone."""
+    width 2048) and needs the wrist view's ``wrist_span`` (> 0, ``vlm_views`` alone). Every ``vlm_*`` source takes
+    an optional ``scene_rank`` (1..2047), the width of the carried token reduction; ``vlm_views`` always has the
+    key (None: full width), the others only when it is set. ``discs`` and ``cnn`` have no 2048-wide tokens to
+    reduce."""
     if source not in SCENE_SOURCES:
         raise ValueError(f"source must be one of {SCENE_SOURCES}, got {source!r}")
-    if source != "vlm_views" and (wrist_span is not None or scene_rank is not None):  # nosec B105
-        raise ValueError(f"wrist_span and scene_rank belong to source 'vlm_views', not {source!r}")
+    if source != "vlm_views" and wrist_span is not None:  # nosec B105
+        raise ValueError(f"wrist_span belongs to source 'vlm_views', not {source!r}")
+    if scene_rank is not None:
+        if not source.startswith("vlm_"):
+            raise ValueError(f"scene_rank reduces the vlm_* sources' tokens, not source {source!r}'s")
+        if not 1 <= scene_rank < VLM_SCENE_DIM:
+            raise ValueError(f"scene_rank must be in 1..{VLM_SCENE_DIM - 1}, got {scene_rank}")
     if source == "discs":  # nosec B105
         return {"token_source": "discs"}
     if size <= 0:
@@ -291,8 +298,6 @@ def scene_spec(
     if source == "vlm_views":  # nosec B105
         if wrist_span is None or wrist_span <= 0:
             raise ValueError(f"source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
-        if scene_rank is not None and not 1 <= scene_rank < VLM_SCENE_DIM:
-            raise ValueError(f"scene_rank must be in 1..{VLM_SCENE_DIM - 1}, got {scene_rank}")
         return {
             "token_source": source,
             "scene_dim": VLM_SCENE_DIM,
@@ -306,4 +311,5 @@ def scene_spec(
         "scene_dim": VLM_SCENE_DIM,
         "scene_tokens": VLM_SCENE_TOKENS,
         "image_size": size,
+        **({} if scene_rank is None else {"scene_rank": scene_rank}),
     }

@@ -13,13 +13,16 @@ movement whose Fitts duration grows with every radian the path turns.
 
 `augment_demos` adds rigidly moved copies of the demos (rotation, shift, mirror).
 `DemoSampler` draws (observation, action chunk) training pairs from the demos,
-optionally with the cursor jittered off the path and a chunk that returns to it.
+optionally with the cursor jittered off the path and a chunk that returns to it, and
+with a disk token store gathers each batch's scene tokens from it.
 """
 
 from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
+
+from lerobot.policies.steering import reduce_tokens
 
 from .env import CursorEnv, Layouts, TaskConfig, layouts_on_screen, move_actions, move_layouts
 
@@ -242,11 +245,20 @@ class DemoSampler:
     (one token row per frame, demo i's frames from row start[i], a frame every `stride` steps) every step is floored to its
     frame and obs["scene"][source] holds that frame's tokens. With `jitter` > 0 every sample's position moves off the path by
     delta ~ N(0, jitter^2 I) and the first `jitter_steps` steps of its chunk (all of a shorter chunk) take delta back out.
-    The history, like everything else in the sample, stays the demonstration step's."""
+    The history, like everything else in the sample, stays the demonstration step's.
 
-    def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None, jitter=0.0, jitter_steps=4):
+    With `store` = (SceneDataset, rows [B], source) the scene tokens stay on disk: every batch gathers its demos' rows
+    (`SceneDataset.gather`) into a host buffer (pinned, allocated for the largest batch seen, when `device` is CUDA),
+    copies them to the device without blocking and puts them in obs["scene"][source], the same values the layouts'
+    `scene` would give; `layouts.scene` is not read. With `reduction` = (mean, basis) the gathered batch is reduced on
+    the device (`reduce_tokens`)."""
+
+    def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None, jitter=0.0, jitter_steps=4,
+                 store=None, reduction=None):
         if jitter < 0 or jitter_steps < 1:
             raise ValueError(f"need jitter >= 0 and jitter_steps >= 1, got {jitter} and {jitter_steps}")
+        if reduction is not None and store is None:
+            raise ValueError("a reduction applies to the tokens gathered from a store")
         B = len(actions)
         zeros = lambda n: np.zeros((B, n, 2))
         pos = demo_positions(layouts, actions)
@@ -257,7 +269,18 @@ class DemoSampler:
         self.goal = torch.as_tensor(layouts.goal_mask(), device=device)
         self.obstacles = f32(layouts.obstacles)
         self.obstacle_mask = torch.as_tensor(layouts.obstacle_mask, device=device)
-        self.scene = None if layouts.scene is None else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()}
+        self.store = None
+        if store is not None:
+            token_store, rows, source = store
+            rows = np.asarray(rows, dtype=np.int64)
+            if rows.shape != (B,):
+                raise ValueError(f"the store's rows must be one per demonstration, [{B}], got {rows.shape}")
+            self.store = (token_store, rows, source)
+        self.device = torch.device(device)
+        self.reduction = None if reduction is None else tuple(torch.as_tensor(t, device=device) for t in reduction)
+        self._host, self._copied = None, None   # the pinned gather buffer and the event of its last copy to the device
+        self.scene = (None if layouts.scene is None or store is not None
+                      else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()})
         if frames and len({stride for _, _, stride in frames.values()}) > 1:
             raise ValueError(f"frame sources need one stride, got {({n: f[2] for n, f in frames.items()})}")
         self.stride = next(iter(frames.values()))[2] if frames else None
@@ -281,6 +304,8 @@ class DemoSampler:
                    mask=self.mask[i], goal=goal, obstacles=self.obstacles[i], obstacle_mask=self.obstacle_mask[i])
         if self.scene is not None:
             obs["scene"] = {name: v[i] for name, v in self.scene.items()}
+        if self.store is not None:
+            obs.setdefault("scene", {})[self.store[2]] = self._gathered(i)
         for name, (tokens, start) in self.frames.items():
             row = start[i.to(start.device)] + (k // self.stride).to(start.device)
             obs.setdefault("scene", {})[name] = tokens[row].to(i.device)
@@ -292,3 +317,20 @@ class DemoSampler:
             chunk = chunk.clone()
             chunk[:, :m] -= delta[:, None] / m
         return (obs, chunk, i, k) if indexed else (obs, chunk)
+
+    def _gathered(self, i):
+        """The store's tokens of demos i [n] on the device (reduced when the sampler has a reduction)."""
+        token_store, rows, _ = self.store
+        rows = rows[i.cpu().numpy()]
+        if self.device.type == "cuda":
+            if self._copied is not None:
+                self._copied.synchronize()   # the buffer's last copy to the device has finished: it may be refilled
+            if self._host is None or len(self._host) < len(rows):
+                self._host = torch.empty((len(rows), token_store.tokens, token_store.width), dtype=torch.float16,
+                                         pin_memory=True)
+            tokens = token_store.gather(rows, self._host).to(self.device, non_blocking=True)
+            self._copied = torch.cuda.Event()
+            self._copied.record()
+        else:
+            tokens = token_store.gather(rows)   # a fresh tensor: on the CPU no copy would separate it from a buffer
+        return tokens if self.reduction is None else reduce_tokens(tokens, *self.reduction)

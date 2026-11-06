@@ -262,6 +262,73 @@ def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_pa
     assert torch.equal(a, red.tokens({**obs, "scene": {"vlm_views": stored}}, 3)[0])
 
 
+def test_scene_rank_is_legal_for_the_image_sources_and_relative_tokens_add_the_geometry_after_the_projection(
+    tmp_path,
+):
+    assert scene_spec("vlm_image", 224, scene_rank=256) == {
+        "token_source": "vlm_image",
+        "scene_dim": 2048,
+        "scene_tokens": 256,
+        "image_size": 224,
+        "scene_rank": 256,
+    }
+    assert scene_spec("vlm_prefix", 224, scene_rank=8)["scene_rank"] == 8 and "scene_rank" not in scene_spec(
+        "vlm_prefix"
+    )
+    for source, kw in (
+        ("discs", {}),
+        ("cnn", {}),
+        ("vlm_image", {"scene_rank": 2048}),
+        ("vlm_image", {"scene_rank": 0}),
+    ):
+        with pytest.raises(ValueError, match="scene_rank"):
+            scene_spec(source, 64, **({"scene_rank": 8} | kw))
+    with pytest.raises(ValueError, match="wrist_span"):
+        scene_spec("vlm_image", 224, wrist_span=0.5, scene_rank=8)
+    prefix = LearnedTaskModule(
+        horizon=16, token_source="vlm_prefix", scene_dim=32, scene_tokens=16, scene_rank=4
+    )
+    assert prefix.config["scene_rank"] == 4 and prefix.scene_in.in_features == 4
+    m = LearnedTaskModule(
+        horizon=16,
+        token_source="vlm_image",
+        token_geometry="relative",
+        scene_dim=32,
+        scene_tokens=16,
+        scene_rank=4,
+    )
+    assert (
+        m.config["scene_rank"] == 4
+        and m.config["token_geometry"] == "relative"
+        and "wrist_span" not in m.config
+    )
+    assert m.scene_in.in_features == 4 and m.state_dict()["scene_basis"].shape == (32, 4)
+    mean, basis = _reduction()
+    m.set_reduction(mean, basis)
+    obs = _scene()
+    x = obs["scene"]["vlm_image"]
+    reduced = reduce_tokens(x, m.scene_mean, m.scene_basis)  # its buffers: a QR basis is not contiguous
+    rel = (_centres(4)[None] - obs["pos"][:, None]) / m.scale
+    feats = torch.cat(
+        [rel, torch.full_like(rel[..., :1], (0.5 / 4) / m.scale), rel.norm(dim=-1, keepdim=True)], -1
+    )
+    tokens, pad = m.tokens(obs, 3)
+    assert pad is None and torch.allclose(
+        tokens[:, 1:], m.scene_in(reduced.float()) + m.token_in(feats), atol=1e-6
+    )
+    stored = {**obs, "scene": {"vlm_image": reduced}}
+    assert torch.equal(tokens, m.tokens(stored, 3)[0])  # full-width and reduced input alike
+    back, _, _ = load_adapter_module(save_adapter_module(m, tmp_path / "r.pt", "task"))
+    assert back.scene_rank == 4 and torch.equal(back.scene_basis, basis) and back.token_geometry == "relative"
+    x, v, t = _xvt()
+    assert all(torch.equal(a, b) for a, b in zip(m(x, t, v, obs), back(x, t, v, stored), strict=True))
+    # a round-2 relative image module's config has no scene_rank: it loads as it was saved
+    old = _module("vlm_image", "relative")
+    assert "scene_rank" not in old.config and "scene_basis" not in old.state_dict()
+    again, _, _ = load_adapter_module(save_adapter_module(old, tmp_path / "old.pt", "task"))
+    assert again.scene_rank is None and again.scene_in.in_features == 32
+
+
 def test_scene_keep_hides_tokens_from_the_attention_and_never_the_null_token():
     m = _views()
     torch.nn.init.normal_(m.out.weight)  # a fresh head is zero: the output would not depend on tokens
@@ -322,10 +389,9 @@ def test_the_modules_refuse_what_they_cannot_read():
             lambda: LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=32, scene_tokens=8),
             "wrist_span",
         ),
+        (lambda: LearnedTaskModule(horizon=16, token_source="discs", scene_rank=4), "scene_rank"),
         (
-            lambda: LearnedTaskModule(
-                horizon=16, token_source="vlm_image", scene_dim=32, scene_tokens=16, scene_rank=4
-            ),
+            lambda: LearnedTaskModule(horizon=16, token_source="cnn", image_size=64, scene_rank=4),
             "scene_rank",
         ),
         (lambda: scene_spec("vlm_image", 224, wrist_span=0.5), None),

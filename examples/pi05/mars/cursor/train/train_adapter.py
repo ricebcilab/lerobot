@@ -42,6 +42,16 @@ hidden alike; a share `p_free` of the layouts has no obstacle, where the module 
 With `--token-source` vlm_image / vlm_prefix / cnn the module reads the obstacles from the rendered scene
 (`--render-size` pixels) instead of the disc parameters: pi0.5's vision tokens (`--vlm`) or a CNN trained with it;
 `--token-geometry relative` (vlm_image, cnn) gives each scene token its offset from the cursor instead of a learned position.
+TOKEN STORE: by default the layouts carry their tokens and the sampler holds them on the device (float16, 1 MB a
+scene). `--scene-store DIR` (vlm_image, vlm_prefix) keeps them instead in a disk store under DIR
+(`cursor_sa.dataset.SceneDataset`, one row per distinct layout, keyed by the layout, the render size and the encoder
+`--vlm`, so the scenes a store holds are encoded once for every run that draws them), and the sampler gathers each
+batch's rows from it to the device; the run is the one the resident tokens give. `--scene-rank r` (vlm_image,
+vlm_prefix; default full width) fits a PCA token reduction to width r on REDUCTION_SAMPLE of the train split's scenes
+(the moved copies among them), drawn with default_rng([seed, 13]) (centred unless `--scene-center no`), and the module
+carries it (its `scene_mean`, `scene_basis`): the stored sampler feeds the reduced tokens, the resident one the full
+ones, which the module reduces. The val split reuses the train split's reduction; a pooled run fits it on its first
+entry's train split. The meta records `scene_store` (the store's folder name), `scene_rank` and `scene_center`.
 `--jitter s` moves every training sample's position off the path by N(0, s^2 I) and has the first `--jitter-steps` steps of
 its chunk take the move back out (a recovery label). `--rigid-motions k` adds up to k copies of every training demonstration
 under random rigid motions of the screen (`augment_demos`), the expert's pushes moved with them; neither touches the val split.
@@ -121,6 +131,7 @@ from cursor_sa.env import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obst
                            sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
+from cursor_sa.dataset import SceneDataset, encoder_digest, store_name  # noqa: E402
 from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
@@ -240,7 +251,9 @@ def readout_core(push, corruption, curl):
 
 VIEW_AFFINE_DEGREES = 5.0     # --view-affine: a moved picture turns by up to this many degrees about its centre
 VIEW_AFFINE_TRANSLATE = 0.05  # and shifts by up to this share of its side per axis
-REDUCTION_SAMPLE = 2000       # frames the token reduction is fitted on
+REDUCTION_SAMPLE = 2000       # frames (vlm_views) or scenes (vlm_image, vlm_prefix) the token reduction is fitted on
+REDUCTION_CHUNK = 64          # scenes per batch of the reduction's fit (its float64 sums take 8 bytes a value)
+STORED_SOURCES = ("vlm_image", "vlm_prefix")   # one token array per layout: --scene-store, --scene-rank
 VIEW_CHUNK = 256              # frames rendered and encoded at a time
 VIEW_GPU_BYTES = 12 * 2**30   # a split's frame table above this stays in RAM
 
@@ -351,15 +364,32 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
                                seconds=time.time() - tic)
 
 
+def scene_reduction(args, tokens_of, n, device):
+    """--scene-rank's PCA token reduction (vlm_image, vlm_prefix) of a split of n scenes: fitted
+    (`fit_token_reduction`, centred unless --scene-center no) on REDUCTION_SAMPLE of them (`SceneDataset.sample_rows`,
+    default_rng([seed, 13]); all of them when fewer), `tokens_of(scenes)` giving their full-width tokens,
+    REDUCTION_CHUNK at a time on `device`. Returns ((mean, basis), the share of the variance kept)."""
+    pick = SceneDataset.sample_rows(np.arange(n), REDUCTION_SAMPLE, np.random.default_rng([args.seed, 13]))
+    batches = (torch.as_tensor(tokens_of(pick[at:at + REDUCTION_CHUNK])).to(device)
+               for at in range(0, len(pick), REDUCTION_CHUNK))
+    mean, basis, kept = fit_token_reduction(batches, args.scene_rank, center=args.scene_center == "yes")
+    return (mean, basis), kept
+
+
+def token_store(args):
+    """The --scene-store SceneDataset of this run's source, render size and encoder."""
+    return SceneDataset(args.scene_store, args.token_source, args.render_size, encoder_digest(args.vlm), args.vlm)
+
+
 class ExpertData:
     """One split of expert calibration data: the demonstrations (a DemoSampler; `frames` its frame table, `jitter` and
-    `jitter_steps` its recovery labels, see `DemoSampler`) and, at every demo step, the expert's push (`push` [B, L, 2]
+    `jitter_steps` its recovery labels, `store` and `reduction` its stored tokens, see `DemoSampler`) and, at every demo step, the expert's push (`push` [B, L, 2]
     when given, else `expert_pushes`) and what the user's readout makes of it before noise."""
 
     def __init__(self, layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False, frames=None, push=None,
-                 jitter=0.0, jitter_steps=4):
+                 jitter=0.0, jitter_steps=4, store=None, reduction=None):
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device, frames, jitter=jitter,
-                                   jitter_steps=jitter_steps)
+                                   jitter_steps=jitter_steps, store=store, reduction=reduction)
         if push is None:
             push = expert_pushes(layouts, demo_positions(layouts, actions))
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
@@ -384,9 +414,13 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
     caller closes it). With vlm_views each split gets a frame table instead (`view_frames`, after its demonstrations are
     drawn as for any source): the train split's fits the reduction and moves pictures with default_rng([seed, 7]), the val
     split's reuses that reduction and moves none; args.view_info gets each split's info (without the reduction) and
-    args.view_reduction the reduction. With --rigid-motions the train split gains its demonstrations' moved copies
-    (`augment_demos` on the expert's pushes, drawing from default_rng([seed, 11])) before anything is rendered; the count
-    is added to args.rigid_kept. --jitter goes to the train split's sampler."""
+    args.view_reduction the reduction. With --scene-store (vlm_image, vlm_prefix) each split's tokens stay in the store
+    instead (`SceneDataset.rows_for` encodes the scenes it lacks with `encoder`) and its sampler gathers them per batch.
+    With --scene-rank (those sources) the train split fits the token reduction (`scene_reduction`) unless
+    args.scene_reduction already holds one (a pooled run's first entry's), stores it there with its kept share in
+    args.scene_kept, and a stored split's sampler reduces with it. With --rigid-motions the train split gains its
+    demonstrations' moved copies (`augment_demos` on the expert's pushes, drawing from default_rng([seed, 11])) before
+    anything is rendered; the count is added to args.rigid_kept. --jitter goes to the train split's sampler."""
     out = {}
     if args.teacher:
         args.teacher_demos = {}
@@ -405,7 +439,7 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             layouts, task = layouts_for(args, obstacle, rng, n, p_free)
             tic = time.time()
             actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
-        frames, push = None, None
+        frames, push, stored, reduction = None, None, None, None
         if split == "train" and args.rigid_motions:  # before any scene: `Layouts.concat` refuses layouts that carry one
             push = expert_pushes(layouts, demo_positions(layouts, actions))
             layouts, actions, lengths, kept, push = augment_demos(np.random.default_rng([args.seed, 11]), layouts, actions, lengths,
@@ -427,11 +461,27 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             kept = "" if info["kept"] is None else f", {100 * info['kept']:.1f}% of the token {what} kept"
             print(f"{split}: {info['frames']} frames of two views, {info['moved']} pictures moved{kept} "
                   f"({info['seconds']:.0f}s)", flush=True)
+        elif args.scene_store is not None:
+            store, started = token_store(args), time.time()
+            rows = store.rows_for(layouts, encoder)
+            print(f"{split}: {len(layouts)} scenes, {store.encoded} newly encoded ({time.time() - started:.0f} s), "
+                  f"store {store.path}", flush=True)
+            stored = (store, rows, args.token_source)
         elif args.token_source != "discs":
             layouts.scene = {args.token_source: scene_for(layouts, args.token_source, args.render_size, encoder)}
+        if args.token_source in STORED_SOURCES and args.scene_rank:
+            if split == "train" and getattr(args, "scene_reduction", None) is None:
+                tokens_of = ((lambda idx: stored[0].gather(stored[1][idx])) if stored is not None
+                             else (lambda idx: layouts.scene[args.token_source][idx]))
+                args.scene_reduction, args.scene_kept = scene_reduction(args, tokens_of, len(layouts), device)
+                what = "variance" if args.scene_center == "yes" else "second moment"
+                print(f"train: a token reduction to width {args.scene_rank}, {100 * args.scene_kept:.1f}% of the token {what} "
+                      f"kept", flush=True)
+            reduction = args.scene_reduction if stored is not None else None   # the resident tokens: the module reduces
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
                                 frozen_noise=split == "train" and args.frozen_noise, frames=frames, push=push,
-                                jitter=args.jitter if split == "train" else 0.0, jitter_steps=args.jitter_steps)
+                                jitter=args.jitter if split == "train" else 0.0, jitter_steps=args.jitter_steps,
+                                store=stored, reduction=reduction)
         # the originals come first: their seconds, not the moved copies'
         print(f"{split}: {n} demonstrations ({lengths[:n].sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
               f"({time.time() - tic:.0f}s)", flush=True)
@@ -614,6 +664,7 @@ def train_task(args, policy, device, rng):
     encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
     entries = entries_of(args)
     args.rigid_kept = 0 if args.rigid_motions else None
+    args.scene_reduction, args.scene_kept = None, None   # --scene-rank (vlm_image, vlm_prefix): fitted on the first train split
     try:
         pairs = []
         for j, e in enumerate(entries):
@@ -627,10 +678,12 @@ def train_task(args, policy, device, rng):
         if encoder is not None:
             encoder.close()
     views = dict(wrist_span=args.wrist_span, scene_rank=args.scene_rank or None) if args.token_source == "vlm_views" else {}
+    if args.token_source in STORED_SOURCES and args.scene_rank:
+        views = dict(scene_rank=args.scene_rank)
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
                       **scene_spec(args.token_source, args.render_size, **views)).to(device)
     if views.get("scene_rank"):
-        task.set_reduction(*args.view_reduction)
+        task.set_reduction(*(args.view_reduction if args.token_source == "vlm_views" else args.scene_reduction))
     adapted = ReversalAdapter(task=task)
     parts = dict(step=0, fm=[], field=[])  # the window's loss parts, reported and cleared by validate
 
@@ -736,15 +789,19 @@ def save(args, kind, module, log):
 def save_module(args, kind, module, name, **extra):
     """checkpoints/adapters/<name>/adapter.pt in lerobot's `save_adapter_module` format, `extra` added to its meta;
     returns its path and the saved arguments."""
-    saved = {k: v for k, v in vars(args).items() if k != "view_reduction"}   # the reduction travels in the module's buffers
-    center = args.scene_center if args.token_source == "vlm_views" else None
+    # the reductions travel in the module's buffers
+    saved = {k: v for k, v in vars(args).items() if k not in ("view_reduction", "scene_reduction")}
+    reduced = args.token_source in STORED_SOURCES and bool(args.scene_rank)
+    center = args.scene_center if args.token_source == "vlm_views" or reduced else None
+    store = None if args.scene_store is None else store_name(args.token_source, args.render_size, encoder_digest(args.vlm))
     augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")}
     path = save_adapter_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
                                                               teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None),
                                                               wrist_span=args.wrist_span, view_stride=args.view_stride,
-                                                              scene_rank=args.scene_rank, view_affine=args.view_affine,
+                                                              scene_rank=args.scene_rank if args.token_source == "vlm_views" else args.scene_rank or None,
+                                                              scene_store=store, view_affine=args.view_affine,
                                                               token_drop=args.token_drop, views=getattr(args, "view_info", None),
                                                               scene_center=center, **augmented, **extra))
     return path, saved
@@ -802,10 +859,13 @@ def parse_args(argv=None):
                         "trained with the module (cnn)")
     p.add_argument("--wrist-span", type=float, default=0.5, help="task, vlm_views: the wrist view's side, in screens")
     p.add_argument("--view-stride", type=int, default=2, help="task, vlm_views: a frame every this many demo steps")
-    p.add_argument("--scene-rank", type=int, default=256, help="task, vlm_views: width of the PCA token reduction fitted "
-                   "on the train split's frames (0: full width, 2048)")
-    p.add_argument("--scene-center", choices=["yes", "no"], default="yes", help="task, vlm_views: no fits the reduction "
-                   "uncentred (the tokens' constant part kept: a zero mean, the second moment's top directions)")
+    p.add_argument("--scene-rank", type=int, help="task, a vlm_* source: width of the PCA token reduction fitted on the "
+                   "train split's frames (vlm_views, default 256) or scenes (vlm_image, vlm_prefix, default full width); "
+                   "0: full width, 2048")
+    p.add_argument("--scene-center", choices=["yes", "no"], default="yes", help="task, with a --scene-rank reduction: no "
+                   "fits it uncentred (the tokens' constant part kept: a zero mean, the second moment's top directions)")
+    p.add_argument("--scene-store", help="task, vlm_image / vlm_prefix: a folder (created if missing) whose disk token store "
+                   "holds the scenes' tokens, gathered per batch, instead of the device (default: the device)")
     p.add_argument("--view-affine", type=float, default=0.0, help="task, vlm_views: the probability a stored training "
                    "picture is moved (a small rotation and shift, frozen in the frame table)")
     p.add_argument("--token-drop", type=float, default=0.0, help="task, an image source: the share of scene tokens hidden "
@@ -874,10 +934,17 @@ def parse_args(argv=None):
         p.error("--wrist-span must be positive")
     if args.view_stride < 1:
         p.error("--view-stride must be at least 1")
-    if not 0 <= args.scene_rank <= 2047:
+    if args.scene_rank is not None and not args.token_source.startswith("vlm_"):
+        p.error("--scene-rank reduces a vlm_* source's 2048-wide tokens: not with --token-source discs or cnn")
+    if args.token_source == "vlm_views" and args.scene_rank is None:
+        args.scene_rank = 256
+    if args.scene_rank is not None and not 0 <= args.scene_rank <= 2047:
         p.error("--scene-rank must be in 0..2047 (0: full width)")
-    if args.scene_center == "no" and (args.token_source != "vlm_views" or not args.scene_rank):
-        p.error("--scene-center no fits the token reduction of --token-source vlm_views: not with --scene-rank 0 or another source")
+    if args.scene_center == "no" and not args.scene_rank:
+        p.error("--scene-center no fits the token reduction of a vlm_* source: not without a --scene-rank or with 0")
+    if args.scene_store is not None and args.token_source not in STORED_SOURCES:
+        p.error("--scene-store holds the tokens of --token-source vlm_image or vlm_prefix (vlm_views has its frame table, "
+                "discs and cnn no tokens)")
     if args.save_every and (args.kind != "task" or args.save_every < 0 or args.save_every % args.log_every):
         p.error("--save-every is for --kind task and must be a positive multiple of --log-every")
     if not 0 <= args.token_drop < 1:
