@@ -16,9 +16,10 @@
 
 """Shared-autonomy steering of a flow-matching sampler: ``FlowControlPolicy`` (Kao et al. 2026) and
 ``FlowReversalSteeringPolicy`` (Tang et al. 2026) over any policy with pi0.5's sampler interface, the MARS
-adapters (``LearnedUserModule``, ``LearnedTaskModule``, ``ReversalAdapter``) with their checkpoints, losses and
-training loop, the one Euler integrator of either flow-time convention, and each method's core. The settings
-and specs are ``configuration_steering``'s; this folder's README describes the methods."""
+adapters (``LearnedUserModule``, ``LearnedTaskModule``, the holder ``ReversalAdapter`` and the composed
+``AdapterModules`` with ``as_adapter``) with their checkpoints, losses and training loop, the one Euler
+integrator of either flow-time convention, and each method's core. The settings and specs are
+``configuration_steering``'s; this folder's README describes the methods."""
 
 import math
 import time
@@ -883,6 +884,73 @@ class AdaptedField:
                 head = apply_user_module(self.user_module, x_t, t, head)
                 result = torch.cat([head, result[..., n:]], dim=-1)
         return result
+
+
+def _obs_device(obs: dict) -> torch.device | None:
+    """The device of an observation: its first tensor's (depth first through nested dicts), or None."""
+    for value in obs.values():
+        if isinstance(value, torch.Tensor):
+            return value.device
+        if isinstance(value, dict) and (device := _obs_device(value)) is not None:
+            return device
+    return None
+
+
+class AdapterModules(nn.Module):
+    """The composed MARS adapter of a policy that takes an observation (the cursor example's
+    ``ReversalAdapter``): a user part (``matrix``, a fixed F, one (n, n) or one per trial (B, n, n), and/or
+    ``user``, a ``LearnedUserModule`` or any (x_t, t) -> (B, H, n, n) callable) and/or a ``task`` module
+    (a ``LearnedTaskModule``, bound to each observation, or any (x_t, t, v) -> (A, b) callable), composed
+    at test time. ``adapt`` applies the task module in both directions and the user part in the backward
+    pass: forward task(v), backward user(task(v)). ``field(obs)`` is the ``AdaptedField`` that ``adapt``
+    and the flows use, acting on ``n_dims`` dims (None: each module's own ``n_dims``); ``load`` reads one
+    module from a ``save_adapter_module`` checkpoint into its slot. ``FlowReversalSteeringPolicy``'s
+    holder is ``ReversalAdapter``, a different class."""
+
+    def __init__(self, user=None, task=None, matrix=None, n_dims: int | None = 2):
+        super().__init__()
+        self.user, self.task, self.n_dims = user, task, n_dims
+        self.matrix = None if matrix is None else torch.as_tensor(matrix, dtype=torch.float32)
+
+    @property
+    def kind(self) -> str:
+        user = self.user is not None or self.matrix is not None
+        return {
+            (True, True): "composed",
+            (True, False): "user",
+            (False, True): "task",
+            (False, False): "none",
+        }[(user, self.task is not None)]
+
+    def field(self, obs: dict) -> AdaptedField:
+        """The ``AdaptedField`` for this observation: the fixed matrix on the observation's device (its first
+        tensor's), the user module, the task module bound to ``obs``."""
+        device = None if self.matrix is None else _obs_device(obs)
+        matrix = self.matrix if device is None else self.matrix.to(device)
+        task = self.task.bind(obs) if self.task is not None and hasattr(self.task, "bind") else self.task
+        return AdaptedField(matrix, self.user, task, n_dims=self.n_dims)
+
+    def adapt(self, obs: dict, x: torch.Tensor, t, v: torch.Tensor, backward: bool) -> torch.Tensor:
+        return self.field(obs).adapt(x, t, v, backward)
+
+    @classmethod
+    def load(cls, path, device="cpu") -> "AdapterModules":
+        """One module of a ``save_adapter_module`` checkpoint in its slot (``kind`` user or task), in eval mode."""
+        module, kind, _ = load_adapter_module(path, device)
+        return cls(**{kind: module}).to(device).eval()
+
+
+def as_adapter(adapter, device="cpu", n_dims: int | None = 2) -> AdapterModules | None:
+    """None or an ``AdapterModules`` as is; a ``LearnedTaskModule`` in the task slot; a user module or any
+    (x_t, t) callable in the user slot; anything else a fixed matrix F ((n, n) or (B, n, n), float32 on
+    ``device``)."""
+    if adapter is None or isinstance(adapter, AdapterModules):
+        return adapter
+    if isinstance(adapter, LearnedTaskModule):
+        return AdapterModules(task=adapter, n_dims=n_dims)
+    if callable(adapter):
+        return AdapterModules(user=adapter, n_dims=n_dims)
+    return AdapterModules(matrix=torch.as_tensor(adapter, dtype=torch.float32, device=device), n_dims=n_dims)
 
 
 def _adapt_velocity(adapter, x_t, t, v, backward: bool):

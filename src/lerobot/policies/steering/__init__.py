@@ -41,6 +41,7 @@ from .configuration_steering import (
 )
 from .modeling_steering import (
     AdaptedField,
+    AdapterModules,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     LearnedTaskModule,
@@ -48,6 +49,7 @@ from .modeling_steering import (
     ReversalAdapter,
     SceneEncoder,
     apply_user_module,
+    as_adapter,
     convert_cursor_module,
     delegation_mask,
     encode_views,
@@ -78,6 +80,7 @@ from .modeling_steering import (
 __all__ = [
     "ACTION_DIMS",
     "AdaptedField",
+    "AdapterModules",
     "AdapterSpec",
     "DEADBAND",
     "FlowControlPolicy",
@@ -98,6 +101,7 @@ __all__ = [
     "SceneEncoder",
     "TeleopSource",
     "apply_user_module",
+    "as_adapter",
     "build_reversal_adapter",
     "check_steps",
     "convert_cursor_module",

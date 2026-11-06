@@ -55,11 +55,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn as nn
 
-from lerobot.policies.steering import (AdaptedField, FlowControlPolicy, FlowReversalSteeringPolicy,
-                                             LearnedTaskModule, LearnedUserModule, encode_views, integrate,
-                                             load_adapter_module, task_velocity_hook)
+from lerobot.policies.steering import (AdapterModules, FlowControlPolicy, FlowReversalSteeringPolicy,
+                                             LearnedTaskModule, LearnedUserModule, as_adapter, encode_views,
+                                             integrate, task_velocity_hook)
 
 from .env import render_views
 from .readout import DEADBAND, Readout, is_active
@@ -162,49 +161,12 @@ def UserModule(horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step
 TaskModule = LearnedTaskModule
 
 
-class ReversalAdapter(nn.Module):
-    """The reversal adapter: a user part (`matrix`, MARS's fixed F, one 2x2 or one per trial [B, 2, 2], and/or
-    `user`, a UserModule or any (x, t) -> [B, H, 2, 2] callable) and/or a task module, composed at test time.
-    `adapt` applies the task module in both directions and the user part in the backward pass: forward task(v),
-    backward user(task(v)). `field(obs)` is the core's `AdaptedField`, which `adapt` and the flows use; `load`
-    reads a checkpoint in lerobot's `save_adapter_module` format (one module, `kind` user or task)."""
+# The reversal adapter: a user part (`matrix`, MARS's fixed F, one 2x2 or one per trial [B, 2, 2], and/or `user`, a
+# UserModule or any (x, t) -> [B, H, 2, 2] callable) and/or a task module, composed at test time; forward task(v),
+# backward user(task(v)). The core's `AdapterModules` (two dims by default), under the name the cursor's code and
+# checkpoints use; `as_adapter` (imported above) coerces a matrix, a module or None into one.
+ReversalAdapter = AdapterModules
 
-    def __init__(self, user=None, task=None, matrix=None):
-        super().__init__()
-        self.user, self.task = user, task
-        self.matrix = None if matrix is None else torch.as_tensor(matrix, dtype=torch.float32)
-
-    @property
-    def kind(self):
-        user = self.user is not None or self.matrix is not None
-        return {(True, True): "composed", (True, False): "user", (False, True): "task", (False, False): "none"}[
-            (user, self.task is not None)]
-
-    def field(self, obs):
-        """The core's `AdaptedField` for this observation: the fixed matrix on its device, the user module, the
-        task module bound to `obs`."""
-        matrix = None if self.matrix is None else self.matrix.to(obs["pos"].device)
-        task = self.task.bind(obs) if self.task is not None and hasattr(self.task, "bind") else self.task
-        return AdaptedField(matrix, self.user, task, n_dims=2)
-
-    def adapt(self, obs, x, t, v, backward):
-        return self.field(obs).adapt(x, t, v, backward)
-
-    @classmethod
-    def load(cls, path, device="cpu"):
-        module, kind, _ = load_adapter_module(path, device)
-        return cls(**{kind: module}).to(device).eval()
-
-def as_adapter(adapter, device="cpu"):
-    """None or a ReversalAdapter as is; a TaskModule in the task slot; a UserModule or any (x, t) callable in the
-    user slot; a matrix F ([2, 2] or [B, 2, 2]) as the fixed matrix."""
-    if adapter is None or isinstance(adapter, ReversalAdapter):
-        return adapter
-    if isinstance(adapter, TaskModule):
-        return ReversalAdapter(task=adapter)
-    if callable(adapter):
-        return ReversalAdapter(user=adapter)
-    return ReversalAdapter(matrix=torch.as_tensor(adapter, dtype=torch.float32, device=device))
 
 def _field(adapter, obs, device):
     """The core's form of an adapter (see `as_adapter`) for this observation, or None."""
