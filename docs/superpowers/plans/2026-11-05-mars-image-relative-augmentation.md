@@ -30,7 +30,7 @@
 - A demonstration none of whose rigid copies fits the screen (a reach spanning the screen): fewer or zero copies, a printed count, no error, and the original rows unchanged bit for bit. Test in Task 2.
 - A jittered sample at a hold step (`k` at or past the demonstration's end, label all zeros) and a chunk shorter than `m`: the correction still returns the cursor to the goal over the steps there are. Test in Task 2.
 - A free layout (no obstacle) under rigid motion: replay succeeds and the copy is kept. Test in Task 2.
-- A context whose user corruption is anisotropic (`gain025y`, `rot60`): the field term's pushes are recomputed on the moved layouts and passed through the unchanged corruption, so nothing in `readout_core` needs a change; a curl corruption is refused. Test in Task 3.
+- A context whose user corruption is anisotropic (`gain025y`, `rot60`): the field term's pushes are the originals' pushes moved with the copy (ruling R17) and passed through the unchanged corruption, so nothing in `readout_core` needs a change; a curl corruption is refused. Test in Task 3.
 - The diagnostic's rebuilt training layouts must equal the trainer's: any draw from the seed's generator before `layouts_for` breaks it. Test in Task 4 against a recorded tiny run.
 
 ---

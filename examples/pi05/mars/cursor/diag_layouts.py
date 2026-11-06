@@ -2,12 +2,15 @@
 """An image task module on its own training layouts, on fresh ones and on its training layouts moved.
 
     python diag_layouts.py --sweep grid_task_check_image2_quick --context T2 --method oracle_task_rel \\
-        --seed 0 --n-demos 300 --p-free 0.25 --fresh-seed 820 --trials 225 --out ../results/sim/diag_layouts
+        --seed 0 --n-demos 300 --p-free 0.25 --fresh-seed 820 --trials 225 --out ../results/sim/reports/diag_layouts
 
 Three sets of layouts of the context's task (the sweep's users x tasks cell of that task with no corruption):
 `train`, the layouts the trainer drew for the module's train split (`rebuild_layouts` with the module's --seed,
---n-demos and --p-free; only the rows with the obstacle), `fresh`, as many new ones drawn from --fresh-seed, all
-with the obstacle, and `moved`, the `train` rows each under one random rigid motion that keeps it on screen
+--n-demos and --p-free; only the rows with the obstacle; this reproduces runs on scripted demonstrations only, not
+--teacher or --demo-seconds runs, which draw their layouts otherwise), `fresh`, as many new ones drawn from
+--fresh-seed, all with the obstacle (--fresh-seed only seeds these fresh layouts: they are not the gate's test
+layouts, which come from another stream; the default 820 is the gate sweep's seed, whose stream also gives its tuning
+layouts), and `moved`, the `train` rows each under one random rigid motion that keeps it on screen
 (`moved_layouts`, drawing from default_rng([seed, 12]), a stream disjoint from the trainer's rigid copies). Each set is cut to its first --trials rows. On every set
 `oracle` (the bare policy), `oracle_task` (the parametric module) and --method (the image module) run once at
 noise 0.0 with the sweep's seed, the scene arrays cached under --scene-cache. A module that hits on `train` but not
@@ -42,7 +45,8 @@ REFERENCES = ("oracle", "oracle_task")  # the bare policy and the parametric mod
 def rebuild_layouts(seed, n, p_free, obstacle, targets=(4, 4), reach=(0.35, 0.5)):
     """The trainer's train-split layouts for these arguments: `train_adapter.layouts_for` on the first draws of
     default_rng(seed), as `train` makes them (the defaults are the trainer's --targets and --reach). The obstacle
-    rows come first, the share p_free without it last."""
+    rows come first, the share p_free without it last. Only a run on scripted demonstrations draws its train split
+    this way: a --teacher or --demo-seconds run's layouts are not reproduced."""
     args = types.SimpleNamespace(reach=list(reach), targets=list(targets))
     layouts, _ = train_adapter.layouts_for(args, obstacle, np.random.default_rng(seed), n, p_free)
     return layouts
@@ -106,25 +110,37 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0, help="the module's training --seed")
     p.add_argument("--n-demos", type=int, default=300, help="the module's training --n-demos")
     p.add_argument("--p-free", type=float, default=0.25, help="the module's training --p-free")
-    p.add_argument("--fresh-seed", type=int, default=820, help="the seed of the fresh layouts")
+    p.add_argument("--fresh-seed", type=int, default=820, help="the seed of the fresh layouts (not the gate's test layouts)")
     p.add_argument("--trials", type=int, required=True, help="the first this many rows of each set")
     p.add_argument("--out", required=True, help="output folder")
     p.add_argument("--scene-cache", help="folder of the cached scene arrays (default: checkpoints/scene/diag_layouts)")
     p.add_argument("--vlm", default=SCENE_VLM_PATH, help="the pi0.5 checkpoint whose vision tokens vlm_* sources use")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)
+    if args.trials < 1:
+        p.error(f"--trials must be at least 1, got {args.trials}")
 
     sweep = load_sweep(args.sweep)
     methods = list(dict.fromkeys([*REFERENCES, args.method]))
     missing = [m for m in methods if m not in sweep["methods"]]
     if missing:
         p.error(f"{sweep['name']} has no methods {missing}")
-    cell = context_cell(sweep, args.context)
+    try:
+        cell = context_cell(sweep, args.context)
+    except ValueError as e:
+        p.error(str(e))
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
 
     obstacle = obstacle_spec(sweep["grid"]["cells"][cell]["obstacle"])
+    if obstacle is None:
+        p.error(f"--context {args.context}: the task has no obstacle, so there is nothing to diagnose")
+    if args.n_demos < 1:
+        p.error(f"--n-demos must be at least 1 (the train set would be empty), got {args.n_demos}")
     rebuilt = rebuild_layouts(args.seed, args.n_demos, args.p_free, obstacle)
     train = rebuilt[np.flatnonzero(rebuilt.obstacle_mask.any(1))]
+    if not len(train):
+        p.error(f"--n-demos {args.n_demos} at --p-free {args.p_free} leaves no training layout with the obstacle: "
+                "the train set is empty")
     sets = dict(train=train, fresh=rebuild_layouts(args.fresh_seed, len(train), 0.0, obstacle),
                 moved=moved_layouts(train, np.random.default_rng([args.seed, 12])))
     sets = {name: layouts[: args.trials] for name, layouts in sets.items()}

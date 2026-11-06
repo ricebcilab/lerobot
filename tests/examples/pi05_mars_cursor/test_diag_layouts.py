@@ -3,6 +3,7 @@
 import json
 
 import numpy as np
+import pytest
 from cursor_sa.env import TaskConfig, layouts_on_screen, obstacle_spec, sample_layouts
 from diag_layouts import main, moved_layouts, rebuild_layouts
 from test_sweep import _image_adapter
@@ -51,6 +52,39 @@ def test_moved_layouts_stay_on_screen_and_are_rigid():
     assert (np.linalg.norm(moved.start - lay.start, axis=1) > 1e-6).mean() > 0.9  # the rows did move
     kept = moved_layouts(lay, np.random.default_rng(1), tries=0)  # no round: every row keeps its original
     assert np.array_equal(kept.start, lay.start) and np.array_equal(kept.obstacles, lay.obstacles)
+
+
+def _refusal_sweep(tmp_path):
+    """A users x tasks sweep with a disc task T2 and an open-field task T0 (no checkpoints: a refusal comes first)."""
+    sweep = tmp_path / "refuse.yaml"
+    sweep.write_text(
+        "name: tiny_refuse\nagent: expert_chunk\narm: condition_grid.yaml\nmethods:\n"
+        "  oracle: {mode: teleop, readout: off}\n"
+        "  oracle_task: {mode: teleop, readout: off, reversal_adapter: {task: cell}}\n"
+        "  oracle_task_rel: {mode: teleop, readout: off, reversal_adapter: {task: nowhere}}\n"
+        "grid:\n  users: {U0: {corruption: null, adapter: null}}\n"
+        f"  tasks: {{T2: {{obstacle: {DISC}, adapter: null}}, T0: {{obstacle: null, adapter: null}}}}\n"
+        "  noises: [0.0]\ntrials: {tune: 2, test: 2}\nseed: 3\n"
+    )
+    return sweep
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--context", "T2", "--trials", "0"], "--trials must be at least 1"),
+        (["--context", "T0", "--trials", "3"], "no obstacle"),
+        (["--context", "T2", "--trials", "3", "--p-free", "1.0"], "the train set is empty"),
+        (["--context", "T2", "--trials", "3", "--n-demos", "0"], "the train set would be empty"),
+        (["--context", "T9", "--trials", "3"], "needs exactly one cell"),
+    ],
+)
+def test_the_diagnostic_refuses_what_it_cannot_diagnose(tmp_path, capsys, extra, message):
+    sweep, out = _refusal_sweep(tmp_path), tmp_path / "d"
+    with pytest.raises(SystemExit) as stop:
+        main(["--sweep", str(sweep), "--method", "oracle_task_rel", "--out", str(out), *extra, "--cpu"])
+    assert stop.value.code == 2 and message in capsys.readouterr().err
+    assert not out.exists()
 
 
 def test_the_diagnostic_runs_end_to_end_on_a_tiny_sweep(tmp_path, monkeypatch):

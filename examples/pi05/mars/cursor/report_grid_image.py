@@ -418,7 +418,8 @@ def main(argv=None):
     ap.add_argument("--reduced", default="base", help="--width: the reduced-width arm (oracle_task_views_<arm>)")
     ap.add_argument("--full", default="full", help="--width: the full-width arm (oracle_task_views_<arm>)")
     ap.add_argument("--prefix", default="views", help="--select, --scan: the arm rows' prefix (oracle_task_<prefix>_<arm>)")
-    ap.add_argument("--base", default="base", help="--select: the base arm (named as --prefix: oracle_task_<prefix>)")
+    ap.add_argument("--base", default="base", help="the base arm of --select; an arm named like --prefix reads the bare "
+                    "oracle_task_<prefix> row")
     ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
     ap.add_argument("--ft", nargs="*", default=[], help="fine-tuned run names, paired with --grid by position")
     ap.add_argument("--results", type=Path, required=True)

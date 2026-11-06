@@ -114,7 +114,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
-from cursor_sa.demos import DemoConfig, DemoSampler, augment_demos, frame_steps, make_demos, plan_reach  # noqa: E402
+from cursor_sa.demos import (  # noqa: E402
+    DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, plan_reach,
+)
 from cursor_sa.env import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
                            sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
@@ -359,8 +361,7 @@ class ExpertData:
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device, frames, jitter=jitter,
                                    jitter_steps=jitter_steps)
         if push is None:
-            pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
-            push = expert_pushes(layouts, pos)
+            push = expert_pushes(layouts, demo_positions(layouts, actions))
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
         self.push, self.core = f32(push), f32(readout_core(push, corruption, curl))
         self.noise = torch.randn_like(self.core) if frozen_noise else None  # one draw per demo step, or fresh ones
@@ -406,10 +407,11 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
         frames, push = None, None
         if split == "train" and args.rigid_motions:  # before any scene: `Layouts.concat` refuses layouts that carry one
-            pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
-            push = expert_pushes(layouts, pos)
+            push = expert_pushes(layouts, demo_positions(layouts, actions))
             layouts, actions, lengths, kept, push = augment_demos(np.random.default_rng([args.seed, 11]), layouts, actions, lengths,
                                                                   args.rigid_motions, task, push=push)
+            if getattr(args, "rigid_kept", None) is None:  # `train_task` sets it; a direct call starts the count here
+                args.rigid_kept = 0
             args.rigid_kept += int(kept.sum())
             print(f"train: {len(kept)} demonstrations and {kept.sum()} moved copies ({kept.min()}-{kept.max()} per demonstration)",
                   flush=True)
@@ -430,7 +432,8 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
         out[split] = ExpertData(layouts, actions, lengths, policy, device, corruption, curl,
                                 frozen_noise=split == "train" and args.frozen_noise, frames=frames, push=push,
                                 jitter=args.jitter if split == "train" else 0.0, jitter_steps=args.jitter_steps)
-        print(f"{split}: {n} demonstrations ({lengths.sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
+        # the originals come first: their seconds, not the moved copies'
+        print(f"{split}: {n} demonstrations ({lengths[:n].sum() * task.dt:.0f} s of demonstrating) and the expert's pushes "
               f"({time.time() - tic:.0f}s)", flush=True)
     return out
 
@@ -449,7 +452,7 @@ class ClosedLoopData:
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
         self.push, self.core = f32(raw), f32(readout_core(raw, corruption, curl))
         H = policy.horizon
-        pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+        pos = demo_positions(layouts, actions)
         labels = np.zeros((len(actions), actions.shape[1], H, 2))
         for i in range(len(actions)):
             goal = layouts.goal_pos[i]

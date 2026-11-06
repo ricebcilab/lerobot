@@ -111,3 +111,18 @@ def test_on_screen_takes_a_separate_margin_for_the_start_and_targets():
     assert layouts_on_screen(lay, margin=0.05).all()  # the margin does not apply to discs
     lay = _one(start=(0.5, 0.5), goal=(0.5, 0.2), discs=[(0.5, 0.92, 0.08)])  # disc edge at 0.99
     assert not layouts_on_screen(lay).all() and not layouts_on_screen(lay, margin=0.05).all()
+
+
+def test_an_empty_batch_and_a_batch_without_discs_move():
+    lay = _lay()
+    none = move_layouts(lay[:0], np.zeros(0), np.zeros((0, 2)), np.zeros(0, bool))
+    assert len(none) == 0 and none.start.shape == (0, 2) and none.targets.shape == (0, 4, 2)
+    assert (
+        none.obstacles.shape == (0, 2, 3) and none.mask.shape == (0, 4) and none.obstacle_mask.shape == (0, 2)
+    )
+    free = Layouts(lay.start, lay.targets, lay.mask, lay.goal)  # K = 0 discs
+    angle, shift, mirror = np.array([0.3, 1.0, 2.0]), np.full((3, 2), 0.05), np.array([True, False, True])
+    out = move_layouts(free, angle, shift, mirror)
+    assert out.obstacles.shape == (3, 0, 3) and out.obstacle_mask.shape == (3, 0)
+    with_discs = move_layouts(lay, angle, shift, mirror)
+    assert np.array_equal(out.start, with_discs.start) and np.array_equal(out.targets, with_discs.targets)

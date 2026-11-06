@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 from cursor_sa import demos
-from cursor_sa.demos import DemoSampler, augment_demos, make_demos, replay
+from cursor_sa.demos import DemoSampler, augment_demos, demo_positions, make_demos, replay
 from cursor_sa.env import Layouts, TaskConfig, layouts_on_screen, move_layouts, obstacle_spec, sample_layouts
 
 STUDY = {"min_reach": 0.35, "max_reach": 0.5}
@@ -162,9 +162,8 @@ def test_a_copy_whose_path_leaves_the_screen_is_refused_though_its_layout_fits()
 
 def test_a_copy_that_does_not_replay_to_success_is_refused():
     lay, actions, lengths = _demos(FREE)
-    still = np.zeros_like(
-        actions
-    )  # the layouts fit the screen and so does the path, but the cursor never moves
+    # the layouts fit the screen and so does the path, but the cursor never moves
+    still = np.zeros_like(actions)
     out, _, _, kept, _ = augment_demos(np.random.default_rng(1), lay, still, lengths, 2, FREE, tries=1)
     assert kept.sum() == 0 and len(out) == 6
 
@@ -193,17 +192,34 @@ def test_pushes_move_with_their_copies():
 
 def test_jitter_zero_draws_nothing():
     lay, actions, lengths = _demos(FREE)
-    sampler = DemoSampler(lay, actions, lengths, 8, 2, "cpu")
+    sampler = DemoSampler(lay, actions, lengths, 8, 2, "cpu", jitter=0.0)
+    # the three documented draws, by hand: the demos, the steps k and the goal dropout
     torch.manual_seed(0)
-    a = sampler.sample(8)
-    after = torch.rand(1)
+    i = sampler.valid[torch.randint(len(sampler.valid), (8,))]
+    k = (torch.rand(8) * sampler.lengths[i]).long()
+    torch.rand(8, 1)
+    three = torch.get_rng_state()
+    delta = 0.02 * torch.randn(8, 2)
+    four = torch.get_rng_state()
+
     torch.manual_seed(0)
-    b = DemoSampler(lay, actions, lengths, 8, 2, "cpu", jitter=0.0).sample(8)
-    assert (
-        torch.equal(a[0]["pos"], b[0]["pos"])
-        and torch.equal(a[1], b[1])
-        and torch.equal(after, torch.rand(1))
-    )
+    obs, chunk, got_i, got_k = sampler.sample(8, indexed=True)
+    assert torch.equal(torch.get_rng_state(), three)  # jitter 0: not one draw past the three
+    assert torch.equal(got_i, i) and torch.equal(got_k, k) and torch.equal(obs["pos"], sampler.pos[i, k])
+
+    torch.manual_seed(0)
+    jittered = DemoSampler(lay, actions, lengths, 8, 2, "cpu", jitter=0.02)
+    obs, _ = jittered.sample(8)
+    assert not torch.equal(torch.get_rng_state(), three) and torch.equal(torch.get_rng_state(), four)
+    assert torch.equal(obs["pos"], sampler.pos[i, k] + delta)
+
+
+def test_demo_positions_are_the_start_plus_the_running_sum_of_the_actions():
+    lay, actions, _ = _demos(FREE, n=3)
+    want = lay.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+    got = demo_positions(lay, actions)
+    assert got.shape == (3, actions.shape[1] + 1, 2) and got.dtype == want.dtype and np.array_equal(got, want)
+    assert np.array_equal(got[:, 0], lay.start)
 
 
 def test_jitter_displaces_the_position_and_the_chunk_returns_to_the_path():

@@ -181,7 +181,8 @@ def move_layouts(layouts: Layouts, angle: np.ndarray, shift: np.ndarray, mirror:
     flip = np.where(np.asarray(mirror, bool), -1.0, 1.0)
 
     def move(points: np.ndarray) -> np.ndarray:  # [B, ..., 2]
-        flat = points.reshape(len(points), -1, 2) - centre
+        # the middle size given explicitly: a -1 cannot be inferred from an empty batch
+        flat = points.reshape(len(points), int(np.prod(points.shape[1:-1])), 2) - centre
         flat = flat * np.stack([flip, np.ones_like(flip)], -1)[:, None]
         out = np.einsum("bij,bnj->bni", rot, flat) + centre + np.asarray(shift, float)[:, None]
         return out.reshape(points.shape)

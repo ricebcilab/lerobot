@@ -290,6 +290,34 @@ def test_the_pushes_of_a_copy_are_not_recomputed(ckpt_dir, monkeypatch):
     assert sizes == [60, 40]                                               # train's originals, then val
 
 
+def _train_seconds(out):
+    """The seconds of demonstrating the train split's summary line prints."""
+    (line,) = (s for s in out.splitlines() if s.startswith("train: 60 demonstrations ("))
+    return line.split("(")[1].split(" s of demonstrating")[0]
+
+
+def test_the_seconds_of_demonstrating_count_the_originals_only(ckpt_dir, capsys):
+    _train_user()
+    capsys.readouterr()
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_plain", *COMMON]))
+    plain = _train_seconds(capsys.readouterr().out)
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--rigid-motions", "2", *COMMON]))
+    out = capsys.readouterr().out
+    assert torch.load(ckpt_dir / "t_aug" / "adapter.pt")["meta"]["rigid_kept"] > 0   # the copies are there
+    assert _train_seconds(out) == plain
+
+
+def test_a_rigid_run_that_keeps_no_copy_says_so(ckpt_dir, monkeypatch, capsys):
+    _train_user()
+    none = lambda rng, layouts, actions, lengths, k, task, push=None: (  # noqa: E731
+        layouts, actions, lengths, np.zeros(len(layouts), dtype=np.int64), push)
+    monkeypatch.setattr(train_adapter, "augment_demos", none)
+    capsys.readouterr()
+    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_none", "--rigid-motions", "2", *COMMON]))
+    assert "train: 60 demonstrations and 0 moved copies (0-0 per demonstration)" in capsys.readouterr().out
+    assert torch.load(ckpt_dir / "t_none" / "adapter.pt")["meta"]["rigid_kept"] == 0
+
+
 def test_the_new_flags_default_off_and_leave_the_meta_explicit(ckpt_dir, monkeypatch):
     _train_user()
     meta = torch.load(ckpt_dir / "u" / "adapter.pt")["meta"]

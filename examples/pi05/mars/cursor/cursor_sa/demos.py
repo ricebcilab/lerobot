@@ -162,7 +162,7 @@ def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25
     and a mirror with chance 1/2, in that order. A copy is kept when its layout is on screen, its whole
     path lies in [0, 1]^2 and its actions replay to success; its length is what the replay took. Rounds
     stop after `tries * k`, so a reach too wide to move gets fewer copies, and a demonstration of length
-    0 gets none.
+    0 gets none. Layouts carrying a `scene` are refused (by `Layouts.concat`) once a copy is kept.
     """
     if push is not None and len(push) != len(actions):
         raise ValueError(f"push has {len(push)} rows for {len(actions)} demonstrations")
@@ -219,6 +219,12 @@ def _pad(seqs):
     return out
 
 
+def demo_positions(layouts, actions):
+    """The cursor's position at every step of each demonstration, [B, L + 1, 2]: the start, then the running sum of
+    its actions [B, L, 2]."""
+    return layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+
+
 def frame_steps(lengths, stride):
     """The frames of every demonstration: step 0, stride, ... < length. Returns (demo [F], step [F], start [B]) as int64,
     where demonstration i's frames are the rows start[i], start[i] + 1, ... (an empty demonstration has none)."""
@@ -243,7 +249,7 @@ class DemoSampler:
             raise ValueError(f"need jitter >= 0 and jitter_steps >= 1, got {jitter} and {jitter_steps}")
         B = len(actions)
         zeros = lambda n: np.zeros((B, n, 2))
-        pos = layouts.start[:, None] + np.concatenate([zeros(1), np.cumsum(actions, 1)], 1)
+        pos = demo_positions(layouts, actions)
         padded = np.concatenate([zeros(hist), actions, zeros(horizon)], 1)
         f32 = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
         self.pos, self.actions, self.targets = f32(pos), f32(padded), f32(layouts.targets)
