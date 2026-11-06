@@ -548,6 +548,20 @@ def test_image_sweep_configs_resolve_every_arm_per_cell():
     assert method_arm(full, "oracle_ft", "U0xT3")["model"] == "flow_goaldrop_wall_gap_ft_n300_s0"
     assert method_arm(full, "oracle_task_rel", "U0xT5")["learned_adapter"]["task"] == "image/task_ring_start_n300_s0_with_curl20_vlm_image_rel"
     assert method_arm(full, "oracle_task_rel_all", "U0xT3")["learned_adapter"]["task"] == "image/task_all_n1200_s0_vlm_image_rel"
+    aug = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_rel_aug.yaml")
+    n300 = load_sweep(config.CONFIG_DIR / "sweeps" / "grid_task_check_views_n300.yaml")
+    assert aug["seed"] == 820 and aug["trials"] == n300["trials"] == {"tune": 20, "test": 500} and aug["arm"] == n300["arm"] and aug["agent"] == n300["agent"] and aug["grid"]["tasks"] == n300["grid"]["tasks"]
+    rel_arms = ("rel", "rel_jit", "rel_rigid", "rel_both")
+    assert set(aug["methods"]) == {"oracle", "oracle_task", "oracle_ft", "policy", "policy_task", *(f"{m}_task_{a}" for m in ("oracle", "policy") for a in rel_arms)}
+    assert aug["focus"] == "oracle_task_rel_both" and aug["against"] == ["oracle_task", "oracle_ft"]
+    assert method_arm(aug, "oracle_ft", "U0xT2")["model"] == method_arm(n300, "oracle_ft", "U0xT2")["model"] == "flow_goaldrop_disc_large_ft_n300_s0"
+    assert method_arm(aug, "oracle_ft", "U0xT4")["model"] == method_arm(n300, "oracle_ft", "U0xT4")["model"] == "flow_goaldrop_ring_goal_ft_n300_s0"
+    names = {"U0xT2": "image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel", "U0xT4": "image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel"}
+    for cell, name in names.items():
+        for suffix in ("", "_jit", "_rigid", "_both"):
+            for m in ("oracle", "policy"):
+                assert method_arm(aug, f"{m}_task_rel{suffix}", cell)["learned_adapter"]["task"] == name + suffix
+        assert method_arm(aug, "policy_task_rel_both", cell)["mode"] == "policy" and method_arm(aug, "oracle_task_rel_both", cell)["mode"] == "teleop"
 
 
 def test_precompute_scene_with_merge_is_rejected(tmp_path):

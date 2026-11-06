@@ -544,3 +544,82 @@ def test_width_names_its_arms_and_select_writes_the_per_context_rows(tmp_path):
     per = json.loads((out / "select.json").read_text())["per_context"]
     assert set(per) == {"base", "span1", "nomask", "noaffine"}
     assert per["base"] == {"T2": {"hits": 0.5, "collision": 0.1}, "T4": {"hits": 0.3, "collision": 0.2}}
+
+
+def test_select_reads_a_prefix_and_a_base_arm():
+    check = _run(
+        {
+            "T2": {
+                "oracle_task_rel": _m(0.55),
+                "oracle_task_rel_jit": _m(0.59),
+                "oracle_task_rel_rigid": _m(0.57),
+            },
+            "T4": {
+                "oracle_task_rel": _m(0.35),
+                "oracle_task_rel_jit": _m(0.39),
+                "oracle_task_rel_rigid": _m(0.37),
+            },
+        }
+    )
+    out = select_recipe(check, base="rel", changes=["jit", "rigid"], prefix="rel")
+    assert out["adopted"] == ["jit"]  # jit 4 points over the base, rigid 2 over
+    assert abs(out["means"]["rel"] - 0.45) < 1e-9 and set(out["per_context"]) == {"rel", "jit", "rigid"}
+    assert out["per_context"]["jit"]["T4"] == {"hits": 0.39, "collision": 0.0}
+    with pytest.raises(ValueError, match="oracle_task_rel_both has no rows"):
+        select_recipe(check, base="rel", prefix="rel")  # the rel arms by default: jit, rigid and both
+
+
+def _rel(runs):
+    """The scan runs with their two-view rows renamed to the relative module's ``oracle_task_rel_n<N>`` rows."""
+    for run in runs.values():
+        for cell in run["test"].values():
+            cell["metrics"] = {k.replace("_views_", "_rel_"): v for k, v in cell["metrics"].items()}
+    return runs
+
+
+def test_scan_reads_a_prefix(tmp_path):
+    assert scan_rows(_rel(_scan_runs()), prefix="rel") == scan_rows(_scan_runs())
+    runs = _rel(_scan_runs())
+    del runs[1000]["test"]["U0xT4|0.0"]["metrics"]["oracle_task_rel_n1000"]
+    with pytest.raises(ValueError, match="no oracle_task_rel_n1000 row for context T4"):
+        scan_rows(runs, prefix="rel")
+    names = _write_runs(tmp_path / "views", _scan_runs())
+    report_main(
+        ["--scan", *names, "--results", str(tmp_path / "views"), "--out", str(tmp_path / "views_out")]
+    )
+    names = _write_runs(tmp_path / "rel", _rel(_scan_runs()))
+    report_main(
+        [
+            "--scan",
+            *names,
+            "--prefix",
+            "rel",
+            "--results",
+            str(tmp_path / "rel"),
+            "--out",
+            str(tmp_path / "rel_out"),
+        ]
+    )
+    for f in ("report.md", "report.json"):
+        assert (tmp_path / "rel_out" / f).read_text() == (tmp_path / "views_out" / f).read_text()
+    with pytest.raises(SystemExit, match="oracle_task_views_n<N>"):  # a rel run read with the default prefix
+        report_main(["--scan", *names, "--results", str(tmp_path / "rel"), "--out", str(tmp_path / "x")])
+
+
+def test_the_select_cli_passes_prefix_and_base(tmp_path):
+    hits = {"rel": 0.50, "rel_jit": 0.52, "rel_rigid": 0.56, "rel_both": 0.535}
+    _write(
+        tmp_path, aug=_run({c: {f"oracle_task_{a}": _m(h) for a, h in hits.items()} for c in ("T2", "T4")})
+    )
+    out = tmp_path / "out"
+    report_main(
+        ["--select", "aug", "--prefix", "rel", "--base", "rel", "--results", str(tmp_path), "--out", str(out)]
+    )
+    sel = json.loads((out / "select.json").read_text())
+    assert sel["adopted"] == ["rigid", "both"]  # jit +2; rigid +6; both +3.5
+    assert set(sel) == {"means", "adopted", "per_context"} and list(sel["means"]) == [
+        "rel",
+        "jit",
+        "rigid",
+        "both",
+    ]

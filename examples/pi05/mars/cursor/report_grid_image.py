@@ -22,6 +22,10 @@ MARGIN = 0.10  # gate: hits may trail the parametric module, collisions and hidd
 LEVEL = 0.03  # scan: "level" with the parametric module is hits and collisions within this much of its
 ADOPT = 0.03  # recipe choice: a change is adopted when its mean hits beat the base's by more than this
 WIDTH_DROP = 0.05  # width check: the reduced run may trail the full-width run by at most this much
+CHANGES = {  # recipe choice: the changes measured against the base, per arm prefix
+    "views": ("span1", "nomask", "noaffine"),  # round 3, the two-view modules
+    "rel": ("jit", "rigid", "both"),  # round 4, the relative module augmented
+}
 
 
 def _context(key: str) -> str | None:
@@ -114,11 +118,11 @@ def _context_means(run: dict, method: str) -> dict[str, dict[str, float]]:
     }
 
 
-def scan_rows(runs: dict[int, dict]) -> list[dict]:
-    """Per context and demonstration count, how the two-view module compares with the parametric one.
+def scan_rows(runs: dict[int, dict], prefix: str = "views") -> list[dict]:
+    """Per context and demonstration count, how the image module compares with the parametric one.
 
-    ``runs`` maps a count N to that count's run; the view rows are its ``oracle_task_views_n<N>`` and
-    ``policy_task_views_n<N>`` methods, the reference ``oracle_task`` / ``policy_task``. ``level`` = hits >=
+    ``runs`` maps a count N to that count's run; the module rows are its ``oracle_task_<prefix>_n<N>`` and
+    ``policy_task_<prefix>_n<N>`` methods, the reference ``oracle_task`` / ``policy_task``. ``level`` = hits >=
     ref_hits - LEVEL and collision <= ref_collision + LEVEL; ``in_band`` the same with MARGIN; ``flag`` as in
     ``gate_table``. Raises ValueError when a context's ``oracle_task`` metrics differ between runs (different layouts).
     """
@@ -126,7 +130,7 @@ def scan_rows(runs: dict[int, dict]) -> list[dict]:
     rows = []
     contexts = {c for run in runs.values() for c in map(_context, run.get("test", {})) if c}
     for n, run in sorted(runs.items()):
-        for method in ("oracle_task", f"oracle_task_views_n{n}"):
+        for method in ("oracle_task", f"oracle_task_{prefix}_n{n}"):
             have = _context_means(run, method)
             for ctx in sorted(contexts - set(have)):
                 raise ValueError(f"the run for {n} demonstrations has no {method} row for context {ctx}")
@@ -134,8 +138,8 @@ def scan_rows(runs: dict[int, dict]) -> list[dict]:
             if ctx in refs and any(abs(refs[ctx][k] - ref[k]) > 1e-9 for k in ref):
                 raise ValueError(f"oracle_task differs between runs for {ctx}: the runs used different layouts")
             refs[ctx] = ref
-        views = _context_means(run, f"oracle_task_views_n{n}")
-        hidden = _context_means(run, f"policy_task_views_n{n}")
+        views = _context_means(run, f"oracle_task_{prefix}_n{n}")
+        hidden = _context_means(run, f"policy_task_{prefix}_n{n}")
         ref_hidden = _context_means(run, "policy_task")
         for ctx, v in views.items():
             ref = refs.get(ctx)
@@ -211,34 +215,45 @@ def joint_crossing(
     return max(h, c, key=lambda t: t[0])
 
 
-def _arm_means(check: dict, arms: list[str]) -> dict[str, float]:
-    """Mean hits of ``oracle_task_views_<arm>`` over the contexts (each context's mean over its cells)."""
+def _arm_method(arm: str, prefix: str) -> str:
+    """The row of an arm: ``oracle_task_<prefix>_<arm>``, or ``oracle_task_<prefix>`` for an arm named as the prefix
+    (the unaugmented module, e.g. ``oracle_task_rel``)."""
+    return f"oracle_task_{prefix}" if arm == prefix else f"oracle_task_{prefix}_{arm}"
+
+
+def _arm_means(check: dict, arms: list[str], prefix: str = "views") -> dict[str, float]:
+    """Mean hits of each arm's row (``_arm_method``) over the contexts (each context's mean over its cells)."""
     out = {}
-    have = {arm: _context_means(check, f"oracle_task_views_{arm}") for arm in arms}
+    have = {arm: _context_means(check, _arm_method(arm, prefix)) for arm in arms}
     contexts = set().union(*have.values())
     for arm in arms:
         per_ctx = have[arm]
         if not per_ctx:
-            raise ValueError(f"oracle_task_views_{arm} has no rows in the run")
+            raise ValueError(f"{_arm_method(arm, prefix)} has no rows in the run")
         for ctx in sorted(contexts - set(per_ctx)):
-            raise ValueError(f"oracle_task_views_{arm} has no row for context {ctx}")
+            raise ValueError(f"{_arm_method(arm, prefix)} has no row for context {ctx}")
         out[arm] = float(np.mean([m["success"] for m in per_ctx.values()]))
     return out
 
 
 def select_recipe(
-    check: dict, base: str = "base", changes: tuple[str, ...] = ("span1", "nomask", "noaffine")
+    check: dict, base: str = "base", changes: list[str] | tuple[str, ...] | None = None, prefix: str = "views"
 ) -> dict:
     """Mean hits of each recipe over the contexts, and the changes whose mean beats the base's by more than ADOPT.
 
+    The rows are ``oracle_task_<prefix>_<arm>`` (``_arm_method``); ``changes`` defaults to the prefix's ``CHANGES``.
     ``per_context`` holds the rows behind the means: ``{arm: {context: {"hits": .., "collision": ..}}}``.
     """
-    means = _arm_means(check, [base, *changes])
+    if changes is None:
+        if prefix not in CHANGES:
+            raise ValueError(f"no default changes for prefix {prefix!r}; known: {sorted(CHANGES)}")
+        changes = CHANGES[prefix]
+    means = _arm_means(check, [base, *changes], prefix=prefix)
     adopted = [c for c in changes if round(means[c] - means[base] - ADOPT, 9) > 0]
     per_context = {
         arm: {
             ctx: dict(hits=m["success"], collision=m["collision"])
-            for ctx, m in sorted(_context_means(check, f"oracle_task_views_{arm}").items())
+            for ctx, m in sorted(_context_means(check, _arm_method(arm, prefix)).items())
         }
         for arm in (base, *changes)
     }
@@ -334,14 +349,17 @@ def _scan_report(a, ap: argparse.ArgumentParser) -> None:
     runs, names = {}, {}
     for name in a.scan:
         run = _load(a.results, name)
-        counts = {int(m.group(1)) for m in map(re.compile(r"oracle_task_views_n(\d+)$").match, _methods(run)) if m}
+        pattern = re.compile(rf"oracle_task_{re.escape(a.prefix)}_n(\d+)$")
+        counts = {int(m.group(1)) for m in map(pattern.match, _methods(run)) if m}
         if len(counts) != 1:
-            raise SystemExit(f"{name}: expected exactly one oracle_task_views_n<N> method, found {sorted(counts)}")
+            raise SystemExit(
+                f"{name}: expected exactly one oracle_task_{a.prefix}_n<N> method, found {sorted(counts)}"
+            )
         n = counts.pop()
         if n in runs:
             ap.error(f"--scan: two runs ({names[n]} and {name}) are for {n} demonstrations; give one run per count")
         runs[n], names[n] = run, name
-    rows = scan_rows(runs)
+    rows = scan_rows(runs, prefix=a.prefix)
     largest = max(runs)
     first_level, first_band = first_count(rows, "level"), first_count(rows, "in_band")
     crossings = {}
@@ -399,6 +417,8 @@ def main(argv=None):
     mode.add_argument("--scan", nargs="+", metavar="RUN", help="demonstration-scan run names, one per count")
     ap.add_argument("--reduced", default="base", help="--width: the reduced-width arm (oracle_task_views_<arm>)")
     ap.add_argument("--full", default="full", help="--width: the full-width arm (oracle_task_views_<arm>)")
+    ap.add_argument("--prefix", default="views", help="--select, --scan: the arm rows' prefix (oracle_task_<prefix>_<arm>)")
+    ap.add_argument("--base", default="base", help="--select: the base arm (named as --prefix: oracle_task_<prefix>)")
     ap.add_argument("--grid", nargs="*", default=[], help="grid run names, one per seed (default: the gate alone)")
     ap.add_argument("--ft", nargs="*", default=[], help="fine-tuned run names, paired with --grid by position")
     ap.add_argument("--results", type=Path, required=True)
@@ -411,7 +431,7 @@ def main(argv=None):
 
     if a.select or a.width:
         if a.select:
-            out = select_recipe(_load(a.results, a.select))
+            out = select_recipe(_load(a.results, a.select), base=a.base, prefix=a.prefix)
         else:
             out = width_check(_load(a.results, a.width), reduced=a.reduced, full=a.full)
         print(json.dumps(out, indent=2))
