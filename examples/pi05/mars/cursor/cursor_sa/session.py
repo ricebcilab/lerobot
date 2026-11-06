@@ -20,7 +20,7 @@ import numpy as np
 
 from . import config
 from .readout import Readout
-from .env import CursorEnv, Layouts, TaskConfig, sample_layouts
+from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, sample_layouts
 from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import FlowPolicy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,

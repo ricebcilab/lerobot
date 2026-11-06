@@ -6,7 +6,7 @@ import torch
 
 from cursor_sa import config, session
 from cursor_sa.agents import ExpertChunkAgent
-from cursor_sa.env import TaskConfig, sample_layouts
+from lerobot.envs.cursor import TaskConfig, sample_layouts
 from cursor_sa.paths import adapter_path
 from cursor_sa.policy import FlowPolicy
 from lerobot.policies.steering import LearnedUserModule

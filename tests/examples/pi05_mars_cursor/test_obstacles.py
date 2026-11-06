@@ -13,7 +13,7 @@ from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import trial_metrics
 from cursor_sa.readout import Readout
 from cursor_sa.demos import DemoSampler, make_demos, plan_reach, replay
-from cursor_sa.env import (CursorEnv, Layouts, TaskConfig, center_out, obstacle_spec, plan_route, route_side,
+from lerobot.envs.cursor import (CursorEnv, Layouts, TaskConfig, center_out, obstacle_spec, plan_route, route_side,
                            sample_layouts, segment_distance)
 from cursor_sa.records import OUTCOMES, arm_fields, outcome_of, summarize
 from cursor_sa.session import arm_task, load_checkpoints, run_trials

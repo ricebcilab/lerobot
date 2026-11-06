@@ -60,7 +60,7 @@ from lerobot.policies.steering import (AdapterModules, FlowControlPolicy, FlowRe
                                              LearnedTaskModule, LearnedUserModule, as_adapter, encode_views,
                                              integrate, task_velocity_hook)
 
-from .env import render_views
+from lerobot.envs.cursor import render_views
 from .readout import DEADBAND, Readout, is_active
 
 MODES = ("policy", "teleop", "flow_control", "frs")

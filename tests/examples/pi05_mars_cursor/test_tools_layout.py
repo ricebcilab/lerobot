@@ -23,3 +23,14 @@ def test_folders_hold_exactly_their_scripts():
     assert py_files(".") == {"run_experiment.py", "run_sweep.py"}
     assert py_files("tools") == {"analyze_results.py", "convert_checkpoints.py", "hub.py", "diag_layouts.py"}
     assert py_files("reports") == {"build_study_report.py", "report_grid_image.py"}
+
+
+def test_cursor_sa_has_no_env_shim_and_demos_share_the_package_layouts():
+    import importlib.util
+
+    import cursor_sa.demos
+
+    import lerobot.envs.cursor
+
+    assert importlib.util.find_spec("cursor_sa.env") is None
+    assert cursor_sa.demos.Layouts is lerobot.envs.cursor.Layouts

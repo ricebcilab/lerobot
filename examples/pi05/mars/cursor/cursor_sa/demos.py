@@ -24,7 +24,7 @@ import torch
 
 from lerobot.policies.steering import reduce_tokens
 
-from .env import CursorEnv, Layouts, TaskConfig, layouts_on_screen, move_actions, move_layouts
+from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, layouts_on_screen, move_actions, move_layouts
 
 CURVE_SLOWDOWN = 0.15  # a demonstration around obstacles takes this fraction longer per radian its path turns
 

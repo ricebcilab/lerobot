@@ -7,7 +7,10 @@ import pytest
 import torch
 from _view_stub import ViewStub
 from cursor_sa.demos import DemoSampler, frame_steps, make_demos
-from cursor_sa.env import (
+from cursor_sa.policy import FlowPolicy
+from cursor_sa.steering import SharedController, hide_goal, observation, view_scene_fn
+
+from lerobot.envs.cursor import (
     RENDER_CURSOR,
     RENDER_CURSOR_RADIUS,
     RENDER_PALETTE,
@@ -19,9 +22,6 @@ from cursor_sa.env import (
     render_views,
     sample_layouts,
 )
-from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import SharedController, hide_goal, observation, view_scene_fn
-
 from lerobot.policies.steering import LearnedTaskModule, encode_views
 
 DISC = {"kind": "disc", "radius": 0.08, "along": 0.5}

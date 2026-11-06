@@ -8,7 +8,13 @@ import pytest
 import torch
 from cursor_sa import demos
 from cursor_sa.demos import DemoSampler, augment_demos, demo_positions, make_demos, replay
-from cursor_sa.env import (
+from cursor_sa.policy import FlowPolicy
+from cursor_sa.readout import corruption_spec
+from diag_layouts import main as diag_main, moved_layouts, rebuild_layouts
+from test_sweep import _image_adapter
+from train import train_adapter
+
+from lerobot.envs.cursor import (
     Layouts,
     TaskConfig,
     layouts_on_screen,
@@ -17,11 +23,6 @@ from cursor_sa.env import (
     obstacle_spec,
     sample_layouts,
 )
-from cursor_sa.policy import FlowPolicy
-from cursor_sa.readout import corruption_spec
-from diag_layouts import main as diag_main, moved_layouts, rebuild_layouts
-from test_sweep import _image_adapter
-from train import train_adapter
 
 STUDY = {"min_reach": 0.35, "max_reach": 0.5}
 TASK = TaskConfig(

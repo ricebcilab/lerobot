@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa, run_s
 
 from cursor_sa import paths as cursor_paths  # noqa: E402
 from cursor_sa.agents import make_agent  # noqa: E402
-from cursor_sa.env import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec  # noqa: E402
+from lerobot.envs.cursor import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec  # noqa: E402
 from cursor_sa.session import load_checkpoints  # noqa: E402
 from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources  # noqa: E402
 from train import train_adapter  # noqa: E402

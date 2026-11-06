@@ -28,7 +28,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa, run_sweep and train sit one folder up
 
 from cursor_sa.analysis import INK, INK_2, style  # noqa: E402
-from cursor_sa.env import TaskConfig  # noqa: E402
+from lerobot.envs.cursor import TaskConfig  # noqa: E402
 from cursor_sa.paths import RESULTS  # noqa: E402
 from cursor_sa.records import load_run, summarize  # noqa: E402
 

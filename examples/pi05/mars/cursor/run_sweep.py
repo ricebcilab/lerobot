@@ -86,7 +86,7 @@ import yaml
 from cursor_sa import config
 from cursor_sa.agents import make_agent
 from cursor_sa.analysis import INK, INK_2, bootstrap_mean, draw_scene, style
-from cursor_sa.env import ROUTE_CLEARANCE, TaskConfig, center_out, curl_steady_state, plan_route, route_side, sample_layouts
+from lerobot.envs.cursor import ROUTE_CLEARANCE, TaskConfig, center_out, curl_steady_state, plan_route, route_side, sample_layouts
 from cursor_sa import paths as cursor_paths
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import logged, summarize

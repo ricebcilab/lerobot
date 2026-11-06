@@ -28,7 +28,7 @@ import yaml
 
 from cursor_sa import config
 from cursor_sa.agents import make_agent
-from cursor_sa.env import sample_layouts
+from lerobot.envs.cursor import sample_layouts
 from cursor_sa.paths import RESULTS
 from cursor_sa.records import append_record, load_run, summarize, trial_record
 from cursor_sa.session import Aborted, Run, arm_task, readout_for, load_checkpoints, run_trials

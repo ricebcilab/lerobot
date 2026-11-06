@@ -10,7 +10,7 @@ from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.readout import Readout, adapter_spec, matrix_spec
 from cursor_sa.demos import DemoSampler, make_demos, replay
-from cursor_sa.env import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
+from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.records import summarize
 from cursor_sa.session import load_checkpoints

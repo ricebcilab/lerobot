@@ -10,7 +10,7 @@ from cursor_sa.agents import ExpertAgent
 from cursor_sa.records import OUTCOMES, load_run, read_records
 from cursor_sa.session import (Aborted, Run, balanced_latin_square, block_order, block_permutation, layout_seed,
                                make_layout_sets)
-from cursor_sa.env import TaskConfig
+from lerobot.envs.cursor import TaskConfig
 
 PROTOCOL = dict(name="tiny", arms={"teleop": "teleop.yaml", "flow_control": "flow_control.yaml"},
                 blocks={"trials": 3, "practice": 1, "order": "latin_square"},

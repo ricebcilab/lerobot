@@ -12,7 +12,7 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.readout import Readout, corruption_spec
-from cursor_sa.env import TaskConfig, obstacle_spec
+from lerobot.envs.cursor import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule

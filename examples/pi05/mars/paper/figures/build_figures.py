@@ -48,7 +48,7 @@ from analyze_results import find_runs, load_trials
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import GRID, INK, INK_2, aligned_path, cumulative_hits, draw_scene, paired_lead
-from cursor_sa.env import Layouts, TaskConfig, sample_layouts
+from lerobot.envs.cursor import Layouts, TaskConfig, sample_layouts
 from cursor_sa.paths import CHECKPOINTS, RESULTS
 from cursor_sa.records import load_run
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials

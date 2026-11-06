@@ -12,7 +12,7 @@ from _view_stub import ViewStub
 from cursor_sa import config
 from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.readout import Readout
-from cursor_sa.env import TaskConfig, sample_layouts
+from lerobot.envs.cursor import TaskConfig, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import SharedController, steered_chunk

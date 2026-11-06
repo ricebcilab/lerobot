@@ -8,9 +8,9 @@ import pytest
 import torch
 from _view_stub import TokenStub
 from cursor_sa.dataset import SceneDataset, encoder_digest, layout_digests
-from cursor_sa.env import Layouts, TaskConfig, move_layouts, obstacle_spec, sample_layouts
 from train import train_adapter
 
+from lerobot.envs.cursor import Layouts, TaskConfig, move_layouts, obstacle_spec, sample_layouts
 from lerobot.policies.steering import scene_for
 
 SIZE = 32

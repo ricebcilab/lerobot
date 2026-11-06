@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 from .readout import adapter_spec, corruption_spec
-from .env import obstacle_spec
+from lerobot.envs.cursor import obstacle_spec
 from .paths import CONFIGS as CONFIG_DIR
 from .steering import GAIN_MODES, MODES, method_name
 

@@ -43,7 +43,7 @@ import yaml
 from cursor_sa import config
 from cursor_sa.agents import make_agent
 from cursor_sa.demos import DemoSampler, make_demos
-from cursor_sa.env import obstacle_spec, sample_layouts
+from lerobot.envs.cursor import obstacle_spec, sample_layouts
 from cursor_sa.paths import policy_dir, policy_path
 from cursor_sa.policy import FlowPolicy, load_checkpoint
 from cursor_sa.session import arm_task, readout_for, run_trials

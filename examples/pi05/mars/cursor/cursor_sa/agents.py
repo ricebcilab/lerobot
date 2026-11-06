@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .readout import Readout, is_active
-from .env import AVOID_CLEARANCE, densify, plan_route
+from lerobot.envs.cursor import AVOID_CLEARANCE, densify, plan_route
 from .devices import Keyboard, SpaceMouse, find_spacemouse, spacemouse_full_scale, spacemouse_hid_id
 from .steering import to_deflection
 

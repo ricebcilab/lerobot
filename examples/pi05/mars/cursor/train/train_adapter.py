@@ -127,7 +127,7 @@ from cursor_sa.readout import DEADBAND, Readout, corruption_spec  # noqa: E402
 from cursor_sa.demos import (  # noqa: E402
     DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, plan_reach,
 )
-from cursor_sa.env import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
+from lerobot.envs.cursor import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
                            sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
