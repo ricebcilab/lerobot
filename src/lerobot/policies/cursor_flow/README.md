@@ -17,7 +17,7 @@ displacements.
 
 It has no processor pipeline and no dataset features, and `lerobot-train` does not train it. It is trained by
 the example's own trainer, `examples/pi05/mars/cursor/train/train_policy.py`, which writes the cursor
-project's `policy.pt` format. `examples/pi05/mars/cursor/convert_checkpoints.py` converts those files (and the
+project's `policy.pt` format. `examples/pi05/mars/cursor/tools/convert_checkpoints.py` converts those files (and the
 cursor's adapter checkpoints) in place to the formats lerobot loads.
 
 ```python

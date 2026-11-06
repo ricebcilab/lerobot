@@ -76,6 +76,8 @@ tools/                hub.py (the checkpoints on the Hugging Face Hub: download,
                       convert_checkpoints.py (trainer checkpoints to lerobot's formats, in place),
                       analyze_results.py (per-participant and pooled analysis of any runs),
                       diag_layouts.py (an image task module on train, fresh and moved layouts)
+                      Obstacle specs take `decoy: true` (the obstacle on the reach to a random non-goal target; the goal-leak sweep
+                      `grid_task_check_rel_leak`), see the design addendum of 2026-11-05 in docs/superpowers/specs
 train/                train_policy.py, train_adapter.py
 reports/              report_grid_image.py (gate verdicts and grid tables of the image task modules);
                       build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or

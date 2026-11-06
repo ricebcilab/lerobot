@@ -2,7 +2,7 @@
 """An image task module on its own training layouts, on fresh ones and on its training layouts moved.
 
     python examples/pi05/mars/cursor/tools/diag_layouts.py --sweep grid_task_check_image2_quick --context T2 --method oracle_task_rel \\
-        --seed 0 --n-demos 300 --p-free 0.25 --fresh-seed 820 --trials 225 --out ../results/sim/reports/diag_layouts
+        --seed 0 --n-demos 300 --p-free 0.25 --fresh-seed 820 --trials 225 --out examples/pi05/mars/results/sim/reports/diag_layouts
 
 Three sets of layouts of the context's task (the sweep's users x tasks cell of that task with no corruption):
 `train`, the layouts the trainer drew for the module's train split (`rebuild_layouts` with the module's --seed,
