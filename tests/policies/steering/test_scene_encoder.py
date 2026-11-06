@@ -158,15 +158,31 @@ class _PatchEncoder:
         return torch.nn.functional.pad(pooled, (0, 2045)).to(torch.float16)
 
 
-def test_encode_views_keeps_the_view_order():
+def test_the_encoder_batches_and_keeps_the_view_order():
     images = np.zeros((2, 2, 3, 32, 32), np.uint8)
     images[:, 1] = 255
     tokens = encode_views(images, _PatchEncoder())
     assert tokens.shape == (2, 512, 2048) and tokens.dtype == torch.float16
     assert float(tokens[:, :256, :3].max()) == 0.0 and float(tokens[:, 256:, :3].min()) == 1.0
 
+    class Recording(SceneEncoder):  # image_tokens encodes batch by batch and frees each on the CPU
+        def __init__(self):
+            super().__init__(device="cpu")
+            self.sizes = []
 
-def test_token_reduction_keeps_the_top_directions():
+        def encode(self, images, batch=256):
+            self.sizes.append(len(images))
+            return torch.full((len(images), 256, 2048), float(images.mean()), dtype=torch.float16)
+
+    enc = Recording()
+    out = enc.image_tokens(
+        np.arange(5, dtype=np.uint8)[:, None, None, None] * np.ones((1, 3, 4, 4), np.uint8), batch=2
+    )
+    assert enc.sizes == [2, 2, 1] and isinstance(out, np.ndarray) and out.dtype == np.float16
+    np.testing.assert_array_equal(out[:, 0, 0], np.array([0.5, 0.5, 2.5, 2.5, 4.0], np.float16))
+
+
+def test_token_reduction_keeps_the_top_directions_centred_or_not():
     g = torch.Generator().manual_seed(0)
     true = torch.linalg.qr(torch.randn(16, 3, generator=g))[0]
     x = (torch.randn(4000, 3, generator=g) * torch.tensor([5.0, 2.0, 1.0])) @ true.T + 0.7
@@ -188,27 +204,7 @@ def test_token_reduction_keeps_the_top_directions():
     for bad in (16, 0):
         with pytest.raises(ValueError):
             fit_token_reduction(iter(x.split(500)), bad)
-
-
-def test_image_tokens_encodes_batch_by_batch_and_frees_each_on_the_cpu():
-    class Recording(SceneEncoder):
-        def __init__(self):
-            super().__init__(device="cpu")
-            self.sizes = []
-
-        def encode(self, images, batch=256):
-            self.sizes.append(len(images))
-            return torch.full((len(images), 256, 2048), float(images.mean()), dtype=torch.float16)
-
-    enc = Recording()
-    images = np.arange(5, dtype=np.uint8)[:, None, None, None] * np.ones((1, 3, 4, 4), np.uint8)
-    out = enc.image_tokens(images, batch=2)
-    assert enc.sizes == [2, 2, 1]
-    assert isinstance(out, np.ndarray) and out.dtype == np.float16 and out.shape == (5, 256, 2048)
-    np.testing.assert_array_equal(out[:, 0, 0], np.array([0.5, 0.5, 2.5, 2.5, 4.0], np.float16))
-
-
-def test_the_uncentred_token_reduction_keeps_the_offset_direction():
+    # uncentred: the second moment's top directions, the large constant part (as pi0.5's tokens have) first
     g = torch.Generator().manual_seed(0)
     offset = torch.linalg.qr(torch.randn(16, 1, generator=g))[0][:, 0]
     x = torch.randn(4000, 16, generator=g) + 50.0 * offset  # a large constant part, as pi0.5's tokens have

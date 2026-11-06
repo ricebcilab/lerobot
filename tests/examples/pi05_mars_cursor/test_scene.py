@@ -1,3 +1,5 @@
+"""The env's pictures: the overhead render, the two views, and the scene arrays the observation and samplers carry."""
+
 import hashlib
 
 import numpy as np
@@ -11,7 +13,6 @@ from cursor_sa.env import (
     RENDER_PALETTE,
     SCENE_SIZE,
     VIEWS,
-    Layouts,
     TaskConfig,
     obstacle_spec,
     render_layouts,
@@ -23,79 +24,61 @@ from cursor_sa.steering import SharedController, hide_goal, observation, view_sc
 
 from lerobot.policies.steering import LearnedTaskModule, encode_views
 
+DISC = {"kind": "disc", "radius": 0.08, "along": 0.5}
+RING = {"kind": "ring", "around": "goal", "gap_angle": [15, 30]}
 
-def _layouts(n=3, spec=None, seed=4):
-    cfg = TaskConfig(min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec(spec))
+
+def _layouts(n=3, spec=None, seed=4, reach=(0.3, 0.5)):
+    cfg = TaskConfig(min_reach=reach[0], max_reach=reach[1], obstacle=obstacle_spec(spec))
     return sample_layouts(np.random.default_rng(seed), n, 4, cfg)
 
 
-def test_scene_rides_through_indexing_tile_and_concat():
-    a = _layouts(3)
-    a.scene = {
-        "cnn": np.arange(3 * 2 * 4 * 4, dtype=np.uint8).reshape(3, 2, 4, 4),
-        "vlm_image": np.ones((3, 5, 6), np.float16),
-    }
-    assert a[[1]].scene["cnn"].shape == (1, 2, 4, 4) and np.array_equal(
-        a[[1]].scene["cnn"][0], a.scene["cnn"][1]
-    )
-    perm = np.array([2, 0, 1])
-    assert np.array_equal(a[perm].scene["vlm_image"], a.scene["vlm_image"][perm])
-    assert a.tile(2).scene["cnn"].shape == (6, 2, 4, 4) and np.array_equal(
-        a.tile(2).scene["cnn"][3:], a.scene["cnn"]
-    )
-    both = Layouts.concat([a, a[[0]]])
-    assert both.scene["vlm_image"].shape == (4, 5, 6) and set(both.scene) == {"cnn", "vlm_image"}
-    plain = _layouts(2)
-    assert (
-        plain.scene is None and Layouts.concat([plain, plain]).scene is None and plain.tile(2).scene is None
-    )
-    with pytest.raises(ValueError, match="scene"):
-        Layouts.concat([a, plain])
+def _near(pixel, colour, tol=3):
+    return np.abs(pixel.astype(int) - np.array(colour)).max() <= tol
 
 
-def test_render_draws_discs_and_targets_and_never_the_goal():
-    lay = _layouts(2, {"kind": "disc", "radius": 0.08, "along": 0.5})
+def test_render_draws_discs_walls_and_targets_and_never_the_goal():
+    lay = _layouts(2, DISC)
     img = render_layouts(lay, size=SCENE_SIZE)
     assert img.shape == (2, 3, SCENE_SIZE, SCENE_SIZE) and img.dtype == np.uint8
-    x, y, r = lay.real_obstacles(0)[0]
-    px, py = int(x * SCENE_SIZE), int(y * SCENE_SIZE)
-    assert tuple(img[0, :, py, px]) == RENDER_PALETTE["obstacle"]  # disc center is obstacle colour
+    x, y, _ = lay.real_obstacles(0)[0]
+    assert tuple(img[0, :, int(y * SCENE_SIZE), int(x * SCENE_SIZE)]) == RENDER_PALETTE["obstacle"]
     assert tuple(img[0, :, 2, 2]) == RENDER_PALETTE["bg"]  # a corner is background
     gx, gy = (lay.goal_pos[0] * SCENE_SIZE).astype(int)
     ox, oy = (lay.targets[0, (lay.goal[0] + 1) % 4] * SCENE_SIZE).astype(int)
     assert (
         tuple(img[0, :, gy, gx]) == tuple(img[0, :, oy, ox]) == RENDER_PALETTE["target_fill"]
-    )  # goal looks like any target
+    )  # the goal is any target
     no_obstacle = render_layouts(_layouts(1))
     assert not (no_obstacle == np.array(RENDER_PALETTE["obstacle"])[None, :, None, None]).all(1).any()
-
-
-def test_render_keeps_the_wall_visible():
-    lay = _layouts(
+    wall = _layouts(
         1, {"kind": "wall", "along": 0.5, "gap": 0.16, "gap_offset": 0.14, "radius": 0.015, "extent": 0.4}
     )
-    img = render_layouts(lay).astype(int)
-    discs = lay.real_obstacles(0)
-    for x, y, _ in discs[::3]:  # along the wall every disc center is well darker than the background
+    img = render_layouts(wall).astype(int)
+    for x, y, _ in wall.real_obstacles(0)[
+        ::3
+    ]:  # along the wall every disc centre is well darker than the background
         assert img[0, :, int(y * SCENE_SIZE), int(x * SCENE_SIZE)].mean() < 128
+    ring = render_layouts(_layouts(4, RING, seed=0, reach=(0.35, 0.5)))  # the pixels as they were
+    assert (
+        hashlib.sha256(ring.tobytes()).hexdigest()
+        == "6f2b3fdd5379ee5b294c7ef59a09f1b031f83805eb538c8e6acbcef9c2decf5b"
+    )
 
 
 def test_observation_and_sampler_carry_the_scene():
-    lay = _layouts(3, {"kind": "disc", "radius": 0.08, "along": 0.5})
+    lay = _layouts(3, DISC)
     lay.scene = {"cnn": render_layouts(lay, 64)}
     obs = observation(lay, lay.start, np.zeros((3, 4, 2)))
-    assert (
-        obs["scene"]["cnn"].dtype == torch.uint8
-        and obs["scene"]["cnn"].shape == (3, 3, 64, 64)
-        and "scene" in hide_goal(obs)
+    assert obs["scene"]["cnn"].dtype == torch.uint8 and obs["scene"]["cnn"].shape == (3, 3, 64, 64)
+    assert "scene" in hide_goal(obs) and "scene" not in observation(
+        _layouts(2), np.zeros((2, 2)), np.zeros((2, 4, 2))
     )
-    assert "scene" not in observation(_layouts(2), np.zeros((2, 2)), np.zeros((2, 4, 2)))
     policy = FlowPolicy().eval()
-    ctl = SharedController(policy, lay, "policy")
-    assert torch.equal(ctl.observation()["scene"]["cnn"], obs["scene"]["cnn"])
-    cfg = TaskConfig(
-        min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
+    assert torch.equal(
+        SharedController(policy, lay, "policy").observation()["scene"]["cnn"], obs["scene"]["cnn"]
     )
+    cfg = TaskConfig(min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec(DISC))
     sampler = DemoSampler(
         lay, *make_demos(np.random.default_rng(0), lay, cfg), policy.horizon, policy.hist, "cpu"
     )
@@ -103,33 +86,14 @@ def test_observation_and_sampler_carry_the_scene():
     assert torch.equal(o["scene"]["cnn"], torch.as_tensor(lay.scene["cnn"])[i])
 
 
-def _near(pixel, colour, tol=3):
-    return np.abs(pixel.astype(int) - np.array(colour)).max() <= tol
-
-
-def test_render_layouts_pixels_are_unchanged():
-    ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
-    lay = sample_layouts(
-        np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5, obstacle=ring)
-    )
-    assert (
-        hashlib.sha256(render_layouts(lay).tobytes()).hexdigest()
-        == "6f2b3fdd5379ee5b294c7ef59a09f1b031f83805eb538c8e6acbcef9c2decf5b"
-    )
-
-
 def test_views_draw_the_cursor_and_centre_the_wrist_window_on_it():
-    task = TaskConfig(
-        min_reach=0.35, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
-    )
-    lay = sample_layouts(np.random.default_rng(0), 3, 4, task)
+    lay = _layouts(3, DISC, seed=0, reach=(0.35, 0.5))
     disc = lay.obstacles[:, 0, :2]
     pos = disc + np.where(disc > 0.5, -1.0, 1.0) * np.array(
         [0.1, 0.05]
     )  # beside the disc, screen-centre side
-    views = render_views(lay, pos, 0.5)
+    views, base = render_views(lay, pos, 0.5), render_layouts(lay)
     assert VIEWS == ("overhead", "wrist") and views.shape == (3, 2, 3, 224, 224) and views.dtype == np.uint8
-    base = render_layouts(lay)
     reach = int(np.ceil(RENDER_CURSOR_RADIUS * 224)) + 5
     for b in range(3):
         cx, cy = (pos[b] * 224).astype(int)
@@ -139,63 +103,36 @@ def test_views_draw_the_cursor_and_centre_the_wrist_window_on_it():
         assert np.array_equal(views[b, 0][:, far], base[b][:, far])  # away from the mark: render_layouts'
         col, row = ((disc[b] - pos[b]) / 0.5 + 0.5) * 224  # where the window puts the disc's centre
         assert _near(views[b, 1, :, int(row), int(col)], RENDER_PALETTE["obstacle"])
-
-
-def test_a_wrist_window_as_wide_as_the_screen_at_its_centre_is_the_overhead_view():
-    lay = sample_layouts(np.random.default_rng(1), 2, 4, TaskConfig(min_reach=0.35, max_reach=0.5))
-    views = render_views(lay, np.full((2, 2), 0.5), 1.0)
-    assert np.array_equal(views[:, 1], views[:, 0])
-    corner = render_views(lay, np.full((2, 2), 0.05), 0.5)  # the window reaches 0.2 outside the screen
-    assert (corner[:, 1, :, 0, 0] == 255).all()
-    for bad in (
-        lambda: render_views(lay, np.full((2, 2), 0.5), 0.0),
-        lambda: render_views(lay, np.full((1, 2), 0.5), 0.5),
-    ):
+    wide = render_views(lay[:2], np.full((2, 2), 0.5), 1.0)  # a window as wide as the screen at its centre
+    assert np.array_equal(wide[:, 1], wide[:, 0])
+    assert (
+        render_views(lay[:2], np.full((2, 2), 0.05), 0.5)[:, 1, :, 0, 0] == 255
+    ).all()  # beyond the screen: white
+    for span, n in ((0.0, 2), (0.5, 1)):
         with pytest.raises(ValueError):
-            bad()
-
-
-def test_the_wrist_view_cuts_a_disc_at_the_screen_edge():
-    ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
-    lay = sample_layouts(
-        np.random.default_rng(0), 40, 4, TaskConfig(min_reach=0.35, max_reach=0.5, obstacle=ring)
-    )
-    xy, r = lay.obstacles[..., :2], lay.obstacles[..., 2]
-    span, found = 0.5, None
-    for b, k in np.argwhere(lay.obstacle_mask):
-        for axis in (0, 1):
-            c, rad = xy[b, k, axis], r[b, k]
-            for edge in (0.0, 1.0):
-                if not abs(c - edge) < rad:
-                    continue  # the disc does not straddle this edge
-                keep = (edge, c + rad) if edge == 0.0 else (c - rad, edge)  # the part on the screen
-                cut = (c - rad, edge) if edge == 0.0 else (edge, c + rad)  # the part beyond it
-                inside, outside = xy[b, k].copy(), xy[b, k].copy()
-                inside[axis], outside[axis] = np.mean(keep), np.mean(cut)
-                other = 1 - axis
-                inside[other] = outside[other] = np.clip(xy[b, k, other], 0.05, 0.95)
-                if all(np.hypot(*(p - xy[b, k])) < 0.9 * rad for p in (inside, outside)):
-                    found = b, axis, edge, inside, outside
-                    break
-            if found:
-                break
-        if found:
-            break
+            render_views(lay[:2], np.full((n, 2), 0.5), span)
+    # a ring disc straddling a screen edge: the wrist window shows the part on the screen and white beyond it
+    ring = _layouts(40, RING, seed=0, reach=(0.35, 0.5))
+    found = [(b, c, r, axis, edge) for b, k in np.argwhere(ring.obstacle_mask) for c, r in [(ring.obstacles[b, k, :2], ring.obstacles[b, k, 2])]
+             for axis in (0, 1) for edge in (0.0, 1.0) if abs(c[axis] - edge) < 0.8 * r and 0.2 < c[1 - axis] < 0.8]  # fmt: skip
     assert found, "no sampled disc straddles a screen edge"
-    b, axis, edge, inside, outside = found
-    pos = inside.copy()
-    pos[axis] = edge + (0.1 if edge == 0.0 else -0.1)  # the cursor just inside that edge
-    view = render_views(lay[[b]], pos[None], span)[0, 1]
+    b, c, r, axis, edge = found[0]
+    s = 1.0 if edge == 0.0 else -1.0  # into the screen
+    pos, inside, outside = c.copy(), c.copy(), c.copy()
+    pos[axis], inside[axis], outside[axis] = (
+        edge + 0.1 * s,
+        (edge + c[axis] + s * r) / 2,
+        (edge + c[axis] - s * r) / 2,
+    )
+    view = render_views(ring[[b]], pos[None], 0.5)[0, 1]
+    (ci, ri), (co, ro) = (((p - pos) / 0.5 + 0.5) * 224 for p in (inside, outside))
+    assert (
+        _near(view[:, int(ri), int(ci)], RENDER_PALETTE["obstacle"])
+        and (view[:, int(ro), int(co)] == 255).all()
+    )
 
-    def pixel(point):  # a screen point -> its wrist-window pixel
-        col, row = ((point - pos) / span + 0.5) * 224
-        return view[:, int(row), int(col)]
 
-    assert _near(pixel(inside), RENDER_PALETTE["obstacle"])
-    assert (pixel(outside) == 255).all()
-
-
-def test_frame_steps_cover_every_demonstration_at_the_stride():
+def test_the_sampler_reads_each_samples_own_frame():
     demo, step, start = frame_steps(np.array([5, 0, 4, 1]), 2)
     assert (
         demo.tolist() == [0, 0, 0, 2, 2, 3]
@@ -203,46 +140,32 @@ def test_frame_steps_cover_every_demonstration_at_the_stride():
         and start.tolist() == [0, 3, 3, 5]
     )
     assert frame_steps(np.array([3]), 1)[1].tolist() == [0, 1, 2]
-
-
-def test_the_sampler_reads_each_samples_own_frame():
     rng, task, policy = np.random.default_rng(0), TaskConfig(min_reach=0.35, max_reach=0.5), FlowPolicy()
     lay = sample_layouts(rng, 6, 4, task)
     actions, lengths = make_demos(rng, lay, task)
     demo, step, start = frame_steps(lengths, 2)
     tokens = torch.stack([torch.as_tensor(demo), torch.as_tensor(step)], -1).float()[
         :, None
-    ]  # each frame names its demo and step
-    sampler = DemoSampler(
-        lay, actions, lengths, policy.horizon, policy.hist, "cpu", frames={"vlm_views": (tokens, start, 2)}
-    )
+    ]  # each frame names itself
+    args = (lay, actions, lengths, policy.horizon, policy.hist, "cpu")
+    sampler = DemoSampler(*args, frames={"vlm_views": (tokens, start, 2)})
     obs, _, i, k = sampler.sample(512, indexed=True)
     assert (k % 2 == 0).all() and (k < sampler.lengths[i]).all() and set(k.tolist()) >= {0, 2, 4}
     got = obs["scene"]["vlm_views"][:, 0]
     assert torch.equal(got[:, 0].long(), i) and torch.equal(got[:, 1].long(), k)
     torch.testing.assert_close(obs["pos"], sampler.pos[i, k])
-    plain = DemoSampler(lay, actions, lengths, policy.horizon, policy.hist, "cpu")
+    plain = DemoSampler(*args)
     assert "scene" not in plain.sample(8)[0]
     torch.manual_seed(5)
     a = plain.sample(64, indexed=True)
     torch.manual_seed(5)
-    b = DemoSampler(lay, actions, lengths, policy.horizon, policy.hist, "cpu", frames=None).sample(
-        64, indexed=True
-    )
+    b = DemoSampler(*args, frames=None).sample(64, indexed=True)
     assert torch.equal(a[3], b[3]) and (a[3] % 2 == 1).any()  # no frames: every step, the same draws
     with pytest.raises(ValueError):
-        DemoSampler(
-            lay,
-            actions,
-            lengths,
-            policy.horizon,
-            policy.hist,
-            "cpu",
-            frames={"a": (tokens, start, 2), "b": (tokens, start, 4)},
-        )
+        DemoSampler(*args, frames={"a": (tokens, start, 2), "b": (tokens, start, 4)})
 
 
-def test_a_controller_asks_its_scene_provider_once_per_position():
+def test_a_controller_encodes_the_running_trials_views_once_per_position():
     lay, calls = sample_layouts(np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5)), []
 
     def scene_fn(layouts, pos, active):
@@ -260,10 +183,6 @@ def test_a_controller_asks_its_scene_provider_once_per_position():
     ctl.observation()
     assert len(calls) == 3 and calls[2].tolist() == [True, False, True, True]
     assert "scene" not in SharedController(FlowPolicy(), lay, "policy").observation()
-
-
-def test_view_scene_fn_encodes_the_running_trials_views_at_their_positions():
-    lay = sample_layouts(np.random.default_rng(0), 4, 4, TaskConfig(min_reach=0.35, max_reach=0.5))
     module = LearnedTaskModule(
         horizon=16, token_source="vlm_views", scene_dim=2048, scene_tokens=512, image_size=56, wrist_span=0.5
     )

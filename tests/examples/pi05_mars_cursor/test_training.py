@@ -1,4 +1,7 @@
-"""The adapter trainer: user modules from expert labels, task modules with a user module in the loop."""
+"""The adapter trainer (train/train_adapter.py): its data, one tiny run per end-to-end path (a module fixture's user
+module, its closed-loop recalibration and a disc task module; the image module with jitter and rigid copies; the pooled
+module; the teacher's student; the two-view module; the user module on a fine-tuned policy) and the parser's refusals.
+The losses are pinned against the cursor reference in test_steering_equivalence.py."""
 
 import json
 from dataclasses import replace
@@ -7,174 +10,86 @@ import numpy as np
 import pytest
 import torch
 
+from cursor_sa import config
 from cursor_sa.readout import corruption_spec
-from cursor_sa.env import TaskConfig, obstacle_spec, sample_layouts
-from cursor_sa.demos import DemoSampler, make_demos, replay
+from cursor_sa.env import TaskConfig, obstacle_spec
+from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
+from cursor_sa.steering import ReversalAdapter, TaskModule
+from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
 from train import train_adapter
 from _view_stub import ViewStub
 
 COMMON = ["--n-demos", "60", "--val-demos", "40", "--steps", "4", "--log-every", "2", "--batch", "32"]
+ROT = ["--corruption", "{rotation_deg: 60}"]
+TASK = ["--kind", "task", "--user-module", "u", *ROT]
+DISC = "{kind: disc, radius: 0.03, along: 0.5}"  # the disc task module's (and so the teacher's) task
+IMAGE = "{kind: disc, radius: 0.08, along: 0.5}"
+RING = "{kind: ring, around: goal, gap_angle: [15, 30]}"
+CNN = ["--token-source", "cnn", "--render-size", "64"]
+VIEWS = ["--token-source", "vlm_views", "--render-size", "56", "--scene-rank", "2", "--view-affine", "0.5", "--token-drop", "0.3",
+         "--frozen-noise", "--render-workers", "0"]
 
 
-@pytest.fixture
-def ckpt_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(train_adapter, "adapter_dir", lambda name: tmp_path / name)
-    monkeypatch.setattr(train_adapter, "adapter_path", lambda name: tmp_path / name / "adapter.pt")
-    return tmp_path
+def _args(*argv):
+    return train_adapter.parse_args(list(argv))
 
 
-def test_task_loss_matches_the_formula():
-    policy, task = FlowPolicy().eval(), TaskModule()
-    torch.nn.init.normal_(task.out.weight, std=0.1)
-    tcfg = TaskConfig(min_reach=0.3, max_reach=0.6, obstacle=obstacle_spec({"kind": "disc", "radius": 0.04, "along": 0.5}))
-    rng = np.random.default_rng(0)
-    layouts = sample_layouts(rng, 6, 3, tcfg)
-    sampler = DemoSampler(layouts, *make_demos(rng, layouts, tcfg), policy.horizon, policy.hist, "cpu")
-    obs, chunk = sampler.sample(5)
-    z, t = torch.randn(5, policy.horizon, 2), torch.rand(5)
-    loss, parts = train_adapter.task_loss(policy, task, obs, chunk, z, t, lambda_id=0.01)
-    a = chunk / policy.action_scale
-    x = (1 - t[:, None, None]) * z + t[:, None, None] * a
-    with torch.no_grad():
-        v = policy(obs, x, t)
-        A, b = task(x, t, v, obs)
-        fm = ((torch.einsum("bsij,bsj->bsi", A, v) + b - (a - z)) ** 2).mean()
-        identity = ((A - torch.eye(2)) ** 2).mean() + (b ** 2).mean()
-    torch.testing.assert_close(loss, fm + 0.01 * identity)
-    assert parts["fm"] == pytest.approx(fm.item()) and parts["identity"] == pytest.approx(identity.item())
+def _log(root, name):
+    return json.loads((root / name / "train_log.json").read_text())["log"]
 
 
-def test_field_loss_matches_the_formula_and_trains_only_the_free_module():
-    policy, user, task = FlowPolicy().eval().requires_grad_(False), UserModule(), TaskModule()
-    torch.nn.init.normal_(user.net[-1].weight, std=0.05)
-    torch.nn.init.normal_(task.out.weight, std=0.05)
-    user.requires_grad_(False)
-    B, H = 4, policy.horizon
-    g = torch.Generator().manual_seed(0)
-    free = dict(pos=torch.rand(B, 2, generator=g), hist=torch.zeros(B, policy.hist, 2), targets=torch.rand(B, 3, 2, generator=g),
-                mask=torch.ones(B, 3, dtype=torch.bool), goal=torch.zeros(B, 3, dtype=torch.bool),
-                obstacles=torch.rand(B, 2, 3, generator=g) * 0.1, obstacle_mask=torch.ones(B, 2, dtype=torch.bool))
-    latent, bci = torch.randn(B, H, 2, generator=g), torch.randn(B, H, 2, generator=g)
-    weight = torch.tensor([1.0, 0.0, 1.0, 1.0])
-    torch.manual_seed(3)
-    loss = train_adapter.field_loss(policy, user, task, free, latent, bci, weight)
-    torch.manual_seed(3)
-    t = torch.rand(B)
-    x = (1 - t[:, None, None]) * latent + t[:, None, None] * bci
-    with torch.no_grad():
-        A, b = task(x, t, policy(free, x, t), free)
-        v = torch.einsum("bsij,bsj->bsi", A, policy(free, x, t)) + b
-        err = ((torch.einsum("bsij,bsj->bsi", user(x, t), v) - (bci - latent)) ** 2).mean((1, 2))
-    torch.testing.assert_close(loss, (err * weight).sum() / 3)
-    loss.backward()
-    assert task.out.weight.grad.abs().sum() > 0 and user.net[-1].weight.grad is None
+def _recording(monkeypatch, name):
+    """Wrap train_adapter.<name>: the list every call's result lands in, and the real function."""
+    calls, real = [], getattr(train_adapter, name)
+    monkeypatch.setattr(train_adapter, name, lambda *a, **k: calls.append(real(*a, **k)) or calls[-1])
+    return calls, real
 
 
-def test_train_a_user_module_then_a_task_module_with_it(ckpt_dir):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{curl: 20, tau: 0.1}", "--name", "u",
-                                                  *COMMON]))
-    ckpt = torch.load(ckpt_dir / "u" / "adapter.pt")
-    assert ckpt["kind"] == "user" and ckpt["meta"]["obstacle"] is None and ckpt["meta"]["args"]["corruption"] == {"curl": 20, "tau": 0.1}
-    assert ReversalAdapter.load(ckpt_dir / "u" / "adapter.pt").kind == "user"
-    log = json.loads((ckpt_dir / "u" / "train_log.json").read_text())["log"]
-    assert len(log) == 2 and {"heading_cos_none", "heading_cos_user"} <= set(log[-1])
-    # recalibrated closed loop (ReFIT-style): the initial module runs the open-field trials, their states join the batches
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{curl: 20, tau: 0.1}", "--name", "u_refit",
-                                                  "--closed-loop", "u", "--closed-loop-trials", "4", "--closed-loop-depth", "2",
-                                                  "--closed-loop-time-limit", "1.0", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "u_refit" / "adapter.pt")
-    assert ckpt["meta"]["args"]["closed_loop"] == ["u"] and ckpt["meta"]["args"]["closed_loop_mix"] == 0.5
-    log = json.loads((ckpt_dir / "u_refit" / "train_log.json").read_text())["log"]
-    assert {"heading_cos_user", "closed_heading_cos_none", "closed_heading_cos_user"} <= set(log[-1])
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: ring, around: start, gap_angle: [15, 30]}",
-                                                  "--name", "t", "--user-module", "u", "--corruption", "{curl: 20, tau: 0.1}",
-                                                  "--lambda-field", "0.1", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "t" / "adapter.pt")
-    assert ckpt["kind"] == "task" and ckpt["meta"]["obstacle"]["kind"] == "ring" and ckpt["meta"]["args"]["user_module"] == "u"
-    loaded = ReversalAdapter.load(ckpt_dir / "t" / "adapter.pt")
-    assert loaded.kind == "task" and isinstance(loaded.task, TaskModule)
-    log = json.loads((ckpt_dir / "t" / "train_log.json").read_text())["log"]
-    assert {"val_fm", "chunk_collision_hidden", "chunk_collision_policy_given", "collide_user", "collide_composed"} <= set(log[-1])
-    for bad in (["--kind", "task", "--obstacle", "{kind: disc, radius: 0.04, along: 0.5}", "--corruption", "{rotation_deg: 60}"],
-                ["--kind", "user", "--obstacle", "{kind: disc, radius: 0.04, along: 0.5}", "--corruption", "{rotation_deg: 60}"]):
-        with pytest.raises(SystemExit):
-            train_adapter.parse_args([*bad, "--name", "x"])
+def _base_policy():
+    return FlowPolicy.load(train_adapter.policy_path(config.load_arm("base.yaml")["model"]), "cpu")
 
 
-def test_retrain_the_policy_for_a_task_then_calibrate_a_user_module_on_it(ckpt_dir, monkeypatch):
-    """The grid's retrained policy: an obstacle head, trained for one obstacle task (a share of its layouts without
-    the obstacle, as a task module) from scratch, or fine-tuned from a trained policy (--init); and a user module
-    calibrated on it (--model) as the others are on the frozen policy."""
-    from train import train_policy
-    monkeypatch.setattr(train_policy, "policy_dir", lambda name: ckpt_dir / name)
-    monkeypatch.setattr(train_policy, "policy_path", lambda name: ckpt_dir / name / "policy.pt")
-    monkeypatch.setattr(train_adapter, "policy_path", lambda name: ckpt_dir / name / "policy.pt")
-    tiny = ["--n_demos", "30", "--val_demos", "10", "--steps", "4", "--batch", "16", "--log_every", "2", "--warmup", "2",
-            "--goal_dropout", "0.25", "--targets", "4", "4", "--reach", "0.35", "0.5"]
-    ring = ["--obstacle", "{kind: ring, around: goal, gap_angle: [15, 30]}"]
-    train_policy.main(["--name", "scratch", *ring, *tiny])
-    scratch = torch.load(ckpt_dir / "scratch" / "policy.pt")
-    assert scratch["config"]["obstacle_tokens"] is True and scratch["args"]["obstacle"]["kind"] == "ring"
-    assert scratch["args"]["p_free"] == 0.25 and scratch["args"]["init"] is None
-    log = json.loads((ckpt_dir / "scratch" / "train_log.json").read_text())
-    assert len(log["log"]) == 2 and np.isfinite(log["log"][-1]["val"])
-    train_policy.main(["--name", "base", "--d_model", "32", "--layers", "1", "--heads", "2", *tiny])
-    train_policy.main(["--name", "tuned", "--init", "base", *ring, *tiny])
-    base, tuned = torch.load(ckpt_dir / "base" / "policy.pt"), torch.load(ckpt_dir / "tuned" / "policy.pt")
-    assert tuned["config"] == {**base["config"], "obstacle_tokens": True}  # the base's architecture, an obstacle head added
-    torch.testing.assert_close(tuned["state_dict"]["action_scale"], base["state_dict"]["action_scale"])  # the base's units
-    assert json.loads((ckpt_dir / "tuned" / "train_log.json").read_text())["action_scale"] == pytest.approx(
-        base["state_dict"]["action_scale"].item())
-    assert hasattr(FlowPolicy.load(ckpt_dir / "tuned" / "policy.pt"), "obstacle_in")
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--model", "scratch", "--corruption", "{rotation_deg: 60}",
-                                                  "--name", "u_scratch", *COMMON]))
-    assert torch.load(ckpt_dir / "u_scratch" / "adapter.pt")["meta"]["args"]["model"] == "scratch"
+@pytest.fixture(scope="module")
+def trained(tmp_path_factory):
+    """The checkpoint folder every run of this module writes to, holding three tiny runs: the user module `u`, its
+    ReFIT-style closed-loop recalibration `u_cl`, and the disc task module `t` with `u` in the loop, saved every 2 steps."""
+    root = tmp_path_factory.mktemp("adapters")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(train_adapter, "adapter_dir", lambda name: root / name)
+        mp.setattr(train_adapter, "adapter_path", lambda name: root / name / "adapter.pt")
+        for argv in (["--kind", "user", *ROT, "--name", "u"],
+                     ["--kind", "user", *ROT, "--name", "u_cl", "--closed-loop", "u", "--closed-loop-trials", "4",
+                      "--closed-loop-depth", "2", "--closed-loop-time-limit", "1.0"],
+                     [*TASK, "--obstacle", DISC, "--name", "t", "--save-every", "2"]):
+            train_adapter.train(_args(*argv, *COMMON))
+        yield root
 
 
-def test_the_experts_pushes_and_the_readout_core_line_up_with_the_demonstrations():
+def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
     policy = FlowPolicy().eval()
-    args = train_adapter.parse_args(["--name", "x", "--corruption", "{scale: [1.0, 0.25]}", "--n-demos", "40",
-                                     "--val-demos", "10"])
-    data = train_adapter.expert_splits(args, None, policy, "cpu", np.random.default_rng(0), *corruption_spec(args.corruption))["train"]
-    obs, chunk, push, core, i, k = data.sample(200)
-    moving = push.norm(dim=-1) > 0.99  # full deflection: far from the goal
-    assert moving.any()
-    # the core is the corruption of the push, M @ push, and the push points at the goal
-    torch.testing.assert_close(core, torch.clamp(push * torch.tensor([1.0, 0.25]), -1, 1))
-    goal = obs["targets"][torch.arange(len(i)), data.sampler.goal[i].float().argmax(1)]
-    cos_goal = torch.nn.functional.cosine_similarity(push, goal - obs["pos"], dim=-1)
-    assert (cos_goal[moving] > 0.999).all()
-
-
-def test_frozen_noise_serves_one_draw_per_demo_step():
-    policy = FlowPolicy().eval()
-    args = train_adapter.parse_args(["--name", "x", "--corruption", "{rotation_deg: 60}", "--n-demos", "20",
-                                     "--val-demos", "10", "--frozen-noise"])
+    args = _args("--name", "x", "--corruption", "{scale: [1.0, 0.25]}", "--n-demos", "40", "--val-demos", "10", "--frozen-noise")
     data = train_adapter.expert_splits(args, None, policy, "cpu", np.random.default_rng(0), *corruption_spec(args.corruption))
-    train, val = data["train"], data["val"]
-    assert train.noise is not None and val.noise is None  # validation keeps fresh commands
+    train = data["train"]
     obs, chunk, push, core, i, k = train.sample(400)
-    sigma = torch.ones(len(i))
+    torch.testing.assert_close(core, torch.clamp(push * torch.tensor([1.0, 0.25]), -1, 1))  # the core is M @ push
+    goal = obs["targets"][torch.arange(len(i)), train.sampler.goal[i].float().argmax(1)]
+    moving = push.norm(dim=-1) > 0.99  # full deflection: far from the goal, where the push points
+    assert moving.any() and (torch.nn.functional.cosine_similarity(push, goal - obs["pos"], dim=-1)[moving] > 0.999).all()
+    assert train.noise is not None and data["val"].noise is None  # validation keeps fresh commands
+    sigma, active = torch.ones(len(i)), train_adapter.active_of(push)
     served = train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k))
-    # a demo step serves the same command every time it is drawn; fresh draws differ
-    torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))
-    active = train_adapter.active_of(push)
+    torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))  # one draw per step
     assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
-    with pytest.raises(SystemExit):
-        train_adapter.parse_args(["--name", "x", "--corruption", "{rotation_deg: 60}", "--frozen-noise", "--closed-loop", "u"])
 
 
 def test_a_time_budget_keeps_the_demonstrations_that_fit_in_it():
     """--demo-seconds: as many of the task's demonstrations as fit in the budget, each taking its duration up to the
     goal's selection; a larger budget extends the same draw, and about a quarter of it is without the obstacle."""
-    args = train_adapter.parse_args(["--name", "x", "--corruption", "{scale: [1.0, 0.25]}"])
+    args = _args("--name", "x", "--corruption", "{scale: [1.0, 0.25]}")
     ring = obstacle_spec({"kind": "ring", "around": "goal", "gap_angle": [15, 30]})
-    def draw(seconds):
-        return train_adapter.budget_demos(args, ring, np.random.default_rng(0), seconds, p_free=0.25, chunk=16)
-
-    (small, task, _, small_lengths), (large, _, _, large_lengths) = draw(12.0), draw(40.0)
+    (small, task, _, small_lengths), (large, _, _, large_lengths) = (
+        train_adapter.budget_demos(args, ring, np.random.default_rng(0), s, p_free=0.25, chunk=16) for s in (12.0, 40.0))
     n = len(small)
     assert 0 < n < len(large)
     assert small_lengths.sum() * task.dt <= 12.0 < large_lengths[:n + 1].sum() * task.dt  # all that fit and no more
@@ -183,487 +98,28 @@ def test_a_time_budget_keeps_the_demonstrations_that_fit_in_it():
     assert 0 < (~large.obstacle_mask.any(1)).mean() < 0.5
 
 
-def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(ckpt_dir, monkeypatch):
-    """train_policy.py --demo_seconds draws the demonstrations as the adapter trainer does (a task module given the
-    same budget and seed gets the same ones); --eval_steps scores the EMA weights alone with the goal given and saves
-    the best, without changing the training itself."""
-    from train import train_policy
-    monkeypatch.setattr(train_policy, "policy_dir", lambda name: ckpt_dir / name)
-    monkeypatch.setattr(train_policy, "policy_path", lambda name: ckpt_dir / name / "policy.pt")
-    tiny = ["--val_demos", "10", "--steps", "4", "--batch", "16", "--log_every", "2", "--warmup", "2",
-            "--goal_dropout", "0.25", "--targets", "4", "4", "--reach", "0.35", "0.5"]
-    ring = "{kind: ring, around: goal, gap_angle: [15, 30]}"
-    train_policy.main(["--name", "base", "--n_demos", "30", "--d_model", "32", "--layers", "1", "--heads", "2", *tiny])
-    ft = ["--init", "base", "--obstacle", ring, "--demo_seconds", "12", *tiny]
-    train_policy.main(["--name", "scored", *ft, "--eval_steps", "2", "--eval_trials", "4"])
-    train_policy.main(["--name", "plain", *ft])
-    log, plain = (json.loads((ckpt_dir / n / "train_log.json").read_text()) for n in ("scored", "plain"))
-    assert [e["step"] for e in log["eval"]] == [2, 4]  # the step asked for and the last
-    assert log["best_step"] == max(log["eval"], key=lambda e: (e["success"], e["step"]))["step"]
-    for key in ("train", "val"):  # scoring left the training's random state alone
-        assert [e[key] for e in log["log"]] == pytest.approx([e[key] for e in plain["log"]], rel=1e-4)
-    assert "eval" not in plain
-    n = log["args"]["n_demos"]
-    args = train_adapter.parse_args(["--kind", "task", "--obstacle", ring, "--user-module", "u", "--corruption",
-                                     "{scale: [1.0, 0.25]}", "--name", "t", "--demo-seconds", "12", "--val-demos", "10"])
-    data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
-                                       *corruption_spec(args.corruption), args.p_free)
-    assert 0 < n == args.n_demos == len(data["train"].sampler.lengths)
-
-
-def test_train_an_image_task_module_from_the_render(ckpt_dir):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_cnn",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn",
-                                                  "--render-size", "64", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "t_cnn" / "adapter.pt")
-    assert ckpt["config"]["token_source"] == "cnn" and ckpt["config"]["image_size"] == 64 and ckpt["meta"]["token_source"] == "cnn"
-    assert ckpt["meta"]["teacher"] is None and ckpt["meta"]["teacher_demos"] is None
-    assert ckpt["meta"]["token_geometry"] == "absolute" and "token_geometry" not in ckpt["config"]
-    loaded = ReversalAdapter.load(ckpt_dir / "t_cnn" / "adapter.pt")
-    assert loaded.task.token_source == "cnn"
-    log = json.loads((ckpt_dir / "t_cnn" / "train_log.json").read_text())["log"]
-    assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(log[-1])
-
-
-def test_train_a_relative_geometry_image_task_module(ckpt_dir):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_rel",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn",
-                                                  "--render-size", "64", "--token-geometry", "relative", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "t_rel" / "adapter.pt")
-    assert ckpt["config"]["token_geometry"] == "relative" and ckpt["meta"]["token_geometry"] == "relative"
-    assert "scene_pos" not in ckpt["state_dict"]
-    assert ReversalAdapter.load(ckpt_dir / "t_rel" / "adapter.pt").task.token_geometry == "relative"
-    with pytest.raises(SystemExit):
-        train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "x", "--user-module", "u",
-                                  "--corruption", "{rotation_deg: 60}", "--token-geometry", "relative"])   # discs have no screen tokens
-
-
-RELATIVE_TASK = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--corruption", "{rotation_deg: 60}",
-                 "--token-source", "cnn", "--render-size", "64", "--token-geometry", "relative"]
-
-
-def _train_user(*extra):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON, *extra]))
-
-
-def test_train_with_jitter_and_rigid_motions_records_them(ckpt_dir, monkeypatch):
-    _train_user()
-    splits, made, real = _record_splits(monkeypatch), [], train_adapter.augment_demos
-
-    def recording(*a, **k):
-        made.append(real(*a, **k))
-        return made[-1]
-
-    monkeypatch.setattr(train_adapter, "augment_demos", recording)
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--jitter", "0.02", "--jitter-steps", "3", "--rigid-motions", "2", *COMMON]))
-    meta = torch.load(ckpt_dir / "t_aug" / "adapter.pt")["meta"]
-    assert meta["jitter"] == 0.02 and meta["jitter_steps"] == 3 and meta["rigid_motions"] == 2
-    assert 0 < meta["rigid_kept"] <= 2 * 60
-    json.dumps(meta["rigid_kept"])                                         # a plain int: the train log carries it too
-    train, val = splits[-1]["train"], splits[-1]["val"]
-    assert train.sampler.jitter == 0.02 and train.sampler.jitter_steps == 3 and val.sampler.jitter == 0.0
-    assert len(train.sampler.lengths) == 60 + meta["rigid_kept"] and len(val.sampler.lengths) == 40
-    assert len(train.sampler.scene["cnn"]) == 60 + meta["rigid_kept"]      # every copy is rendered
-    (layouts, actions, _, kept, _), = made                                 # the val split never augments
-    assert kept.sum() == meta["rigid_kept"]
-    push = train.push.numpy()
-    origin, dots = np.repeat(np.arange(60), kept), (push * actions).sum(-1)
-    assert (np.abs(dots[60:]).sum(1) > 0).all() and np.allclose(dots[60:], dots[origin], atol=1e-6)   # a rigid motion keeps push . action
-    pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
-    fresh = train_adapter.expert_pushes(layouts, pos)
-    assert np.allclose(push[:60], fresh[:60], atol=1e-6)                   # the originals' are the expert's
-    assert not np.allclose(push[60:], fresh[60:], atol=1e-3)               # a copy's are its original's moved
-
-
-def test_the_pushes_of_a_copy_are_not_recomputed(ckpt_dir, monkeypatch):
-    _train_user()
-    sizes, real = [], train_adapter.expert_pushes
-
-    def recording(layouts, pos):
-        sizes.append(len(layouts))
-        return real(layouts, pos)
-
-    monkeypatch.setattr(train_adapter, "expert_pushes", recording)
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--rigid-motions", "2", *COMMON]))
-    assert sizes == [60, 40]                                               # train's originals, then val
-
-
-def _train_seconds(out):
-    """The seconds of demonstrating the train split's summary line prints."""
-    (line,) = (s for s in out.splitlines() if s.startswith("train: 60 demonstrations ("))
-    return line.split("(")[1].split(" s of demonstrating")[0]
-
-
-def test_the_seconds_of_demonstrating_count_the_originals_only(ckpt_dir, capsys):
-    _train_user()
-    capsys.readouterr()
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_plain", *COMMON]))
-    plain = _train_seconds(capsys.readouterr().out)
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_aug", "--rigid-motions", "2", *COMMON]))
-    out = capsys.readouterr().out
-    assert torch.load(ckpt_dir / "t_aug" / "adapter.pt")["meta"]["rigid_kept"] > 0   # the copies are there
-    assert _train_seconds(out) == plain
-
-
-def test_a_rigid_run_that_keeps_no_copy_says_so(ckpt_dir, monkeypatch, capsys):
-    _train_user()
-    none = lambda rng, layouts, actions, lengths, k, task, push=None: (  # noqa: E731
-        layouts, actions, lengths, np.zeros(len(layouts), dtype=np.int64), push)
-    monkeypatch.setattr(train_adapter, "augment_demos", none)
-    capsys.readouterr()
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_none", "--rigid-motions", "2", *COMMON]))
-    assert "train: 60 demonstrations and 0 moved copies (0-0 per demonstration)" in capsys.readouterr().out
-    assert torch.load(ckpt_dir / "t_none" / "adapter.pt")["meta"]["rigid_kept"] == 0
-
-
-def test_the_new_flags_default_off_and_leave_the_meta_explicit(ckpt_dir, monkeypatch):
-    _train_user()
-    meta = torch.load(ckpt_dir / "u" / "adapter.pt")["meta"]
-    assert [meta[k] for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")] == [None] * 4
-    calls = []
-    monkeypatch.setattr(train_adapter, "augment_demos", lambda *a, **k: calls.append(a))
-    splits = _record_splits(monkeypatch)
-    train_adapter.train(train_adapter.parse_args([*RELATIVE_TASK, "--name", "t_plain", *COMMON]))
-    meta = torch.load(ckpt_dir / "t_plain" / "adapter.pt")["meta"]
-    assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"], meta["rigid_kept"]) == (0.0, 4, 0, None)
-    assert not calls and splits[-1]["train"].sampler.jitter == 0.0 and len(splits[-1]["train"].sampler.lengths) == 60
-
-
-def test_a_pooled_run_counts_the_rigid_copies_of_every_entry(pooled_fixture, ckpt_dir, monkeypatch):
-    splits = _record_splits(monkeypatch)
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", "--token-source", "cnn",
-                                                  "--render-size", "64", "--rigid-motions", "1", *COMMON]))
-    meta = torch.load(ckpt_dir / "t_all" / "adapter.pt")["meta"]
-    assert len(splits) == 2 and 0 < meta["rigid_kept"] == sum(len(s["train"].sampler.lengths) - 60 for s in splits)
-    assert all(len(s["train"].sampler.lengths) > 60 for s in splits)
-
-
-def test_jitter_and_rigid_motions_are_refused_where_they_make_no_sense(tmp_path):
-    task = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--name", "x"]
-    rotation = [*task, "--corruption", "{rotation_deg: 60}"]
-    curled = "{curl: 2.0, tau: 0.1}"
-    (tmp_path / "pooled.yaml").write_text(f"entries:\n  - {{obstacle: {{kind: disc, radius: 0.08, along: 0.5}}, user_module: u, corruption: {curled}}}\n")
-    for bad in ([*rotation, "--token-source", "vlm_views", "--jitter", "0.02"],     # the picture would show the cursor elsewhere
-                [*rotation, "--token-source", "vlm_views", "--rigid-motions", "2"],
-                [*task, "--corruption", curled, "--rigid-motions", "2"],             # a curl is not mirror-invariant
-                ["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "x", "--rigid-motions", "2"],
-                [*rotation, "--teacher", "t", "--rigid-motions", "2"],               # a teacher's demonstrations are rollouts
-                [*rotation, "--jitter", "-0.1"], [*rotation, "--jitter-steps", "0"], [*rotation, "--rigid-motions", "-1"],
-                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--jitter", "0.02"],   # the task module's
-                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--rigid-motions", "2"]):
-        with pytest.raises(SystemExit):
-            train_adapter.parse_args(bad)
-    assert train_adapter.parse_args([*task, "--corruption", curled, "--jitter", "0.02"]).jitter == 0.02    # the jitter alone is fine with a curl
-    assert train_adapter.parse_args([*rotation, "--teacher", "t", "--jitter", "0.02"]).jitter == 0.02      # and with a teacher
-    args = train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "x", "--jitter", "0.02"])
-    assert args.jitter == 0.02
-
-
-def test_vlm_sources_use_the_encoder_once_per_split(ckpt_dir, monkeypatch):
-    calls = []
-    class Stub:
-        def __init__(self, *a, **k): pass
-        def image_tokens(self, images):
-            calls.append(len(images))
-            return np.zeros((len(images), 256, 2048), np.float16)
-
-        def close(self): calls.append("closed")
-    monkeypatch.setattr(train_adapter, "SceneEncoder", Stub)
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_vlm",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "vlm_image",
-                                                  "--render-size", "56", *COMMON]))
-    assert calls[-1] == "closed" and len(calls) == 3                      # train split, val split, closed
-    assert torch.load(ckpt_dir / "t_vlm" / "adapter.pt")["config"]["scene_dim"] == 2048
-
-
-def test_train_a_pooled_task_module_over_two_contexts(ckpt_dir, tmp_path):
-    for name, corr in (("u_rot", "{rotation_deg: 60}"), ("u_gain", "{scale: [1.0, 0.25]}")):
-        train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", corr, "--name", name, *COMMON]))
-    (tmp_path / "pooled.yaml").write_text(
-        "entries:\n  - {obstacle: {kind: disc, radius: 0.08, along: 0.5}, user_module: u_rot, corruption: {rotation_deg: 60}}\n"
-        "  - {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, user_module: u_gain, corruption: {scale: [1.0, 0.25]}}\n")
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "t_all",
-                                                  "--token-source", "cnn", "--render-size", "64", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "t_all" / "adapter.pt")
-    assert ckpt["meta"]["obstacle"] is None and [e["user_module"] for e in ckpt["meta"]["pooled"]] == ["u_rot", "u_gain"]
-    log = json.loads((ckpt_dir / "t_all" / "train_log.json").read_text())["log"]
-    assert {"val_fm", "val_fm_0", "val_fm_1", "chunk_collision_hidden_1"} <= set(log[-1])
-    with pytest.raises(SystemExit):   # --pooled and --obstacle together
-        train_adapter.parse_args(["--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}",
-                                  "--name", "x", "--corruption", "{rotation_deg: 60}"])
-
-
-POOLED = (
-    ("u_rot", "{rotation_deg: 60}", "{kind: disc, radius: 0.08, along: 0.5}"),
-    ("u_gain", "{scale: [1.0, 0.25]}", "{kind: ring, around: start, gap_angle: [15, 30]}"),
-)
-
-
-@pytest.fixture
-def pooled_fixture(ckpt_dir, tmp_path):
-    """Two user modules and a two-entry pooled file (a disc task with a rotation, a ring task with a gain)."""
-    for name, corr, _ in POOLED:
-        train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", corr, "--name", name, *COMMON]))
-    (tmp_path / "pooled.yaml").write_text(
-        "entries:\n" + "".join(f"  - {{obstacle: {obs}, user_module: {name}, corruption: {corr}}}\n" for name, corr, obs in POOLED)
-    )
-    return tmp_path / "pooled.yaml"
-
-
-def _record_splits(monkeypatch):
-    """Wrap expert_splits: the list every call's train split lands in (its layouts' arrays and frozen noise)."""
-    splits, real = [], train_adapter.expert_splits
-
-    def wrapped(*a, **k):
-        out = real(*a, **k)
-        splits.append(out)
-        return out
-
-    monkeypatch.setattr(train_adapter, "expert_splits", wrapped)
-    return splits
-
-
-def test_the_pooled_arm_trains_on_the_per_task_modules_demonstrations(pooled_fixture, monkeypatch):
-    """Each pooled entry draws its layouts, demos and frozen noise as a single-context run of it at the same seed."""
-    extra = ["--token-source", "cnn", "--render-size", "64", "--frozen-noise", "--lambda-field", "0.1"]
-    splits = _record_splits(monkeypatch)
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", *extra, *COMMON]))
-    pooled = list(splits)
-    assert len(pooled) == 2
-    for j, (name, corr, obstacle) in enumerate(POOLED):
-        splits.clear()
-        train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", obstacle, "--user-module", name, "--corruption", corr,
-                                                      "--name", f"t_{j}", *extra, *COMMON]))
-        (single,) = splits
-        for split in ("train", "val"):
-            a, b = pooled[j][split].sampler, single[split].sampler
-            for field in ("obstacles", "obstacle_mask", "targets", "pos", "lengths"):
-                torch.testing.assert_close(getattr(a, field), getattr(b, field), msg=f"entry {j} {split} {field}")
-            torch.testing.assert_close(a.scene["cnn"], b.scene["cnn"])
-        torch.testing.assert_close(pooled[j]["train"].noise, single["train"].noise, msg=f"entry {j} frozen noise")
-        torch.testing.assert_close(pooled[j]["train"].push, single["train"].push)
-    assert not torch.equal(pooled[0]["train"].sampler.obstacles, pooled[1]["train"].sampler.obstacles)
-
-
-def test_the_pooled_trainer_alternates_the_contexts_each_with_its_own_user_module(pooled_fixture, monkeypatch):
-    splits = _record_splits(monkeypatch)  # one per entry, in order
-    users = {}  # id of a loaded user module -> the module's name
-    load = train_adapter.ReversalAdapter.load
-
-    def recording_load(path, *a, **k):
-        adapter = load(path, *a, **k)
-        users[id(adapter.user)] = path.parent.name
-        return adapter
-
-    monkeypatch.setattr(train_adapter.ReversalAdapter, "load", staticmethod(recording_load))
-    drawn, used = [], []  # per training step: the entry whose train data was drawn, the user module the field loss used
-    real_sample, real_field = train_adapter.ExpertData.sample, train_adapter.field_loss
-
-    def sample(self, *a, **k):
-        entries = [j for j, s in enumerate(splits) if s["train"] is self]
-        if entries:  # not the validation draws
-            drawn.append(entries[0])
-        return real_sample(self, *a, **k)
-
-    def field(policy, user, *a, **k):
-        used.append(users[id(user)])
-        return real_field(policy, user, *a, **k)
-
-    monkeypatch.setattr(train_adapter.ExpertData, "sample", sample)
-    monkeypatch.setattr(train_adapter, "field_loss", field)
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--pooled", str(pooled_fixture), "--name", "t_all", "--token-source", "cnn",
-                                                  "--render-size", "64", "--lambda-field", "0.1", *COMMON, "--steps", "6"]))
-    assert drawn == [step % 2 for step in range(1, 7)]  # step % len(entries), the steps counting from 1
-    assert used == [POOLED[j][0] for j in drawn] == ["u_gain", "u_rot"] * 3  # each context with its own user module
-
-
-def test_planned_steps_resample_a_half_speed_path_and_drop_an_odd_final_control_step():
-    path = np.cumsum(np.repeat([[0.01, 0.0]], 6, axis=0), axis=0)          # 6 positions: 5 control steps
-    assert train_adapter.planned_steps(path).shape == (2, 2)                # control steps 0-1 and 2-3; the 5th is half a step
-    assert np.allclose(train_adapter.planned_steps(path), [[0.02, 0.0], [0.02, 0.0]])
-    seven = np.vstack([path, path[-1:] + [0.01, 0.0]])                      # 7 positions: 6 control steps, 3 planned
-    assert train_adapter.planned_steps(seven).shape == (3, 2)
-
-
-def _tiny_teacher(ckpt_dir):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "t",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON]))
-
-
-def test_teacher_demonstrations_are_the_teachers_hits_at_the_policy_step_rate(ckpt_dir):
-    _tiny_teacher(ckpt_dir)
-    args = train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "s", "--user-module", "u",
-                                     "--corruption", "{rotation_deg: 60}", "--teacher", "t", "--teacher-chunk", "8", *COMMON])
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy = FlowPolicy.load(train_adapter.policy_path(train_adapter.config.load_arm("base.yaml")["model"]), device)
-    layouts, task, actions, lengths, info = train_adapter.teacher_demos(args, args.obstacle, policy, device, np.random.default_rng(0), 4, args.p_free)
-    print(f"teacher keep rate: {info['kept']} kept / {info['drawn']} drawn, {info['outcomes']}")
-    assert len(layouts) == 4 and info["kept"] == 4 and info["drawn"] >= 4 and info["drawn"] % 8 == 0
-    assert all(r["outcome"] == "hit" for r in info["records"]) and sum(info["outcomes"].values()) == info["drawn"]
-    for i, r in enumerate(info["records"]):
-        path = np.asarray(r["path"])
-        assert lengths[i] == (len(path) - 1) // 2 and np.allclose(actions[i, :lengths[i]], train_adapter.planned_steps(path))
-        assert np.allclose(np.abs(np.diff(path[::2], axis=0)).sum(), np.abs(np.diff(path, axis=0)).sum(), atol=2e-3)  # same travel, half the steps
-    assert np.all(actions[np.arange(actions.shape[1])[None] >= lengths[:, None]] == 0)
-    assert replay(actions, layouts, replace(task, cursor_noise=0.0)).success.all()        # a valid demonstration at the policy's rate
-
-
-def _teacher_args(*extra, obstacle="{kind: disc, radius: 0.03, along: 0.5}"):
-    return train_adapter.parse_args(["--kind", "task", "--obstacle", obstacle, "--name", "s", "--user-module", "u",
-                                     "--corruption", "{rotation_deg: 60}", "--teacher", "t", *extra, *COMMON])
-
-
-def test_the_teacher_loop_is_guarded(ckpt_dir, monkeypatch):
-    with pytest.raises(SystemExit):
-        _teacher_args("--teacher-chunk", "0")
-    _tiny_teacher(ckpt_dir)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy = FlowPolicy.load(train_adapter.policy_path(train_adapter.config.load_arm("base.yaml")["model"]), device)
-    ring = _teacher_args("--teacher-chunk", "8", obstacle="{kind: ring, around: goal, gap_angle: [15, 30]}")
-    with pytest.raises(ValueError, match="obstacle"):          # the teacher was trained on a disc
-        train_adapter.teacher_demos(ring, ring.obstacle, policy, device, np.random.default_rng(0), 4, ring.p_free)
-    args = _teacher_args("--teacher-chunk", "8")
-    calls = []
-
-    def never_hits(arm, layouts, *a, **k):
-        calls.append(len(layouts))
-        return [dict(outcome="timeout", path=[[0.0, 0.0]]) for _ in range(len(layouts))]
-
-    monkeypatch.setattr(train_adapter, "run_trials", never_hits)
-    with pytest.raises(RuntimeError, match="hits"):
-        train_adapter.teacher_demos(args, args.obstacle, policy, device, np.random.default_rng(0), 4, args.p_free)
-    assert sum(calls) == 88                                      # 20 * 4 + 8 layouts drawn, then the cap
-
-
-def test_train_a_task_module_on_teacher_demonstrations(ckpt_dir):
-    _tiny_teacher(ckpt_dir)
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "s",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON,
-                                                  "--teacher", "t", "--teacher-chunk", "8", "--n-demos", "4", "--val-demos", "2"]))
-    ckpt = torch.load(ckpt_dir / "s" / "adapter.pt")
-    assert ckpt["meta"]["teacher"] == "t" and ckpt["meta"]["teacher_demos"]["train"]["kept"] == 4 and ckpt["meta"]["teacher_demos"]["val"]["kept"] == 2
-    assert {"val_fm", "collide_composed"} <= set(json.loads((ckpt_dir / "s" / "train_log.json").read_text())["log"][-1])
-    base = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.03, along: 0.5}", "--name", "x", "--user-module", "u", "--corruption", "{rotation_deg: 60}"]
-    for bad in ([*base, "--teacher", "t", "--demo-seconds", "10"],                                  # a time budget is the scripted expert's
-                ["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "x", "--teacher", "t"],   # user modules calibrate on the open field
-                ["--kind", "task", "--pooled", "p.yaml", "--name", "x", "--teacher", "t"]):           # no pooled teacher run
-        with pytest.raises(SystemExit):
-            train_adapter.parse_args(bad)
-
-
-def test_an_image_module_is_refused_as_a_teacher(ckpt_dir):
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "t_cnn",
-                                                  "--user-module", "u", "--corruption", "{rotation_deg: 60}", "--token-source", "cnn", "--render-size", "64", *COMMON]))
-    with pytest.raises(ValueError, match="discs"):
-        train_adapter.train(train_adapter.parse_args(["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--name", "s",
-                                                      "--user-module", "u", "--corruption", "{rotation_deg: 60}", *COMMON, "--teacher", "t_cnn", "--n-demos", "2", "--val-demos", "2"]))
-
-
-VIEW_TASK = ["--kind", "task", "--obstacle", "{kind: disc, radius: 0.08, along: 0.5}", "--user-module", "u", "--corruption", "{rotation_deg: 60}"]
-VIEW_FLAGS = ["--token-source", "vlm_views", "--render-size", "56", "--scene-rank", "2", "--view-affine", "0.5", "--token-drop", "0.3",
-              "--frozen-noise", "--render-workers", "0"]
-
-
 def test_move_pictures_moves_a_share_and_fills_with_the_background():
     images = np.full((200, 3, 32, 32), 255, np.uint8)
-    images[:, :, 12:20, 12:20] = 0                                         # a dark square on the picture's centre
+    images[:, :, 12:20, 12:20] = 0  # a dark square on the picture's centre
     out, moved = train_adapter.move_pictures(images, np.random.default_rng(0), 0.5)
     assert out.shape == images.shape and out.dtype == np.uint8 and 60 < moved.sum() < 140
     assert np.array_equal(out[~moved], images[~moved]) and not np.array_equal(out[moved], images[moved])
-    assert (out[:, :, 0, 0] == 255).all() and (out[:, :, -1, -1] == 255).all()   # the uncovered border is background
+    assert (out[:, :, 0, 0] == 255).all() and (out[:, :, -1, -1] == 255).all()  # the uncovered border is background
     ys, xs = np.mgrid[:32, :32]
     for img in out[moved][:20]:
         w = 255.0 - img[0]
-        assert abs((w * ys).sum() / w.sum() - 15.5) <= 2.2 and abs((w * xs).sum() / w.sum() - 15.5) <= 2.2   # 5% of 32 px, and some blur
+        assert abs((w * ys).sum() / w.sum() - 15.5) <= 2.2 and abs((w * xs).sum() / w.sum() - 15.5) <= 2.2  # 5% of 32 px, and some blur
     again, moved2 = train_adapter.move_pictures(images, np.random.default_rng(0), 0.5)
     assert np.array_equal(again, out) and np.array_equal(moved2, moved)
     assert not train_adapter.move_pictures(images, np.random.default_rng(0), 0.0)[1].any()
 
 
-def test_train_a_two_view_task_module_on_the_scripted_draws(ckpt_dir, monkeypatch):
-    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
-    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
-    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    splits = _record_splits(monkeypatch)
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_views", *VIEW_FLAGS, *COMMON]))
-    (views,) = splits
-    ckpt = torch.load(ckpt_dir / "t_views" / "adapter.pt")
-    cfg, meta = ckpt["config"], ckpt["meta"]
-    assert (cfg["token_source"], cfg["wrist_span"], cfg["scene_rank"], cfg["scene_tokens"]) == ("vlm_views", 0.5, 2, 512)
-    assert ckpt["state_dict"]["scene_basis"].abs().sum() > 0               # the fitted reduction, not the zeros it starts as
-    assert (meta["view_stride"], meta["token_drop"], meta["view_affine"], meta["wrist_span"], meta["scene_rank"]) == (2, 0.3, 0.5, 0.5, 2)
-    lengths = views["train"].sampler.lengths.cpu().numpy()
-    info = meta["views"]
-    assert info["train"]["frames"] == int(np.ceil(lengths / 2).sum()) and 0 < info["train"]["moved"] < 2 * info["train"]["frames"]
-    assert info["val"]["moved"] == 0 and 0 < info["train"]["kept"] <= 1 and info["val"]["kept"] is None
-    assert views["train"].sampler.sample(4)[0]["scene"]["vlm_views"].shape == (4, 512, 2)
-    log = json.loads((ckpt_dir / "t_views" / "train_log.json").read_text())["log"]
-    assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(log[-1])
-    assert ReversalAdapter.load(ckpt_dir / "t_views" / "adapter.pt").task.wrist_span == 0.5
-    splits.clear()                                                         # the same seed with another source: the same demonstrations
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_cnn", "--token-source", "cnn", "--render-size", "64", "--frozen-noise", *COMMON]))
-    (cnn,) = splits
-    for split in ("train", "val"):
-        for field in ("obstacles", "targets", "pos", "lengths"):
-            torch.testing.assert_close(getattr(views[split].sampler, field), getattr(cnn[split].sampler, field))
-    torch.testing.assert_close(views["train"].noise, cnn["train"].noise)
-
-
-def test_token_masking_reaches_the_flow_matching_loss_only(ckpt_dir, monkeypatch):
-    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
-    monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
-    monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    seen, real_fm, real_field = {"fm": [], "field": []}, train_adapter.task_loss, train_adapter.field_loss
-
-    def fm(policy, task, obs, *a):
-        seen["fm"].append(obs.get("scene_keep"))
-        return real_fm(policy, task, obs, *a)
-
-    def field(policy, user, task, free, *a):
-        seen["field"].append("scene_keep" in free)
-        return real_field(policy, user, task, free, *a)
-
-    monkeypatch.setattr(train_adapter, "task_loss", fm)
-    monkeypatch.setattr(train_adapter, "field_loss", field)
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_mask", *VIEW_FLAGS, *COMMON]))
-    keeps = [k for k in seen["fm"] if k is not None]
-    assert len(keeps) == 4 and all(k.shape == (32, 512) and k.dtype == torch.bool for k in keeps)   # COMMON: 4 steps of batch 32
-    assert 0.6 < torch.stack(keeps).float().mean() < 0.8
-    assert any(k is None for k in seen["fm"])                              # validation sees every token
-    assert seen["field"] and not any(seen["field"])
-
-
-def test_full_width_views_and_the_flags_refusals(ckpt_dir, monkeypatch):
-    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_full", "--token-source", "vlm_views", "--render-size", "56", "--scene-rank", "0",
-                                                  "--view-stride", "8", "--render-workers", "0", *COMMON, "--n-demos", "6", "--val-demos", "4"]))
-    ckpt = torch.load(ckpt_dir / "t_full" / "adapter.pt")
-    assert "scene_rank" not in ckpt["config"] and "scene_basis" not in ckpt["state_dict"] and ckpt["meta"]["views"]["train"]["kept"] is None
-    assert ckpt["state_dict"]["scene_in.weight"].shape[1] == 2048 and ckpt["meta"]["views"]["train"]["moved"] == 0
-    v = ["--token-source", "vlm_views"]
-    for bad in ([*VIEW_TASK, "--name", "x", *v, "--token-geometry", "relative"], [*VIEW_TASK, "--name", "x", *v, "--teacher", "t"],
-                ["--kind", "task", "--pooled", "missing.yaml", "--name", "x", *v], [*VIEW_TASK, "--name", "x", "--token-drop", "0.3"],
-                [*VIEW_TASK, "--name", "x", "--token-source", "cnn", "--view-affine", "0.5"], [*VIEW_TASK, "--name", "x", *v, "--wrist-span", "0"],
-                [*VIEW_TASK, "--name", "x", *v, "--view-stride", "0"], [*VIEW_TASK, "--name", "x", *v, "--scene-rank", "2048"],
-                [*VIEW_TASK, "--name", "x", *v, "--token-drop", "1.0"], [*VIEW_TASK, "--name", "x", *v, "--view-affine", "1.5"]):
-        with pytest.raises(SystemExit):
-            train_adapter.parse_args(bad)
-
-
 def test_the_frame_table_is_the_same_rendered_in_a_process_pool(monkeypatch):
     """--render-workers 2 renders the chunks in spawned processes: the same frame table as rendering in-process, the
-    pictures' moves and the reduction's sample drawn in the trainer either way."""
+    pictures' moves and the reduction's sample drawn in the trainer either way; --scene-rank 0 keeps the full width."""
     monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 8)
     monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 16)
-    args = train_adapter.parse_args([*VIEW_TASK, "--name", "x", *VIEW_FLAGS, "--view-stride", "4"])
+    args = _args(*TASK, "--obstacle", IMAGE, "--name", "x", *VIEWS, "--view-stride", "4")
     rng = np.random.default_rng(0)
     layouts, task = train_adapter.layouts_for(args, args.obstacle, rng, 6, args.p_free)
     actions, lengths = make_demos(rng, layouts, task, allow_failed=True)
@@ -672,56 +128,293 @@ def test_the_frame_table_is_the_same_rendered_in_a_process_pool(monkeypatch):
         args.render_workers = workers
         cpu_state, cuda_state = torch.get_rng_state(), torch.cuda.get_rng_state_all() if cuda else []
         tables[workers] = train_adapter.view_frames(args, layouts, actions, lengths, ViewStub(), "cpu", affine_rng=np.random.default_rng(1))
-        assert torch.equal(torch.get_rng_state(), cpu_state)                # the encoder's draws left torch's streams alone
+        assert torch.equal(torch.get_rng_state(), cpu_state)  # the encoder's draws left torch's streams alone
         assert all(torch.equal(a, b) for a, b in zip(torch.cuda.get_rng_state_all() if cuda else [], cuda_state, strict=True))
     (pooled, start, info), (inline, start0, info0) = tables[2], tables[0]
-    assert info["frames"] == len(inline) > 2 * 8 and info["moved"] == info0["moved"] > 0   # several chunks through the pool
+    assert info["frames"] == len(inline) > 2 * 8 and info["moved"] == info0["moved"] > 0  # several chunks through the pool
     assert torch.equal(pooled, inline) and np.array_equal(start, start0) and pooled.shape[1:] == (512, 2)
+    args.scene_rank = 0
+    full, _, info = train_adapter.view_frames(args, layouts, actions, lengths, ViewStub(), "cpu")
+    assert full.shape == (info["frames"], 512, 2048) and info["kept"] is None and info["reduction"] is None and info["moved"] == 0
 
 
-def _views_ready(monkeypatch):
-    monkeypatch.setattr(train_adapter, "SceneEncoder", ViewStub)
+def test_a_user_module_trains_and_recalibrates_closed_loop(trained):
+    ckpt = torch.load(trained / "u" / "adapter.pt")
+    assert ckpt["kind"] == "user" and ckpt["meta"]["obstacle"] is None and ckpt["meta"]["args"]["corruption"] == {"rotation_deg": 60}
+    assert [ckpt["meta"][k] for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")] == [None] * 4  # the task module's flags
+    assert ReversalAdapter.load(trained / "u" / "adapter.pt").kind == "user"
+    log = _log(trained, "u")
+    assert len(log) == 2 and {"heading_cos_none", "heading_cos_user"} <= set(log[-1])
+    # recalibrated closed loop: the initial module runs the open-field trials, their states join the batches
+    args = torch.load(trained / "u_cl" / "adapter.pt")["meta"]["args"]
+    assert args["closed_loop"] == ["u"] and args["closed_loop_mix"] == 0.5
+    assert {"heading_cos_user", "closed_heading_cos_none", "closed_heading_cos_user"} <= set(_log(trained, "u_cl")[-1])
+
+
+def test_a_disc_task_module_trains_with_the_user_module_in_the_loop(trained):
+    final = torch.load(trained / "t" / "adapter.pt")
+    meta = final["meta"]
+    assert final["kind"] == "task" and meta["obstacle"]["kind"] == "disc" and meta["args"]["user_module"] == "u"
+    assert meta["token_geometry"] == "absolute" and "token_geometry" not in final["config"]
+    assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"], meta["rigid_kept"]) == (0.0, 4, 0, None)  # off, and said so
+    assert isinstance(ReversalAdapter.load(trained / "t" / "adapter.pt").task, TaskModule)
+    log = _log(trained, "t")
+    assert {"val_fm", "chunk_collision_hidden", "chunk_collision_policy_given", "collide_user", "collide_composed"} <= set(log[-1])
+    assert all(np.isfinite(row[k]) and row[k] >= 0 for row in log for k in ("train_fm", "train_field")), log  # the loss parts
+    for n in (2, 4):  # --save-every 2: the module at each of those steps, as a sibling
+        step = torch.load(trained / f"t_step{n}" / "adapter.pt")
+        assert step["meta"]["step"] == n and step["config"] == final["config"] and "step" not in meta
+        assert {k: v for k, v in step["meta"].items() if k != "step"} == meta
+        assert ReversalAdapter.load(trained / f"t_step{n}" / "adapter.pt").task is not None
+        same = all(torch.equal(step["state_dict"][k], v) for k, v in final["state_dict"].items())
+        assert same == (n == 4)  # the module as it was at that step
+
+
+def test_an_image_module_trains_on_jittered_and_moved_copies(trained, monkeypatch, capsys):
+    """The image path (cnn, relative geometry) with --jitter and --rigid-motions: copies of the train split's
+    demonstrations moved rigidly (their pushes moved with them, not recomputed), the jitter on its sampler only."""
+    (splits, _), (made, _) = _recording(monkeypatch, "expert_splits"), _recording(monkeypatch, "augment_demos")
+    pushed, real_pushes = _recording(monkeypatch, "expert_pushes")
+    capsys.readouterr()
+    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_aug", *CNN, "--token-geometry", "relative", "--jitter", "0.02",
+                              "--jitter-steps", "3", "--rigid-motions", "2", *COMMON))
+    out = capsys.readouterr().out.splitlines()
+    ckpt = torch.load(trained / "t_aug" / "adapter.pt")
+    cfg, meta = ckpt["config"], ckpt["meta"]
+    assert (cfg["token_source"], cfg["image_size"], cfg["token_geometry"]) == ("cnn", 64, "relative") and "scene_pos" not in ckpt["state_dict"]
+    assert (meta["token_source"], meta["token_geometry"], meta["teacher"], meta["teacher_demos"], meta["scene_center"]) == ("cnn", "relative", None, None, None)
+    assert ReversalAdapter.load(trained / "t_aug" / "adapter.pt").task.token_geometry == "relative"
+    assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(_log(trained, "t_aug")[-1])
+    assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"]) == (0.02, 3, 2) and type(meta["rigid_kept"]) is int
+    (layouts, actions, lengths, kept, _), = made  # the val split never augments
+    assert 0 < kept.sum() == meta["rigid_kept"] <= 2 * 60 and [len(p) for p in pushed] == [60, 40]  # train's originals, then val: no copy's
+    train, val = splits[-1]["train"], splits[-1]["val"]
+    assert train.sampler.jitter == 0.02 and train.sampler.jitter_steps == 3 and val.sampler.jitter == 0.0
+    assert len(train.sampler.lengths) == len(train.sampler.scene["cnn"]) == 60 + kept.sum() and len(val.sampler.lengths) == 40  # every copy rendered
+    push = train.push.numpy()
+    origin, dots = np.repeat(np.arange(60), kept), (push * actions).sum(-1)
+    assert (np.abs(dots[60:]).sum(1) > 0).all() and np.allclose(dots[60:], dots[origin], atol=1e-6)  # a rigid motion keeps push . action
+    fresh = real_pushes(layouts, demo_positions(layouts, actions))
+    assert np.allclose(push[:60], fresh[:60], atol=1e-6) and not np.allclose(push[60:], fresh[60:], atol=1e-3)  # a copy's are its original's moved
+    assert f"train: 60 demonstrations and {kept.sum()} moved copies ({kept.min()}-{kept.max()} per demonstration)" in out
+    seconds = f"train: 60 demonstrations ({lengths[:60].sum() * TaskConfig().dt:.0f} s of demonstrating)"
+    assert any(line.startswith(seconds) for line in out), out  # the originals' seconds, not the copies'
+
+
+def test_a_pooled_module_alternates_the_contexts_on_their_own_demonstrations(trained, tmp_path, monkeypatch):
+    """--pooled: each entry draws its layouts, demos, frozen noise and rigid copies as a single-context run of it at the
+    same seed would, and the batches alternate the entries, each with its own user module in the field loss."""
+    entries = (("u", "{rotation_deg: 60}", IMAGE), ("u_cl", "{scale: [1.0, 0.25]}", "{kind: ring, around: start, gap_angle: [15, 30]}"))
+    (tmp_path / "pooled.yaml").write_text("entries:\n" + "".join(f"  - {{obstacle: {o}, user_module: {u}, corruption: {c}}}\n" for u, c, o in entries))
+    splits, real_splits = _recording(monkeypatch, "expert_splits")
+    users, load = {}, train_adapter.ReversalAdapter.load  # id of a loaded user module -> its name
+
+    def recording_load(path, *a, **k):
+        adapter = load(path, *a, **k)
+        users[id(adapter.user)] = path.parent.name
+        return adapter
+
+    drawn, used = [], []  # per training step: the entry whose train data was drawn, the user module the field loss used
+    real_sample, real_field = train_adapter.ExpertData.sample, train_adapter.field_loss
+
+    def sample(self, *a, **k):
+        drawn.extend(j for j, s in enumerate(splits) if s["train"] is self)  # not the validation draws
+        return real_sample(self, *a, **k)
+
+    monkeypatch.setattr(train_adapter.ReversalAdapter, "load", staticmethod(recording_load))
+    monkeypatch.setattr(train_adapter.ExpertData, "sample", sample)
+    monkeypatch.setattr(train_adapter, "field_loss", lambda policy, user, *a, **k: used.append(users[id(user)]) or real_field(policy, user, *a, **k))
+    flags = [*CNN, "--frozen-noise", "--lambda-field", "0.1", "--rigid-motions", "1", *COMMON]
+    train_adapter.train(_args("--kind", "task", "--pooled", str(tmp_path / "pooled.yaml"), "--name", "t_all", *flags, "--steps", "6"))
+    meta = torch.load(trained / "t_all" / "adapter.pt")["meta"]
+    assert meta["obstacle"] is None and [e["user_module"] for e in meta["pooled"]] == ["u", "u_cl"]
+    assert {"val_fm", "val_fm_0", "val_fm_1", "chunk_collision_hidden_1"} <= set(_log(trained, "t_all")[-1])
+    assert drawn == [step % 2 for step in range(1, 7)]  # step % len(entries), the steps counting from 1
+    assert used == [entries[j][0] for j in drawn] == ["u_cl", "u"] * 3
+    assert all(len(s["train"].sampler.lengths) > 60 for s in splits)
+    assert meta["rigid_kept"] == sum(len(s["train"].sampler.lengths) - 60 for s in splits)  # every entry's copies counted
+    policy = _base_policy()
+    for j, (name, corr, obstacle) in enumerate(entries):
+        args = _args("--kind", "task", "--obstacle", obstacle, "--user-module", name, "--corruption", corr, "--name", "x", *flags)
+        torch.manual_seed(args.seed)
+        single = real_splits(args, obstacle_spec(args.obstacle), policy, "cpu", np.random.default_rng(args.seed), *corruption_spec(args.corruption),
+                             args.p_free)
+        for split in ("train", "val"):
+            a, b = splits[j][split].sampler, single[split].sampler
+            for field in ("obstacles", "obstacle_mask", "targets", "pos", "lengths"):
+                torch.testing.assert_close(getattr(a, field), getattr(b, field), msg=f"entry {j} {split} {field}")
+            torch.testing.assert_close(a.scene["cnn"], b.scene["cnn"])
+        torch.testing.assert_close(splits[j]["train"].noise, single["train"].noise, msg=f"entry {j} frozen noise")
+        torch.testing.assert_close(splits[j]["train"].push, single["train"].push)
+    assert not torch.equal(splits[0]["train"].sampler.obstacles, splits[1]["train"].sampler.obstacles)
+
+
+def test_the_teacher_loop_is_guarded(trained, monkeypatch):
+    policy = _base_policy()
+
+    def demos(*argv):
+        args = _args(*TASK, "--name", "s", "--teacher-chunk", "8", *argv)
+        return train_adapter.teacher_demos(args, args.obstacle, policy, "cpu", np.random.default_rng(0), 4, args.p_free)
+
+    with pytest.raises(ValueError, match="obstacle"):  # the teacher was trained on a disc
+        demos("--obstacle", RING, "--teacher", "t")
+    meta = dict(obstacle={"kind": "disc", "radius": 0.03, "along": 0.5})
+    save_adapter_module(LearnedTaskModule(horizon=16, token_source="cnn", image_size=64), trained / "t_cnn" / "adapter.pt", "task", meta=meta)
+    with pytest.raises(ValueError, match="discs"):  # an image module is not a teacher
+        demos("--obstacle", DISC, "--teacher", "t_cnn")
+    calls = []
+    monkeypatch.setattr(train_adapter, "run_trials", lambda arm, layouts, *a, **k: calls.append(len(layouts)) or [dict(outcome="timeout", path=[[0.0, 0.0]])] * len(layouts))
+    with pytest.raises(RuntimeError, match="hits"):
+        demos("--obstacle", DISC, "--teacher", "t")
+    assert sum(calls) == 88  # 20 * 4 + 8 layouts drawn, then the cap
+
+
+def test_a_task_module_trains_on_the_teachers_hits(trained, monkeypatch):
+    """--teacher: the teacher's hit rollouts as demonstrations, resampled to the policy's step rate (`planned_steps`:
+    every second position of a half-speed path, an odd final control step dropped)."""
+    path = np.cumsum(np.repeat([[0.01, 0.0]], 6, axis=0), axis=0)  # 6 positions: 5 control steps
+    assert np.allclose(train_adapter.planned_steps(path), [[0.02, 0.0], [0.02, 0.0]])  # control steps 0-1 and 2-3
+    assert train_adapter.planned_steps(np.vstack([path, path[-1:] + [0.01, 0.0]])).shape == (3, 2)
+    made, _ = _recording(monkeypatch, "teacher_demos")
+    train_adapter.train(_args(*TASK, "--obstacle", DISC, "--name", "s", "--teacher", "t", "--teacher-chunk", "8", *COMMON, "--n-demos", "4",
+                              "--val-demos", "2"))
+    meta = torch.load(trained / "s" / "adapter.pt")["meta"]
+    assert meta["teacher"] == "t" and meta["teacher_demos"]["train"]["kept"] == 4 and meta["teacher_demos"]["val"]["kept"] == 2
+    assert {"val_fm", "collide_composed"} <= set(_log(trained, "s")[-1])
+    (layouts, task, actions, lengths, info), _ = made
+    assert len(layouts) == 4 and info["drawn"] % 8 == 0 and sum(info["outcomes"].values()) == info["drawn"]
+    for i, r in enumerate(info["records"]):
+        path = np.asarray(r["path"])
+        assert r["outcome"] == "hit" and lengths[i] == (len(path) - 1) // 2
+        assert np.allclose(actions[i, :lengths[i]], train_adapter.planned_steps(path))
+        assert np.allclose(np.abs(np.diff(path[::2], axis=0)).sum(), np.abs(np.diff(path, axis=0)).sum(), atol=2e-3)  # same travel
+    assert np.all(actions[np.arange(actions.shape[1])[None] >= lengths[:, None]] == 0)
+    assert replay(actions, layouts, replace(task, cursor_noise=0.0)).success.all()  # a valid demonstration at the policy's rate
+
+
+def test_a_two_view_module_trains_on_the_scripted_draws(trained, monkeypatch):
+    class Encoder(ViewStub):
+        closed = 0
+
+        def close(self):
+            Encoder.closed += 1
+
+    monkeypatch.setattr(train_adapter, "SceneEncoder", Encoder)
     monkeypatch.setattr(train_adapter, "VIEW_CHUNK", 32)
     monkeypatch.setattr(train_adapter, "REDUCTION_SAMPLE", 64)
-    train_adapter.train(train_adapter.parse_args(["--kind", "user", "--corruption", "{rotation_deg: 60}", "--name", "u", *COMMON]))
+    ViewStub.made = 0
+    splits, real_splits = _recording(monkeypatch, "expert_splits")
+    seen, real_fm, real_field = {"fm": [], "field": []}, train_adapter.task_loss, train_adapter.field_loss
+    monkeypatch.setattr(train_adapter, "task_loss", lambda policy, task, obs, *a: seen["fm"].append(obs.get("scene_keep")) or real_fm(policy, task, obs, *a))
+    monkeypatch.setattr(train_adapter, "field_loss", lambda p, u, t, free, *a: seen["field"].append("scene_keep" in free) or real_field(p, u, t, free, *a))
+    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_views", *VIEWS, "--scene-center", "no", *COMMON))
+    assert ViewStub.made == 1 and Encoder.closed == 1  # one encoder for both splits, closed after
+    ckpt = torch.load(trained / "t_views" / "adapter.pt")
+    cfg, meta, state = ckpt["config"], ckpt["meta"], ckpt["state_dict"]
+    assert (cfg["token_source"], cfg["wrist_span"], cfg["scene_rank"], cfg["scene_tokens"]) == ("vlm_views", 0.5, 2, 512)
+    assert state["scene_basis"].abs().sum() > 0 and not state["scene_mean"].any()  # the fitted uncentred reduction
+    assert (meta["view_stride"], meta["token_drop"], meta["view_affine"], meta["wrist_span"], meta["scene_rank"], meta["scene_center"]) == (2, 0.3, 0.5, 0.5, 2, "no")
+    (views,) = splits
+    info, lengths = meta["views"], views["train"].sampler.lengths.cpu().numpy()
+    assert info["train"]["frames"] == int(np.ceil(lengths / 2).sum()) and 0 < info["train"]["moved"] < 2 * info["train"]["frames"]
+    assert info["val"]["moved"] == 0 and 0 < info["train"]["kept"] <= 1 and info["val"]["kept"] is None
+    assert views["train"].sampler.sample(4)[0]["scene"]["vlm_views"].shape == (4, 512, 2)
+    assert {"val_fm", "chunk_collision_hidden", "collide_composed", "train_fm", "train_field"} <= set(_log(trained, "t_views")[-1])
+    assert ReversalAdapter.load(trained / "t_views" / "adapter.pt").task.wrist_span == 0.5
+    keeps = [k for k in seen["fm"] if k is not None]  # --token-drop hides tokens from the flow matching loss only
+    assert len(keeps) == 4 and all(k.shape == (32, 512) and k.dtype == torch.bool for k in keeps)  # COMMON: 4 steps of batch 32
+    assert 0.6 < torch.stack(keeps).float().mean() < 0.8 and any(k is None for k in seen["fm"])  # validation sees every token
+    assert seen["field"] and not any(seen["field"])
+    # the same seed with another source draws the same demonstrations
+    args = _args(*TASK, "--obstacle", IMAGE, "--name", "x", *CNN, "--frozen-noise", *COMMON)
+    policy = _base_policy()  # loaded first: building it draws from torch's generator
+    torch.manual_seed(args.seed)
+    cnn = real_splits(args, obstacle_spec(args.obstacle), policy, "cpu", np.random.default_rng(args.seed), *corruption_spec(args.corruption),
+                      args.p_free)
+    for split in ("train", "val"):
+        for field in ("obstacles", "targets", "pos", "lengths"):
+            torch.testing.assert_close(getattr(views[split].sampler, field), getattr(cnn[split].sampler, field))
+    torch.testing.assert_close(views["train"].noise, cnn["train"].noise)
 
 
-def test_an_uncentred_reduction_is_carried_with_a_zero_mean_and_its_refusals(ckpt_dir, monkeypatch):
-    _views_ready(monkeypatch)
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_unc", *VIEW_FLAGS, "--scene-center", "no", *COMMON]))
-    ckpt = torch.load(ckpt_dir / "t_unc" / "adapter.pt")
-    assert not ckpt["state_dict"]["scene_mean"].any() and ckpt["state_dict"]["scene_basis"].abs().sum() > 0
-    assert ckpt["meta"]["scene_center"] == "no"
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_cnn", "--token-source", "cnn", "--render-size", "64", *COMMON]))
-    assert torch.load(ckpt_dir / "t_cnn" / "adapter.pt")["meta"]["scene_center"] is None
-    for bad in ([*VIEW_TASK, "--name", "x", *VIEW_FLAGS, "--scene-center", "no", "--scene-rank", "0"],
-                [*VIEW_TASK, "--name", "x", "--token-source", "cnn", "--scene-center", "no"]):
+def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, monkeypatch):
+    """train_policy.py --init fine-tunes a trained policy for an obstacle task (its architecture and units, an obstacle
+    head added); --demo_seconds draws the demonstrations as the adapter trainer does (a task module given the same
+    budget and seed gets the same ones); --eval_steps scores the EMA weights alone with the goal given and saves the
+    best, without changing the training itself; a user module calibrates on the result with --model."""
+    from train import train_policy
+    monkeypatch.setattr(train_policy, "policy_dir", lambda name: trained / name)
+    monkeypatch.setattr(train_policy, "policy_path", lambda name: trained / name / "policy.pt")
+    tiny = ["--val_demos", "10", "--steps", "4", "--batch", "16", "--log_every", "2", "--warmup", "2",
+            "--goal_dropout", "0.25", "--targets", "4", "4", "--reach", "0.35", "0.5"]
+    train_policy.main(["--name", "base", "--n_demos", "30", "--d_model", "32", "--layers", "1", "--heads", "2", *tiny])
+    ft = ["--init", "base", "--obstacle", RING, "--demo_seconds", "12", *tiny]
+    train_policy.main(["--name", "scored", *ft, "--eval_steps", "2", "--eval_trials", "4"])
+    train_policy.main(["--name", "plain", *ft])
+    base, scored = (torch.load(trained / n / "policy.pt") for n in ("base", "scored"))
+    assert scored["config"] == {**base["config"], "obstacle_tokens": True} and hasattr(FlowPolicy.load(trained / "scored" / "policy.pt"), "obstacle_in")
+    assert scored["args"]["init"] == "base" and scored["args"]["obstacle"]["kind"] == "ring" and scored["args"]["p_free"] == 0.25
+    torch.testing.assert_close(scored["state_dict"]["action_scale"], base["state_dict"]["action_scale"])  # the base's units
+    log, plain = (json.loads((trained / n / "train_log.json").read_text()) for n in ("scored", "plain"))
+    assert log["action_scale"] == pytest.approx(base["state_dict"]["action_scale"].item())
+    assert [e["step"] for e in log["eval"]] == [2, 4]  # the step asked for and the last
+    assert log["best_step"] == max(log["eval"], key=lambda e: (e["success"], e["step"]))["step"]
+    for key in ("train", "val"):  # scoring left the training's random state alone
+        assert [e[key] for e in log["log"]] == pytest.approx([e[key] for e in plain["log"]], rel=1e-4)
+    assert "eval" not in plain
+    args = _args(*TASK, "--obstacle", RING, "--name", "t", "--demo-seconds", "12", "--val-demos", "10")
+    data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
+                                       *corruption_spec(args.corruption), args.p_free)
+    assert 0 < log["args"]["n_demos"] == args.n_demos == len(data["train"].sampler.lengths)
+    monkeypatch.setattr(train_adapter, "policy_path", lambda name: trained / name / "policy.pt")
+    train_adapter.train(_args("--kind", "user", *ROT, "--model", "scored", "--name", "u_scored", *COMMON))
+    assert torch.load(trained / "u_scored" / "adapter.pt")["meta"]["args"]["model"] == "scored"
+
+
+CURLED = "{curl: 2.0, tau: 0.1}"
+POOLED = ["--kind", "task", "--pooled", "POOLED", "--name", "x"]
+VIEWS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x", "--token-source", "vlm_views"]
+DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
+
+
+@pytest.mark.parametrize("argv, refused", [
+    (["--kind", "task", "--obstacle", IMAGE, *ROT, "--name", "x"], True),            # a task module needs its user module
+    (["--kind", "user", "--obstacle", IMAGE, *ROT, "--name", "x"], True),           # a user module calibrates on the open field
+    (["--kind", "user", *ROT, "--name", "x", "--frozen-noise", "--closed-loop", "u"], True),
+    (["--kind", "user", *ROT, "--name", "x", "--cross-step-dims", "0"], True),     # needs --cross-step-rank
+    (["--kind", "user", *ROT, "--name", "x", "--cross-step-rank", "2", "--cross-step-dims", "1"], False),
+    ([*DISCS_TASK, "--token-geometry", "relative"], True),                         # discs have no screen tokens
+    ([*POOLED, "--obstacle", IMAGE], True),                                        # --pooled carries its own obstacles
+    ([*DISCS_TASK, "--save-every", "3"], True),                                    # not a multiple of COMMON's --log-every 2
+    ([*DISCS_TASK, "--teacher", "t", "--teacher-chunk", "0"], True),
+    ([*DISCS_TASK, "--teacher", "t", "--demo-seconds", "10"], True),               # a time budget is the scripted expert's
+    (["--kind", "user", *ROT, "--name", "x", "--teacher", "t"], True),
+    ([*POOLED, "--teacher", "t"], True),                                           # no pooled teacher run
+    ([*VIEWS_TASK, "--jitter", "0.02"], True),                                     # the picture would show the cursor elsewhere
+    ([*VIEWS_TASK, "--rigid-motions", "2"], True),
+    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--rigid-motions", "2"], True),  # a curl does not mirror
+    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--jitter", "0.02"], False),
+    (["--kind", "task", "--pooled", "CURLED_POOL", "--name", "x", "--rigid-motions", "2"], True),
+    ([*POOLED, "--jitter", "0.02"], False),
+    ([*DISCS_TASK, "--teacher", "t", "--rigid-motions", "2"], True),               # a teacher's demonstrations are rollouts
+    ([*DISCS_TASK, "--teacher", "t", "--jitter", "0.02"], False),
+    ([*DISCS_TASK, "--jitter", "-0.1"], True), ([*DISCS_TASK, "--jitter-steps", "0"], True), ([*DISCS_TASK, "--rigid-motions", "-1"], True),
+    (["--kind", "user", *ROT, "--name", "x", "--jitter", "0.02"], True),            # the task module's
+    (["--kind", "user", *ROT, "--name", "x", "--rigid-motions", "2"], True),
+    ([*VIEWS_TASK, "--token-geometry", "relative"], True), ([*VIEWS_TASK, "--teacher", "t"], True),
+    ([*POOLED, "--token-source", "vlm_views"], True), ([*DISCS_TASK, "--token-drop", "0.3"], True),
+    ([*DISCS_TASK, *CNN, "--view-affine", "0.5"], True), ([*VIEWS_TASK, "--wrist-span", "0"], True),
+    ([*VIEWS_TASK, "--view-stride", "0"], True), ([*VIEWS_TASK, "--scene-rank", "2048"], True),
+    ([*VIEWS_TASK, "--token-drop", "1.0"], True), ([*VIEWS_TASK, "--view-affine", "1.5"], True),
+    ([*VIEWS_TASK, "--scene-center", "no", "--scene-rank", "0"], True), ([*DISCS_TASK, *CNN, "--scene-center", "no"], True),
+])
+def test_the_parser_refuses_what_makes_no_sense(argv, refused, tmp_path):
+    entries = {"POOLED": ROT[1], "CURLED_POOL": CURLED}
+    for name, corruption in entries.items():
+        (tmp_path / f"{name}.yaml").write_text(f"entries:\n  - {{obstacle: {IMAGE}, user_module: u, corruption: {corruption}}}\n")
+    argv = [str(tmp_path / f"{a}.yaml") if a in entries else a for a in argv]
+    if refused:
         with pytest.raises(SystemExit):
-            train_adapter.parse_args(bad)
-
-
-def test_the_task_log_has_the_loss_parts(ckpt_dir, monkeypatch):
-    _views_ready(monkeypatch)
-    for name, flags in (("t_views", VIEW_FLAGS), ("t_discs", [])):
-        train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", name, *flags, *COMMON]))
-        log = json.loads((ckpt_dir / name / "train_log.json").read_text())["log"]
-        assert all({"train_fm", "train_field"} <= set(row) for row in log)
-        assert all(np.isfinite(log[-1][k]) and log[-1][k] >= 0 for k in ("train_fm", "train_field")), log[-1]
-
-
-def test_step_checkpoints_are_saved_as_sibling_modules(ckpt_dir, monkeypatch):
-    _views_ready(monkeypatch)
-    train_adapter.train(train_adapter.parse_args([*VIEW_TASK, "--name", "t_steps", *VIEW_FLAGS, *COMMON, "--save-every", "2"]))
-    final = torch.load(ckpt_dir / "t_steps" / "adapter.pt")
-    for n in (2, 4):
-        path = ckpt_dir / f"t_steps_step{n}" / "adapter.pt"
-        assert ReversalAdapter.load(path).task is not None
-        ckpt = torch.load(path)
-        assert ckpt["meta"]["step"] == n and ckpt["config"] == final["config"] and "step" not in final["meta"]
-        assert {k: v for k, v in ckpt["meta"].items() if k != "step"} == final["meta"]
-    step4 = torch.load(ckpt_dir / "t_steps_step4" / "adapter.pt")["state_dict"]
-    assert all(torch.equal(step4[k], v) for k, v in final["state_dict"].items())
-    step2 = torch.load(ckpt_dir / "t_steps_step2" / "adapter.pt")["state_dict"]
-    assert not all(torch.equal(step2[k], v) for k, v in final["state_dict"].items())   # the module as it was at step 2
-    with pytest.raises(SystemExit):
-        train_adapter.parse_args([*VIEW_TASK, "--name", "x", *COMMON, "--save-every", "3"])
+            _args(*argv, *COMMON)
+    else:
+        _args(*argv, *COMMON)

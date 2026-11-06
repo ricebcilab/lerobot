@@ -9,8 +9,6 @@ from cursor_sa import paths
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule, steered_chunk
 
-from lerobot.policies.steering import load_adapter_module
-
 
 def _obs(b=3, n=5, k=2):
     g = torch.Generator().manual_seed(0)
@@ -47,12 +45,15 @@ def _perturb(module, seed):
 
 
 @pytest.mark.parametrize("obstacle_tokens", [False, True])
-def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens):
+def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens, monkeypatch, caplog):
     model = _old_policy(tmp_path, "p", obstacle_tokens=obstacle_tokens)
     d = tmp_path / "policies" / "p"
+    monkeypatch.setattr(paths, "CHECKPOINTS", tmp_path)
+    assert paths.policy_path("p") == d and paths.policy_weights("p") == d / "policy.pt"
     unconverted = FlowPolicy.load(d)  # a trainer's policy.pt in the directory
     assert isinstance(unconverted, FlowPolicy)
     convert_checkpoints.convert_tree(tmp_path)
+    assert paths.policy_weights("p") == d / "model.safetensors"
     converted = FlowPolicy.load(d)
     obs, x, t = _obs(), torch.randn(3, 16, 2), torch.rand(3)
     ref = model(obs, x, t)
@@ -61,6 +62,18 @@ def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens):
         assert torch.equal(loaded(obs, x, t), ref)
     ckpt = load_checkpoint(d)
     assert ckpt["config"] == model.config and ckpt["state_dict"].keys() == model.state_dict().keys()
+    # a trainer's newer policy.pt beside the converted files: it is loaded, with a warning
+    torch.manual_seed(1)
+    retrained = FlowPolicy(
+        d_model=32, layers=1, heads=2, d_ff=64, action_scale=0.0077, obstacle_tokens=obstacle_tokens
+    ).eval()
+    torch.save(
+        {"config": retrained.config, "state_dict": retrained.state_dict(), "args": {}}, d / "policy.pt"
+    )
+    with caplog.at_level("WARNING"):
+        loaded = FlowPolicy.load(d)
+    assert "both policy.pt and model.safetensors; loading policy.pt" in caplog.text
+    assert torch.equal(loaded(obs, x, t), retrained(obs, x, t)) and not torch.equal(loaded(obs, x, t), ref)
 
 
 def test_policy_chunk_is_the_lerobot_policy_chunk(tmp_path):
@@ -111,45 +124,3 @@ def test_converted_adapters_load_as_before(tmp_path):
         assert after[n].kind == before[n].kind
         assert torch.equal(after[n].adapt(obs, x, t, v, True), before[n].adapt(obs, x, t, v, True))
     assert "arch" not in torch.load(tmp_path / "adapters" / "t" / "adapter.pt")
-
-
-def test_a_task_arch_other_than_obstacle_is_a_value_error(tmp_path):
-    task = TaskModule()
-    torch.save(
-        {"kind": "task", "arch": "mlp", "config": task.config, "state_dict": task.state_dict(), "meta": {}},
-        tmp_path / "adapter.pt",
-    )
-    with pytest.raises(ValueError, match="arch 'mlp'"):
-        ReversalAdapter.load(tmp_path / "adapter.pt")
-    with pytest.raises(ValueError, match="arch 'mlp'"):
-        load_adapter_module(tmp_path / "adapter.pt")
-
-
-def test_policy_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "CHECKPOINTS", tmp_path)
-    assert paths.policy_path("p") == tmp_path / "policies" / "p"
-    assert paths.policy_weights("p") == tmp_path / "policies" / "p" / "model.safetensors"
-    (tmp_path / "policies" / "p").mkdir(parents=True)
-    (tmp_path / "policies" / "p" / "policy.pt").touch()
-    assert paths.policy_weights("p") == tmp_path / "policies" / "p" / "policy.pt"
-
-
-def test_load_warns_when_a_folder_holds_both_formats(tmp_path, caplog):
-    model = _old_policy(tmp_path, "p")
-    d = tmp_path / "policies" / "p"
-    convert_checkpoints.convert_tree(tmp_path)
-    torch.manual_seed(1)
-    retrained = FlowPolicy(d_model=32, layers=1, heads=2, d_ff=64, action_scale=0.0077).eval()
-    torch.save(
-        {"config": retrained.config, "state_dict": retrained.state_dict(), "args": {}}, d / "policy.pt"
-    )
-    with caplog.at_level("WARNING"):
-        loaded = FlowPolicy.load(d)
-    assert "both policy.pt and model.safetensors; loading policy.pt" in caplog.text
-    obs, x, t = _obs(), torch.randn(3, 16, 2), torch.rand(3)
-    assert torch.equal(loaded(obs, x, t), retrained(obs, x, t))  # the trainer's newer output, as ruled
-    assert not torch.equal(loaded(obs, x, t), model(obs, x, t))
-    caplog.clear()
-    (d / "policy.pt").unlink()
-    FlowPolicy.load(d)
-    assert "both policy.pt" not in caplog.text

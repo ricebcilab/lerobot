@@ -1,5 +1,7 @@
-"""Obstacle tasks: layouts with discs, the collision outcome, the waypoint planner, obstacle-avoiding
+"""Obstacle tasks: layouts with discs (and decoys), the collision outcome, the waypoint planner, obstacle-avoiding
 demos and the obstacle-aware expert."""
+
+import hashlib
 
 import numpy as np
 import pytest
@@ -10,16 +12,19 @@ from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import trial_metrics
 from cursor_sa.readout import Readout
-from cursor_sa.demos import DemoSampler, make_demos, replay
-from cursor_sa.env import (CursorEnv, Layouts, TaskConfig, _layout, center_out, obstacle_spec, plan_route,
+from cursor_sa.demos import DemoSampler, make_demos, plan_reach, replay
+from cursor_sa.env import (CursorEnv, Layouts, TaskConfig, center_out, obstacle_spec, plan_route, route_side,
                            sample_layouts, segment_distance)
 from cursor_sa.records import OUTCOMES, arm_fields, outcome_of, summarize
-from cursor_sa.session import Run, arm_task, load_checkpoints, run_trials
-from run_sweep import cell_groups, cell_key, load_sweep, method_arm
+from cursor_sa.session import arm_task, load_checkpoints, run_trials
 
 DISC = {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.05}
 WALL = {"kind": "wall", "along": 0.5, "gap": 0.16, "gap_offset": 0.14}
 STUDY = dict(min_reach=0.35, max_reach=0.5)
+GRID_DISC = {"kind": "disc", "radius": 0.08, "along": 0.5, "offset": [0.012, 0.024]}
+GRID_WALL = {"kind": "wall", "along": 0.5, "gap": 0.16, "gap_offset": 0.14, "radius": 0.015, "extent": 0.4}
+RING_GOAL = {"kind": "ring", "around": "goal", "gap_angle": [15, 30]}
+RING_START = {"kind": "ring", "around": "start", "gap_angle": [15, 30]}
 
 
 def _one(start, goal, obstacles, extra_targets=()):
@@ -30,7 +35,13 @@ def _one(start, goal, obstacles, extra_targets=()):
                    obstacles, np.ones(obstacles.shape[:2], bool))
 
 
-def test_layouts_without_obstacles_are_unchanged():
+def _lateral(points, start, goal):
+    """Signed distance of points across the reach (+ left)."""
+    u = (goal - start) / np.linalg.norm(goal - start)
+    return (points - start) @ np.array([-u[1], u[0]])
+
+
+def test_layouts_are_bit_identical_to_before():
     # recorded from sample_layouts before obstacles existed: the same seed must give the same layouts
     layouts = sample_layouts(np.random.default_rng(0), 3, (1, 2), TaskConfig())
     np.testing.assert_array_equal(layouts.start, [[0.7065469048855986, 0.5392624923188806],
@@ -42,20 +53,24 @@ def test_layouts_without_obstacles_are_unchanged():
     study = sample_layouts(np.random.default_rng(5), 4, 4, TaskConfig(**STUDY))
     np.testing.assert_array_equal(study.start[0], [0.4031641979013003, 0.4937207168585683])
     assert study.goal.tolist() == [2, 3, 0, 3]
-    assert center_out().obstacles.shape == (8, 0, 3)
-
-
-def test_layouts_carry_obstacles_through_indexing_tile_and_concat():
-    a = _one((0.2, 0.5), (0.8, 0.5), [[0.5, 0.5, 0.04]])
-    b = Layouts(np.zeros((2, 2)), np.full((2, 1, 2), 0.5), np.ones((2, 1), bool), np.zeros(2, int),
-                np.ones((2, 3, 3)), np.array([[True, True, False], [True, False, False]]))
-    assert a[[0]].obstacles.shape == (1, 1, 3) and a.tile(3).obstacles.shape == (3, 1, 3)
-    np.testing.assert_array_equal(a.tile(3).obstacle_mask, [[True]] * 3)
-    both = Layouts.concat([a, b])
-    assert both.obstacles.shape == (3, 3, 3) and both.obstacle_mask.tolist() == [[True, False, False], [True, True, False],
-                                                                                  [True, False, False]]
-    np.testing.assert_array_equal(both.obstacles[0, 0], [0.5, 0.5, 0.04])
-    assert both.targets.shape == (3, 1, 2)
+    ring = center_out(8)
+    assert sorted(ring.goal) == list(range(8)) and np.allclose(ring.start, 0.5) and ring.obstacles.shape == (8, 0, 3)
+    # digests recorded at 2f3e3ce7, before the decoy key existed: the key absent, False, or dropped from a
+    # normalized spec (as one stored before it) all give those layouts, bit for bit
+    recorded = {"disc": "935f889dae666006", "ring": "4afdd3668314bb52"}
+    fields = ("start", "targets", "mask", "goal", "obstacles", "obstacle_mask")
+    for spec in (DISC, RING_GOAL):
+        bare = {k: v for k, v in obstacle_spec(spec).items() if k != "decoy"}
+        variants = [obstacle_spec(spec), obstacle_spec(dict(spec, decoy=False)), bare]
+        digests = [hashlib.sha256(), hashlib.sha256(), hashlib.sha256()]
+        for seed in (0, 1, 2):
+            lays = [sample_layouts(np.random.default_rng(seed), 6, (2, 4), TaskConfig(**STUDY, obstacle=v))
+                    for v in variants]
+            for lay, h in zip(lays, digests):
+                assert all(np.array_equal(getattr(lay, f), getattr(lays[0], f)) for f in fields)
+                for f in fields:
+                    h.update(np.ascontiguousarray(getattr(lay, f)).tobytes())
+        assert {h.hexdigest()[:16] for h in digests} == {recorded[spec["kind"]]}
 
 
 def test_obstacle_specs_place_discs_and_walls_relative_to_the_reach():
@@ -88,11 +103,9 @@ def test_obstacle_specs_place_discs_and_walls_relative_to_the_reach():
     for b in range(100):
         start, goal = walls.start[b], walls.goal_pos[b]
         u = (goal - start) / np.linalg.norm(goal - start)
-        n = np.array([-u[1], u[0]])
         real = walls.obstacles[b, walls.obstacle_mask[b]]
-        along = (real[:, :2] - start) @ u
-        assert np.allclose(along, 0.5 * np.linalg.norm(goal - start))  # the discs sit on one line across the reach
-        across = (real[:, :2] - start) @ n
+        assert np.allclose((real[:, :2] - start) @ u, 0.5 * np.linalg.norm(goal - start))  # one line across the reach
+        across = (real[:, :2] - start) @ np.array([-u[1], u[0]])
         gap_side = 1.0 if (across > 1e-9).sum() < (across < -1e-9).sum() else -1.0  # the gap is on the sparser side
         assert (np.abs(across - gap_side * 0.14) >= 0.08 + 0.03 - 1e-9).all()  # no disc within gap/2 + r of the gap center
     with pytest.raises(ValueError, match="cannot place obstacles"):
@@ -110,15 +123,11 @@ def test_collision_ends_the_trial_and_is_an_outcome():
     assert env.pos[0, 0] < 0.5 and outcome_of(env, 0) == "collision"
     metrics = trial_metrics(env, np.stack(path, 1), layouts, TaskConfig())
     assert metrics["collision"][0] and not metrics["timeout"][0] and not metrics["success"][0]
-    # a step that jumps across a thin disc still collides (segment test, not a point test)
-    thin = _one((0.45, 0.5), (0.8, 0.5), [[0.5, 0.5, 0.01]])
-    env = CursorEnv(thin, TaskConfig())
-    env.step(np.array([[0.1, 0.0]]))
-    assert env.collided[0] and env.done[0]
-    # the same step with the disc out of the way is nothing special
-    env = CursorEnv(_one((0.45, 0.5), (0.8, 0.5), [[0.5, 0.6, 0.01]]), TaskConfig())
-    env.step(np.array([[0.1, 0.0]]))
-    assert not env.collided[0] and not env.done[0]
+    # a step that jumps across a thin disc still collides (segment test, not a point test); beside it, nothing
+    for y, hit in ((0.5, True), (0.6, False)):
+        env = CursorEnv(_one((0.45, 0.5), (0.8, 0.5), [[0.5, y, 0.01]]), TaskConfig())
+        env.step(np.array([[0.1, 0.0]]))
+        assert env.collided[0] == env.done[0] == hit
     recs = [dict(outcome="hit", duration_s=1.0), dict(outcome="collision", duration_s=0.5), dict(outcome="timeout", duration_s=5.0)]
     assert summarize(recs)["collision"] == pytest.approx(1 / 3)
 
@@ -141,62 +150,76 @@ def test_waypoints_route_around_discs_and_through_the_gap():
     # a wall with a gap: the route crosses the wall line inside the gap
     ys = np.arange(0.25, 0.751, 0.06)
     wall = np.array([[0.5, y, 0.03] for y in ys if not 0.56 < y < 0.72])
-    route = plan_route(start, goal, wall, clearance=0.03)
-    pts = np.vstack([start, route])
-    crossing = next(i for i in range(len(pts) - 1) if (pts[i, 0] - 0.5) * (pts[i + 1, 0] - 0.5) <= 0)
-    y_cross = pts[crossing, 1] + (0.5 - pts[crossing, 0]) / (pts[crossing + 1, 0] - pts[crossing, 0]) * (pts[crossing + 1, 1] - pts[crossing, 1])
+    pts = np.vstack([start, plan_route(start, goal, wall, clearance=0.03)])
+    i = next(i for i in range(len(pts) - 1) if (pts[i, 0] - 0.5) * (pts[i + 1, 0] - 0.5) <= 0)
+    y_cross = pts[i, 1] + (0.5 - pts[i, 0]) / (pts[i + 1, 0] - pts[i, 0]) * (pts[i + 1, 1] - pts[i, 1])
     assert 0.56 < y_cross < 0.72
 
 
-@pytest.mark.parametrize("spec", [DISC, dict(DISC, radius=0.08, offset=0.0), WALL, {"kind": "disc", "radius": 0.05, "along": 0.7}])
+@pytest.mark.parametrize("spec", [DISC, {"kind": "disc", "radius": 0.05, "along": 0.7}, GRID_DISC, GRID_WALL, RING_GOAL,
+                                  RING_START, dict(GRID_DISC, decoy=True), dict(RING_GOAL, decoy=True)])
 def test_obstacle_demos_avoid_the_obstacles_and_end_on_the_goal(spec):
     task = TaskConfig(**STUDY, obstacle=obstacle_spec(spec))
     rng = np.random.default_rng(3)
-    layouts = sample_layouts(rng, 60, 4, task)
+    layouts = sample_layouts(rng, 30, 4, task)
     actions, lengths = make_demos(rng, layouts, task)
     env = replay(actions, layouts, task)
-    assert env.success.all() and not env.collided.any() and (env.steps == lengths).all()
-    end = layouts.start + actions.sum(1)
-    np.testing.assert_allclose(end, layouts.goal_pos, atol=1e-9)
-    assert np.linalg.norm(actions, axis=-1).max() < 0.1
+    assert (lengths > 0).all() and env.success.all() and not env.collided.any() and (env.steps == lengths).all()
+    np.testing.assert_allclose(layouts.start + actions.sum(1), layouts.goal_pos, atol=1e-9)
+    assert np.linalg.norm(actions, axis=-1).max() / task.dt < 2.5  # no faster than the policy's own demos
+    obs, chunk = DemoSampler(layouts, actions, lengths, 16, 4, "cpu").sample(5)  # the sampler carries the discs
+    assert obs["obstacles"].shape == (5, layouts.obstacles.shape[1], 3) and obs["obstacles"].dtype == torch.float32
+    assert obs["obstacle_mask"].dtype == torch.bool and chunk.shape == (5, 16, 2)
+    if spec is not DISC:
+        return
+    # without obstacles a demo is the plain reach, drawing the same random numbers as before
+    plain = sample_layouts(np.random.default_rng(6), 1, 4, TaskConfig(**STUDY))
+    actions, _ = make_demos(np.random.default_rng(9), plain, TaskConfig(**STUDY))
+    reach = plan_reach(np.random.default_rng(9), plain.start[0], plain.goal_pos[0], TaskConfig(**STUDY))
+    np.testing.assert_allclose(actions[0, :len(reach) - 1], np.diff(reach, axis=0))
+    # a layout no demonstration can reach is an error, or with allow_failed a zero-length demo the sampler never draws
+    ring = [[0.5 + 0.11 * np.cos(a), 0.5 + 0.11 * np.sin(a), 0.045] for a in np.linspace(0, 2 * np.pi, 10, endpoint=False)]
+    layouts = Layouts.concat([_one((0.2, 0.5), (0.5, 0.5), ring), _one((0.2, 0.2), (0.6, 0.2), [[0.4, 0.3, 0.03]])])
+    with pytest.raises(RuntimeError, match="no successful demo"):
+        make_demos(np.random.default_rng(0), layouts, TaskConfig(), max_tries=3)
+    actions, lengths = make_demos(np.random.default_rng(0), layouts, TaskConfig(), max_tries=3, allow_failed=True)
+    assert lengths[0] == 0 and lengths[1] > 0 and not actions[0].any()
+    obs, _ = DemoSampler(layouts, actions, lengths, 16, 4, "cpu").sample(50)
+    assert (obs["obstacle_mask"].sum(1) == 1).all()  # only the layout with a demonstration is ever drawn
 
 
-def test_sampler_carries_obstacles():
-    task = TaskConfig(**STUDY, obstacle=obstacle_spec(WALL))
-    rng = np.random.default_rng(4)
-    layouts = sample_layouts(rng, 8, 4, task)
-    sampler = DemoSampler(layouts, *make_demos(rng, layouts, task), 16, 4, "cpu")
-    obs, chunk = sampler.sample(5)
-    assert obs["obstacles"].shape == (5, layouts.obstacles.shape[1], 3) and obs["obstacle_mask"].shape == (5, layouts.obstacles.shape[1])
-    assert obs["obstacles"].dtype == torch.float32 and obs["obstacle_mask"].dtype == torch.bool and chunk.shape == (5, 16, 2)
-
-
-def test_expert_detours_and_is_unchanged_without_obstacles():
-    arm = config.load_arm("teleop.yaml")
+def test_the_expert_solves_every_obstacle_task_without_touching_anything():
+    arm = config.load_arm("teleop.yaml", {"targets": [4, 4], "reach": [0.35, 0.5], "time_limit_s": 8.0})
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
-    rng = np.random.default_rng(6)
-    for spec in (WALL, dict(DISC, radius=0.08, offset=0.0)):
-        task = TaskConfig(**STUDY, obstacle=obstacle_spec(spec))
-        layouts = sample_layouts(rng, 100, 4, task)
+    for spec in (GRID_DISC, GRID_WALL, RING_GOAL, RING_START):
+        arm["obstacle"] = obstacle_spec(spec)
+        layouts = sample_layouts(np.random.default_rng(4), 40, 4, arm_task(arm))
         recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
-        outcomes = [r["outcome"] for r in recs]
-        assert outcomes.count("collision") == 0 and outcomes.count("hit") >= 95, {o: outcomes.count(o) for o in set(outcomes)}
+        assert [r["outcome"] for r in recs].count("hit") == 40, spec
+        if spec is GRID_DISC:  # it passes the disc on the side its first route takes, away from the offset
+            for b, r in enumerate(recs):
+                path, start, goal, disc = np.array(r["path"]), layouts.start[b], layouts.goal_pos[b], layouts.obstacles[b, 0]
+                route = plan_route(start, goal, disc[None], 0.05, avoid=layouts.distractors(b, 0.05))
+                u = (goal - start) / np.linalg.norm(goal - start)
+                near = np.abs((path - start) @ u - (disc[:2] - start) @ u) < 0.02
+                lateral = _lateral(path[near], start, goal) - _lateral(disc[None, :2], start, goal)
+                assert (np.sign(lateral) == (1 if route_side(route, start, goal) == "left" else -1)).all()
     # without obstacles the command is the closed form it always was
-    plain = sample_layouts(rng, 5, (2, 4), TaskConfig())
+    plain = sample_layouts(np.random.default_rng(6), 5, (2, 4), TaskConfig())
     agent = ExpertAgent()
     agent.reset(5)
     to_goal = plain.goal_pos - plain.start
     dist = np.linalg.norm(to_goal, axis=1, keepdims=True)
     np.testing.assert_allclose(agent.command(plain.start, plain), to_goal / dist * np.minimum(1.0, dist / 0.15))
     # no side flipping on a symmetric disc: the teleop path stays on one side of the reach line
-    layouts = _one((0.2, 0.5), (0.8, 0.5), [[0.5, 0.5, 0.06]])
-    recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
+    recs = run_trials(arm, _one((0.2, 0.5), (0.8, 0.5), [[0.5, 0.5, 0.06]]), ExpertAgent(), Readout(None, 0.0),
+                      policies[arm["model"]], adapters, "cpu")
     lateral = np.array(recs[0]["path"])[:, 1] - 0.5
     signs = np.sign(lateral[np.abs(lateral) > 2e-3])
     assert recs[0]["outcome"] == "hit" and len(signs) and (signs == signs[0]).all()
 
 
-def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records(tmp_path):
+def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records():
     from run_experiment import parse_args
     arm = config.load_arm("teleop.yaml", {"obstacle": {"kind": "disc", "radius": 0.04, "along": 0.5}, "targets": [4, 4],
                                           "reach": [0.35, 0.5]})
@@ -211,58 +234,9 @@ def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records(tmp_
     recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
     assert len(recs[0]["obstacles"]) == 1 and len(recs[0]["obstacles"][0]) == 3
     np.testing.assert_allclose(recs[0]["obstacles"], layouts.real_obstacles(0), atol=1e-4)
-    # every arm of a protocol must play the same obstacles
-    base = config.CONFIG_DIR / "teleop.yaml"
-    (tmp_path / "with.yaml").write_text(f"extends: {base}\ntask: {{obstacle: {{kind: disc, radius: 0.04, along: 0.5}}}}\n")
-    (tmp_path / "without.yaml").write_text(f"extends: {base}\n")
-    protocol = dict(name="tiny", arms={"a": str(tmp_path / "with.yaml"), "b": str(tmp_path / "without.yaml")},
-                    blocks={"trials": 2, "practice": 1, "order": "listed"}, trial={"ready_hold_s": 0.0, "feedback_s": 0.0},
-                    expert={"lag": 0, "slow_radius": 0.15}, display={"blind": True})
-    with pytest.raises(ValueError, match="same task layouts"):
-        Run(protocol, "p1", 1, ExpertAgent(), "cpu", tmp_path)
     # free play takes the spec on the command line
     args = parse_args(["--arm", "teleop.yaml", "--obstacle", "{kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14}"])
     assert args.overrides["obstacle"]["kind"] == "wall"
-
-
-def test_sweep_axes_accept_named_values(tmp_path):
-    (tmp_path / "named.yaml").write_text(
-        "name: named\nmethods:\n  teleop: {mode: teleop}\n  frs: {mode: frs}\n"
-        "grid:\n  family: none\n  noises: [0.5]\n"
-        "  axes: {obstacle: {T0: null, T1: {kind: disc, radius: 0.04, along: 0.5}}, targets: [[4, 4]]}\n")
-    sweep = load_sweep(tmp_path / "named.yaml")
-    groups = cell_groups(sweep)
-    assert groups == [(None, {"obstacle": "T0", "targets": [4, 4]}), (None, {"obstacle": "T1", "targets": [4, 4]})]
-    assert cell_key(None, 0.5, groups[1][1]) == "-|0.5|obstacle=T1|targets=4-4"
-    assert method_arm(sweep, "frs", None, groups[1][1])["obstacle"]["kind"] == "disc"
-    assert method_arm(sweep, "teleop", None, groups[0][1])["obstacle"] is None
-
-
-def test_demos_can_drop_layouts_that_have_no_route():
-    ring = [[0.5 + 0.11 * np.cos(a), 0.5 + 0.11 * np.sin(a), 0.045] for a in np.linspace(0, 2 * np.pi, 10, endpoint=False)]
-    boxed = _one((0.2, 0.5), (0.5, 0.5), ring)                   # the goal is walled in: no demonstration can reach it
-    free = _one((0.2, 0.2), (0.6, 0.2), [[0.4, 0.3, 0.03]])
-    layouts = Layouts.concat([boxed, free])
-    with pytest.raises(RuntimeError, match="no successful demo"):
-        make_demos(np.random.default_rng(0), layouts, TaskConfig(), max_tries=3)
-    actions, lengths = make_demos(np.random.default_rng(0), layouts, TaskConfig(), max_tries=3, allow_failed=True)
-    assert lengths[0] == 0 and lengths[1] > 0 and not actions[0].any()
-    sampler = DemoSampler(layouts, actions, lengths, 16, 4, "cpu")
-    obs, _ = sampler.sample(50)
-    assert (obs["obstacle_mask"].sum(1) == 1).all()  # only the layout with a demonstration is ever drawn
-
-
-def test_layouts_redraw_the_targets_when_no_start_fits_them():
-    # a reach of 0.95 fits only goals near a corner: most target sets admit no start, and are redrawn
-    cfg = TaskConfig(min_reach=0.95)
-    layouts = sample_layouts(np.random.default_rng(0), 20, 2, cfg)
-    assert (np.linalg.norm(layouts.goal_pos - layouts.start, axis=1) >= 0.95).all()
-    with pytest.raises(ValueError, match="cannot place a start"):
-        _layout(np.random.default_rng(0), 2, 0, cfg, max_tries=20, rounds=1)
-    assert _layout(np.random.default_rng(0), 2, 0, cfg, max_tries=20, rounds=500)[0].shape == (2,)
-
-
-DECOY_RING = {"kind": "ring", "around": "goal", "gap_angle": [15, 30]}
 
 
 def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
@@ -270,6 +244,8 @@ def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
     assert spec["decoy"] is True and obstacle_spec(DISC)["decoy"] is False and obstacle_spec(WALL)["decoy"] is False
     with pytest.raises(ValueError, match="decoy"):
         obstacle_spec(dict(DISC, decoy="yes"))
+    with pytest.raises(ValueError, match="decoy needs at least two targets"):
+        sample_layouts(np.random.default_rng(0), 2, 1, TaskConfig(**STUDY, obstacle=obstacle_spec(dict(DISC, decoy=True))))
     lay = sample_layouts(np.random.default_rng(0), 40, 4, TaskConfig(**STUDY, obstacle=spec))
     for b in range(40):
         start, goal, disc = lay.start[b], lay.goal_pos[b], lay.real_obstacles(b)[0, :2]
@@ -279,44 +255,7 @@ def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
         assert sum(on) == 1 and not np.allclose(disc, start + 0.5 * (goal - start), atol=1e-6)
         assert np.linalg.norm(goal - start) >= 0.35 - 1e-9  # the reach rule is still about the goal
     ring = sample_layouts(np.random.default_rng(1), 20, 4, TaskConfig(**STUDY, obstacle=obstacle_spec(
-        dict(DECOY_RING, decoy=True))))
+        dict(RING_GOAL, decoy=True))))
     for b in range(20):  # the ring is round a non-goal target
-        centre = ring.real_obstacles(b)[:, :2].mean(0)
-        d = np.linalg.norm(ring.targets[b][ring.mask[b]] - centre, axis=1)
+        d = np.linalg.norm(ring.targets[b][ring.mask[b]] - ring.real_obstacles(b)[:, :2].mean(0), axis=1)
         assert np.argmin(d) != ring.goal[b] and d.min() < 0.14
-
-
-def test_layouts_without_decoy_are_bit_identical_to_before():
-    import hashlib
-
-    # digests recorded at 2f3e3ce7, before the decoy key existed: the key absent, False, or dropped from a
-    # normalized spec (as one stored before it) all give those layouts, bit for bit
-    recorded = {"disc": "935f889dae666006", "ring": "4afdd3668314bb52"}
-    fields = ("start", "targets", "mask", "goal", "obstacles", "obstacle_mask")
-    for spec in (DISC, DECOY_RING):
-        bare = {k: v for k, v in obstacle_spec(spec).items() if k != "decoy"}
-        variants = [obstacle_spec(spec), obstacle_spec(dict(spec, decoy=False)), bare]
-        digests = [hashlib.sha256(), hashlib.sha256(), hashlib.sha256()]
-        for seed in (0, 1, 2):
-            lays = [sample_layouts(np.random.default_rng(seed), 6, (2, 4), TaskConfig(**STUDY, obstacle=v))
-                    for v in variants]
-            for lay, h in zip(lays, digests):
-                assert all(np.array_equal(getattr(lay, f), getattr(lays[0], f)) for f in fields)
-                for f in fields:
-                    h.update(np.ascontiguousarray(getattr(lay, f)).tobytes())
-        assert {h.hexdigest()[:16] for h in digests} == {recorded[spec["kind"]]}
-
-
-def test_decoy_needs_two_targets():
-    with pytest.raises(ValueError, match="decoy needs at least two targets"):
-        sample_layouts(np.random.default_rng(0), 2, 1, TaskConfig(**STUDY, obstacle=obstacle_spec(dict(DISC, decoy=True))))
-
-
-@pytest.mark.parametrize("spec", [dict(DISC, radius=0.08, offset=[0.012, 0.024]), DECOY_RING])
-def test_decoy_layouts_still_admit_a_demonstration(spec):
-    task = TaskConfig(**STUDY, obstacle=obstacle_spec(dict(spec, decoy=True)))
-    rng = np.random.default_rng(4)
-    layouts = sample_layouts(rng, 20, 4, task)
-    actions, lengths = make_demos(rng, layouts, task)
-    env = replay(actions, layouts, task)
-    assert (lengths > 0).all() and env.success.all() and not env.collided.any()

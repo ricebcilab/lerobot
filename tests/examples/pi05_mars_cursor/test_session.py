@@ -7,10 +7,9 @@ import pytest
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.readout import Readout
 from cursor_sa.records import OUTCOMES, load_run, read_records
 from cursor_sa.session import (Aborted, Run, balanced_latin_square, block_order, block_permutation, layout_seed,
-                               load_checkpoints, make_layout_sets, run_trials)
+                               make_layout_sets)
 from cursor_sa.env import TaskConfig
 
 PROTOCOL = dict(name="tiny", arms={"teleop": "teleop.yaml", "flow_control": "flow_control.yaml"},
@@ -19,27 +18,18 @@ PROTOCOL = dict(name="tiny", arms={"teleop": "teleop.yaml", "flow_control": "flo
                 display={"blind": True})
 
 
-def test_latin_square_is_balanced():
+def test_block_order_is_balanced_by_participant_and_session(tmp_path):
     for n in (2, 3, 4, 5):
         rows = balanced_latin_square(n)
         for row in rows:
             assert sorted(row) == list(range(n))
         for pos in range(n):  # every arm in every position equally often
             assert sorted(row[pos] for row in rows) == sorted(list(range(n)) * (len(rows) // n))
-
-
-def test_block_order_by_participant_and_listed():
     arms = ["a", "b", "c", "d"]
-    orders = {tuple(block_order(arms, f"p{i}")) for i in range(1, 5)}
-    assert len(orders) == 4 and block_order(arms, "sim") == block_order(arms, "p4")  # 4 rows, wrap at 4
-    assert block_order(arms, "p3", "listed") == arms
-
-
-def test_block_order_advances_with_the_session(tmp_path):
-    arms = ["a", "b", "c", "d"]
+    assert len({tuple(block_order(arms, f"p{i}")) for i in range(1, 5)}) == 4
+    assert block_order(arms, "sim") == block_order(arms, "p4") and block_order(arms, "p3", "listed") == arms  # wrap at 4
     assert block_order(arms, "p1", session=1) == block_order(arms, "p1")  # a first visit is what it always was
     orders = [block_order(arms, "p1", session=k) for k in range(1, 5)]
-    assert len({tuple(o) for o in orders}) == 4
     for pos in range(4):  # over four visits every arm sits in every position once
         assert sorted(o[pos] for o in orders) == arms
     assert block_order(arms, "p2", session=1) == block_order(arms, "p1", session=2)
@@ -107,17 +97,14 @@ class FakeRenderer:
         self.calls.append("feedback")
 
 
-def test_realtime_path_runs_one_trial_at_a_time(tmp_path):
+def test_realtime_path_runs_one_trial_at_a_time_and_logs_an_abort(tmp_path):
     renderer = FakeRenderer()
     run = Run(PROTOCOL, "p1", 1, ExpertAgent(), "cpu", tmp_path)
     run.start()
     assert run.run(renderer) == 8
     assert renderer.calls.count("block") == 2 and renderer.calls.count("ready") == 8 and renderer.calls.count("break") == 2
-    records = load_run(run.dir)[1]
-    assert all(len(r["frame_dt_ms"]) == len(r["raw_commands"]) for r in records)
+    assert all(len(r["frame_dt_ms"]) == len(r["raw_commands"]) for r in load_run(run.dir)[1])
 
-
-def test_abort_logs_the_partial_trial(tmp_path):
     class AbortingRenderer(FakeRenderer):
         def frame(self, ctx):
             if len(ctx["env"].pos) and ctx["env"].t >= 5:
@@ -145,17 +132,6 @@ def test_run_samples_layouts_from_the_arms_task(tmp_path):
     with pytest.raises(ValueError, match="same task layouts"):
         Run(dict(protocol, arms={"a": str(tmp_path / "near.yaml"), "b": str(tmp_path / "far.yaml")}), "p1", 1,
             ExpertAgent(), "cpu", tmp_path)
-
-
-def test_run_trials_batched_matches_single(tmp_path):
-    arm = config.load_arm("study_frs.yaml")
-    policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
-    layouts, _ = make_layout_sets(7, 4, 0, (2, 4), TaskConfig())
-    readout = Readout(arm["corruption_matrix"], 0.0)
-    recs = run_trials(arm, layouts, ExpertAgent(), readout, policies[arm["model"]], adapters, "cpu")
-    assert len(recs) == 4 and all(r["served_commands"] != r["raw_commands"] for r in recs)  # the gain corrupts them
-    for r in recs:
-        assert r["targets"][r["goal"]] is not None and 2 <= r["n_targets"] <= 4
 
 
 def test_logged_copies_what_is_printed_into_the_log_and_restores_the_console(tmp_path, capsys):

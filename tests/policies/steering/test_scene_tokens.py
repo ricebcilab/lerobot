@@ -38,81 +38,40 @@ def _module(src, geometry="absolute"):
 
 
 @pytest.mark.parametrize("src", ["vlm_image", "vlm_prefix", "cnn"])
-def test_image_sources_start_at_identity_and_round_trip(src, tmp_path):
+def test_image_sources_start_at_identity_round_trip_and_read_their_scene(src, tmp_path):
     torch.manual_seed(0)
     m = _module(src).eval()
     x, v, t = _xvt()
     obs = _scene()
     if src == "vlm_prefix":
         obs["scene"] = {"vlm_prefix": obs["scene"]["vlm_image"]}
+    eye = torch.eye(2).expand(3, 16, 2, 2)
     a, b = m(x, t, v, obs)
-    assert torch.equal(a, torch.eye(2).expand(3, 16, 2, 2)) and torch.equal(b, torch.zeros(3, 16, 2))
-    a, b = m(x, t, v, None)  # the LIBERO call still runs
-    assert torch.equal(a, torch.eye(2).expand(3, 16, 2, 2))
+    assert torch.equal(a, eye) and torch.equal(b, torch.zeros(3, 16, 2))
+    assert torch.equal(m(x, t, v, None)[0], eye)  # the LIBERO call still runs
+    keys = {"horizon", "d", "tdim", "heads", "layers", "scale", "n_dims"}
+    assert set(LearnedTaskModule(horizon=16).config) == keys  # the discs' config as it was
+    assert set(m.config) == keys | {"token_source", "scene_dim", "scene_tokens", "image_size"}  # no new keys
     assert m.config["token_source"] == src and m.config["scene_tokens"] == 16
     with torch.no_grad():
         for p in m.parameters():
             p.add_(0.1 * torch.randn_like(p))
     m.requires_grad_(False)
-    path = save_adapter_module(m, tmp_path / "t.pt", kind="task")
-    loaded, kind, _ = load_adapter_module(path)
+    loaded, kind, _ = load_adapter_module(save_adapter_module(m, tmp_path / "t.pt", kind="task"))
     assert kind == "task" and loaded.token_source == src
     a0, b0 = m(x, t, v, obs)
     a1, b1 = loaded(x, t, v, obs)
-    assert torch.equal(a0, a1) and torch.equal(b0, b1)
-    assert not torch.equal(a0, torch.eye(2).expand(3, 16, 2, 2))
-
-
-def test_discs_config_is_unchanged_and_an_image_module_needs_its_scene():
-    assert set(LearnedTaskModule(horizon=16).config) == {
-        "horizon",
-        "d",
-        "tdim",
-        "heads",
-        "layers",
-        "scale",
-        "n_dims",
-    }
-    m = _module("vlm_image")
-    x, v, t = _xvt()
-    with pytest.raises(ValueError, match="vlm_image"):
-        m(x, t, v, {"pos": torch.rand(3, 2)})
-    with pytest.raises(ValueError, match="vlm_image"):
-        m(x, t, v, {"pos": torch.rand(3, 2), "scene": {"cnn": torch.zeros(3, 3, 64, 64, dtype=torch.uint8)}})
-    with pytest.raises(ValueError):
-        LearnedTaskModule(horizon=16, token_source="vlm_image")  # no scene_dim
-    with pytest.raises(ValueError):
-        LearnedTaskModule(horizon=16, token_source="cnn", image_size=50)  # not a multiple of 16
-    with pytest.raises(ValueError):
-        LearnedTaskModule(horizon=16, token_source="nope")
-
-
-def test_fp16_tokens_match_fp32_within_tolerance():
-    torch.manual_seed(0)
-    m = _module("vlm_image").eval()
-    with torch.no_grad():
-        torch.nn.init.normal_(m.out.weight, std=0.3)
-    x, v, t = _xvt()
-    obs = _scene()
-    half = obs["scene"]["vlm_image"]
-    a16, b16 = m(x, t, v, obs)
-    a32, b32 = m(x, t, v, {**obs, "scene": {"vlm_image": half.float()}})
-    torch.testing.assert_close(a16, a32, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(b16, b32, atol=1e-3, rtol=1e-3)
-    assert a16.dtype == torch.float32
-
-
-def test_cnn_tokens_change_with_the_image_and_vlm_tokens_with_the_scene():
-    torch.manual_seed(0)
-    x, v, t = _xvt()
-    obs = _scene()
-    for src in ("cnn", "vlm_image"):
-        m = _module(src).eval()
-        with torch.no_grad():
-            torch.nn.init.normal_(m.out.weight, std=0.3)
-        other = {**obs, "scene": {src: torch.flip(obs["scene"][src], [0])}}  # another layout's scene
-        assert not torch.equal(m(x, t, v, obs)[0], m(x, t, v, other)[0])
-    assert SCENE_SOURCES == ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")
+    assert torch.equal(a0, a1) and torch.equal(b0, b1) and not torch.equal(a0, eye)
+    other = {
+        **obs,
+        "scene": {k: torch.flip(s, [0]) for k, s in obs["scene"].items()},
+    }  # another layout's scene
+    assert not torch.equal(m(x, t, v, other)[0], a0)
+    if src == "vlm_image":  # fp16 tokens give what fp32 ones do, to a tolerance
+        a32, b32 = m(x, t, v, {**obs, "scene": {src: obs["scene"][src].float()}})
+        torch.testing.assert_close(a0, a32, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(b0, b32, atol=1e-3, rtol=1e-3)
+        assert a0.dtype == torch.float32
 
 
 def _live(src, geometry="absolute"):
@@ -156,7 +115,7 @@ def test_a_bound_call_equals_the_unbound_call(src, geometry):
         x, v, t = _xvt()
 
 
-def test_ten_calls_on_one_bound_module_run_the_cnn_once_and_another_batch_size_recomputes():
+def test_a_bound_module_runs_the_cnn_once_and_gradients_reach_it():
     m, obs = _live("cnn")
     runs = []
     m.cnn.register_forward_hook(lambda *_: runs.append(1))
@@ -180,9 +139,7 @@ def test_ten_calls_on_one_bound_module_run_the_cnn_once_and_another_batch_size_r
     x3, v3, t3 = _xvt()
     bound(x3, t3, v3)
     assert len(runs) == 5
-
-
-def test_gradients_reach_the_cnn_through_the_cached_tokens():
+    # gradients reach the CNN through the cached tokens
     m, obs = _live("cnn")
     m.train().requires_grad_(True)
     runs = []
@@ -218,28 +175,21 @@ def _centres(g):  # token k = (row, col) = divmod(k, g); x right (col), y down (
 
 
 @pytest.mark.parametrize("src", ["vlm_image", "cnn"])
-def test_relative_geometry_round_trips_and_absolute_stays_the_default_without_a_key(src, tmp_path):
+def test_relative_tokens_are_the_projection_plus_the_cursor_relative_geometry(src, tmp_path):
     assert TOKEN_GEOMETRIES == ("absolute", "relative")
-    rel, ab = _module(src, "relative"), _module(src)
-    assert rel.config["token_geometry"] == "relative" and "token_geometry" not in ab.config
-    assert "scene_pos" not in rel.state_dict() and "scene_pos" in ab.state_dict()
+    m, ab, obs = _module(src, "relative"), _module(src), _scene()
+    assert m.config["token_geometry"] == "relative" and "token_geometry" not in ab.config
+    assert "scene_pos" not in m.state_dict() and "scene_pos" in ab.state_dict()
     assert LearnedTaskModule(**ab.config).token_geometry == "absolute"  # a round-1 config
-    obs, (x, v, t) = _scene(), _xvt()
-    save_adapter_module(rel, tmp_path / "rel.pt", "task")
-    back, kind, _ = load_adapter_module(tmp_path / "rel.pt")
+    back, kind, _ = load_adapter_module(save_adapter_module(m, tmp_path / "rel.pt", "task"))
+    x, v, t = _xvt()
     assert kind == "task" and back.token_geometry == "relative"
-    a, b = rel(x, t, v, obs), back(x, t, v, obs)
-    assert torch.allclose(a[0], b[0]) and torch.allclose(a[1], b[1])
-
-
-@pytest.mark.parametrize("src", ["vlm_image", "cnn"])
-def test_relative_tokens_are_the_projection_plus_the_cursor_relative_geometry(src):
-    m, obs = _module(src, "relative"), _scene()
-    x = obs["scene"][src]
+    assert all(torch.allclose(a, b) for a, b in zip(m(x, t, v, obs), back(x, t, v, obs), strict=True))
     rel = (_centres(4)[None] - obs["pos"][:, None]) / m.scale
     feats = torch.cat(
         [rel, torch.full_like(rel[..., :1], (0.5 / 4) / m.scale), rel.norm(dim=-1, keepdim=True)], -1
     )
+    x = obs["scene"][src]
     content = (
         m.scene_in(x.float()) if src == "vlm_image" else m.cnn(x.float() / 255).flatten(2).transpose(1, 2)
     )
@@ -247,37 +197,19 @@ def test_relative_tokens_are_the_projection_plus_the_cursor_relative_geometry(sr
     assert pad is None and tokens.shape == (3, 17, 128)
     assert torch.allclose(tokens[:, 1:], content + m.token_in(feats), atol=1e-6)
     assert torch.equal(m.token_centres, _centres(4)) and m.token_half == 0.5 / 4
-
-
-def test_relative_geometry_is_refused_where_tokens_have_no_screen_position():
-    for src in ("discs", "vlm_prefix"):
-        with pytest.raises(ValueError, match="relative"):
-            _module(src, "relative")
-    with pytest.raises(ValueError, match="square"):
-        LearnedTaskModule(token_source="vlm_image", token_geometry="relative", scene_dim=32, scene_tokens=15)
-    with pytest.raises(ValueError, match="token_geometry"):
-        _module("vlm_image", "polar")
-    obs = _scene()
-    del obs["pos"]
-    with pytest.raises(ValueError, match="pos"):
-        _module("vlm_image", "relative").tokens(obs, 3)
-
-
-def test_relative_tokens_shift_with_the_cursor_by_whole_tokens():
-    # vlm_image only: its content can be made identical per token; the CNN's zero-padded borders cannot. The centres
-    # buffer is shared, so this pins the row/col convention for both sources.
-    src = "vlm_image"
-    m, obs = _module(src, "relative"), _scene()
-    x = obs["scene"][src]
-    obs["scene"][src] = x[:, :1].expand_as(x).clone()  # every token the same
+    if src == "cnn":  # the CNN's zero-padded borders keep its content from being the same per token
+        return
+    # every token the same content: a cursor one column right, or one row down, sees the same offsets shifted by one
+    # token (the centres buffer is shared, so this pins the row/col convention for both sources)
+    obs["scene"][src] = x[:, :1].expand_as(x).clone()
     p = torch.tensor([[0.3, 0.4]]).expand(3, -1)
-    tp = m.tokens({**obs, "pos": p}, 3)[0][:, 1:].view(3, 4, 4, -1)  # [b, row, col, d]
-    tx = m.tokens({**obs, "pos": p + torch.tensor([0.25, 0.0])}, 3)[0][:, 1:].view(3, 4, 4, -1)
-    ty = m.tokens({**obs, "pos": p + torch.tensor([0.0, 0.25])}, 3)[0][:, 1:].view(3, 4, 4, -1)
-    assert torch.allclose(
-        tx[:, :, 1:], tp[:, :, :-1], atol=1e-5
-    )  # a cursor one column right sees the same offsets
-    assert torch.allclose(ty[:, 1:, :], tp[:, :-1, :], atol=1e-5)  # one row down likewise
+    tp, tx, ty = (
+        m.tokens({**obs, "pos": p + d}, 3)[0][:, 1:].view(3, 4, 4, -1)  # [b, row, col, d]
+        for d in (torch.zeros(2), torch.tensor([0.25, 0.0]), torch.tensor([0.0, 0.25]))
+    )
+    assert torch.allclose(tx[:, :, 1:], tp[:, :, :-1], atol=1e-5) and torch.allclose(
+        ty[:, 1:, :], tp[:, :-1, :], atol=1e-5
+    )
 
 
 def _views(rank=None, **kw):
@@ -298,47 +230,36 @@ def _reduction(dim=32, rank=4):
 
 def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_path):
     assert "vlm_views" in SCENE_SOURCES
+    assert scene_spec("vlm_views", 224, wrist_span=0.5, scene_rank=256) == {
+        "token_source": "vlm_views",
+        "scene_dim": 2048,
+        "scene_tokens": 512,
+        "image_size": 224,
+        "wrist_span": 0.5,
+        "scene_rank": 256,
+    }
+    assert scene_spec("vlm_views", 224, wrist_span=1.0)["scene_rank"] is None
+    assert set(scene_spec("vlm_image")) == {"token_source", "scene_dim", "scene_tokens", "image_size"}
     full, red = _views(), _views(rank=4)
-    assert full.config["wrist_span"] == 0.5 and "scene_rank" not in full.config
-    assert "scene_mean" not in full.state_dict()
-    assert red.config["scene_rank"] == 4 and red.scene_in.in_features == 4
-    assert full.scene_in.in_features == 32
+    assert (
+        full.config["wrist_span"] == 0.5
+        and "scene_rank" not in full.config
+        and "scene_mean" not in full.state_dict()
+    )
+    assert red.config["scene_rank"] == 4 and red.scene_in.in_features == 4 and full.scene_in.in_features == 32
     assert red.state_dict()["scene_basis"].shape == (32, 4) and red.state_dict()["scene_pos"].shape[0] == 8
     mean, basis = _reduction()
     red.set_reduction(mean, basis)
-    save_adapter_module(red, tmp_path / "v.pt", "task")
-    back, kind, _ = load_adapter_module(tmp_path / "v.pt")
+    back, kind, _ = load_adapter_module(save_adapter_module(red, tmp_path / "v.pt", "task"))
     assert kind == "task" and back.wrist_span == 0.5 and back.scene_rank == 4
     torch.testing.assert_close(back.scene_basis, basis)
     torch.testing.assert_close(back.scene_mean, mean)
-    with pytest.raises(ValueError):
-        red.set_reduction(mean, basis[:, :3])
-    assert set(_module("vlm_image").config) == {
-        "horizon",
-        "d",
-        "tdim",
-        "heads",
-        "layers",
-        "scale",
-        "n_dims",
-        "token_source",
-        "scene_dim",
-        "scene_tokens",
-        "image_size",
-    }  # no new keys
-
-
-def test_a_reduced_module_reads_full_width_and_reduced_tokens_alike():
-    red = _views(rank=4)
-    red.set_reduction(*_reduction())
+    # a reduced module reads full-width and reduced tokens alike
     raw, obs = torch.randn(3, 8, 32).to(torch.float16), {"pos": torch.rand(3, 2)}
     stored = reduce_tokens(raw, red.scene_mean, red.scene_basis)
     assert stored.dtype == torch.float16 and stored.shape == (3, 8, 4)
     a = red.tokens({**obs, "scene": {"vlm_views": raw}}, 3)[0]
-    b = red.tokens({**obs, "scene": {"vlm_views": stored}}, 3)[0]
-    assert torch.equal(a, b)
-    with pytest.raises(ValueError, match="width"):
-        red.tokens({**obs, "scene": {"vlm_views": torch.randn(3, 8, 5)}}, 3)
+    assert torch.equal(a, red.tokens({**obs, "scene": {"vlm_views": stored}}, 3)[0])
 
 
 def test_scene_keep_hides_tokens_from_the_attention_and_never_the_null_token():
@@ -361,17 +282,56 @@ def test_scene_keep_hides_tokens_from_the_attention_and_never_the_null_token():
         m.tokens({**obs, "scene_keep": keep[:, :5]}, 2)
 
 
-def test_views_spec_and_refusals():
-    assert scene_spec("vlm_views", 224, wrist_span=0.5, scene_rank=256) == {
-        "token_source": "vlm_views",
-        "scene_dim": 2048,
-        "scene_tokens": 512,
-        "image_size": 224,
-        "wrist_span": 0.5,
-        "scene_rank": 256,
-    }
-    assert scene_spec("vlm_views", 224, wrist_span=1.0)["scene_rank"] is None
-    assert set(scene_spec("vlm_image")) == {"token_source", "scene_dim", "scene_tokens", "image_size"}
+def test_the_modules_refuse_what_they_cannot_read():
+    x, v, t = _xvt()
+    m = _module("vlm_image")
+    for scene in (
+        {},
+        {"cnn": torch.zeros(3, 3, 64, 64, dtype=torch.uint8)},
+    ):  # an image module needs its scene
+        with pytest.raises(ValueError, match="vlm_image"):
+            m(x, t, v, {"pos": torch.rand(3, 2), **({"scene": scene} if scene else {})})
+    obs = _scene()
+    del obs["pos"]
+    with pytest.raises(ValueError, match="pos"):
+        _module("vlm_image", "relative").tokens(obs, 3)
+    red = _views(rank=4)
+    red.set_reduction(*_reduction())
+    with pytest.raises(ValueError, match="width"):
+        red.tokens({"pos": torch.rand(3, 2), "scene": {"vlm_views": torch.randn(3, 8, 5)}}, 3)
+    with pytest.raises(ValueError):
+        red.set_reduction(*_reduction(rank=3))
+    for build, match in (
+        (lambda: LearnedTaskModule(horizon=16, token_source="vlm_image"), "scene_dim"),  # no scene_dim
+        (
+            lambda: LearnedTaskModule(horizon=16, token_source="cnn", image_size=50),
+            None,
+        ),  # not a multiple of 16
+        (lambda: LearnedTaskModule(horizon=16, token_source="nope"), None),
+        (lambda: _module("discs", "relative"), "relative"),  # tokens without a screen position
+        (lambda: _module("vlm_prefix", "relative"), "relative"),
+        (
+            lambda: LearnedTaskModule(
+                token_source="vlm_image", token_geometry="relative", scene_dim=32, scene_tokens=15
+            ),
+            "square",
+        ),
+        (lambda: _module("vlm_image", "polar"), "token_geometry"),
+        (lambda: _views(token_geometry="relative"), "relative"),
+        (
+            lambda: LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=32, scene_tokens=8),
+            "wrist_span",
+        ),
+        (
+            lambda: LearnedTaskModule(
+                horizon=16, token_source="vlm_image", scene_dim=32, scene_tokens=16, scene_rank=4
+            ),
+            "scene_rank",
+        ),
+        (lambda: scene_spec("vlm_image", 224, wrist_span=0.5), None),
+    ):
+        with pytest.raises(ValueError, match=match):
+            build()
     for bad in (
         {},
         {"wrist_span": 0.0},
@@ -380,11 +340,3 @@ def test_views_spec_and_refusals():
     ):
         with pytest.raises(ValueError):
             scene_spec("vlm_views", 224, **bad)
-    with pytest.raises(ValueError):
-        scene_spec("vlm_image", 224, wrist_span=0.5)
-    with pytest.raises(ValueError, match="relative"):
-        _views(token_geometry="relative")
-    with pytest.raises(ValueError, match="wrist_span"):
-        LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=32, scene_tokens=8)
-    with pytest.raises(ValueError, match="scene_rank"):
-        LearnedTaskModule(horizon=16, token_source="vlm_image", scene_dim=32, scene_tokens=16, scene_rank=4)
