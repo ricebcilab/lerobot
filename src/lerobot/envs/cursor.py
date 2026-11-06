@@ -162,6 +162,68 @@ class Layouts:
         )
 
 
+# ---------------------------------------------------------------- rigid motions
+
+
+def _rotations(angle: np.ndarray) -> np.ndarray:
+    """[B, 2, 2] counter-clockwise rotation matrices for angles [B] in radians."""
+    cos, sin = np.cos(angle), np.sin(angle)
+    return np.stack([np.stack([cos, -sin], -1), np.stack([sin, cos], -1)], -2)
+
+
+def move_layouts(layouts: Layouts, angle: np.ndarray, shift: np.ndarray, mirror: np.ndarray) -> Layouts:
+    """Every point p of each layout becomes R(angle) (M(p) - c) + c + shift, with c the screen centre,
+    M the mirror x -> 1 - x where `mirror` is set and R the counter-clockwise rotation: the start, the
+    targets (padding rows too) and the disc centres move; radii, masks and the goal index are copied
+    and the scene (which no longer matches) is dropped. angle [B], shift [B, 2], mirror [B] bool."""
+    centre = np.array([0.5, 0.5])
+    rot = _rotations(np.asarray(angle, float))
+    flip = np.where(np.asarray(mirror, bool), -1.0, 1.0)
+
+    def move(points: np.ndarray) -> np.ndarray:  # [B, ..., 2]
+        flat = points.reshape(len(points), -1, 2) - centre
+        flat = flat * np.stack([flip, np.ones_like(flip)], -1)[:, None]
+        out = np.einsum("bij,bnj->bni", rot, flat) + centre + np.asarray(shift, float)[:, None]
+        return out.reshape(points.shape)
+
+    assert layouts.obstacles is not None and layouts.obstacle_mask is not None  # set by __post_init__
+    obstacles = layouts.obstacles.copy()
+    obstacles[..., :2] = move(layouts.obstacles[..., :2])
+    return Layouts(
+        move(layouts.start),
+        move(layouts.targets),
+        layouts.mask.copy(),
+        layouts.goal.copy(),
+        obstacles,
+        layouts.obstacle_mask.copy(),
+    )
+
+
+def move_actions(actions: np.ndarray, angle: np.ndarray, mirror: np.ndarray) -> np.ndarray:
+    """Displacements [B, L, 2] under the motion of `move_layouts` (no shift): the x component is flipped
+    where `mirror` is set, then every displacement is rotated by `angle` [B]."""
+    flip = np.where(np.asarray(mirror, bool), -1.0, 1.0)
+    flipped = actions * np.stack([flip, np.ones_like(flip)], -1)[:, None]
+    return np.einsum("bij,blj->bli", _rotations(np.asarray(angle, float)), flipped)
+
+
+def layouts_on_screen(layouts: Layouts, edge: float = SCREEN_EDGE) -> np.ndarray:
+    """[B] True where the start, every real target and every real disc (centre plus and minus its radius)
+    lie inside [edge, 1 - edge]^2."""
+
+    def inside(points: np.ndarray) -> np.ndarray:  # [B, ..., 2] -> [B, ...]
+        return ((points >= edge) & (points <= 1 - edge)).all(-1)
+
+    assert layouts.obstacles is not None and layouts.obstacle_mask is not None  # set by __post_init__
+    centres, radii = layouts.obstacles[..., :2], layouts.obstacles[..., 2:]
+    discs = inside(centres - radii) & inside(centres + radii)
+    return (
+        inside(layouts.start)
+        & (inside(layouts.targets) | ~layouts.mask).all(1)
+        & (discs | ~layouts.obstacle_mask).all(1)
+    )
+
+
 # ---------------------------------------------------------------- obstacles
 
 
