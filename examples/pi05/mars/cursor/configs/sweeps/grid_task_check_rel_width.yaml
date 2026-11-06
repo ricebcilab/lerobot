@@ -1,0 +1,24 @@
+# Round 4c width check: the rigid recipe at 300 demonstrations trained through the disk token store at full width (`full`)
+# and at rank 256 (`r256`), both from the same code, demonstrations and copies, against the parametric module. Rule: the
+# reduced module may trail the full-width one by at most 5 points of hits on each context.
+# Report: report_grid_image.py --width grid_task_check_rel_width --prefix rel --reduced r256 --full full --context T2 (and T4).
+#   python run_sweep.py --sweep grid_task_check_rel_width
+name: grid_task_check_rel_width
+agent: expert_chunk
+arm: condition_grid.yaml
+methods:
+  oracle_task: {mode: teleop, readout: off, reversal_adapter: {task: cell}}
+  oracle_task_rel_full: {mode: teleop, readout: off, reversal_adapter: {task: {T2: image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_full, T4: image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_full}}}
+  oracle_task_rel_r256: {mode: teleop, readout: off, reversal_adapter: {task: {T2: image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256, T4: image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256}}}
+tune: {frs: {n_reverse_steps: [10]}}
+grid:
+  users:
+    U0: {corruption: null, adapter: null}
+  tasks:
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: task_disc_large_n300_s0_with_gain025y}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: task_ring_goal_n300_s0_with_rot60}
+  noises: [0.0]
+trials: {tune: 20, test: 500}
+focus: oracle_task_rel_r256
+against: [oracle_task]
+seed: 820
