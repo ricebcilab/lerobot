@@ -16,7 +16,7 @@
 - `src/lerobot/envs/cursor.py` is mypy-strict (`lerobot.envs`): full annotations on everything added.
 - `--jitter` and `--rigid-motions` are refused (`p.error`) with `--token-source vlm_views`; `--rigid-motions` is also refused with a curl corruption and with `--teacher`.
 - Rotation is about the screen centre `(0.5, 0.5)`; mirror is `x -> 1 - x` applied before the rotation; shifts are uniform in `[-0.25, 0.25]^2`; disc radii never change; `Layouts.scene` is dropped by `move_layouts`.
-- A rigid copy is accepted only when `layouts_on_screen` holds, every path point lies in `[0, 1]^2`, and `replay` of its actions succeeds; at most `tries * k` draws per demonstration; demonstrations of length 0 get no copies.
+- A rigid copy is accepted only when `layouts_on_screen` holds with the discs at `SCREEN_EDGE` and the start and targets at the sampler's margin (`task.margin`, 0.05), every path point lies in `[0, 1]^2`, and `replay` of its actions succeeds; at most `tries * k` draws per demonstration; demonstrations of length 0 get no copies.
 - Jitter: `delta ~ N(0, sigma^2 I)` per sample in screen units; `obs["pos"] += delta`; the first `m = min(jitter_steps, horizon)` chunk steps each lose `delta / m`; nothing else in the sample changes; never on the validation split.
 - Defaults: `--jitter 0.0`, `--jitter-steps 4`, `--rigid-motions 0`; the runs use `--jitter 0.02` and `--rigid-motions 32`.
 - A copy's field-term pushes are its original's pushes moved by the copy's motion (`move_actions`), never recomputed by the expert on the moved layout; `ExpertData` takes them as `push=`. With `--frozen-noise` a copy draws its own noise track.
@@ -38,15 +38,17 @@
 ### Task 1: Rigid-motion primitives in the cursor env
 
 **Files:**
+
 - Modify: `src/lerobot/envs/cursor.py` (after the `Layouts` class and its helpers)
 - Test: `tests/examples/pi05_mars_cursor/test_rigid_motion.py` (new; import through `cursor_sa.env`, as `test_obstacles.py` does)
 
 **Interfaces:**
+
 - Consumes: `Layouts` (`start [B, 2]`, `targets [B, N, 2]`, `mask`, `goal`, `obstacles [B, K, 3]`, `obstacle_mask`, `scene`), `SCREEN_EDGE`.
 - Produces:
   - `move_layouts(layouts: Layouts, angle: np.ndarray, shift: np.ndarray, mirror: np.ndarray) -> Layouts` — `angle [B]` radians, `shift [B, 2]`, `mirror [B]` bool; every point `p` becomes `R(angle) (M(p) - c) + c + shift` with `c = (0.5, 0.5)`, `M` the mirror `x -> 1 - x` when `mirror`, `R` the rotation `[[cos, -sin], [sin, cos]]`; applied to `start`, `targets` (padding rows too), disc centres; radii, `mask`, `goal`, `obstacle_mask` copied; `scene=None`.
   - `move_actions(actions: np.ndarray, angle: np.ndarray, mirror: np.ndarray) -> np.ndarray` — `[B, L, 2]` displacements: mirror flips the x component, then the rotation is applied (no shift).
-  - `layouts_on_screen(layouts: Layouts, edge: float = SCREEN_EDGE) -> np.ndarray` — bool `[B]`: `start` and every real target inside `[edge, 1 - edge]^2`, and every real disc's centre plus and minus its radius inside it.
+  - `layouts_on_screen(layouts: Layouts, edge: float = SCREEN_EDGE, margin: float | None = None) -> np.ndarray` — bool `[B]`: `start` and every real target inside `[edge, 1 - edge]^2`, and every real disc's centre plus and minus its radius inside it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -103,10 +105,12 @@ git commit -m "MARS round 4: rigid motions of a cursor layout and its actions"
 ### Task 2: Demonstration copies under rigid motion, and jitter in the sampler
 
 **Files:**
+
 - Modify: `examples/pi05/mars/cursor/cursor_sa/demos.py` (`DemoSampler.__init__` / `sample`; new `augment_demos` after `make_demos`)
 - Test: `tests/examples/pi05_mars_cursor/test_augmentation.py` (new)
 
 **Interfaces:**
+
 - Consumes: Task 1's three functions (import from `lerobot.envs.cursor` as `demos.py` imports the env); `replay(actions, layouts, task)` (`.success`, `.steps`); `Layouts.concat`, `Layouts.__getitem__`.
 - Produces:
   - `augment_demos(rng: np.random.Generator, layouts, actions, lengths, k: int, task, push=None, shift: float = 0.25, tries: int = 20) -> tuple[Layouts, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]` — `(layouts_out, actions_out, lengths_out, kept, push_out)`: rows `0..B-1` are the originals unchanged (layouts, actions, lengths, push bit for bit), then the accepted copies grouped by original in original order; `kept [B]` int = copies per original (`0` for a demonstration of length 0); `push_out` = `push` (`[B, L, 2]`) with each copy's rows `move_actions(push[i], angle, mirror)` of its motion, `None` when `push` is `None`. Draws per round, for every original still short of `k`: `angle ~ U[0, 2 pi)`, `shift ~ U[-shift, shift]^2`, `mirror ~ Bernoulli(1/2)`, in that order from `rng`; a copy is accepted by the Global Constraints' rule, its `lengths` from `replay(...).steps`; at most `tries * k` rounds. `replay` runs 500 rows at a time.
@@ -185,10 +189,12 @@ git commit -m "MARS round 4: rigid copies of the demonstrations and a jittered s
 ### Task 3: The trainer's flags
 
 **Files:**
+
 - Modify: `examples/pi05/mars/cursor/train/train_adapter.py` (`ExpertData.__init__`, `expert_splits`, the task `meta`, `parse_args`, the module docstring's TASK MODULE paragraph)
 - Test: `tests/examples/pi05_mars_cursor/test_training.py`
 
 **Interfaces:**
+
 - Consumes: Task 2's `augment_demos` and the sampler's `jitter`, `jitter_steps`; `corruption_spec` (its curl); `_record_splits` (existing test helper that captures every split's `ExpertData`).
 - Produces: flags `--jitter FLOAT` (default 0.0), `--jitter-steps INT` (default 4), `--rigid-motions INT` (default 0); `ExpertData(layouts, actions, lengths, policy, device, corruption, curl, frozen_noise=False, frames=None, push=None, jitter=0.0, jitter_steps=4)` — `push` (`[B, L, 2]`, given) replaces `expert_pushes(layouts, pos)`, `jitter` and `jitter_steps` go to its sampler; in `expert_splits`, for the train split only, after its demonstrations are drawn and before any rendering or frame table, when `args.rigid_motions`: the originals' pushes `expert_pushes(layouts, pos)` (pos as `ExpertData` computes it), then `augment_demos(np.random.default_rng([args.seed, 11]), layouts, actions, lengths, args.rigid_motions, task, push=push)`, the moved pushes handed to that split's `ExpertData` as `push=`, a printed line `train: <B> demonstrations and <kept.sum()> moved copies (<min>-<max> per demonstration)`, and `args.rigid_kept` accumulated over entries; `meta["jitter"]`, `meta["jitter_steps"]`, `meta["rigid_motions"]`, `meta["rigid_kept"]` (`None` for user modules; `rigid_kept` `None` when `--rigid-motions 0`). Without `--rigid-motions` the pushes are computed inside `ExpertData` as today (no extra call).
 
@@ -243,10 +249,12 @@ git commit -m "MARS round 4: the trainer jitters its samples and copies its demo
 ### Task 4: The layout diagnostic
 
 **Files:**
+
 - Create: `examples/pi05/mars/cursor/diag_layouts.py`
 - Test: `tests/examples/pi05_mars_cursor/test_diag_layouts.py` (new)
 
 **Interfaces:**
+
 - Consumes: `train_adapter.parse_args`, `train_adapter.layouts_for(args, obstacle, rng, n, p_free)`, `obstacle_spec`; `run_sweep.load_sweep`, `method_arm(sweep, method, level)`, `scene_sources(adapters)`, `attach_scene(layouts, sources, cache_dir, key, encoder_factory, vlm)`, `run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed)`; `cursor_sa.session.load_checkpoints(arms, device)`; `cursor_sa.agents.make_agent`; Task 1's `move_layouts`, `layouts_on_screen`.
 - Produces:
   - `rebuild_layouts(seed: int, n: int, p_free: float, obstacle, targets=(4, 4), reach=(0.35, 0.5)) -> Layouts` — the trainer's train-split layouts for those arguments (`layouts_for` with `np.random.default_rng(seed)`, the first draws of that stream; the defaults are the trainer's `--targets` and `--reach`).
@@ -298,11 +306,13 @@ git commit -m "MARS round 4: a diagnostic of an image module on its training, fr
 ### Task 5: The gate sweep and the report's arm prefix
 
 **Files:**
+
 - Create: `examples/pi05/mars/cursor/configs/sweeps/grid_task_check_rel_aug.yaml`
 - Modify: `examples/pi05/mars/cursor/report_grid_image.py` (`_arm_means`, `select_recipe`, `width_check` untouched, `scan_rows` and the `--scan` count regex, `parse_args`)
 - Test: `tests/examples/pi05_mars_cursor/test_report_grid_image.py`, `tests/examples/pi05_mars_cursor/test_sweep.py` (`test_image_sweep_configs_resolve_every_arm_per_cell`)
 
 **Interfaces:**
+
 - Consumes: the existing `report_grid_image.py` functions and their tests' synthetic check dicts.
 - Produces:
   - The sweep config, following `grid_task_check_views_n300.yaml`: seed 820, T2 and T4 as there, `trials: {tune: 20, test: 500}`, methods `oracle`, `oracle_task`, `oracle_ft` (the same fine-tuned models), `oracle_task_rel` (`image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel`, `image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel`), `oracle_task_rel_jit`, `oracle_task_rel_rigid`, `oracle_task_rel_both` (the same names with `_jit`, `_rigid`, `_both` appended), `policy`, `policy_task`, and `policy_task_rel`, `policy_task_rel_jit`, `policy_task_rel_rigid`, `policy_task_rel_both`; `focus: oracle_task_rel_both`; `against: [oracle_task, oracle_ft]`.
@@ -323,6 +333,7 @@ def test_scan_reads_a_prefix():
 def test_the_select_cli_passes_prefix_and_base(tmp_path):
     ... main(["--select", run, "--prefix", "rel", "--base", "rel", "--results", ..., "--out", ...]) writes select.json
 ```
+
 and add `grid_task_check_rel_aug` to the list in `test_image_sweep_configs_resolve_every_arm_per_cell`.
 
 - [ ] **Step 2: Run them to verify they fail**

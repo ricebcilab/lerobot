@@ -96,7 +96,7 @@ screen: a rotation about the screen's centre by an angle uniform in [0, 2 pi), a
 and a mirror about the screen's vertical midline with probability one half; the start, every target, every obstacle
 disc's centre, and the action sequence (displacements) move together; radii do not change. A copy is accepted when
 everything stays on screen (the start, the real targets and the discs with their radii inside
-`[SCREEN_EDGE, 1 - SCREEN_EDGE]`, every path point inside the screen) and replaying its actions from its start
+`[SCREEN_EDGE, 1 - SCREEN_EDGE]` for the discs, and the start and the real targets at least `TaskConfig.margin` (0.05, where the layout sampler keeps them) from the edge; every path point inside the screen) and replaying its actions from its start
 succeeds; up to `20 K` draws per demonstration, fewer copies kept when they run out (the count is printed). The copies
 are rendered from their moved layouts (exact, no picture resampling) and encoded like any layout. The free layouts
 (no obstacle) are moved too. The expert's pushes of the field term are NOT recomputed on a copy: the builder check
@@ -160,10 +160,10 @@ because its encoder must not share a GPU with a trainer's encoding phase; it dec
 - `src/lerobot/envs/cursor.py` (mypy-strict): `move_layouts(layouts, angle, shift, mirror) -> Layouts` and
   `move_actions(actions, angle, mirror) -> np.ndarray`, vectorised over the batch (angle `[B]`, shift `[B, 2]`,
   mirror `[B]` bool); rotation about (0.5, 0.5), mirror as `x -> 1 - x` applied before the rotation; `scene` is
-  dropped (the caller re-renders). `layouts_on_screen(layouts, edge=SCREEN_EDGE) -> np.ndarray[bool]` for the
+  dropped (the caller re-renders). `layouts_on_screen(layouts, edge=SCREEN_EDGE, margin=None) -> np.ndarray[bool]` (`margin`, default `edge`, bounds the start and targets) for the
   acceptance test.
 - `examples/pi05/mars/cursor/cursor_sa/demos.py`: `augment_demos(rng, layouts, actions, lengths, k, task, push=None,
-  shift=0.25, tries=20) -> (layouts, actions, lengths, kept, push)` (the originals first, then the accepted copies;
+shift=0.25, tries=20) -> (layouts, actions, lengths, kept, push)` (the originals first, then the accepted copies;
   `kept` = copies per original; `push` `[B, L, 2]` sequences moved like the actions, `None` when not given);
   `DemoSampler(..., jitter=0.0, jitter_steps=4)` applying the jitter in `sample`.
 - `examples/pi05/mars/cursor/train/train_adapter.py`: flags `--jitter`, `--jitter-steps`, `--rigid-motions`, their
@@ -181,7 +181,7 @@ because its encoder must not share a GPU with a trainer's encoding phase; it dec
 2. Six trainings, one job per GPU, run-folder job list `jobs_r4_aug.txt`: `_jit`, `_rigid`, `_both` on T2 and T4,
    about three hours in total.
 3. Gate `grid_task_check_rel_aug` (both cells in parallel, about 15 minutes), `--check` and `--select --prefix rel
-   --base rel`.
+--base rel`.
 4. Report to the user: the diagnostic's table, the gate table, the adoption decision by the rule in goal 3, costs, and
    the rulings made. Stage 2 waits for the user's go.
 

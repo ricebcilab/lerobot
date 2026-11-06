@@ -28,7 +28,7 @@ import torch
 
 from cursor_sa import paths as cursor_paths
 from cursor_sa.agents import make_agent
-from cursor_sa.env import layouts_on_screen, move_layouts, obstacle_spec
+from cursor_sa.env import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec
 from cursor_sa.session import load_checkpoints
 from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources
 from train import train_adapter
@@ -48,8 +48,9 @@ def rebuild_layouts(seed, n, p_free, obstacle, targets=(4, 4), reach=(0.35, 0.5)
     return layouts
 
 
-def moved_layouts(layouts, rng, shift=0.25, tries=50):
-    """Every layout under one random rigid motion (`move_layouts`) that keeps it on screen (`layouts_on_screen`).
+def moved_layouts(layouts, rng, shift=0.25, tries=50, margin=TaskConfig().margin):
+    """Every layout under one random rigid motion (`move_layouts`) that keeps it on screen (`layouts_on_screen`, the
+    start and targets at least `margin` from the edge, as the layout sampler places them).
     Each round draws, for the rows not yet moved, an angle in [0, 2 pi), a shift in [-shift, shift]^2 and a mirror
     with chance 1/2, in that order, and keeps the motions that fit; after `tries` rounds a row still unmoved keeps
     its original (their count is printed). The rows keep their order; the result carries no scene."""
@@ -63,7 +64,7 @@ def moved_layouts(layouts, rng, shift=0.25, tries=50):
         offset = rng.uniform(-shift, shift, (len(todo), 2))
         mirror = rng.random(len(todo)) < 0.5
         moved = move_layouts(layouts[todo], angle, offset, mirror)
-        fits = layouts_on_screen(moved)
+        fits = layouts_on_screen(moved, margin=margin)
         rows = todo[fits]
         out.start[rows], out.targets[rows], out.obstacles[rows] = moved.start[fits], moved.targets[fits], moved.obstacles[fits]
         todo = todo[~fits]

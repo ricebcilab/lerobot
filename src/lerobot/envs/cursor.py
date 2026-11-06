@@ -207,19 +207,21 @@ def move_actions(actions: np.ndarray, angle: np.ndarray, mirror: np.ndarray) -> 
     return np.einsum("bij,blj->bli", _rotations(np.asarray(angle, float)), flipped)
 
 
-def layouts_on_screen(layouts: Layouts, edge: float = SCREEN_EDGE) -> np.ndarray:
-    """[B] True where the start, every real target and every real disc (centre plus and minus its radius)
-    lie inside [edge, 1 - edge]^2."""
+def layouts_on_screen(layouts: Layouts, edge: float = SCREEN_EDGE, margin: float | None = None) -> np.ndarray:
+    """[B] True where every real disc (centre plus and minus its radius) lies inside [edge, 1 - edge]^2 and the
+    start and every real target inside [margin, 1 - margin]^2 (`margin` defaults to `edge`; the layout sampler keeps
+    them `TaskConfig.margin` from the edge)."""
+    margin = edge if margin is None else margin
 
-    def inside(points: np.ndarray) -> np.ndarray:  # [B, ..., 2] -> [B, ...]
-        return ((points >= edge) & (points <= 1 - edge)).all(-1)
+    def inside(points: np.ndarray, bound: float) -> np.ndarray:  # [B, ..., 2] -> [B, ...]
+        return ((points >= bound) & (points <= 1 - bound)).all(-1)
 
     assert layouts.obstacles is not None and layouts.obstacle_mask is not None  # set by __post_init__
     centres, radii = layouts.obstacles[..., :2], layouts.obstacles[..., 2:]
-    discs = inside(centres - radii) & inside(centres + radii)
+    discs = inside(centres - radii, edge) & inside(centres + radii, edge)
     return (
-        inside(layouts.start)
-        & (inside(layouts.targets) | ~layouts.mask).all(1)
+        inside(layouts.start, margin)
+        & (inside(layouts.targets, margin) | ~layouts.mask).all(1)
         & (discs | ~layouts.obstacle_mask).all(1)
     )
 

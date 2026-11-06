@@ -99,3 +99,15 @@ def test_on_screen_needs_the_discs_and_targets_inside_the_edge():
     lay.targets[1, 2:] = 5.0
     lay.obstacles[2] = 5.0
     assert layouts_on_screen(lay).all()
+
+
+def test_on_screen_takes_a_separate_margin_for_the_start_and_targets():
+    lay = _one(start=(0.03, 0.5), goal=(0.5, 0.5), discs=[(0.5, 0.7, 0.08)])
+    assert layouts_on_screen(lay).all()  # 0.03 clears the 0.01 edge
+    assert not layouts_on_screen(lay, margin=0.05).all()  # but not the sampler's 0.05 margin for the start
+    lay = _one(
+        start=(0.5, 0.5), goal=(0.5, 0.2), discs=[(0.5, 0.75, 0.08)]
+    )  # disc edge at 0.83, 0.17 off the edge
+    assert layouts_on_screen(lay, margin=0.05).all()  # the margin does not apply to discs
+    lay = _one(start=(0.5, 0.5), goal=(0.5, 0.2), discs=[(0.5, 0.92, 0.08)])  # disc edge at 0.99
+    assert not layouts_on_screen(lay).all() and not layouts_on_screen(lay, margin=0.05).all()

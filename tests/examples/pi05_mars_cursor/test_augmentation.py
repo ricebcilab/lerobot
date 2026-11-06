@@ -50,7 +50,7 @@ def test_copies_are_rigid_images_of_their_originals_and_the_originals_come_first
 
     env = replay(acts[6:], out[6:], TASK)
     assert env.success.all() and np.array_equal(lens[6:], env.steps)
-    assert layouts_on_screen(out[6:]).all()
+    assert layouts_on_screen(out[6:], margin=TASK.margin).all()  # starts and targets at the sampler's margin
     assert ((_path(out[6:], acts[6:]) >= 0) & (_path(out[6:], acts[6:]) <= 1)).all()
 
     origin = np.repeat(np.arange(6), kept)  # the copies come grouped by original, in original order
@@ -92,7 +92,7 @@ def test_a_seed_gives_the_same_copies_whatever_the_cursor_noise_of_the_task():
 
 def test_replays_run_500_rows_at_a_time(monkeypatch):
     lay, actions, lengths = _demos(FREE)
-    lay, actions, lengths = lay.tile(350), np.tile(actions, (350, 1, 1)), np.tile(lengths, 350)
+    lay, actions, lengths = lay.tile(700), np.tile(actions, (700, 1, 1)), np.tile(lengths, 700)
     rows = []
 
     def counted(moved, layouts, task):
@@ -101,7 +101,7 @@ def test_replays_run_500_rows_at_a_time(monkeypatch):
 
     monkeypatch.setattr(demos, "replay", counted)
     out = augment_demos(np.random.default_rng(1), lay, actions, lengths, 1, FREE, tries=1)[0]
-    assert len(rows) >= 2 and max(rows) == 500 and len(out) > 2100
+    assert len(rows) >= 2 and max(rows) == 500 and len(out) > 4200
 
 
 def test_a_failed_demonstration_gets_no_copies():

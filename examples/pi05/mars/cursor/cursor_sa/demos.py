@@ -179,7 +179,7 @@ def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25
         moved_layouts = move_layouts(layouts[rows], angle, offset, mirror)
         moved = move_actions(actions[rows], angle, mirror)
         path = moved_layouts.start[:, None] + np.concatenate([np.zeros_like(moved[:, :1]), np.cumsum(moved, 1)], 1)
-        fits = np.flatnonzero(layouts_on_screen(moved_layouts) & ((path >= 0) & (path <= 1)).all((1, 2)))
+        fits = np.flatnonzero(layouts_on_screen(moved_layouts, margin=task.margin) & ((path >= 0) & (path <= 1)).all((1, 2)))
         steps = np.zeros(len(rows), dtype=np.int64)  # 0: not kept
         for at in range(0, len(fits), 500):
             chunk = fits[at:at + 500]
