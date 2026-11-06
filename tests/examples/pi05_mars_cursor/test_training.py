@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from cursor_sa import config
-from cursor_sa.readout import corruption_spec, curl_commands
+from cursor_sa.readout import Readout, corruption_spec
 from cursor_sa.env import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
@@ -81,11 +81,11 @@ def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
     served = train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k))
     torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))  # one draw per step
     assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
-    # a curl's core is its velocity driven from rest by the pushes in turn (the trainer's readout_core), not M @ push
+    # a curl's core is its velocity driven from rest by the pushes in turn (the readout's core), not M @ push
     args = _args("--name", "x", "--corruption", "{curl: 20, tau: 0.1}", "--n-demos", "10", "--val-demos", "4")
     _, curl = corruption_spec(args.corruption)
     curled = train_adapter.expert_splits(args, None, policy, "cpu", np.random.default_rng(0), None, curl)["train"]
-    torch.testing.assert_close(curled.core, torch.as_tensor(curl_commands(curled.push.numpy(), curl), dtype=torch.float32))
+    torch.testing.assert_close(curled.core, torch.as_tensor(Readout(curl=curl).core(curled.push.numpy()), dtype=torch.float32))
     assert not torch.allclose(curled.core, curled.push, atol=1e-2)
 
 

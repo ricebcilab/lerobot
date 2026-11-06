@@ -62,7 +62,7 @@ from lerobot.policies.steering import (AdaptedField, FlowControlPolicy, FlowReve
                                              load_adapter_module, task_velocity_hook)
 
 from .env import render_views
-from .readout import DEADBAND, corrupt_chunk, is_active
+from .readout import DEADBAND, Readout, is_active
 
 MODES = ("policy", "teleop", "flow_control", "frs")
 GAIN_MODES = ("step", "time")  # how speed_gain slows the cursor: smaller steps, or each planned step over more control steps
@@ -91,7 +91,7 @@ def bci_chunk(intended, corruption, sigma, policy, dt=0.02, max_speed=MAX_SPEED)
     """The BCI's version of an intended chunk (normalized policy units, [B, H, 2]): each
     step as the operator's deflection, through the readout (`corruption` M, noise
     std `sigma` [B]), and back. The torch twin of what an expert_chunk agent delivers."""
-    return to_action(corrupt_chunk(to_deflection(intended, policy, dt, max_speed), corruption, sigma),
+    return to_action(Readout(corruption).chunk(to_deflection(intended, policy, dt, max_speed), sigma),
                      policy, dt, max_speed)
 
 

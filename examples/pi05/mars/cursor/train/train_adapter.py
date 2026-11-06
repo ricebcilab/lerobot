@@ -123,7 +123,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
-from cursor_sa.readout import DEADBAND, corruption_spec, curl_commands, serve_command  # noqa: E402
+from cursor_sa.readout import DEADBAND, Readout, corruption_spec  # noqa: E402
 from cursor_sa.demos import (  # noqa: E402
     DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, plan_reach,
 )
@@ -239,14 +239,6 @@ def expert_pushes(layouts, pos, rows_per_call=500):
         for k in range(L):
             out[rows, k] = agent.command(pos[rows, k], sub)
     return out
-
-
-def readout_core(push, corruption, curl):
-    """What the user's readout makes of the pushes [B, L, 2] before the noise: M @ push clipped, or a curl's
-    velocity driven from rest by the pushes in turn."""
-    if curl is not None:
-        return curl_commands(push, curl)
-    return push if corruption is None else np.clip(push @ np.asarray(corruption).T, -1.0, 1.0)
 
 
 VIEW_AFFINE_DEGREES = 5.0     # --view-affine: a moved picture turns by up to this many degrees about its centre
@@ -393,7 +385,7 @@ class ExpertData:
         if push is None:
             push = expert_pushes(layouts, demo_positions(layouts, actions))
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
-        self.push, self.core = f32(push), f32(readout_core(push, corruption, curl))
+        self.push, self.core = f32(push), f32(Readout(corruption, curl=curl).core(push))
         self.noise = torch.randn_like(self.core) if frozen_noise else None  # one draw per demo step, or fresh ones
 
     def noise_at(self, i, k):
@@ -500,7 +492,7 @@ class ClosedLoopData:
     def __init__(self, layouts, actions, lengths, raw, policy, device, corruption, curl, rng, task):
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
         f32 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
-        self.push, self.core = f32(raw), f32(readout_core(raw, corruption, curl))
+        self.push, self.core = f32(raw), f32(Readout(corruption, curl=curl).core(raw))
         H = policy.horizon
         pos = demo_positions(layouts, actions)
         labels = np.zeros((len(actions), actions.shape[1], H, 2))
@@ -563,7 +555,7 @@ def bci_command(policy, push, core, sigma, noise=None):
     """The controller's reference for one served command per sample: noise on the readout core (where the
     push is active; `noise` the standard normal draws, default fresh), held over the chunk, in the policy's
     units [B, H, 2]."""
-    served = serve_command(core, push, sigma, noise)
+    served = Readout.serve(core, push, sigma, noise)
     return to_action(served[:, None].expand(-1, policy.horizon, -1), policy)
 
 

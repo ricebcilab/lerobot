@@ -6,17 +6,15 @@ LeRobot's TeleopChain: raw -> M @ raw (corruption) -> + Gaussian noise. A
 corruption is a 2x2 matrix M, or a curl field on the command: the command the
 controller gets is a velocity v driven by the raw push through
 dv/dt = (raw - v) / tau + curl * R v (R a clockwise quarter turn), the dynamics
-`env.CursorEnv` gives the cursor, here acting on the command instead. The rules are LeRobot's operator
-readout (`lerobot.teleoperators.readout`), which the robot example's TeleopChain runs too; the torch twins
-below, for training, follow them step for step (the tests check they agree).
+`env.CursorEnv` gives the cursor, here acting on the command instead. The rules and the stateful
+`Readout` (with its torch forms for training, `Readout.chunk` and `Readout.serve`) are LeRobot's operator
+readout (`lerobot.teleoperators.readout`), which the robot example's TeleopChain runs too; this module keeps
+the specs that configure it and re-exports the rest.
 """
 
 import numpy as np
-import torch
 
-from lerobot.teleoperators.readout import DEADBAND, add_noise, corrupt, curl_step, is_active  # noqa: F401
-
-from .env import curl_discretization
+from lerobot.teleoperators.readout import DEADBAND, Readout, add_noise, corrupt, curl_step, is_active  # noqa: F401
 
 
 def matrix_spec(spec, where="matrix"):
@@ -78,82 +76,3 @@ def adapter_spec(spec, corruption, where="reversal_adapter"):
             raise ValueError(f"{where}: translation: corruption needs a corruption to copy")
         return corruption.copy()
     return matrix_spec(spec["translation"], f"{where}.translation")
-
-
-class Readout:
-    """What happens to a command between the operator and the controller:
-    raw -> M @ raw (corruption, clipped to [-1, 1]) -> + N(0, input_noise^2) per
-    axis (clipped again). As in LeRobot, both apply only while the operator is
-    commanding (outside DEADBAND), so idle input stays exactly idle.
-
-    With `curl` ({curl, tau}) the corruption is a curl field instead of M: the
-    readout keeps a velocity per trial, driven by every raw push (idle ones too)
-    and reset by `reset(n_trials)` at the start of a batch of trials; the
-    controller gets that velocity (clipped), then the noise. Steps of `dt` s.
-
-    Batched: commands are [B, 2], or [B, H, 2] for a whole chunk per trial (not
-    with a curl). `corruption` is one 2x2 matrix or one per trial [B, 2, 2];
-    `input_noise` is one std or one per trial [B].
-    """
-
-    def __init__(self, corruption=None, input_noise=0.0, rng=None, curl=None, dt=0.02):
-        self.corruption, self.input_noise = corruption, np.asarray(input_noise, dtype=float)
-        self.rng = rng if rng is not None else np.random.default_rng()
-        self.curl, self.vel = curl, None
-        if curl is not None:
-            if corruption is not None:
-                raise ValueError("a readout has a matrix corruption or a curl, not both")
-            self._decay, self._drive = curl_discretization(curl["tau"], curl["curl"], dt)
-
-    def reset(self, n_trials=1):
-        """A new batch of trials: the curl's velocity starts at rest."""
-        self.vel = None if self.curl is None else np.zeros((n_trials, 2))
-
-    def __call__(self, raw):
-        raw = np.asarray(raw, dtype=float)
-        extra = (1,) * (raw.ndim - 2)  # per-trial parameters broadcast over a chunk's steps
-        out = raw
-        if self.curl is not None:
-            if raw.ndim != 2:
-                raise ValueError("a curl readout takes one command per trial and step, [B, 2]")
-            if self.vel is None or self.vel.shape != raw.shape:
-                self.vel = np.zeros_like(raw)
-            self.vel = curl_step(self.vel, raw, self._decay, self._drive)
-            out = np.clip(self.vel, -1.0, 1.0)
-        if self.corruption is not None:
-            m = self.corruption
-            out = corrupt(raw, m.reshape(m.shape[:1] + extra + m.shape[1:]) if m.ndim == 3 else m)
-        if np.any(self.input_noise):  # a draw per step and axis while the noise is on, active or not
-            sigma = self.input_noise.reshape(self.input_noise.shape + extra) if self.input_noise.ndim else self.input_noise
-            return add_noise(out, raw, sigma, self.rng.normal(size=out.shape))
-        return np.where(is_active(raw)[..., None], out, raw)
-
-
-def curl_commands(raw, curl, dt=0.02):
-    """What a curl readout ({curl, tau}) serves, before noise, for raw pushes [B, L, 2] given step by
-    step from rest (numpy): the velocity after every step, clipped to [-1, 1]."""
-    decay, drive = curl_discretization(curl["tau"], curl["curl"], dt)
-    vel, out = np.zeros(raw.shape[::2]), np.empty_like(raw, dtype=float)
-    for k in range(raw.shape[1]):
-        vel = curl_step(vel, raw[:, k], decay, drive)
-        out[:, k] = vel
-    return np.clip(out, -1.0, 1.0)
-
-
-def serve_command(core, raw, sigma, noise=None):
-    """The torch twin of the readout's last stage, for training: `core` [B, 2] (M @ raw clipped, or a
-    curl's velocity) plus noise of std `sigma` [B], clipped, only where the raw push [B, 2] is active.
-    `noise` [B, 2]: the standard normal draws to scale by sigma (default: fresh ones)."""
-    noise = torch.randn_like(core) if noise is None else noise
-    out = torch.clamp(core + sigma[:, None] * noise, -1.0, 1.0)
-    return torch.where(raw.abs().amax(-1, keepdim=True) >= DEADBAND, out, raw)
-
-
-def corrupt_chunk(command, corruption, sigma):
-    """`Readout` in torch, for training: deflection chunks `command` [B, H, 2],
-    one 2x2 `corruption` (or None) and a noise std per trial `sigma` [B]. The same
-    rule, step by step: M @ raw, clip, + noise, clip, only where the step is active."""
-    out = command if corruption is None else torch.clamp(command @ corruption.T, -1.0, 1.0)
-    out = torch.clamp(out + sigma[:, None, None] * torch.randn_like(out), -1.0, 1.0)
-    active = command.abs().amax(-1, keepdim=True) >= DEADBAND
-    return torch.where(active, out, command)

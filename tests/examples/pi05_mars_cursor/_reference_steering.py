@@ -49,7 +49,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from cursor_sa.readout import corrupt_chunk, is_active
+from cursor_sa.readout import Readout, is_active
 from cursor_sa.policy import mlp, time_embedding
 
 MODES = ("policy", "teleop", "flow_control", "frs")
@@ -79,7 +79,7 @@ def bci_chunk(intended, corruption, sigma, policy, dt=0.02, max_speed=MAX_SPEED)
     """The BCI's version of an intended chunk (normalized policy units, [B, H, 2]): each
     step as the operator's deflection, through the readout (`corruption` M, noise
     std `sigma` [B]), and back. The torch twin of what an expert_chunk agent delivers."""
-    return to_action(corrupt_chunk(to_deflection(intended, policy, dt, max_speed), corruption, sigma),
+    return to_action(Readout(corruption).chunk(to_deflection(intended, policy, dt, max_speed), sigma),
                      policy, dt, max_speed)
 
 

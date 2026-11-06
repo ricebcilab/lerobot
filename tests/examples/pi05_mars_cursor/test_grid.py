@@ -10,7 +10,7 @@ import torch
 
 from cursor_sa import config, session
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.readout import Readout, corruption_spec, curl_commands, serve_command
+from cursor_sa.readout import Readout, corruption_spec
 from cursor_sa.env import TaskConfig, curl_steady_state, obstacle_count, obstacle_spec, place_obstacles, plan_route, route_side, sample_layouts
 from cursor_sa.session import readout_for, load_checkpoints, run_trials
 from cursor_sa.steering import TaskModule, UserModule
@@ -104,10 +104,10 @@ def test_curl_readout_turns_and_slows_the_command_and_resets_per_batch():
     live = Readout(None, 0.0, curl=curl)
     live.reset(3)
     stepped = np.stack([live(pushes[:, k]) for k in range(30)], 1)
-    np.testing.assert_allclose(curl_commands(pushes, curl), stepped, atol=1e-12)
+    np.testing.assert_allclose(Readout(curl=curl).core(pushes), stepped, atol=1e-12)
     with pytest.raises(ValueError, match="one command per trial"):
         live(pushes[:, :16])
-    out = serve_command(torch.tensor([[0.3, 0.2], [0.3, 0.2]]), torch.tensor([[1.0, 0.0], [0.0, 0.0]]), torch.zeros(2))
+    out = Readout.serve(torch.tensor([[0.3, 0.2], [0.3, 0.2]]), torch.tensor([[1.0, 0.0], [0.0, 0.0]]), torch.zeros(2))
     np.testing.assert_allclose(out.numpy(), [[0.3, 0.2], [0.0, 0.0]])                   # noise-free core where active
     arm = config.load_arm("teleop.yaml", {"corruption": {"curl": 20, "tau": 0.1}, "input_noise": 0.0})
     assert arm["corruption_matrix"] is None and arm["corruption_curl"] == curl

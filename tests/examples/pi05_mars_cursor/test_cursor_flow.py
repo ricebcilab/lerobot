@@ -8,7 +8,7 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.readout import Readout, adapter_spec, corrupt_chunk, matrix_spec, serve_command
+from cursor_sa.readout import Readout, adapter_spec, matrix_spec
 from cursor_sa.demos import DemoSampler, make_demos, replay
 from cursor_sa.env import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
 from cursor_sa.policy import FlowPolicy
@@ -191,21 +191,21 @@ def test_the_torch_readout_twins_follow_the_shared_readout():
     policy = FlowPolicy().eval()
     m = matrix_spec({"scale": [1.0, 0.25]})
     deflection = torch.tensor([[[0.8, 0.8], [0.02, 0.01], [-0.5, 1.0]]])  # the middle step is idle
-    served = corrupt_chunk(deflection, torch.as_tensor(m, dtype=torch.float32), torch.zeros(1))
+    served = Readout(torch.as_tensor(m, dtype=torch.float32)).chunk(deflection, torch.zeros(1))
     torch.testing.assert_close(served, torch.as_tensor(Readout(m)(deflection.numpy()), dtype=torch.float32))
     bci = bci_chunk(to_action(deflection, policy), torch.as_tensor(m, dtype=torch.float32), torch.zeros(1), policy)
     torch.testing.assert_close(to_deflection(bci, policy), served, atol=1e-6, rtol=1e-6)
     pushed = torch.tensor([[[0.0, 0.5], [0.02, 0.01]]]).expand(4000, -1, -1)  # noise far from the clip at +-1
-    noisy = corrupt_chunk(pushed, None, torch.full((4000,), 0.3))
+    noisy = Readout(None).chunk(pushed, torch.full((4000,), 0.3))
     assert abs(noisy[:, 0, 0].std().item() - 0.3) < 0.02 and torch.equal(noisy[:, 1], pushed[:, 1])
     g = np.random.default_rng(5)
     raw = g.uniform(-1, 1, (6, 2))
     raw[1] = 0.02  # idle
     core, sigma, noise = shared_readout.corrupt(raw, m), g.uniform(0, 2, 6), g.normal(size=(6, 2))
-    out = serve_command(torch.tensor(core), torch.tensor(raw), torch.tensor(sigma), torch.tensor(noise))
+    out = Readout.serve(torch.tensor(core), torch.tensor(raw), torch.tensor(sigma), torch.tensor(noise))
     np.testing.assert_allclose(out.numpy(), shared_readout.add_noise(core, raw, sigma, noise), atol=1e-12)
     chunk = torch.tensor(g.uniform(-1, 1, (6, 4, 2)))
-    np.testing.assert_allclose(corrupt_chunk(chunk, torch.tensor(m), torch.zeros(6)).numpy(), shared_readout.corrupt(chunk.numpy(), m),
+    np.testing.assert_allclose(Readout(torch.tensor(m)).chunk(chunk, torch.zeros(6)).numpy(), shared_readout.corrupt(chunk.numpy(), m),
                                atol=1e-12)
 
 
