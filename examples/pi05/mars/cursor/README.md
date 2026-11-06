@@ -20,9 +20,9 @@ from the repo root. Day one, on a fresh clone:
 
 ```bash
 uv sync --extra mars        # or: pip install -e ".[mars]"
-uv run --extra mars python examples/pi05/mars/cursor/hub.py download
+uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py download
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study.yaml --participant p1
-uv run --extra mars python examples/pi05/mars/cursor/analyze_results.py --participants p1
+uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --participants p1
 ```
 
 `hub.py download` fetches the checkpoints the study and the grid use (the folders listed in
@@ -42,7 +42,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study.yaml --participant sim         # the expert agent, headless (20 s)
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study.yaml --participant sim --watch # the expert, rendered
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --arm study_mars.yaml                            # free play with one arm
-uv run --extra mars python examples/pi05/mars/cursor/analyze_results.py                                               # tables and figures for every run
+uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py                                               # tables and figures for every run
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1          # a participant's study report (PDF)
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1 p2 p3 p4 # the group's
 uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --device cpu                          # the paper's figures (examples/pi05/mars/figures/*.pdf, *.png, stats.json)
@@ -70,13 +70,15 @@ cursor_sa/            the library: env, policy, demos (+ the training sampler), 
                       renderer, records (trial records and their summary), analysis (figure style,
                       kinematics, goal-choice statistics), paths
 run_experiment.py     the portal: a protocol for a participant (human or expert), or free play
-hub.py                the checkpoints on the Hugging Face Hub: download, manifest (--check), upload
 hub_manifest.yaml     the checkpoint folders the study and the grid use (written by hub.py manifest)
-convert_checkpoints.py  converts trainer checkpoints (policy.pt, adapter.pt) in place to lerobot's formats
 run_sweep.py          tune-then-test sweeps of the steering methods with a simulated agent
-analyze_results.py    per-participant and pooled analysis of any runs
+tools/                hub.py (the checkpoints on the Hugging Face Hub: download, manifest (--check), upload),
+                      convert_checkpoints.py (trainer checkpoints to lerobot's formats, in place),
+                      analyze_results.py (per-participant and pooled analysis of any runs),
+                      diag_layouts.py (an image task module on train, fresh and moved layouts)
 train/                train_policy.py, train_adapter.py
-reports/              build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or
+reports/              report_grid_image.py (gate verdicts and grid tables of the image task modules);
+                      build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or
                       study_group.pdf for several (paper-style figures)
 ../paper/figures/     (examples/pi05/mars/paper/figures/) the paper's figures, PDF + PNG, and build_figures.py (one script; `--only fig1 fig2 fig3`):
                       fig1_method (MARS illustrated), fig2_study (the human study), fig3_grid (the user x task
@@ -346,7 +348,7 @@ uv run --extra mars python examples/pi05/mars/cursor/train/train_policy.py --nam
 uv run --extra mars python examples/pi05/mars/cursor/train/train_adapter.py --kind user --model flow_goaldrop_disc_large \
     --corruption '{scale: [1.0, 0.25]}' --name user_gain025y_expert_n100_s0_on_disc_large --n-demos 100 --steps 500 --frozen-noise
 # then convert the policy it wrote to lerobot's format (below; adapters are written in it already)
-uv run --extra mars python examples/pi05/mars/cursor/convert_checkpoints.py
+uv run --extra mars python examples/pi05/mars/cursor/tools/convert_checkpoints.py
 ```
 
 `train_adapter.py` trains one module of the reversal adapter, on the study's geometry (4 targets,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """An image task module on its own training layouts, on fresh ones and on its training layouts moved.
 
-    python diag_layouts.py --sweep grid_task_check_image2_quick --context T2 --method oracle_task_rel \\
+    python examples/pi05/mars/cursor/tools/diag_layouts.py --sweep grid_task_check_image2_quick --context T2 --method oracle_task_rel \\
         --seed 0 --n-demos 300 --p-free 0.25 --fresh-seed 820 --trials 225 --out ../results/sim/reports/diag_layouts
 
 Three sets of layouts of the context's task (the sweep's users x tasks cell of that task with no corruption):
@@ -29,12 +29,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from cursor_sa import paths as cursor_paths
-from cursor_sa.agents import make_agent
-from cursor_sa.env import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec
-from cursor_sa.session import load_checkpoints
-from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources
-from train import train_adapter
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa, run_sweep and train sit one folder up
+
+from cursor_sa import paths as cursor_paths  # noqa: E402
+from cursor_sa.agents import make_agent  # noqa: E402
+from cursor_sa.env import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec  # noqa: E402
+from cursor_sa.session import load_checkpoints  # noqa: E402
+from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources  # noqa: E402
+from train import train_adapter  # noqa: E402
 
 from lerobot.policies.steering import SceneEncoder
 from lerobot.policies.steering.modeling_steering import SCENE_VLM_PATH

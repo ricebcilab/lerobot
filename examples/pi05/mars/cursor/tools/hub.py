@@ -34,7 +34,8 @@ from pathlib import Path
 import yaml
 from huggingface_hub import HfApi, snapshot_download
 
-ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa (imported lazily) sits one folder up
+ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINTS = ROOT.parent / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
 MANIFEST = ROOT / "hub_manifest.yaml"
 REPO = "ricebcilab/mars-cursor"

@@ -35,7 +35,7 @@ from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
 from lerobot.policies.steering import (LearnedTaskModule, LearnedUserModule, convert_cursor_module, load_adapter_module,
                                              save_adapter_module)
 
-CHECKPOINTS = Path(__file__).resolve().parents[1] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
+CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
 
 
 def _same_weights(a, b):

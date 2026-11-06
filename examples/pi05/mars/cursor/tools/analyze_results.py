@@ -1,8 +1,8 @@
 """Analyze experiment runs: per participant and pooled, human or simulated.
 
-    python analyze_results.py                               # every run under results/p*/ and results/sim/
-    python analyze_results.py --participants p1 p2 sim      # some participants
-    python analyze_results.py --protocol study --out study  # one protocol, named output folder
+    python examples/pi05/mars/cursor/tools/analyze_results.py                               # every run under results/p*/ and results/sim/
+    python examples/pi05/mars/cursor/tools/analyze_results.py --participants p1 p2 sim      # some participants
+    python examples/pi05/mars/cursor/tools/analyze_results.py --protocol study --out study  # one protocol, named output folder
 
 Practice and aborted trials are excluded. Writes to results/analysis/<out>/:
 
@@ -17,6 +17,7 @@ Practice and aborted trials are excluded. Writes to results/analysis/<out>/:
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -24,10 +25,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cursor_sa.analysis import INK, INK_2, style
-from cursor_sa.env import TaskConfig
-from cursor_sa.paths import RESULTS
-from cursor_sa.records import load_run, summarize
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa, run_sweep and train sit one folder up
+
+from cursor_sa.analysis import INK, INK_2, style  # noqa: E402
+from cursor_sa.env import TaskConfig  # noqa: E402
+from cursor_sa.paths import RESULTS  # noqa: E402
+from cursor_sa.records import load_run, summarize  # noqa: E402
 
 ARM_COLORS = ["#8a8984", "#eb6834", "#1baf7a", "#2a78d6", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
 
