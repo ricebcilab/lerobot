@@ -32,6 +32,7 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cursor"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cursor" / "tools"))  # analyze_results lives there
 
 import matplotlib
 matplotlib.use("Agg")
