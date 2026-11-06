@@ -1,10 +1,10 @@
 """The checkpoints on the Hugging Face Hub: the folders under examples/pi05/mars/checkpoints/ that the study and
 the grid use, listed in hub_manifest.yaml.
 
-    uv run --extra mars python examples/pi05/mars/cursor/hub.py download                  # fetch them (public repo, no login)
-    uv run --extra mars python examples/pi05/mars/cursor/hub.py manifest                  # rewrite hub_manifest.yaml from the configs
-    uv run --extra mars python examples/pi05/mars/cursor/hub.py manifest --check          # fail if hub_manifest.yaml is out of date
-    uv run --extra mars python examples/pi05/mars/cursor/hub.py upload                    # maintainers: create the repo, upload
+    uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py download                  # fetch them (public repo, no login)
+    uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py manifest                  # rewrite hub_manifest.yaml from the configs
+    uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py manifest --check          # fail if hub_manifest.yaml is out of date
+    uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py upload                    # maintainers: create the repo, upload
 
 The manifest is rebuilt from the configs, never edited by hand:
 - study: configs/study.yaml's arms (their policy and adapters);

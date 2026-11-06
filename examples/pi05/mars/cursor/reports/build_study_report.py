@@ -363,7 +363,7 @@ def repro_paragraph(args, participants, fig_dir):
     who = " ".join(participants)
     return Paragraph("<b>Reproducing.</b> " + " · ".join(code(line) for line in (
         f"python run_experiment.py --protocol {args.protocol}.yaml --participant p&lt;N&gt; --session &lt;k&gt;",
-        f"python analyze_results.py --participants {who}",
+        f"python tools/analyze_results.py --participants {who}",
         f"python reports/build_study_report.py --participants {who}"))
         + f". Figures as PDF and PNG: {code(str(fig_dir.relative_to(Path(args.results).parent)) + '/')}", CAP)
 

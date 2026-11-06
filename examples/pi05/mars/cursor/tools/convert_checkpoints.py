@@ -1,6 +1,6 @@
 """Convert the cursor project's checkpoints, in place, to the formats lerobot loads.
 
-    python examples/pi05/mars/cursor/convert_checkpoints.py [--checkpoints DIR]
+    python examples/pi05/mars/cursor/tools/convert_checkpoints.py [--checkpoints DIR]
 
 DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
 

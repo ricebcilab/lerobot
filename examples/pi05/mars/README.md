@@ -22,9 +22,9 @@ Run from the repo root.
 
 ```bash
 uv sync --extra mars        # or: pip install -e ".[mars]"
-uv run --extra mars python examples/pi05/mars/cursor/hub.py download
+uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py download
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study.yaml --participant p1
-uv run --extra mars python examples/pi05/mars/cursor/analyze_results.py --participants p1
+uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --participants p1
 ```
 
 `hub.py download` fetches the trained checkpoints (the folders in
@@ -38,7 +38,7 @@ Results go to `examples/pi05/mars/results/`, checkpoints to
 
 The cursor trainers write the cursor project's checkpoint formats (`policy.pt`,
 `adapter.pt`) and the loaders read both; rerun
-`cursor/convert_checkpoints.py` after training to get the lerobot format. When a
+`cursor/tools/convert_checkpoints.py` after training to get the lerobot format. When a
 policy folder holds both, `policy.pt` wins, with a warning
 ([cursor/README.md](cursor/README.md#training)).
 
