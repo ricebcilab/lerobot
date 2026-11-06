@@ -11,7 +11,9 @@ Around obstacles a demonstration follows the expert's own path (the pure-pursuit
 `agents.ExpertAgent` along its planned route), timed as one minimum-jerk
 movement whose Fitts duration grows with every radian the path turns.
 
-`DemoSampler` draws (observation, action chunk) training pairs from the demos.
+`augment_demos` adds rigidly moved copies of the demos (rotation, shift, mirror).
+`DemoSampler` draws (observation, action chunk) training pairs from the demos,
+optionally with the cursor jittered off the path and a chunk that returns to it.
 """
 
 from dataclasses import dataclass, replace
@@ -19,7 +21,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from .env import CursorEnv, TaskConfig
+from .env import CursorEnv, Layouts, TaskConfig, layouts_on_screen, move_actions, move_layouts
 
 CURVE_SLOWDOWN = 0.15  # a demonstration around obstacles takes this fraction longer per radian its path turns
 
@@ -150,6 +152,56 @@ def make_demos(rng, layouts, task=TaskConfig(), demo=DemoConfig(), max_tries=50,
     return np.concatenate([actions, np.zeros((B, extra, 2))], 1), lengths
 
 
+def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25, tries=20):
+    """Up to `k` rigidly moved copies of every demonstration (`env.move_layouts`, `env.move_actions`).
+
+    Returns (layouts, actions, lengths, kept, push): rows 0..B-1 are the originals unchanged, then the
+    copies grouped by original in original order; kept [B] counts each original's copies and push is
+    `push` [B, L, 2] with the copies' rows moved by their motions (None stays None). Every round draws
+    one motion for each original still short of `k`: an angle in [0, 2 pi), a shift in [-shift, shift]^2
+    and a mirror with chance 1/2, in that order. A copy is kept when its layout is on screen, its whole
+    path lies in [0, 1]^2 and its actions replay to success; its length is what the replay took. Rounds
+    stop after `tries * k`, so a reach too wide to move gets fewer copies, and a demonstration of length
+    0 gets none.
+    """
+    if push is not None and len(push) != len(actions):
+        raise ValueError(f"push has {len(push)} rows for {len(actions)} demonstrations")
+    task = replace(task, cursor_noise=0.0)
+    kept = np.zeros(len(layouts), dtype=np.int64)
+    found = []
+    for _ in range(tries * k):
+        rows = np.flatnonzero((lengths > 0) & (kept < k))
+        if not len(rows):
+            break
+        angle = rng.uniform(0, 2 * np.pi, len(rows))
+        offset = rng.uniform(-shift, shift, (len(rows), 2))
+        mirror = rng.random(len(rows)) < 0.5
+        moved_layouts = move_layouts(layouts[rows], angle, offset, mirror)
+        moved = move_actions(actions[rows], angle, mirror)
+        path = moved_layouts.start[:, None] + np.concatenate([np.zeros_like(moved[:, :1]), np.cumsum(moved, 1)], 1)
+        fits = np.flatnonzero(layouts_on_screen(moved_layouts) & ((path >= 0) & (path <= 1)).all((1, 2)))
+        steps = np.zeros(len(rows), dtype=np.int64)  # 0: not kept
+        for at in range(0, len(fits), 500):
+            chunk = fits[at:at + 500]
+            env = replay(moved[chunk], moved_layouts[chunk], task)
+            steps[chunk] = env.steps * env.success
+        good = np.flatnonzero(steps)
+        if len(good):
+            origin = rows[good]
+            kept[origin] += 1
+            found.append((origin, moved_layouts[good], moved[good], steps[good],
+                          None if push is None else move_actions(push[origin], angle[good], mirror[good])))
+    if not found:
+        return layouts, actions, lengths, kept, push
+    origin, moved_layouts, moved, steps, pushes = zip(*found)
+    order = np.argsort(np.concatenate(origin), kind="stable")  # by original, each in the order accepted
+    out = Layouts.concat([layouts, Layouts.concat(moved_layouts)[order]])
+    actions_out = np.concatenate([actions, np.concatenate(moved)[order]])
+    lengths_out = np.concatenate([lengths, np.concatenate(steps)[order]])
+    push_out = None if push is None else np.concatenate([push, np.concatenate(pushes)[order]])
+    return out, actions_out, lengths_out, kept, push_out
+
+
 def replay(actions, layouts, task=TaskConfig(), rng=None):
     """Step action sequences [B, L, 2] open loop; the cursor holds after they end."""
     env = CursorEnv(layouts, task, rng)
@@ -182,9 +234,13 @@ class DemoSampler:
     """Draws (observation, action chunk) pairs uniformly over all demo time steps.
     Steps before a demo starts count as rest; steps after it ends are holds. With `frames` = {source: (tokens, start, stride)}
     (one token row per frame, demo i's frames from row start[i], a frame every `stride` steps) every step is floored to its
-    frame and obs["scene"][source] holds that frame's tokens."""
+    frame and obs["scene"][source] holds that frame's tokens. With `jitter` > 0 every sample's position moves off the path by
+    delta ~ N(0, jitter^2 I) and the first `jitter_steps` steps of its chunk (all of a shorter chunk) take delta back out.
+    The history, like everything else in the sample, stays the demonstration step's."""
 
-    def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None):
+    def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None, jitter=0.0, jitter_steps=4):
+        if jitter < 0 or jitter_steps < 1:
+            raise ValueError(f"need jitter >= 0 and jitter_steps >= 1, got {jitter} and {jitter_steps}")
         B = len(actions)
         zeros = lambda n: np.zeros((B, n, 2))
         pos = layouts.start[:, None] + np.concatenate([zeros(1), np.cumsum(actions, 1)], 1)
@@ -204,6 +260,7 @@ class DemoSampler:
         self.valid = torch.nonzero(self.lengths > 0).squeeze(1)   # demos that exist (length 0: none was found)
         self.window = torch.arange(hist + horizon, device=device)
         self.hist = hist
+        self.jitter, self.jitter_steps = jitter, jitter_steps
 
     def sample(self, n, goal_dropout=0.0, indexed=False):
         """goal_dropout: fraction of samples whose goal flag is hidden (all targets 0). With `indexed`
@@ -221,4 +278,11 @@ class DemoSampler:
         for name, (tokens, start) in self.frames.items():
             row = start[i.to(start.device)] + (k // self.stride).to(start.device)
             obs.setdefault("scene", {})[name] = tokens[row].to(i.device)
-        return (obs, seq[:, self.hist:], i, k) if indexed else (obs, seq[:, self.hist:])
+        chunk = seq[:, self.hist:]
+        if self.jitter > 0:
+            delta = self.jitter * torch.randn(n, 2, device=i.device)
+            m = min(self.jitter_steps, chunk.shape[1])
+            obs["pos"] = obs["pos"] + delta
+            chunk = chunk.clone()
+            chunk[:, :m] -= delta[:, None] / m
+        return (obs, chunk, i, k) if indexed else (obs, chunk)
