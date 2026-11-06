@@ -80,3 +80,29 @@
 
 - [ ] Whole-range review of the three commits on the most capable model, with the equivalence tests as the bar; one fix wave if needed.
 - [ ] Report: what moved where (a table), what stayed and why, the test counts and runtime, and the rulings made.
+
+---
+
+### Task E: The steering package itself, functions folded into classes along the package's concerns
+
+**Why (user, 2026-11-06 afternoon):** "consolidation to the steering utils, by cleanly folding functions into classes, following the examples of other implementations in `src/lerobot/policies`." Today `modeling_steering.py` is 1,734 lines with about thirty module-level functions around five concerns; the sibling policies keep a `configuration_<name>.py` (a config dataclass and specs), a `modeling_<name>.py` (the `nn.Module` cores and the policy class, with few module-level helpers, all pure math), and a `processor_<name>.py` (processing steps as classes).
+
+**The map (the controller's proposal; the user may amend it before this task runs):**
+
+| today (module-level) | becomes | in |
+|---|---|---|
+| `apply_user_module` | `LearnedUserModule.apply(x_t, t, v)` | `adapters.py` |
+| `_BoundTaskModule`, `reduce_tokens` | `LearnedTaskModule.bind(obs)` (already) and `LearnedTaskModule.reduce(tokens)` (static), `reduce_tokens` kept as a thin alias for the trainer | `adapters.py` |
+| `save_adapter_module`, `load_adapter_module`, `convert_cursor_module`, `_MODULE_KINDS` | `AdapterModules.save(path, kind, meta)` / `AdapterModules.load(path, device)` / `AdapterModules.from_cursor_checkpoint(ckpt)` on the composed adapter moved in Task C | `adapters.py` |
+| `scene_for`, `encode_views`, `fit_token_reduction`, `SCENE_VLM_PATH`, `SCENE_PROMPT` | `SceneEncoder.scene_for(layouts, source, size)`, `SceneEncoder.encode_views(images, batch)`, `SceneEncoder.fit_reduction(batches, rank, center)` (the `discs`/`cnn` branches of `scene_for`, which need no encoder, stay reachable as `SceneEncoder.scene_for(..., encoder=None)` or a static method) | `scene.py` |
+| `AdaptedField`, `_adapt_velocity`, `integrate`, `reverse_flow`, `forward_flow`, `frs_schedule`, `frs_latent`, `uniform_reference` | `AdaptedField.adapt` (already) plus a `Flow(sampler, field)` class with `integrate(x, t0, h, n)`, `reverse(x, n, steps)`, `forward(x, t0, t1, steps)`, `latent(...)`, `schedule(...)` (static), `uniform_reference(...)` (static) | `flow.py` |
+| `user_field_loss`, `task_field_loss`, `heading_cosine`, `regenerate`, `step_if_finite`, `train_module`, `_rng_state`, `_set_rng_state`, `paired_chunks` | an `AdapterTrainer(policy, module, kind, ...)` class with `field_loss(...)`, `regenerate(...)`, `step(loss)`, `train(...)`, `paired_chunks(...)`; `heading_cosine` a static method | `training.py` |
+| `flow_control_write`, `delegation_mask`, `task_velocity_hook`, `get_action_mean_std` | methods of `_ChunkSteering` / `FlowControlPolicy` / `FlowReversalSteeringPolicy` (`write`, `delegation_mask`, `velocity_hook`, `action_mean_std`) | `modeling_steering.py` (the two steering policies stay here) |
+| `validate_matrix`, `rotation_about_z`, `translation_matrix`, `format_matrix`, `build_reversal_adapter`, `parse_adapter_spec` | static or class methods of `AdapterSpec` / `MatrixHolder` (`AdapterSpec.parse`, `AdapterSpec.build`, `MatrixHolder.format`, matrix helpers as `AdapterSpec` statics) | `configuration_steering.py` |
+| `sinusoidal_time_embedding`, `check_steps`, `scene_spec`, the constants | stay module-level (pure helpers and specs, as the siblings keep theirs) | where they are |
+
+`__init__.py` exports the classes and keeps every name the example, the tests and the π0.5 steering harness import today as aliases for this round, each marked deprecated in its docstring; a later round removes the aliases once every caller is on the methods. No number changes: every equivalence and reference test must pass unchanged; `save`/`load` keep the checkpoint format; the π0.5 harness tests (`tests/policies/steering/test_steering_wrappers.py`, `test_steering_core.py`) must pass unchanged except for import lines.
+
+**Files:** create `src/lerobot/policies/steering/{adapters,scene,flow,training}.py`; modify `modeling_steering.py` (shrinks to the steering policies), `configuration_steering.py`, `__init__.py`; the example and tests only in import lines and call sites. **Tests:** the package's existing tests re-run; one new test per folded class asserting the method equals the alias on the same inputs.
+
+- [ ] Step 1: the alias-equality tests; Step 2: move concern by concern (scene, flow, adapters, training, policies, configuration), running `tests/policies/steering` after each; Step 3: the example's call sites, `tests/examples/pi05_mars_cursor` whole; Step 4: pre-commit, one commit per concern, subjects `MARS: the steering package's <concern> as a class`.
