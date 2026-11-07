@@ -136,9 +136,9 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder, encode_views,  # noqa: E402
-                                       fit_token_reduction, heading_cosine, load_adapter_module, reduce_tokens, regenerate,
-                                       save_adapter_module, scene_for, scene_spec, task_field_loss, train_module,
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder,  # noqa: E402
+                                       heading_cosine, load_adapter_module, reduce_tokens, regenerate,
+                                       save_adapter_module, scene_spec, task_field_loss, train_module,
                                        user_field_loss)
 
 # ---------------------------------------------------------------- data
@@ -309,8 +309,8 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
     demonstration (`frame_steps`), its two views (`render_views`, overhead and wrist at --wrist-span) drawn at the
     demonstration's position at that step, rendered VIEW_CHUNK frames at a time (--render-workers processes, 0:
     in-process), with `affine_rng` every picture moved (`move_pictures` at --view-affine, the two views independently),
-    encoded (`encode_views`). With --scene-rank the tokens are reduced by `reduction` (mean, basis) or, when it is None,
-    by a PCA (`fit_token_reduction`, streamed) of up to REDUCTION_SAMPLE frames chosen with `affine_rng` (or a
+    encoded (`SceneEncoder.view_tokens`). With --scene-rank the tokens are reduced by `reduction` (mean, basis) or, when it is None,
+    by a PCA (`SceneEncoder.fit_reduction`, streamed) of up to REDUCTION_SAMPLE frames chosen with `affine_rng` (or a
     default_rng([seed, 7])), whose pictures are rendered, moved and encoded for the fit first. Draws from no other
     generator, and leaves torch's CPU and CUDA generator states as it found them (the encoder runs inside `fork_rng`).
     Returns float16 tokens [F, 512, rank or 2048] (on `device` when at most VIEW_GPU_BYTES, else on the CPU), start
@@ -332,7 +332,7 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
             if affine_rng is not None:
                 flat, hit = move_pictures(views.reshape(-1, *views.shape[2:]), affine_rng, args.view_affine)
                 views, hits = flat.reshape(views.shape), int(hit.sum())
-            yield rows, encode_views(views, encoder), hits
+            yield rows, SceneEncoder.view_tokens(views, encoder), hits
 
     # the encoder (its lazy first load builds a model, initialised from torch's generators) runs on forked streams
     with (torch.random.fork_rng(devices=range(torch.cuda.device_count())),
@@ -340,7 +340,7 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
         kept = None
         if args.scene_rank and reduction is None:
             sample = np.sort(rng.choice(len(demo), min(len(demo), REDUCTION_SAMPLE), replace=False))
-            mean, basis, kept = fit_token_reduction((t for _, t, _ in encoded(sample, pool)), args.scene_rank,
+            mean, basis, kept = SceneEncoder.fit_reduction((t for _, t, _ in encoded(sample, pool)), args.scene_rank,
                                                     center=args.scene_center == "yes")
             reduction = (mean, basis)
         shape = (len(demo), spec["scene_tokens"], args.scene_rank or spec["scene_dim"])
@@ -358,13 +358,13 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
 
 def scene_reduction(args, tokens_of, n, device):
     """--scene-rank's PCA token reduction (vlm_image, vlm_prefix) of a split of n scenes: fitted
-    (`fit_token_reduction`, centred unless --scene-center no) on REDUCTION_SAMPLE of them (`SceneDataset.sample_rows`,
+    (`SceneEncoder.fit_reduction`, centred unless --scene-center no) on REDUCTION_SAMPLE of them (`SceneDataset.sample_rows`,
     default_rng([seed, 13]); all of them when fewer), `tokens_of(scenes)` giving their full-width tokens,
     REDUCTION_CHUNK at a time on `device`. Returns ((mean, basis), the share of the variance kept)."""
     pick = SceneDataset.sample_rows(np.arange(n), REDUCTION_SAMPLE, np.random.default_rng([args.seed, 13]))
     batches = (torch.as_tensor(tokens_of(pick[at:at + REDUCTION_CHUNK])).to(device)
                for at in range(0, len(pick), REDUCTION_CHUNK))
-    mean, basis, kept = fit_token_reduction(batches, args.scene_rank, center=args.scene_center == "yes")
+    mean, basis, kept = SceneEncoder.fit_reduction(batches, args.scene_rank, center=args.scene_center == "yes")
     return (mean, basis), kept
 
 
@@ -460,7 +460,7 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
                   f"store {store.path}", flush=True)
             stored = (store, rows, args.token_source)
         elif args.token_source != "discs":
-            layouts.scene = {args.token_source: scene_for(layouts, args.token_source, args.render_size, encoder)}
+            layouts.scene = {args.token_source: SceneEncoder.scene_array(layouts, args.token_source, args.render_size, encoder)}
         if args.token_source in STORED_SOURCES and args.scene_rank:
             if split == "train" and getattr(args, "scene_reduction", None) is None:
                 tokens_of = ((lambda idx: stored[0].gather(stored[1][idx])) if stored is not None

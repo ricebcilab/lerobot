@@ -12,7 +12,7 @@ sha256 of the encoder's path and prompt, 12 hex characters (the encoder part of 
 layout drawn twice (two budgets of one seed, a split drawn again) is encoded once, and a moved copy, another render
 size or another encoder gets rows of its own.
 
-`rows_for(layouts, encoder)` returns every layout's row, rendering and encoding (`scene_for`, 256 layouts at a time) the
+`rows_for(layouts, encoder)` returns every layout's row, rendering and encoding (`SceneEncoder.scene_array`, 256 layouts at a time) the
 ones the store lacks and appending them. An append writes the rows, then the index (to a temporary file, renamed), then
 the meta, under an exclusive lock on the folder, so writers in several processes take turns; a crash before the index is
 renamed leaves the index naming only rows that were whole before, and the next append writes over the orphan bytes.
@@ -30,9 +30,8 @@ import numpy as np
 import torch
 
 from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
-from lerobot.policies.steering import scene_for
 from lerobot.policies.steering.configuration_steering import VLM_SCENE_DIM, VLM_SCENE_TOKENS
-from lerobot.policies.steering.modeling_steering import SCENE_PROMPT
+from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SceneEncoder
 
 ENCODE_CHUNK = 256  # layouts rendered and encoded at a time
 STORED_SOURCES = ("vlm_image", "vlm_prefix")  # the sources whose scene is one [256, 2048] token array per layout
@@ -150,7 +149,7 @@ class SceneDataset:
 
     def rows_for(self, layouts, encoder) -> np.ndarray:
         """The row of every layout (int64 [B]), in the layouts' order; the layouts the store lacks are rendered and
-        encoded (`scene_for` with `encoder`, ENCODE_CHUNK at a time, each distinct layout once) and appended in
+        encoded (`SceneEncoder.scene_array` with `encoder`, ENCODE_CHUNK at a time, each distinct layout once) and appended in
         their first order. Sets `encoded` to the number of layouts this call encoded."""
         digests = layout_digests(layouts, self.size)
         self.index = self._read_index()
@@ -165,7 +164,7 @@ class SceneDataset:
             with torch.random.fork_rng(devices=range(torch.cuda.device_count())):
                 for lo in range(0, len(at), ENCODE_CHUNK):
                     chunk = at[lo:lo + ENCODE_CHUNK]
-                    tokens = scene_for(layouts[chunk], self.source, self.size, encoder)
+                    tokens = SceneEncoder.scene_array(layouts[chunk], self.source, self.size, encoder)
                     if tokens.shape[1:] != (self.tokens, self.width):
                         raise ValueError(f"the encoder gave tokens {tokens.shape[1:]}, not ({self.tokens}, {self.width})")
                     self._append([digests[b] for b in chunk], tokens)

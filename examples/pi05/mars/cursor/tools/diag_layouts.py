@@ -38,8 +38,7 @@ from cursor_sa.session import load_checkpoints  # noqa: E402
 from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources  # noqa: E402
 from train import train_adapter  # noqa: E402
 
-from lerobot.policies.steering import SceneEncoder
-from lerobot.policies.steering.modeling_steering import SCENE_VLM_PATH
+from lerobot.policies.steering.processor_steering import SCENE_VLM_PATH, SceneEncoder
 
 REFERENCES = ("oracle", "oracle_task")  # the bare policy and the parametric module, beside the method
 

@@ -22,7 +22,7 @@ from lerobot.envs.cursor import (
     render_views,
     sample_layouts,
 )
-from lerobot.policies.steering import LearnedTaskModule, encode_views
+from lerobot.policies.steering import LearnedTaskModule, SceneEncoder
 
 DISC = {"kind": "disc", "radius": 0.08, "along": 0.5}
 RING = {"kind": "ring", "around": "goal", "gap_angle": [15, 30]}
@@ -192,7 +192,7 @@ def test_a_controller_encodes_the_running_trials_views_once_per_position():
     full = fn(lay, pos, None)["vlm_views"]
     assert torch.equal(torch.get_rng_state(), rng)  # the encoder draws on forked streams
     assert full.shape == (4, 512, 2048) and full.dtype == torch.float16 and enc.images == 8
-    assert torch.equal(full, encode_views(render_views(lay, pos, 0.5, 56), ViewStub()))
+    assert torch.equal(full, SceneEncoder.view_tokens(render_views(lay, pos, 0.5, 56), ViewStub()))
     active = np.array([True, False, True, False])
     part = fn(lay, pos, active)["vlm_views"]
     assert enc.images == 12 and torch.equal(part[active], full[active]) and not part[~active].any()

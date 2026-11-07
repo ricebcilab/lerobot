@@ -2,8 +2,10 @@
 
 import torch
 
+from lerobot.policies.steering import SceneEncoder
 
-class ViewStub:
+
+class ViewStub(SceneEncoder):
     """Stands in for SceneEncoder: token j's first three dims are patch j's mean colour / 255. Counts the stubs made
     (`made`, on the class) and the pictures each one encoded (`images`); every `encode` draws once from torch's global
     generator, so a caller that must leave torch's streams alone is tested for it."""
@@ -26,7 +28,7 @@ class ViewStub:
         pass
 
 
-class TokenStub:
+class TokenStub(SceneEncoder):
     """Stands in for SceneEncoder's `image_tokens` / `prefix_tokens`: float16 [B, 256, 2048], each token a fixed
     nonlinear function of its 16 x 16 patch grid cell's mean colour (a local generator's weights, so torch's global
     streams are never touched). Counts the pictures it encoded (`images`)."""

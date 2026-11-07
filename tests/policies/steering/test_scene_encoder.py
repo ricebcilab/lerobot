@@ -28,9 +28,6 @@ from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, render_la
 from lerobot.policies.steering import (
     LearnedTaskModule,
     SceneEncoder,
-    encode_views,
-    fit_token_reduction,
-    scene_for,
     scene_spec,
 )
 
@@ -66,7 +63,7 @@ def test_scene_spec_builds_a_module_that_accepts_scene_for():
     for src in ("vlm_image", "vlm_prefix", "cnn"):
         spec = scene_spec(src, 112)
         m = LearnedTaskModule(horizon=16, **spec)
-        arr = scene_for(lay, src, 112, encoder=stub)
+        arr = SceneEncoder.scene_array(lay, src, 112, encoder=stub)
         assert arr.shape[0] == 4 and (arr.dtype == np.uint8 if src == "cnn" else arr.dtype == np.float16)
         obs = {"pos": torch.rand(4, 2), "scene": {src: torch.as_tensor(arr)}}
         a, _ = m(torch.randn(4, 16, 2), torch.rand(4), torch.randn(4, 16, 2), obs)
@@ -80,7 +77,7 @@ def test_scene_spec_builds_a_module_that_accepts_scene_for():
         scene_spec("vlm_image", 112)["scene_tokens"] == 256 and scene_spec("cnn", 112)["scene_tokens"] == 49
     )
     with pytest.raises(ValueError):
-        scene_for(lay, "discs")
+        SceneEncoder.scene_array(lay, "discs")
     with pytest.raises(ValueError):
         scene_spec("cnn", 50)
 
@@ -119,8 +116,8 @@ def test_encoder_without_weights_raises_before_building_a_policy(where, tmp_path
 )
 def test_real_pi05_image_tokens_have_the_documented_shape():
     enc = SceneEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
-    tok = scene_for(_layouts(2), "vlm_image", SCENE_SIZE, encoder=enc)
-    pre = scene_for(_layouts(2), "vlm_prefix", SCENE_SIZE, encoder=enc)
+    tok = enc.scene_for(_layouts(2), "vlm_image", SCENE_SIZE)
+    pre = enc.scene_for(_layouts(2), "vlm_prefix", SCENE_SIZE)
     assert (
         tok.shape == (2, 256, 2048) and tok.dtype == np.float16 and np.isfinite(tok.astype(np.float32)).all()
     )
@@ -129,7 +126,7 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert np.array_equal(enc.encode(images).cpu().numpy(), enc.image_tokens(images))
     assert np.isfinite(pre.astype(np.float32)).all()
     # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
-    other = scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, encoder=enc)
+    other = enc.scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE)
     # T3 wall against T2 disc at one seed: the same targets and an unrendered start, so only the obstacles differ
     wall_spec = {
         "kind": "wall",
@@ -141,8 +138,8 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     }
     wall_layouts = _layouts(2, obstacle=wall_spec)
     assert np.array_equal(wall_layouts.targets, _layouts(2).targets)
-    wall = scene_for(wall_layouts, "vlm_image", SCENE_SIZE, encoder=enc)
-    again = scene_for(_layouts(2), "vlm_image", SCENE_SIZE, encoder=enc)
+    wall = enc.scene_for(wall_layouts, "vlm_image", SCENE_SIZE)
+    again = enc.scene_for(_layouts(2), "vlm_image", SCENE_SIZE)
     assert not np.array_equal(tok, other) and not np.array_equal(tok, wall)
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)
@@ -161,7 +158,7 @@ class _PatchEncoder:
 def test_the_encoder_batches_and_keeps_the_view_order():
     images = np.zeros((2, 2, 3, 32, 32), np.uint8)
     images[:, 1] = 255
-    tokens = encode_views(images, _PatchEncoder())
+    tokens = SceneEncoder.view_tokens(images, _PatchEncoder())
     assert tokens.shape == (2, 512, 2048) and tokens.dtype == torch.float16
     assert float(tokens[:, :256, :3].max()) == 0.0 and float(tokens[:, 256:, :3].min()) == 1.0
 
@@ -186,7 +183,7 @@ def test_token_reduction_keeps_the_top_directions_centred_or_not():
     g = torch.Generator().manual_seed(0)
     true = torch.linalg.qr(torch.randn(16, 3, generator=g))[0]
     x = (torch.randn(4000, 3, generator=g) * torch.tensor([5.0, 2.0, 1.0])) @ true.T + 0.7
-    mean, basis, kept = fit_token_reduction(iter(x.split(500)), 3)
+    mean, basis, kept = SceneEncoder.fit_reduction(iter(x.split(500)), 3)
     assert (
         mean.shape == (16,)
         and basis.shape == (16, 3)
@@ -197,18 +194,20 @@ def test_token_reduction_keeps_the_top_directions_centred_or_not():
     torch.testing.assert_close(mean, x.mean(0), atol=1e-4, rtol=0)
     assert float(((x - mean) @ basis @ basis.T + mean - x).abs().max()) < 1e-3
     assert abs(float(basis[:, 0] @ true[:, 0])) > 0.99
-    assert 0.9 < fit_token_reduction(iter(x.split(500)), 2)[2] < 0.999  # 29 of 30 parts of the variance
+    assert (
+        0.9 < SceneEncoder.fit_reduction(iter(x.split(500)), 2)[2] < 0.999
+    )  # 29 of 30 parts of the variance
     torch.testing.assert_close(
-        fit_token_reduction(iter(x.reshape(8, 500, 16)), 3)[0], mean, atol=1e-5, rtol=0
+        SceneEncoder.fit_reduction(iter(x.reshape(8, 500, 16)), 3)[0], mean, atol=1e-5, rtol=0
     )
     for bad in (16, 0):
         with pytest.raises(ValueError):
-            fit_token_reduction(iter(x.split(500)), bad)
+            SceneEncoder.fit_reduction(iter(x.split(500)), bad)
     # uncentred: the second moment's top directions, the large constant part (as pi0.5's tokens have) first
     g = torch.Generator().manual_seed(0)
     offset = torch.linalg.qr(torch.randn(16, 1, generator=g))[0][:, 0]
     x = torch.randn(4000, 16, generator=g) + 50.0 * offset  # a large constant part, as pi0.5's tokens have
-    mean, basis, kept = fit_token_reduction(iter(x.split(500)), 3, center=False)
+    mean, basis, kept = SceneEncoder.fit_reduction(iter(x.split(500)), 3, center=False)
     assert mean.shape == (16,) and mean.dtype == basis.dtype == torch.float32 and not mean.any()
     assert basis.shape == (16, 3) and abs(float(basis[:, 0] @ offset)) > 0.99
     torch.testing.assert_close(basis.T @ basis, torch.eye(3), atol=1e-5, rtol=0)
@@ -216,8 +215,8 @@ def test_token_reduction_keeps_the_top_directions_centred_or_not():
     values = torch.linalg.eigvalsh(second)
     assert abs(kept - float(values[-3:].sum() / values.sum())) < 1e-6 and kept > 0.99
     centred, default = (
-        fit_token_reduction(iter(x.split(500)), 3, center=True),
-        fit_token_reduction(iter(x.split(500)), 3),
+        SceneEncoder.fit_reduction(iter(x.split(500)), 3, center=True),
+        SceneEncoder.fit_reduction(iter(x.split(500)), 3),
     )
     assert (
         all(torch.equal(a, b) for a, b in zip(centred[:2], default[:2], strict=True))

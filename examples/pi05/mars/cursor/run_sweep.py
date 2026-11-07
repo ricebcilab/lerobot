@@ -93,8 +93,7 @@ from cursor_sa.records import logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
 from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
-from lerobot.policies.steering import SceneEncoder, scene_for
-from lerobot.policies.steering.modeling_steering import SCENE_PROMPT, SCENE_VLM_PATH
+from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SCENE_VLM_PATH, SceneEncoder
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
 FAMILIES = {  # level -> arm overrides; level -> the family's reversal adapter (the known corruption)
@@ -800,7 +799,7 @@ def attach_scene(layouts, sources, cache_dir, key, encoder_factory, vlm=SCENE_VL
             scene[source] = np.load(file)
         else:
             encoder = encoder_factory() if source.startswith("vlm_") else None
-            scene[source] = scene_for(layouts, source, size, encoder)
+            scene[source] = SceneEncoder.scene_array(layouts, source, size, encoder)
             tmp = file.with_name(f"{file.name}.{os.getpid()}.tmp")
             with open(tmp, "wb") as f:
                 np.save(f, scene[source])

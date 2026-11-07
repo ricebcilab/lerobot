@@ -20,9 +20,11 @@
 command corruption or a fixed reversal adapter, and the ``reversal_adapter`` specs (a fixed F and/or the paths of
 learned modules). ``modeling_steering`` holds the methods; this folder's README describes them."""
 
+import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -65,6 +67,21 @@ def check_steps(name: str, value, low: int, high: int, unit: str, optional: bool
     if not (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high):
         none = "None or " if optional else ""
         raise ValueError(f"{name} must be {none}an integer in [{low}, {high}] ({unit}), got {value!r}")
+
+
+def deprecated_alias(target: Callable[..., Any], name: str, new: str) -> Callable[..., Any]:
+    """A function named ``name`` that calls ``target`` with its arguments: the deprecated alias of ``new`` (a
+    method that replaced a module-level function of this package), kept for one round."""
+
+    @functools.wraps(target)
+    def alias(*args: Any, **kwargs: Any) -> Any:
+        return target(*args, **kwargs)
+
+    alias.__name__ = alias.__qualname__ = name
+    alias.__doc__ = (
+        f"Deprecated alias of ``{new}``, kept for one round: call ``{new}``.\n\n{target.__doc__ or ''}"
+    )
+    return alias
 
 
 # ---------------------------------------------------------------- matrices

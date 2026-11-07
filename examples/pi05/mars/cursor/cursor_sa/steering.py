@@ -56,8 +56,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from lerobot.policies.steering import (AdapterModules, FlowControlPolicy, FlowReversalSteeringPolicy,
-                                             LearnedTaskModule, LearnedUserModule, as_adapter, encode_views,
+from lerobot.policies.steering import (AdapterModules, SceneEncoder, FlowControlPolicy, FlowReversalSteeringPolicy,
+                                             LearnedTaskModule, LearnedUserModule, as_adapter,
                                              integrate, task_velocity_hook)
 
 from lerobot.envs.cursor import render_views
@@ -116,7 +116,7 @@ def view_scene_fn(module, encoder):
     """The scene provider (`SharedController(scene_fn=...)`) of a vlm_views task module: (layouts, pos [B, 2], active
     [B] bool or None = all) -> {"vlm_views": float16 [B, 512, 2048]} on the encoder's device, the running trials'
     two views at their positions (`render_views` at the module's wrist_span and image_size) encoded by `encoder`
-    (`encode_views`; the module applies its own reduction to these raw tokens), zeros for the finished rows, nothing
+    (`SceneEncoder.view_tokens`; the module applies its own reduction to these raw tokens), zeros for the finished rows, nothing
     rendered when none runs. Leaves torch's CPU and CUDA generators as it found them (the encoder's lazy first load
     builds a model from them)."""
 
@@ -128,7 +128,7 @@ def view_scene_fn(module, encoder):
         with torch.random.fork_rng(devices=range(torch.cuda.device_count())):
             views = render_views(layouts if active is None else layouts[rows], np.asarray(pos)[rows], module.wrist_span,
                                  module.image_size)
-            tokens = encode_views(views, encoder)
+            tokens = SceneEncoder.view_tokens(views, encoder)
         if len(rows) == len(layouts):
             return {"vlm_views": tokens}
         out = torch.zeros(len(layouts), *tokens.shape[1:], dtype=tokens.dtype, device=tokens.device)
