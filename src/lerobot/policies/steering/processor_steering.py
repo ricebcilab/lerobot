@@ -49,15 +49,16 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 from .configuration_steering import (
     DEADBAND,
     PI05_TOKENIZER,
+    SCENE_PROMPT,
+    SCENE_VLM_PATH,
     VLM_SCENE_DIM,
     VLM_SCENE_TOKENS,
+    SteeringConfig,
     deprecated_alias,
     scene_spec,
 )
 from .modeling_steering import LearnedTaskModule
 
-SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
-SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
 STORED_SCENE_SOURCES = ("vlm_image", "vlm_prefix")  # the sources with one token array per layout
 
 OBS_LAYOUTS = "observation.layouts"  # the scene step's input: the trials' layouts (a ``Layouts``) ...
@@ -433,7 +434,7 @@ def steering_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
 
 
 def make_steering_pre_post_processors(
-    config: Any,
+    config: SteeringConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
     preprocessor_kwargs: dict[str, Any] | None = None,
     postprocessor_kwargs: dict[str, Any] | None = None,
@@ -475,7 +476,7 @@ def make_steering_pre_post_processors(
             stats=dataset_stats,
         ),
     ]
-    if config.task_module is not None and config.scene_source in STORED_SCENE_SOURCES:
+    if config.has_task_module and config.scene_source in STORED_SCENE_SOURCES:
         input_steps.append(
             SteeringSceneTokensProcessorStep(
                 source=config.scene_source,

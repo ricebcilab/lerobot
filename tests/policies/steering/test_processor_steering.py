@@ -16,19 +16,21 @@
 """The steering policy's processor: each step on a hand-built transition, its features, and the factory's
 pipelines (modelled on tests/processor/test_act_processor.py)."""
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
+from lerobot.policies.cursor_flow import FlowPolicy
 from lerobot.policies.steering import (
     DEADBAND,
+    AdapterSpec,
     LearnedTaskModule,
     SceneEncoder,
     SteeringCommandProcessorStep,
+    SteeringConfig,
+    SteeringPolicy,
     SteeringSceneTokensProcessorStep,
     make_steering_pre_post_processors,
 )
@@ -88,19 +90,9 @@ def _transition(observation=None, complementary=None):
     }
 
 
-def _config(task_module=None, scene_source="discs"):
-    return SimpleNamespace(
-        input_features={},
-        output_features={},
-        normalization_mapping={},
-        device="cpu",
-        task_module=task_module,
-        scene_source=scene_source,
-        render_size=SIZE,
-        vlm_path="lerobot/pi05_base",
-        deadband=DEADBAND,
-        n_dims=2,
-    )
+def _config(task_module=None, scene_source="discs", **kw):
+    adapter = None if task_module is None else AdapterSpec(task_path=task_module)
+    return SteeringConfig(adapter=adapter, scene_source=scene_source, render_size=SIZE, device="cpu", **kw)
 
 
 # ---------------------------------------------------------------- the scene tokens step
@@ -240,3 +232,31 @@ def test_the_pre_pipeline_carries_the_observation_and_the_command():
     torch.testing.assert_close(batch[COMMAND], torch.tensor([[0.5, 0.0], [0.0, 0.0], [-0.3, 0.4]]))
     action = torch.rand(3, 16, 2)
     assert torch.equal(post(action), action)
+
+
+@pytest.mark.parametrize("mode", ["flow_control", "frs"])
+def test_a_round_trip_through_the_pre_pipeline_into_the_policy(mode):
+    """The pre pipeline's batch (the cursor's observation under ``observation.``, the operator's raw command) gives
+    the chunk the policy makes of the observation and the command directly."""
+    torch.manual_seed(0)
+    base = FlowPolicy(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123).eval()
+    config = _config(mode=mode)
+    policy = SteeringPolicy(config, base_policy=base)
+    pre, post = make_steering_pre_post_processors(config)
+    g = torch.Generator().manual_seed(1)
+    obs = {
+        "pos": torch.rand(3, 2, generator=g),
+        "hist": 0.01 * torch.randn(3, 4, 2, generator=g),
+        "targets": torch.rand(3, 4, 2, generator=g),
+        "mask": torch.ones(3, 4, dtype=torch.bool),
+        "goal": torch.zeros(3, 4, dtype=torch.bool),
+    }
+    raw = np.array(
+        [[0.6, -0.2, 0.9], [DEADBAND / 2, 0.0, 0.9], [-0.4, 0.8, 0.9]]
+    )  # a third dim the policy ignores
+    batch = pre({**{f"observation.{k}": v for k, v in obs.items()}, COMMAND: raw})
+    torch.manual_seed(2)
+    chunk = post(policy.predict_action_chunk(batch))
+    torch.manual_seed(2)
+    want = policy.predict_action_chunk({**obs, COMMAND: torch.as_tensor(raw[:, :2], dtype=torch.float32)})
+    assert chunk.shape == (3, 16, 2) and torch.equal(chunk, want)

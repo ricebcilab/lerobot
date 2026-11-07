@@ -33,7 +33,13 @@ from lerobot.policies.steering import (
 )
 
 CONVERTER = (
-    Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "cursor" / "convert_checkpoints.py"
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "pi05"
+    / "mars"
+    / "cursor"
+    / "tools"
+    / "convert_checkpoints.py"
 )
 
 

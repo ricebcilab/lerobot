@@ -124,3 +124,32 @@ def test_converted_adapters_load_as_before(tmp_path):
         assert after[n].kind == before[n].kind
         assert torch.equal(after[n].adapt(obs, x, t, v, True), before[n].adapt(obs, x, t, v, True))
     assert "arch" not in torch.load(tmp_path / "adapters" / "t" / "adapter.pt")
+
+
+def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_module(tmp_path):
+    from lerobot.policies.steering import AdapterModules, SteeringPolicy
+
+    torch.manual_seed(0)
+    policy = FlowPolicy(d_model=32, layers=1, heads=2, d_ff=64, action_scale=0.0077).eval()
+    user, task = _perturb(UserModule(), 1), _perturb(TaskModule(), 2)
+    for name, kind, module in (("u", "user", user), ("group/t", "task", task)):
+        AdapterModules.save_module(
+            module, tmp_path / "adapters" / name / "adapter.pt", kind, meta={"args": {}}
+        )
+    before = {n: (tmp_path / "adapters" / n / "adapter.pt").read_bytes() for n in ("u", "group/t")}
+    counts = convert_checkpoints.convert_tree(tmp_path, steering=True, base_policy_path=tmp_path / "base")
+    assert counts == {"policies": 0, "adapters": 0, "tasks": 0, "skipped": 0, "steering": 2}
+    assert (
+        convert_checkpoints.convert_tree(tmp_path, steering=True)["steering"] == 0
+    )  # a re-run converts nothing
+    obs, command = _obs(), torch.tensor([[0.5, -0.3], [0.0, 0.0], [-0.7, 0.2]])
+    for n in ("u", "group/t"):
+        folder = tmp_path / "adapters" / n
+        assert folder.joinpath("adapter.pt").read_bytes() == before[n]  # adapter.pt stays as it was
+        steering = SteeringPolicy.from_pretrained(folder, base_policy=policy)
+        assert (steering.config.mode, steering.config.base_policy_path) == ("frs", str(tmp_path / "base"))
+        adapter = ReversalAdapter.load(folder / "adapter.pt")  # before the seed: building a module draws
+        torch.manual_seed(3)
+        want = steered_chunk(policy, obs, command, "frs", adapter=adapter)
+        torch.manual_seed(3)
+        assert torch.equal(steering.predict_action_chunk({**obs, "command": command}), want)

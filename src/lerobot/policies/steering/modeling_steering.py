@@ -23,12 +23,16 @@ integrator of either flow-time convention, and each method's core. The settings 
 
 import math
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
+
+from lerobot.policies.pretrained import PreTrainedPolicy
 
 from .configuration_steering import (
     DEADBAND,
@@ -38,7 +42,9 @@ from .configuration_steering import (
     OPERATOR_DIM_GROUPS,
     SCENE_SOURCES,
     TOKEN_GEOMETRIES,
+    AdapterSpec,
     MatrixHolder,
+    SteeringConfig,
     TeleopSource,
     check_steps,
     deprecated_alias,
@@ -1522,6 +1528,264 @@ class FlowReversalSteering(_ChunkSteering):
             target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
             self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
         return chunk, plain
+
+
+# ---------------------------------------------------------------- the lerobot policy wrapper
+
+STEERING_BATCH_KEYS = (
+    "command",
+    "kind",
+    "chunk",
+    "latent",
+    "noise",
+    "time",
+    "weight",
+)  # not the observation's
+OBS_PREFIX = "observation."
+
+
+class _SampleChunkSampler:
+    """A flow policy with ``FlowPolicy.sample_chunk`` (the cursor's) behind pi0.5's sampler interface, as the cursor
+    example's ``CursorSampler``: ``config`` gives the flow's Euler steps, the chunk, the action dims, the steps
+    executed per replan and the flow time of noise (0, the cursor's convention)."""
+
+    def __init__(self, model: nn.Module, steps: int, chunk_size: int, n_dims: int, n_action_steps: int):
+        self.model = model
+        self.config = SimpleNamespace(
+            num_inference_steps=steps,
+            chunk_size=chunk_size,
+            max_action_dim=n_dims,
+            n_action_steps=n_action_steps,
+            noise_time=0.0,
+        )
+
+    def reset(self) -> None:
+        pass
+
+    def predict_action_chunk(self, obs: dict, **hooks) -> torch.Tensor:
+        return self.model.sample_chunk(obs, self.config.num_inference_steps, **hooks)
+
+
+class SteeringPolicy(PreTrainedPolicy):
+    """Shared-autonomy steering as a lerobot policy: a frozen base policy's chunks steered toward the operator's
+    command by the mode's core (``FlowControlSteering`` or ``FlowReversalSteering``) through the MARS adapter
+    (``AdapterModules``, the policy's only weights); saving, loading and the Hub through ``PreTrainedPolicy``.
+
+    The base policy (``base_policy``, or loaded from ``config.base_policy_path`` on first use) is not part of this
+    policy's weights. A policy with ``sample_chunk`` (the cursor's ``FlowPolicy``, or a ``CursorFlowPolicy``
+    around one) is driven through pi0.5's sampler interface, its chunks scaled to its action units
+    (``action_scale``), FRS's reference the command held at ``max_speed``; any other policy is driven as pi0.5 is,
+    its ``postprocessor`` giving the action statistics.
+
+    A batch is the base policy's observation (the cursor's dict, or its keys under ``observation.`` as the
+    pre-processor leaves them, ``observation.scene_tokens`` the task module's scene) and ``command``, the
+    operator's command per row ((B, n)) or per chunk step ((B, H, n)) in the operator's units (deflections in
+    [-1, 1]). ``forward`` is the adapter's training loss for ``batch["kind"]``: ``"task"`` the task module's flow
+    matching on ``chunk`` (in action units), ``"user"`` the user module's field regression from ``latent`` to
+    ``command`` (the BCI's chunk, normalized) through the task module if any; ``noise``, ``time`` and ``weight``
+    as the example's trainer draws them (drawn here when absent)."""
+
+    config_class = SteeringConfig
+    name = "steering"
+
+    def __init__(self, config: SteeringConfig, base_policy=None, postprocessor=None, **kwargs: Any):
+        super().__init__(config)
+        spec = config.adapter or AdapterSpec()
+        user = self._module("user", config.user_module, spec.user_path)
+        task = self._module("task", config.task_module, spec.task_path)
+        self.adapter = AdapterModules(user=user, task=task, matrix=spec.matrix, n_dims=config.n_dims)
+        object.__setattr__(
+            self, "_base_policy", base_policy
+        )  # not a submodule: its weights are not this policy's
+        self._postprocessor = postprocessor
+        self._core: FlowControlSteering | FlowReversalSteering | None = None
+
+    def _module(self, kind: str, arch: dict | None, path: str | None) -> nn.Module | None:
+        """The ``kind`` module: built from its recorded config (its weights come with the policy's), else read from
+        its checkpoint (its config then recorded), else None."""
+        if arch is not None:
+            return AdapterModules.KINDS[kind](**arch)
+        if path is None:
+            return None
+        module, found, _ = AdapterModules.load_module(path)
+        if found != kind:
+            raise ValueError(f"{path} holds a {found} module, not a {kind} module")
+        setattr(self.config, f"{kind}_module", dict(module.config))
+        return module
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, *, base_policy=None, postprocessor=None, **kwargs):
+        """``PreTrainedPolicy.from_pretrained``, the base policy (and its postprocessor) passed in or loaded from the
+        config's reference on first use. The adapter is served frozen, as ``AdapterModules.load_module`` serves a
+        module checkpoint: ``nn.MultiheadAttention`` (the task module's) computes in a different order when its
+        weights require grad, even under ``torch.no_grad``, so a frozen module is what reproduces the checkpoint's
+        chunks bit for bit. ``policy.adapter.requires_grad_(True)`` to train it further."""
+        policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
+        policy.adapter.requires_grad_(False)
+        policy.set_base_policy(base_policy, postprocessor)
+        return policy
+
+    def set_base_policy(self, base_policy, postprocessor=None) -> None:
+        """Steer ``base_policy`` (None: the config's reference, loaded on first use) from now on."""
+        object.__setattr__(self, "_base_policy", base_policy)
+        self._postprocessor = postprocessor
+        self._core = None
+
+    @property
+    def base_policy(self):
+        """The policy whose chunks are steered."""
+        if self._base_policy is None:
+            if self.config.base_policy_path is None:
+                raise ValueError(
+                    "SteeringPolicy needs a base policy: pass one, or set config.base_policy_path"
+                )
+            from lerobot.policies.factory import get_policy_class
+
+            policy = get_policy_class(self.config.base_policy_type).from_pretrained(
+                self.config.base_policy_path
+            )
+            object.__setattr__(self, "_base_policy", policy.eval())
+        return self._base_policy
+
+    def _flow_model(self):
+        """The base policy's flow model: a ``CursorFlowPolicy``'s ``FlowPolicy``, else the base policy itself."""
+        model = getattr(self.base_policy, "model", None)
+        return model if hasattr(model, "sample_chunk") else self.base_policy
+
+    def _action_scale(self):
+        """Action units per normalized unit of a ``sample_chunk`` policy, or None (pi0.5: the postprocessor's)."""
+        model = self._flow_model()
+        return getattr(model, "action_scale", None) if hasattr(model, "sample_chunk") else None
+
+    def _reference(self, commands: torch.Tensor) -> torch.Tensor:
+        """FRS's reference for commands in the operator's units: held over the chunk (or one per step) at
+        ``max_speed``, in the policy's normalized units (the cursor example's ``to_action``)."""
+        horizon = self.core._policy.config.chunk_size
+        per_step = commands if commands.dim() == 3 else commands[:, None].expand(-1, horizon, -1)
+        return per_step * (self.config.max_speed * self.config.dt) / self._action_scale()
+
+    @property
+    def core(self) -> "FlowControlSteering | FlowReversalSteering":
+        """The mode's steering core over the base policy's sampler, built on first use."""
+        if self._core is None:
+            cfg, model = self.config, self._flow_model()
+            if hasattr(model, "sample_chunk"):
+                horizon = getattr(model, "horizon", cfg.horizon)
+                sampler = _SampleChunkSampler(
+                    model, cfg.num_inference_steps, horizon, cfg.n_dims, cfg.n_action_steps
+                )
+            else:
+                sampler = model
+            dims = None if cfg.operator_dims is None else tuple(cfg.operator_dims)
+            if cfg.mode == "flow_control":
+                if dims is not None and len(dims) != 1:
+                    raise ValueError(
+                        f"flow control writes one group of action dims, got operator_dims {dims}"
+                    )
+                written = slice(None) if dims is None else OPERATOR_DIM_GROUPS[dims[0]]
+                self._core = FlowControlSteering(
+                    sampler,
+                    None,
+                    self._postprocessor,
+                    tau=cfg.tau,
+                    lam=cfg.lam,
+                    ic_gain=cfg.ic_gain,
+                    deadband=cfg.deadband,
+                    dims=written,
+                )
+            else:
+                self._core = FlowReversalSteering(
+                    sampler,
+                    None,
+                    self._postprocessor,
+                    n_reversal_steps=cfg.n_reversal_steps,
+                    operator_dims=dims,
+                    pinned_steps=cfg.pinned_steps,
+                    deadband=cfg.deadband,
+                    reference_fn=self._reference if self._action_scale() is not None else None,
+                )
+        return self._core
+
+    def observation(self, batch: dict) -> dict:
+        """The base policy's observation in ``batch``: its ``observation.`` keys without the prefix (the
+        pre-processor's form; ``scene_tokens`` becomes ``scene[scene_source]``), else every key but the steering
+        policy's own."""
+        if any(k.startswith(OBS_PREFIX) for k in batch):
+            obs = {k[len(OBS_PREFIX) :]: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
+            for key in ("layouts", "scene_images"):  # the scene step's inputs, not the policy's
+                obs.pop(key, None)
+            tokens = obs.pop("scene_tokens", None)
+            if tokens is not None:
+                obs["scene"] = {**(obs.get("scene") or {}), self.config.scene_source: tokens}
+            return obs
+        return {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
+
+    def _field(self, obs: dict) -> AdaptedField | None:
+        return None if self.adapter.kind == "none" else self.adapter.field(obs)
+
+    def _velocity(self, obs: dict, batch: dict):
+        """The base policy's velocity field for this observation."""
+        if hasattr(self.base_policy, "velocity_field"):
+            return self.base_policy.velocity_field(batch)
+        model = self._flow_model()
+        return lambda x, t: model(obs, x, t)
+
+    def get_optim_params(self) -> Iterator[nn.Parameter]:
+        return self.adapter.parameters()
+
+    def reset(self) -> None:
+        """Clears the core's queues (and the base policy's)."""
+        if self._core is not None:
+            self._core.reset()
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
+        """The adapter's training loss for ``batch["kind"]`` (``"task"`` or ``"user"``) and its parts."""
+        obs, kind = self.observation(batch), batch.get("kind")
+        velocity = self._velocity(obs, batch)
+        if kind == "task":
+            if self.adapter.task is None:
+                raise ValueError("a task batch needs a task module")
+            chunk = batch["chunk"]
+            scale = self._action_scale()
+            chunk = chunk if scale is None else chunk / scale
+            z = batch.get("noise")
+            z = torch.randn_like(chunk) if z is None else z
+            t = batch.get("time")
+            t = torch.rand(len(chunk), device=chunk.device) if t is None else t
+            task = self.adapter.task.bind(obs)
+            return LearnedTaskModule.field_loss(
+                task, velocity, chunk, z, t, self.config.lambda_id, self.config.n_dims
+            )
+        if kind == "user":
+            if self.adapter.user is None:
+                raise ValueError("a user batch needs a user module")
+            latent = batch["latent"]
+            t = batch.get("time")
+            t = torch.rand(len(latent), device=latent.device) if t is None else t
+            task = None if self.adapter.task is None else self.adapter.task.bind(obs)
+            loss = LearnedUserModule.field_loss(
+                self.adapter.user, velocity, latent, batch["command"], t, task, batch.get("weight")
+            )
+            return loss, {"field": loss.item()}
+        raise ValueError(f"batch['kind'] must be 'task' or 'user', got {kind!r}")
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
+        """The steered chunk (B, H, n) for ``batch["command"]`` (None, or rows inside the deadband: the policy's
+        own chunk, from the same noise), the adapter bound to the observation; in the base policy's action units
+        for a ``sample_chunk`` policy, else normalized (the postprocessor unnormalizes it)."""
+        obs = self.observation(batch)
+        command = batch.get("command")
+        if command is not None and not torch.is_tensor(command):
+            command = torch.as_tensor(np.asarray(command), dtype=torch.float32)
+        chunk = self.core.steered_chunk(obs, command, field=self._field(obs))[0]
+        scale = self._action_scale()
+        return chunk if scale is None else chunk * scale
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
+        """The first step (B, n) of a fresh steered chunk."""
+        return self.predict_action_chunk(batch)[:, 0]
 
 
 # ---------------------------------------------------------------- deprecated aliases (one round)

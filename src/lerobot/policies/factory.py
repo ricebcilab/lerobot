@@ -56,6 +56,7 @@ from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
 from .pretrained import PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig
+from .steering.configuration_steering import SteeringConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
 from .utils import validate_visual_features_consistency
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig
@@ -92,7 +93,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
             "multi_task_dit", "vqbet", "pi0", "pi05", "gaussian_actor", "smolvla", "wall_x",
-            "molmoact2", "cursor_flow".
+            "molmoact2", "cursor_flow", "steering".
     Returns:
         The policy class corresponding to the given name.
 
@@ -115,6 +116,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .cursor_flow.modeling_cursor_flow import CursorFlowPolicy
 
         return CursorFlowPolicy
+    elif name == "steering":
+        from .steering.modeling_steering import SteeringPolicy
+
+        return SteeringPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -184,7 +189,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
                      "multi_task_dit", "diffusion", "act", "vqbet", "pi0", "pi05", "gaussian_actor",
-                     "smolvla", "wall_x", "molmoact2", "cursor_flow".
+                     "smolvla", "wall_x", "molmoact2", "cursor_flow", "steering".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -201,6 +206,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "cursor_flow":
         return CursorFlowConfig(**kwargs)
+    elif policy_type == "steering":
+        return SteeringConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -454,6 +461,14 @@ def make_pre_post_processors(
         from .vla_jepa.processor_vla_jepa import make_vla_jepa_pre_post_processors
 
         processors = make_vla_jepa_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SteeringConfig):
+        from .steering.processor_steering import make_steering_pre_post_processors
+
+        processors = make_steering_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

@@ -22,13 +22,16 @@ learned modules). ``modeling_steering`` holds the methods; this folder's README 
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+import draccus
 import numpy as np
 
+from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.envs.cursor import SCENE_SIZE
+from lerobot.optim import AdamWConfig, LRSchedulerConfig, OptimizerConfig
 from lerobot.teleoperators import readout
 
 ACTION_DIMS = ("dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper")
@@ -330,3 +333,128 @@ def scene_spec(
         "image_size": size,
         **({} if scene_rank is None else {"scene_rank": scene_rank}),
     }
+
+
+# ---------------------------------------------------------------- the steering policy
+
+SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
+SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
+STEERING_MODES = ("flow_control", "frs")
+
+# draccus writes and reads an AdapterSpec's fixed matrix (the config's `adapter`) as nested lists
+draccus.encode.register(np.ndarray, lambda array: array.tolist())
+draccus.decode.register(np.ndarray, lambda value: np.asarray(value, dtype=np.float64))
+
+
+@PreTrainedConfig.register_subclass("steering")
+@dataclass
+class SteeringConfig(PreTrainedConfig):
+    """Configuration of the steering policy (``SteeringPolicy``): a frozen flow policy's chunks steered toward an
+    operator's command by flow control or Flow Reversal Steering, through the MARS adapter modules.
+
+    The base policy reads its own observation (the cursor's dict, or pi0.5's features), so this config has, like
+    ``CursorFlowConfig``, no input/output features of its own and no delta indices; its optimizer preset (AdamW)
+    trains the adapter modules.
+
+    Args:
+        mode: ``"flow_control"`` (Kao et al. 2026) or ``"frs"`` (Flow Reversal Steering, Tang et al. 2026; MARS
+            with an adapter).
+        tau: Flow control: the chunk steps the command is written into (None: the whole chunk).
+        lam: Flow control: the Euler steps the command is written at (lambda; 1 = the initial condition only).
+        ic_gain: Flow control: the command's scale in the noise prior (a full push writes ``ic_gain`` sigma).
+        n_reversal_steps: FRS: the Euler steps of the reversal (None: all the way to noise).
+        pinned_steps: FRS: the leading chunk steps the reference pins (None: all of them).
+        deadband: Below this (the operator's units) the operator counts as idle and the row gets the policy's own
+            chunk.
+        operator_dims: The action dim groups the operator commands (names of ``OPERATOR_DIM_GROUPS``; None: every
+            dim, as on the cursor).
+        adapter: The MARS adapter: a fixed user matrix F (normalized, ``n_dims`` x ``n_dims``) and/or the paths of
+            learned user and task module checkpoints (``AdapterModules.save_module``'s format). None: plain FRS.
+        user_module: The user module's constructor config, recorded when the module is built (so a saved policy
+            rebuilds it without its checkpoint); None: read from ``adapter.user_path``.
+        task_module: The task module's, likewise.
+        lambda_id: The task module's pull of A, b toward the identity in ``forward``.
+        n_dims: The action dims the adapter acts on.
+        horizon: The base policy's chunk length (when it does not say).
+        num_inference_steps: The base policy's Euler steps per chunk (a ``sample_chunk`` policy's, as the cursor's).
+        n_action_steps: The chunk steps executed per replan.
+        max_speed: The command's speed at full deflection, in action units per second (FRS's reference).
+        dt: The control period in seconds (FRS's reference: a full push moves ``max_speed * dt`` per step).
+        base_policy_type: The registered type of the policy whose chunks are steered.
+        base_policy_path: Its checkpoint (a directory or a Hub repo id), loaded when no base policy is passed.
+        scene_source: The task module's token source (``SCENE_SOURCES``).
+        render_size: The size the scene is rendered at for the scene tokens.
+        token_geometry: The task module's token geometry (``TOKEN_GEOMETRIES``).
+        scene_rank: The width of the task module's token reduction (None: full width).
+        vlm_path: The pi0.5 checkpoint whose vision tokens the ``vlm_*`` sources read.
+        normalization_mapping: The normalization of the base policy's features (none for the cursor's).
+    """
+
+    mode: str = "frs"
+    tau: int | None = 5
+    lam: int = 1
+    ic_gain: float = 1.0
+    n_reversal_steps: int | None = None
+    pinned_steps: int | None = None
+    deadband: float = DEADBAND
+    operator_dims: list[str] | None = None
+    adapter: AdapterSpec | None = None
+    user_module: dict | None = None
+    task_module: dict | None = None
+    lambda_id: float = 1e-3
+    n_dims: int = 2
+    horizon: int = 16
+    num_inference_steps: int = 10
+    n_action_steps: int = 8
+    max_speed: float = 1.2
+    dt: float = 0.02
+    base_policy_type: str = "cursor_flow"
+    base_policy_path: str | None = None
+    scene_source: str = "discs"
+    render_size: int = SCENE_SIZE
+    token_geometry: str = "absolute"
+    scene_rank: int | None = None
+    vlm_path: str = SCENE_VLM_PATH
+    normalization_mapping: dict[str, NormalizationMode] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.mode not in STEERING_MODES:
+            raise ValueError(f"mode must be one of {STEERING_MODES}, got {self.mode!r}")
+        if self.scene_source not in SCENE_SOURCES:
+            raise ValueError(f"scene_source must be one of {SCENE_SOURCES}, got {self.scene_source!r}")
+        if self.token_geometry not in TOKEN_GEOMETRIES:
+            raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {self.token_geometry!r}")
+        unknown = [d for d in self.operator_dims or () if d not in OPERATOR_DIM_GROUPS]
+        if unknown:
+            raise ValueError(
+                f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
+            )
+
+    @property
+    def has_task_module(self) -> bool:
+        """Whether the adapter has a task module (built from ``task_module`` or read from its checkpoint)."""
+        return self.task_module is not None or (
+            self.adapter is not None and self.adapter.task_path is not None
+        )
+
+    def get_optimizer_preset(self) -> OptimizerConfig:
+        return AdamWConfig()
+
+    def get_scheduler_preset(self) -> LRSchedulerConfig | None:
+        return None
+
+    def validate_features(self) -> None:
+        pass
+
+    @property
+    def observation_delta_indices(self) -> None:
+        return None
+
+    @property
+    def action_delta_indices(self) -> None:
+        return None
+
+    @property
+    def reward_delta_indices(self) -> None:
+        return None
