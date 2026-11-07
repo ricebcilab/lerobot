@@ -54,7 +54,7 @@ from .configuration_steering import (
     deprecated_alias,
     scene_spec,
 )
-from .modeling_steering import reduce_tokens
+from .modeling_steering import LearnedTaskModule
 
 SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
 SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
@@ -335,7 +335,7 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
         tokens = torch.as_tensor(array)
         if self.reduction is not None:
             mean, basis = self.reduction
-            tokens = reduce_tokens(tokens, mean.to(tokens.device), basis.to(tokens.device))
+            tokens = LearnedTaskModule.reduce(tokens, mean.to(tokens.device), basis.to(tokens.device))
         return tokens
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:

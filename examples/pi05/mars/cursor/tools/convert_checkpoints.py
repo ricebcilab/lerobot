@@ -8,7 +8,7 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
   `CursorFlowPolicy` directory beside it: config.json + model.safetensors (`save_pretrained`). The
   policy.pt is kept as policy.pt.orig.
 - every adapters/**/adapter.pt (the cursor's {kind?, config, state_dict, args, obstacle}) is rewritten in
-  the `save_adapter_module` format (`convert_cursor_module`; kind, config, weights, meta). The original is
+  the `AdapterModules.save_module` format (`AdapterModules.from_cursor_checkpoint`; kind, config, weights, meta). The original is
   kept as adapter.pt.orig.
 
 Each converted file is written to a temporary name, loaded back and its weights compared with the
@@ -18,7 +18,7 @@ interrupted run leaves every checkpoint loadable and can simply be run again. An
 differs from the file is never overwritten: that file is skipped with a warning. Files already in the new
 format are left untouched, so re-running is a no-op. The policy trainer still writes policy.pt, so run this
 again after training a policy (FlowPolicy.load reads both formats meanwhile); the adapter trainer writes the
-`save_adapter_module` format itself, and ReversalAdapter.load reads only that.
+`AdapterModules.save_module` format itself, and ReversalAdapter.load reads only that.
 """
 
 import argparse
@@ -32,8 +32,7 @@ from pathlib import Path
 import torch
 
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
-from lerobot.policies.steering import (LearnedTaskModule, LearnedUserModule, convert_cursor_module, load_adapter_module,
-                                             save_adapter_module)
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
 CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
 
@@ -86,19 +85,19 @@ def convert_policy(path):
 
 
 def converted(ckpt):
-    """The `save_adapter_module` format: a kind and a meta (the cursor formats have neither, or no meta)."""
+    """The `AdapterModules.save_module` format: a kind and a meta (the cursor formats have neither, or no meta)."""
     return "kind" in ckpt and "meta" in ckpt
 
 
 def convert_adapter(path):
-    """adapters/**/adapter.pt in place to the `save_adapter_module` format. Returns its kind ("user" or
+    """adapters/**/adapter.pt in place to the `AdapterModules.save_module` format. Returns its kind ("user" or
     "task"), "skipped" for a differing backup, or None when the file is already converted."""
     path = Path(path)
     ckpt = torch.load(path, map_location="cpu")
     if converted(ckpt):
         return None
     if "n_dims" not in ckpt["config"]:  # the cursor project's format
-        new = convert_cursor_module(ckpt)
+        new = AdapterModules.from_cursor_checkpoint(ckpt)
     else:  # the cursor trainer since the port: the core's module configs, the cursor's keys
         new = {"kind": ckpt["kind"], "config": dict(ckpt["config"]), "state_dict": ckpt["state_dict"],
                "meta": {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}}
@@ -109,8 +108,8 @@ def convert_adapter(path):
     module.load_state_dict(new["state_dict"])
     tmp = path.with_name(path.name + ".tmp")
     try:
-        save_adapter_module(module, tmp, kind, meta=new["meta"])
-        loaded, loaded_kind, _ = load_adapter_module(tmp)
+        AdapterModules.save_module(module, tmp, kind, meta=new["meta"])
+        loaded, loaded_kind, _ = AdapterModules.load_module(tmp)
         if loaded_kind != kind or not _same_weights(loaded.state_dict(), ckpt["state_dict"]):
             raise RuntimeError(f"{path}: the converted module does not reproduce the checkpoint")
         if not backup(path):

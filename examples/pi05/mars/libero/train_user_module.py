@@ -35,11 +35,15 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -51,11 +55,9 @@ from lerobot.policies.steering import (  # noqa: E402
     GRIPPER_OPEN,
     N_ACTION_DIMS,
     AdaptedField,
+    AdapterModules,
     Flow,
     LearnedUserModule,
-    save_adapter_module,
-    train_module,
-    user_field_loss,
 )
 from lerobot.teleoperators import readout  # noqa: E402
 
@@ -220,6 +222,67 @@ def label_states(session, states: list[dict], generic_prompt: str, control, mean
             print(f"labelled {i + 1}/{len(states)} states", flush=True)
 
 
+# ---------------------------------------------------------------- the training loop
+#
+# Moved verbatim from lerobot.policies.steering (train_module, step_if_finite), which keeps no training loop.
+
+
+def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
+    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
+    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
+    opt.zero_grad(set_to_none=True)
+    if not torch.isfinite(loss):
+        return False
+    loss.backward()
+    norm = nn.utils.clip_grad_norm_(list(params), clip)
+    if not torch.isfinite(norm):
+        opt.zero_grad(set_to_none=True)
+        return False
+    opt.step()
+    return True
+
+
+def _train_module(
+    module: nn.Module,
+    steps: int,
+    lr: float,
+    batch_loss: Callable[[int], torch.Tensor],
+    validate: Callable[[], dict] | None = None,
+    log_every: int = 1000,
+    weight_decay: float = 1e-4,
+    clip: float = 1.0,
+) -> list[dict]:
+    """The MARS modules' training loop, shared by the cursor and the LIBERO trainers: AdamW with a cosine
+    schedule over ``steps``, gradients clipped to ``clip``, non-finite batches skipped (``_step_if_finite``).
+    ``batch_loss(step)`` returns one batch's loss. Every ``log_every`` steps, and at the last, the module is put
+    in eval mode for ``validate()`` (named numbers, or None) and {step, train_loss (the window's mean),
+    skipped, **validation} is logged and printed. Returns the log."""
+    opt = torch.optim.AdamW(module.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
+    log: list[dict] = []
+    running, skipped, tic = 0.0, 0, time.time()
+    for step in range(1, steps + 1):
+        loss = batch_loss(step)
+        skipped += not _step_if_finite(opt, loss, module.parameters(), clip)
+        sched.step()
+        running += loss.item() if torch.isfinite(loss) else 0.0
+        if step % log_every == 0 or step == steps:
+            module.eval()
+            val = validate() if validate is not None else {}
+            module.train()
+            entry = {"step": step, "train_loss": running / log_every, "skipped": skipped, **val}
+            log.append(entry)
+            shown = "  ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}" for k, v in val.items())
+            print(
+                f"step {step:6d}  train {entry['train_loss']:.4f}  {shown}"
+                + (f"  skipped {skipped}" if skipped else "")
+                + f"  ({time.time() - tic:.0f}s)",
+                flush=True,
+            )
+            running = 0.0
+    return log
+
+
 # ---------------------------------------------------------------- training
 
 
@@ -291,7 +354,7 @@ def train(args) -> None:
         )
         t = torch.rand(len(z_l), device=device)
         # The straight path from a_bci (t = 0) to z_L (t = 1): U(x_t, t) P(x_t, t) = z_L - a_bci
-        return user_field_loss(user, velocity, a_bci, z_l, t, weight=active)
+        return LearnedUserModule.field_loss(user, velocity, a_bci, z_l, t, weight=active)
 
     def validate():
         velocity, a_bci, _, label, active = batch_of(val_idx[: args.batch])
@@ -308,7 +371,7 @@ def train(args) -> None:
             "heading_cos_user": float(cos_user[active].mean()) if active.any() else None,
         }
 
-    log = train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every)
+    log = _train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every)
     meta = {
         "corruption": control.corruption,
         "policy_path": settings.session.policy_path,
@@ -320,7 +383,7 @@ def train(args) -> None:
         "steps": args.steps,
         "config": str(args.config),
     }
-    path = save_adapter_module(user.cpu(), out / "user.pt", kind="user", meta=meta)
+    path = AdapterModules.save_module(user.cpu(), out / "user.pt", kind="user", meta=meta)
     (out / "train_log.json").write_text(json.dumps({"meta": meta, "log": log}, indent=1))
     print(f"saved {path}")
     session.close()

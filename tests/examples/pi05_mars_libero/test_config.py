@@ -153,10 +153,14 @@ def test_flow_control_knobs_and_the_old_name(tmp_path):
 
 
 def test_learned_and_composed_adapter_specs(tmp_path):
-    from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule, save_adapter_module
+    from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
-    user = save_adapter_module(LearnedUserModule(horizon=4, d=8, tdim=4), tmp_path / "user.pt", kind="user")
-    task = save_adapter_module(LearnedTaskModule(horizon=4, d=8, tdim=4), tmp_path / "task.pt", kind="task")
+    user = AdapterModules.save_module(
+        LearnedUserModule(horizon=4, d=8, tdim=4), tmp_path / "user.pt", kind="user"
+    )
+    task = AdapterModules.save_module(
+        LearnedTaskModule(horizon=4, d=8, tdim=4), tmp_path / "task.pt", kind="task"
+    )
     base = "control:\n  mode: shared_flow_reversal_steering\n  corruption: {rotation_z_deg: 20}\n"
     c = load_experiment_settings(
         _write(tmp_path, "a.yaml", base + f"  reversal_adapter: {{learned: {user}}}\n"), {}

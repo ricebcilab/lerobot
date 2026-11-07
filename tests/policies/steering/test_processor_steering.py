@@ -26,12 +26,12 @@ from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
 from lerobot.policies.steering import (
     DEADBAND,
+    LearnedTaskModule,
     SceneEncoder,
     SteeringCommandProcessorStep,
     SteeringSceneTokensProcessorStep,
     make_steering_pre_post_processors,
 )
-from lerobot.policies.steering.modeling_steering import reduce_tokens
 from lerobot.policies.steering.processor_steering import (
     COMMAND,
     OBS_LAYOUTS,
@@ -132,7 +132,7 @@ def test_scene_tokens_carry_a_task_modules_reduction():
     step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=TokenStub(), reduction=(mean, basis))
     tokens = step(_transition({OBS_LAYOUTS: lay}))[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS]
     full = torch.as_tensor(SceneEncoder.scene_array(lay, "vlm_image", SIZE, TokenStub()))
-    assert tokens.shape == (3, 256, 8) and torch.equal(tokens, reduce_tokens(full, mean, basis))
+    assert tokens.shape == (3, 256, 8) and torch.equal(tokens, LearnedTaskModule.reduce(full, mean, basis))
     state = step.state_dict()
     again = SteeringSceneTokensProcessorStep(**step.get_config(), encoder=TokenStub())
     again.load_state_dict(state)

@@ -10,7 +10,6 @@ from lerobot.policies.steering import (
     GRIPPER_OPEN,
     Flow,
     LearnedUserModule,
-    user_field_loss,
 )
 
 CHUNK, MAX_DIM = 4, 8
@@ -55,13 +54,13 @@ def test_field_loss_is_zero_for_the_exact_path_velocity_and_scales_otherwise():
     a_bci, z_l = torch.randn(2, CHUNK, MAX_DIM), torch.randn(2, CHUNK, MAX_DIM)
     t = torch.rand(2)
     exact = lambda x_t, tt: z_l - a_bci  # noqa: E731
-    assert user_field_loss(user, exact, a_bci, z_l, t).item() == pytest.approx(0.0, abs=1e-6)
+    assert LearnedUserModule.field_loss(user, exact, a_bci, z_l, t).item() == pytest.approx(0.0, abs=1e-6)
     doubled = lambda x_t, tt: 2 * (z_l - a_bci)  # noqa: E731
     expected = ((z_l - a_bci)[..., :7] ** 2).mean((1, 2))
-    assert user_field_loss(user, doubled, a_bci, z_l, t).item() == pytest.approx(
+    assert LearnedUserModule.field_loss(user, doubled, a_bci, z_l, t).item() == pytest.approx(
         expected.mean().item(), rel=1e-5
     )
-    weighted = user_field_loss(user, doubled, a_bci, z_l, t, weight=torch.tensor([1.0, 0.0]))
+    weighted = LearnedUserModule.field_loss(user, doubled, a_bci, z_l, t, weight=torch.tensor([1.0, 0.0]))
     assert weighted.item() == pytest.approx(expected[0].item(), rel=1e-5)
     weighted.backward()  # gradients reach the module
     assert user.net[-1].weight.grad is not None
@@ -150,6 +149,6 @@ def test_field_loss_applies_the_cross_step_coupling():
     x_t = (1 - t[:, None, None]) * a_bci + t[:, None, None] * z_l
     pred = user.velocity(x_t, t, field(x_t, t)[..., :7])
     expected = ((pred - (z_l - a_bci)[..., :7]) ** 2).mean((1, 2)).mean()
-    torch.testing.assert_close(user_field_loss(user, field, a_bci, z_l, t), expected)
+    torch.testing.assert_close(LearnedUserModule.field_loss(user, field, a_bci, z_l, t), expected)
     per_step = torch.einsum("bhij,bhj->bhi", user(x_t, t), field(x_t, t)[..., :7])
     assert not torch.allclose(pred, per_step)  # the coupling is in the loss

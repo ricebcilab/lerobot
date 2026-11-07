@@ -22,7 +22,6 @@ integrator of either flow-time convention, and each method's core. The settings 
 ``configuration_steering``'s; this folder's README describes the methods."""
 
 import math
-import time
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -86,7 +85,7 @@ class LearnedUserModule(nn.Module):
     parameters: for LIBERO's H = 50 and n = 7, 700 * q outputs (179 900 * q parameters at d = 256).
 
     ``velocity(x_t, t, v)`` applies the whole correction (call it, not ``forward``, to apply the
-    module: ``apply_user_module`` does); ``forward(x_t, t)`` gives the per-step matrices alone,
+    module: ``apply_correction`` does); ``forward(x_t, t)`` gives the per-step matrices alone,
     (B, H, n, n), which is all of it when ``cross_step_rank`` is 0. The knobs enter ``config`` only
     when they differ from their defaults, so checkpoints without them load and save as before."""
 
@@ -198,14 +197,49 @@ class LearnedUserModule(nn.Module):
                 out = out.index_add(-1, torch.as_tensor(dims, device=out.device), term)
         return out
 
+    @staticmethod
+    def apply_correction(user, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tensor:
+        """A user module's correction of the velocity ``v`` (B, H, n): its own ``velocity`` when it has one (a
+        ``LearnedUserModule``, with any cross-step coupling), else its per-step matrices, ``user(x_t, t)``
+        (B, H, n, n) applied step by step (a fixed matrix holder or any such callable). In ``v``'s dtype."""
+        if hasattr(user, "velocity"):
+            return user.velocity(x_t, t, v)
+        return torch.einsum("bhij,bhj->bhi", user(x_t, t).to(v.dtype), v)
 
-def apply_user_module(user, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tensor:
-    """A user module's correction of the velocity ``v`` (B, H, n): its own ``velocity`` when it has one (a
-    ``LearnedUserModule``, with any cross-step coupling), else its per-step matrices, ``user(x_t, t)``
-    (B, H, n, n) applied step by step (a fixed matrix holder or any such callable). In ``v``'s dtype."""
-    if hasattr(user, "velocity"):
-        return user.velocity(x_t, t, v)
-    return torch.einsum("bhij,bhj->bhi", user(x_t, t).to(v.dtype), v)
+    @staticmethod
+    def field_loss(
+        user: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        latent: torch.Tensor,
+        target: torch.Tensor,
+        t: torch.Tensor,
+        task: Callable | None = None,
+        weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The user module's field regression: along the straight path x_t = (1 - t) latent + t target
+        (t (B,), one flow time per sample),
+
+            U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad, in float32),
+
+        on the module's first ``n_dims`` dims (all of ``v``'s for a callable without them), T the bound task
+        module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity; U(x_t, t) T(v) is
+        ``apply_correction`` (a ``LearnedUserModule``'s ``velocity``, cross-step coupling included). In the
+        t = 0 noise convention ``latent`` is the noise and ``target`` the action; in pi0.5's (t = 1 noise) they
+        swap. A full reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach
+        whichever module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
+        x = (1 - t[:, None, None]) * latent + t[:, None, None] * target
+        with torch.no_grad():
+            v = velocity(x, t).float()
+        if task is not None:
+            a, b = task(x, t, v)
+            v = torch.einsum("bsij,bsj->bsi", a, v) + b
+        n = getattr(user, "n_dims", v.shape[-1])
+        pred = LearnedUserModule.apply_correction(user, x.float(), t, v[..., :n])
+        err = ((pred - (target - latent)[..., :n].float()) ** 2).mean((1, 2))
+        if weight is None:
+            return err.mean()
+        weight = weight.float()
+        return (err * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 class _BoundTaskModule:
@@ -224,12 +258,6 @@ class _BoundTaskModule:
         if self._tokens is None or self._key != key:
             self._tokens, self._key = self.module.tokens(self.obs, key[0]), key
         return self.module(x_t, t, v, self.obs, precomputed=self._tokens)
-
-
-def reduce_tokens(tokens: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-    """The fixed linear token reduction of a reduced ``vlm_*`` module: ``(tokens - mean) @ basis`` in float32,
-    stored as float16. ``tokens`` (..., scene_dim), ``mean`` (scene_dim,), ``basis`` (scene_dim, rank)."""
-    return ((tokens.float() - mean) @ basis).to(torch.float16)
 
 
 class LearnedTaskModule(nn.Module):
@@ -267,7 +295,7 @@ class LearnedTaskModule(nn.Module):
     module carries a fixed linear reduction (``scene_mean`` (scene_dim,), ``scene_basis`` (scene_dim,
     scene_rank), zeros until ``set_reduction``; persistent, so they travel in the checkpoint) and
     ``scene_in`` reads ``scene_rank`` wide tokens: ``tokens`` reduces a full-width input with
-    ``reduce_tokens`` and takes a ``scene_rank``-wide one as stored; any other width raises. Relative
+    ``reduce`` and takes a ``scene_rank``-wide one as stored; any other width raises. Relative
     geometry is added after the projection, as at full width. ``scene_rank`` is a config key only when set,
     so a module without it has the config and weights it always had.
 
@@ -423,7 +451,7 @@ class LearnedTaskModule(nn.Module):
             else:
                 if self.scene_rank is not None:
                     if x.shape[-1] == self.scene_dim:
-                        x = reduce_tokens(x, self.scene_mean, self.scene_basis)
+                        x = LearnedTaskModule.reduce(x, self.scene_mean, self.scene_basis)
                     elif x.shape[-1] != self.scene_rank:
                         raise ValueError(
                             f"a reduced task module takes tokens of width {self.scene_dim} or "
@@ -496,73 +524,36 @@ class LearnedTaskModule(nn.Module):
         """This module with ``obs`` fixed: a ``(x_t, t, v) -> (A, b)`` callable carrying ``n_dims``."""
         return _BoundTaskModule(self, obs)
 
+    @staticmethod
+    def reduce(tokens: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+        """The fixed linear token reduction of a reduced ``vlm_*`` module: ``(tokens - mean) @ basis`` in float32,
+        stored as float16. ``tokens`` (..., scene_dim), ``mean`` (scene_dim,), ``basis`` (scene_dim, rank)."""
+        return ((tokens.float() - mean) @ basis).to(torch.float16)
 
-_MODULE_KINDS = {"user": LearnedUserModule, "task": LearnedTaskModule}
+    @staticmethod
+    def field_loss(
+        task: Callable,
+        velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        chunk: torch.Tensor,
+        z: torch.Tensor,
+        t: torch.Tensor,
+        lambda_id: float,
+        n_dims: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """The task module's flow matching through the adapted field, in the t = 0 noise convention: on the
+        policy's interpolation x_t = (1 - t) z + t a (``chunk`` a, normalized (B, H, n); t (B,)),
 
+            L = || A v + b - (a - z) ||^2 + lambda_id (||A - I||^2 + ||b||^2),   v = velocity(x_t, t) (no grad),
 
-def save_adapter_module(module: nn.Module, path, kind: str, meta: dict | None = None) -> Path:
-    """Save a MARS module checkpoint: ``kind`` (user | task, matching the module's class), its config,
-    weights and free-form meta."""
-    if kind not in _MODULE_KINDS or type(module) is not _MODULE_KINDS[kind]:
-        raise ValueError(f"kind must be one of {sorted(_MODULE_KINDS)} and match the module, got {kind!r}")
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"kind": kind, "config": module.config, "state_dict": module.state_dict(), "meta": meta or {}}, path
-    )
-    return path
-
-
-def load_adapter_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
-    """Load a MARS module checkpoint: (module in eval mode, kind, meta). Task checkpoints written while
-    there were two task module classes carry ``arch``: ``"obstacle"`` is this ``LearnedTaskModule``;
-    ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO files) is the removed MLP module."""
-    ckpt = torch.load(Path(path), map_location=device, weights_only=True)  # tensors, numbers, strings only
-    kind = ckpt.get("kind")
-    if kind not in _MODULE_KINDS:
-        raise ValueError(f"{path}: unknown adapter module kind {kind!r} (format {ckpt.get('format')!r})")
-    if kind == "task" and (
-        ckpt.get("arch", "obstacle") != "obstacle" or "net.0.weight" in ckpt["state_dict"]
-    ):
-        raise ValueError(
-            f"{path}: a task module of arch {ckpt.get('arch', 'mlp')!r}, the MLP task module, which was removed; "
-            "retrain it as a LearnedTaskModule"
-        )
-    module = _MODULE_KINDS[kind](**ckpt["config"])
-    module.load_state_dict(ckpt["state_dict"])
-    return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
-
-
-def convert_cursor_module(ckpt: dict) -> dict:
-    """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
-    adapters, saved without ``kind``, are user modules) in the ``save_adapter_module`` format. A user
-    module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
-    embedding computes the same frequencies, so outputs agree to float rounding; its ``step_rank`` and
-    ``cross_step_rank``, when set, carry over, and ``cross_step_dims``, which the cursor never had, stays
-    None: the coupling covers both dims), a task module a ``LearnedTaskModule`` (over 2 dims).
-    ``args`` and ``obstacle`` go into ``meta``."""
-    kind = ckpt.get("kind", "user")
-    config = dict(ckpt["config"])
-    meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
-    if kind == "user":
-        ranks = {k: config[k] for k in ("step_rank", "cross_step_rank") if config.get(k)}  # only when set
-        config = {
-            "horizon": config["horizon"],
-            "n_dims": 2,
-            "d": config["d"],
-            "tdim": config["tdim"],
-            **ranks,
-        }
-        return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
-    if kind == "task":
-        config["n_dims"] = 2
-        return {
-            "kind": "task",
-            "config": config,
-            "state_dict": ckpt["state_dict"],
-            "meta": meta,
-        }
-    raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
+        ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. Returns the loss and its
+        two parts (``fm``, ``identity``) as floats."""
+        x = (1 - t[:, None, None]) * z + t[:, None, None] * chunk
+        with torch.no_grad():
+            v = velocity(x, t)
+        mat, b = task(x, t, v)
+        fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
+        identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
+        return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
 
 
 class ReversalAdapter(MatrixHolder):
@@ -595,12 +586,12 @@ class ReversalAdapter(MatrixHolder):
     def load_modules(self, user_path=None, task_path=None, device="cpu") -> None:
         """Load learned modules from checkpoints into the user and/or task slot (None leaves a slot alone)."""
         if user_path is not None:
-            module, kind, _ = load_adapter_module(user_path, device)
+            module, kind, _ = AdapterModules.load_module(user_path, device)
             if kind != "user":
                 raise ValueError(f"{user_path} holds a {kind} module, not a user module")
             self.user_module, self.user_label = module, str(user_path)
         if task_path is not None:
-            module, kind, _ = load_adapter_module(task_path, device)
+            module, kind, _ = AdapterModules.load_module(task_path, device)
             if kind != "task":
                 raise ValueError(f"{task_path} holds a {kind} module, not a task module")
             self.task_module, self.task_label = module, str(task_path)
@@ -640,7 +631,7 @@ class ReversalAdapter(MatrixHolder):
 
 class AdaptedField:
     """Applies MARS modules to a velocity: task (both directions), then user (backward only, through
-    ``apply_user_module``: a learned module's ``velocity``, any other callable's per-step matrices).
+    ``LearnedUserModule.apply_correction``: a learned module's ``velocity``, any other callable's per-step matrices).
     Only the first n action dims are touched; the padding dims pass through. ``matrix`` is a fixed
     (n, n) F or one per trial, (B, n, n). A module acts on its ``n_dims`` attribute's dims
     (``N_ACTION_DIMS`` when it has none) unless ``n_dims`` is given, which overrides both."""
@@ -671,7 +662,7 @@ class AdaptedField:
             if self.user_module is not None:
                 n = self._dims(self.user_module)
                 head = result[..., :n]
-                head = apply_user_module(self.user_module, x_t, t, head)
+                head = LearnedUserModule.apply_correction(self.user_module, x_t, t, head)
                 result = torch.cat([head, result[..., n:]], dim=-1)
         return result
 
@@ -694,12 +685,18 @@ class AdapterModules(nn.Module):
     at test time. ``adapt`` applies the task module in both directions and the user part in the backward
     pass: forward task(v), backward user(task(v)). ``field(obs)`` is the ``AdaptedField`` that ``adapt``
     and the flows use, acting on ``n_dims`` dims (None: each module's own ``n_dims``); ``load`` reads one
-    module from a ``save_adapter_module`` checkpoint into its slot. ``FlowReversalSteeringPolicy``'s
+    module from a module checkpoint (``save_module``) into its slot. ``FlowReversalSteeringPolicy``'s
     holder is ``ReversalAdapter``, a different class."""
+
+    KINDS: dict[str, type[nn.Module]] = {
+        "user": LearnedUserModule,
+        "task": LearnedTaskModule,
+    }  # checkpoint kinds
 
     def __init__(self, user=None, task=None, matrix=None, n_dims: int | None = 2):
         super().__init__()
         self.user, self.task, self.n_dims = user, task, n_dims
+        self.meta: dict = {}  # a loaded checkpoint's free-form meta
         self.matrix = None if matrix is None else torch.as_tensor(matrix, dtype=torch.float32)
 
     @property
@@ -723,11 +720,95 @@ class AdapterModules(nn.Module):
     def adapt(self, obs: dict, x: torch.Tensor, t, v: torch.Tensor, backward: bool) -> torch.Tensor:
         return self.field(obs).adapt(x, t, v, backward)
 
+    def save(self, path, kind: str | None = None, meta: dict | None = None) -> Path:
+        """Save the module in slot ``kind`` (user or task; None: the one learned module this adapter holds) as a
+        module checkpoint (``save_module``): the format ``load`` and ``load_module`` read."""
+        if kind is None:
+            filled = [k for k in self.KINDS if getattr(self, k) is not None]
+            if len(filled) != 1:
+                raise ValueError(f"save needs a kind: this adapter holds the modules {filled}")
+            kind = filled[0]
+        module = getattr(self, kind) if kind in self.KINDS else None
+        return AdapterModules.save_module(module, path, kind, meta)
+
     @classmethod
     def load(cls, path, device="cpu") -> "AdapterModules":
-        """One module of a ``save_adapter_module`` checkpoint in its slot (``kind`` user or task), in eval mode."""
-        module, kind, _ = load_adapter_module(path, device)
-        return cls(**{kind: module}).to(device).eval()
+        """One module of a module checkpoint (``save_module``'s format) in its slot (``kind`` user or task), in
+        eval mode; the checkpoint's free-form meta is ``meta``."""
+        module, kind, meta = AdapterModules.load_module(path, device)
+        adapter = cls(**{kind: module}).to(device).eval()
+        adapter.meta = meta
+        return adapter
+
+    @staticmethod
+    def save_module(module: nn.Module, path, kind: str, meta: dict | None = None) -> Path:
+        """Save a MARS module checkpoint: ``kind`` (user | task, matching the module's class), its config,
+        weights and free-form meta."""
+        if kind not in AdapterModules.KINDS or type(module) is not AdapterModules.KINDS[kind]:
+            raise ValueError(
+                f"kind must be one of {sorted(AdapterModules.KINDS)} and match the module, got {kind!r}"
+            )
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"kind": kind, "config": module.config, "state_dict": module.state_dict(), "meta": meta or {}},
+            path,
+        )
+        return path
+
+    @staticmethod
+    def load_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
+        """Load a MARS module checkpoint: (module in eval mode, kind, meta). Task checkpoints written while
+        there were two task module classes carry ``arch``: ``"obstacle"`` is this ``LearnedTaskModule``;
+        ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO files) is the removed MLP module."""
+        ckpt = torch.load(
+            Path(path), map_location=device, weights_only=True
+        )  # tensors, numbers, strings only
+        kind = ckpt.get("kind")
+        if kind not in AdapterModules.KINDS:
+            raise ValueError(f"{path}: unknown adapter module kind {kind!r} (format {ckpt.get('format')!r})")
+        if kind == "task" and (
+            ckpt.get("arch", "obstacle") != "obstacle" or "net.0.weight" in ckpt["state_dict"]
+        ):
+            raise ValueError(
+                f"{path}: a task module of arch {ckpt.get('arch', 'mlp')!r}, the MLP task module, which was removed; "
+                "retrain it as a LearnedTaskModule"
+            )
+        module = AdapterModules.KINDS[kind](**ckpt["config"])
+        module.load_state_dict(ckpt["state_dict"])
+        return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
+
+    @staticmethod
+    def from_cursor_checkpoint(ckpt: dict) -> dict:
+        """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
+        adapters, saved without ``kind``, are user modules) in the ``save_module`` format. A user
+        module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
+        embedding computes the same frequencies, so outputs agree to float rounding; its ``step_rank`` and
+        ``cross_step_rank``, when set, carry over, and ``cross_step_dims``, which the cursor never had, stays
+        None: the coupling covers both dims), a task module a ``LearnedTaskModule`` (over 2 dims).
+        ``args`` and ``obstacle`` go into ``meta``."""
+        kind = ckpt.get("kind", "user")
+        config = dict(ckpt["config"])
+        meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
+        if kind == "user":
+            ranks = {k: config[k] for k in ("step_rank", "cross_step_rank") if config.get(k)}  # only when set
+            config = {
+                "horizon": config["horizon"],
+                "n_dims": 2,
+                "d": config["d"],
+                "tdim": config["tdim"],
+                **ranks,
+            }
+            return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
+        if kind == "task":
+            config["n_dims"] = 2
+            return {
+                "kind": "task",
+                "config": config,
+                "state_dict": ckpt["state_dict"],
+                "meta": meta,
+            }
+        raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
 
 
 def as_adapter(adapter, device="cpu", n_dims: int | None = 2) -> AdapterModules | None:
@@ -987,122 +1068,6 @@ def flow_control_write(
     region = x_t[:, :tau, dims]
     x_t[:, :tau, dims] = w if steer is None else torch.where(steer, w.expand_as(region), region)
     return x_t
-
-
-def user_field_loss(
-    user: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    latent: torch.Tensor,
-    target: torch.Tensor,
-    t: torch.Tensor,
-    task: Callable | None = None,
-    weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """The user module's field regression: along the straight path x_t = (1 - t) latent + t target
-    (t (B,), one flow time per sample),
-
-        U(x_t, t) T(v) = target - latent,   v = velocity(x_t, t) (no grad, in float32),
-
-    on the module's first ``n_dims`` dims (all of ``v``'s for a callable without them), T the bound task
-    module ``task(x_t, t, v) -> (A, b)`` (A v + b) if any, else the identity; U(x_t, t) T(v) is
-    ``apply_user_module`` (a ``LearnedUserModule``'s ``velocity``, cross-step coupling included). In the
-    t = 0 noise convention ``latent`` is the noise and ``target`` the action; in pi0.5's (t = 1 noise) they
-    swap. A full reversal of ``target`` through the backward field then lands on ``latent``. Gradients reach
-    whichever module trains. ``weight`` (B,) (e.g. the active commands) averages the per-sample errors."""
-    x = (1 - t[:, None, None]) * latent + t[:, None, None] * target
-    with torch.no_grad():
-        v = velocity(x, t).float()
-    if task is not None:
-        a, b = task(x, t, v)
-        v = torch.einsum("bsij,bsj->bsi", a, v) + b
-    n = getattr(user, "n_dims", v.shape[-1])
-    pred = apply_user_module(user, x.float(), t, v[..., :n])
-    err = ((pred - (target - latent)[..., :n].float()) ** 2).mean((1, 2))
-    if weight is None:
-        return err.mean()
-    weight = weight.float()
-    return (err * weight).sum() / weight.sum().clamp_min(1.0)
-
-
-def task_field_loss(
-    task: Callable,
-    velocity: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    chunk: torch.Tensor,
-    z: torch.Tensor,
-    t: torch.Tensor,
-    lambda_id: float,
-    n_dims: int,
-) -> tuple[torch.Tensor, dict]:
-    """The task module's flow matching through the adapted field, in the t = 0 noise convention: on the
-    policy's interpolation x_t = (1 - t) z + t a (``chunk`` a, normalized (B, H, n); t (B,)),
-
-        L = || A v + b - (a - z) ||^2 + lambda_id (||A - I||^2 + ||b||^2),   v = velocity(x_t, t) (no grad),
-
-    ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. Returns the loss and its
-    two parts (``fm``, ``identity``) as floats."""
-    x = (1 - t[:, None, None]) * z + t[:, None, None] * chunk
-    with torch.no_grad():
-        v = velocity(x, t)
-    mat, b = task(x, t, v)
-    fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
-    identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
-    return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
-
-
-def step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
-    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
-    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
-    opt.zero_grad(set_to_none=True)
-    if not torch.isfinite(loss):
-        return False
-    loss.backward()
-    norm = nn.utils.clip_grad_norm_(list(params), clip)
-    if not torch.isfinite(norm):
-        opt.zero_grad(set_to_none=True)
-        return False
-    opt.step()
-    return True
-
-
-def train_module(
-    module: nn.Module,
-    steps: int,
-    lr: float,
-    batch_loss: Callable[[int], torch.Tensor],
-    validate: Callable[[], dict] | None = None,
-    log_every: int = 1000,
-    weight_decay: float = 1e-4,
-    clip: float = 1.0,
-) -> list[dict]:
-    """The MARS modules' training loop, shared by the cursor and the LIBERO trainers: AdamW with a cosine
-    schedule over ``steps``, gradients clipped to ``clip``, non-finite batches skipped (``step_if_finite``).
-    ``batch_loss(step)`` returns one batch's loss. Every ``log_every`` steps, and at the last, the module is put
-    in eval mode for ``validate()`` (named numbers, or None) and {step, train_loss (the window's mean),
-    skipped, **validation} is logged and printed. Returns the log."""
-    opt = torch.optim.AdamW(module.parameters(), lr=lr, weight_decay=weight_decay)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
-    log: list[dict] = []
-    running, skipped, tic = 0.0, 0, time.time()
-    for step in range(1, steps + 1):
-        loss = batch_loss(step)
-        skipped += not step_if_finite(opt, loss, module.parameters(), clip)
-        sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
-        if step % log_every == 0 or step == steps:
-            module.eval()
-            val = validate() if validate is not None else {}
-            module.train()
-            entry = {"step": step, "train_loss": running / log_every, "skipped": skipped, **val}
-            log.append(entry)
-            shown = "  ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}" for k, v in val.items())
-            print(
-                f"step {step:6d}  train {entry['train_loss']:.4f}  {shown}"
-                + (f"  skipped {skipped}" if skipped else "")
-                + f"  ({time.time() - tic:.0f}s)",
-                flush=True,
-            )
-            running = 0.0
-    return log
 
 
 # ---------------------------------------------------------------- FlowControlPolicy
@@ -1643,3 +1608,24 @@ frs_schedule = deprecated_alias(Flow.schedule, "frs_schedule", "Flow.schedule")
 uniform_reference = deprecated_alias(Flow.uniform_reference, "uniform_reference", "Flow.uniform_reference")
 heading_cosine = deprecated_alias(Flow.heading_cosine, "heading_cosine", "Flow.heading_cosine")
 paired_chunks = deprecated_alias(Flow.paired_chunks, "paired_chunks", "Flow.paired_chunks")
+
+apply_user_module = deprecated_alias(
+    LearnedUserModule.apply_correction, "apply_user_module", "LearnedUserModule.apply_correction"
+)
+user_field_loss = deprecated_alias(
+    LearnedUserModule.field_loss, "user_field_loss", "LearnedUserModule.field_loss"
+)
+reduce_tokens = deprecated_alias(LearnedTaskModule.reduce, "reduce_tokens", "LearnedTaskModule.reduce")
+task_field_loss = deprecated_alias(
+    LearnedTaskModule.field_loss, "task_field_loss", "LearnedTaskModule.field_loss"
+)
+save_adapter_module = deprecated_alias(
+    AdapterModules.save_module, "save_adapter_module", "AdapterModules.save_module"
+)
+load_adapter_module = deprecated_alias(
+    AdapterModules.load_module, "load_adapter_module", "AdapterModules.load_module"
+)
+convert_cursor_module = deprecated_alias(
+    AdapterModules.from_cursor_checkpoint, "convert_cursor_module", "AdapterModules.from_cursor_checkpoint"
+)
+_MODULE_KINDS = AdapterModules.KINDS  # deprecated: AdapterModules.KINDS

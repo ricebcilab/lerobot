@@ -43,7 +43,7 @@ SEEDS = (1, 2, 3, 4)  # the grid's training seeds besides seed 0 (each module's 
 GROUPS = ("study", "grid", "grid_seeds")
 POLICY_FILES = ("config.json", "model.safetensors", "train_log.json")
 ADAPTER_FILES = ("adapter.pt", "train_log.json")
-# the files the loaders open (FlowPolicy.load, ReversalAdapter.load / load_adapter_module): a download must bring these
+# the files the loaders open (FlowPolicy.load, ReversalAdapter.load / AdapterModules.load_module): a download must bring these
 POLICY_REQUIRED = ("config.json", "model.safetensors")
 ADAPTER_REQUIRED = ("adapter.pt",)
 HEADER = """\
@@ -94,7 +94,7 @@ def all_folders(folders):
 
 
 def adapter_converted(path):
-    """Whether an adapter.pt is in the save_adapter_module format (convert_checkpoints.py)."""
+    """Whether an adapter.pt is in the AdapterModules.save_module format (convert_checkpoints.py)."""
     import torch
     from convert_checkpoints import converted
     return converted(torch.load(path, map_location="cpu", weights_only=True))

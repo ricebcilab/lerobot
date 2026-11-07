@@ -3,10 +3,8 @@ import torch
 
 from lerobot.policies.steering import (
     TOKEN_GEOMETRIES,
+    AdapterModules,
     LearnedTaskModule,
-    load_adapter_module,
-    reduce_tokens,
-    save_adapter_module,
     scene_spec,
 )
 from lerobot.policies.steering.modeling_steering import SCENE_SOURCES
@@ -57,7 +55,9 @@ def test_image_sources_start_at_identity_round_trip_and_read_their_scene(src, tm
         for p in m.parameters():
             p.add_(0.1 * torch.randn_like(p))
     m.requires_grad_(False)
-    loaded, kind, _ = load_adapter_module(save_adapter_module(m, tmp_path / "t.pt", kind="task"))
+    loaded, kind, _ = AdapterModules.load_module(
+        AdapterModules.save_module(m, tmp_path / "t.pt", kind="task")
+    )
     assert kind == "task" and loaded.token_source == src
     a0, b0 = m(x, t, v, obs)
     a1, b1 = loaded(x, t, v, obs)
@@ -181,7 +181,7 @@ def test_relative_tokens_are_the_projection_plus_the_cursor_relative_geometry(sr
     assert m.config["token_geometry"] == "relative" and "token_geometry" not in ab.config
     assert "scene_pos" not in m.state_dict() and "scene_pos" in ab.state_dict()
     assert LearnedTaskModule(**ab.config).token_geometry == "absolute"  # a round-1 config
-    back, kind, _ = load_adapter_module(save_adapter_module(m, tmp_path / "rel.pt", "task"))
+    back, kind, _ = AdapterModules.load_module(AdapterModules.save_module(m, tmp_path / "rel.pt", "task"))
     x, v, t = _xvt()
     assert kind == "task" and back.token_geometry == "relative"
     assert all(torch.allclose(a, b) for a, b in zip(m(x, t, v, obs), back(x, t, v, obs), strict=True))
@@ -250,13 +250,13 @@ def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_pa
     assert red.state_dict()["scene_basis"].shape == (32, 4) and red.state_dict()["scene_pos"].shape[0] == 8
     mean, basis = _reduction()
     red.set_reduction(mean, basis)
-    back, kind, _ = load_adapter_module(save_adapter_module(red, tmp_path / "v.pt", "task"))
+    back, kind, _ = AdapterModules.load_module(AdapterModules.save_module(red, tmp_path / "v.pt", "task"))
     assert kind == "task" and back.wrist_span == 0.5 and back.scene_rank == 4
     torch.testing.assert_close(back.scene_basis, basis)
     torch.testing.assert_close(back.scene_mean, mean)
     # a reduced module reads full-width and reduced tokens alike
     raw, obs = torch.randn(3, 8, 32).to(torch.float16), {"pos": torch.rand(3, 2)}
-    stored = reduce_tokens(raw, red.scene_mean, red.scene_basis)
+    stored = LearnedTaskModule.reduce(raw, red.scene_mean, red.scene_basis)
     assert stored.dtype == torch.float16 and stored.shape == (3, 8, 4)
     a = red.tokens({**obs, "scene": {"vlm_views": raw}}, 3)[0]
     assert torch.equal(a, red.tokens({**obs, "scene": {"vlm_views": stored}}, 3)[0])
@@ -307,7 +307,9 @@ def test_scene_rank_is_legal_for_the_image_sources_and_relative_tokens_add_the_g
     m.set_reduction(mean, basis)
     obs = _scene()
     x = obs["scene"]["vlm_image"]
-    reduced = reduce_tokens(x, m.scene_mean, m.scene_basis)  # its buffers: a QR basis is not contiguous
+    reduced = LearnedTaskModule.reduce(
+        x, m.scene_mean, m.scene_basis
+    )  # its buffers: a QR basis is not contiguous
     rel = (_centres(4)[None] - obs["pos"][:, None]) / m.scale
     feats = torch.cat(
         [rel, torch.full_like(rel[..., :1], (0.5 / 4) / m.scale), rel.norm(dim=-1, keepdim=True)], -1
@@ -318,14 +320,14 @@ def test_scene_rank_is_legal_for_the_image_sources_and_relative_tokens_add_the_g
     )
     stored = {**obs, "scene": {"vlm_image": reduced}}
     assert torch.equal(tokens, m.tokens(stored, 3)[0])  # full-width and reduced input alike
-    back, _, _ = load_adapter_module(save_adapter_module(m, tmp_path / "r.pt", "task"))
+    back, _, _ = AdapterModules.load_module(AdapterModules.save_module(m, tmp_path / "r.pt", "task"))
     assert back.scene_rank == 4 and torch.equal(back.scene_basis, basis) and back.token_geometry == "relative"
     x, v, t = _xvt()
     assert all(torch.equal(a, b) for a, b in zip(m(x, t, v, obs), back(x, t, v, stored), strict=True))
     # a round-2 relative image module's config has no scene_rank: it loads as it was saved
     old = _module("vlm_image", "relative")
     assert "scene_rank" not in old.config and "scene_basis" not in old.state_dict()
-    again, _, _ = load_adapter_module(save_adapter_module(old, tmp_path / "old.pt", "task"))
+    again, _, _ = AdapterModules.load_module(AdapterModules.save_module(old, tmp_path / "old.pt", "task"))
     assert again.scene_rank is None and again.scene_in.in_features == 32
 
 

@@ -106,10 +106,12 @@ modules without a user.
 
 import argparse
 import json
+import math
 import multiprocessing
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
@@ -118,6 +120,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -136,10 +139,8 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, Flow, SceneEncoder,  # noqa: E402
-                                       load_adapter_module, reduce_tokens,
-                                       save_adapter_module, scene_spec, task_field_loss, train_module,
-                                       user_field_loss)
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, AdapterModules, Flow,  # noqa: E402
+                                       LearnedTaskModule, LearnedUserModule, SceneEncoder, scene_spec)
 
 # ---------------------------------------------------------------- data
 
@@ -168,7 +169,7 @@ def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
     planned steps, zero after each demonstration's length), the lengths [n] and info: drawn, kept, outcomes (counts
     over everything drawn) and records (the kept trials')."""
     adapter = ReversalAdapter.load(adapter_path(args.teacher), device)
-    taught = obstacle_spec(load_adapter_module(adapter_path(args.teacher))[2]["obstacle"])
+    taught = obstacle_spec(AdapterModules.load_module(adapter_path(args.teacher))[2]["obstacle"])
     if taught != obstacle_spec(obstacle):
         raise ValueError(f"--teacher {args.teacher} was trained on the obstacle {taught}, not this run's "
                          f"{obstacle_spec(obstacle)}: a teacher's rollouts are only demonstrations of its own obstacle")
@@ -349,7 +350,7 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
         moved = 0
         for rows, t, hits in encoded(np.arange(len(demo)), pool):
             if args.scene_rank:
-                t = reduce_tokens(t, reduction[0].to(t.device), reduction[1].to(t.device))
+                t = LearnedTaskModule.reduce(t, reduction[0].to(t.device), reduction[1].to(t.device))
             tokens[rows[0]:rows[-1] + 1] = t.to(tokens.device)
             moved += hits
     return tokens, start, dict(frames=len(demo), moved=moved, kept=kept, reduction=reduction if args.scene_rank else None,
@@ -573,19 +574,19 @@ def active_of(push):
 def task_loss(policy, task, obs, chunk, z, t, lambda_id):
     """Flow matching through the adapted field on the policy's interpolation x_t = (1 - t) z + t a (the cursor's
     time convention, t = 0 noise; a the chunk in normalized units), plus the pull of A, b toward the identity.
-    Returns the loss and its two parts. The core's `task_field_loss` on this policy and observation."""
-    return task_field_loss(task.bind(obs), lambda x, t_: policy(obs, x, t_), chunk / policy.action_scale, z, t,
-                           lambda_id, n_dims=2)
+    Returns the loss and its two parts. The core's `LearnedTaskModule.field_loss` on this policy and observation."""
+    return LearnedTaskModule.field_loss(task.bind(obs), lambda x, t_: policy(obs, x, t_), chunk / policy.action_scale,
+                                        z, t, lambda_id, n_dims=2)
 
 
 def field_loss(policy, user, task, free, latent, bci, weight=None):
     """The regression along the straight path from `latent` to a_bci, x_t = (1 - t) latent + t a_bci (the cursor's
     time convention, t = 0 noise; t drawn uniformly here): U(x_t, t) T(v) = a_bci - latent, v the policy's field
     and T the task module (A v + b) if any. Gradients reach whichever module trains. `weight` [B] (e.g. the active
-    commands) averages the per-sample errors. The core's `user_field_loss` on this policy and observation."""
+    commands) averages the per-sample errors. The core's `LearnedUserModule.field_loss` on this policy and observation."""
     t = torch.rand(len(latent), device=latent.device)
-    return user_field_loss(user, lambda x, t_: policy(free, x, t_), latent, bci, t,
-                           None if task is None else task.bind(free), weight)
+    return LearnedUserModule.field_loss(user, lambda x, t_: policy(free, x, t_), latent, bci, t,
+                                        None if task is None else task.bind(free), weight)
 
 
 def collides(obs, chunk):
@@ -635,6 +636,67 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
             rows = active & obs["obstacle_mask"].any(1)
             out[f"collide_{name}"] = float(collides(rows_of(obs, rows), regen[rows]).float().mean())
     return out
+
+
+# ---------------------------------------------------------------- the training loop
+#
+# Moved verbatim from lerobot.policies.steering (train_module, step_if_finite), which keeps no training loop.
+
+
+def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
+    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
+    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
+    opt.zero_grad(set_to_none=True)
+    if not torch.isfinite(loss):
+        return False
+    loss.backward()
+    norm = nn.utils.clip_grad_norm_(list(params), clip)
+    if not torch.isfinite(norm):
+        opt.zero_grad(set_to_none=True)
+        return False
+    opt.step()
+    return True
+
+
+def _train_module(
+    module: nn.Module,
+    steps: int,
+    lr: float,
+    batch_loss: Callable[[int], torch.Tensor],
+    validate: Callable[[], dict] | None = None,
+    log_every: int = 1000,
+    weight_decay: float = 1e-4,
+    clip: float = 1.0,
+) -> list[dict]:
+    """The MARS modules' training loop, shared by the cursor and the LIBERO trainers: AdamW with a cosine
+    schedule over ``steps``, gradients clipped to ``clip``, non-finite batches skipped (``_step_if_finite``).
+    ``batch_loss(step)`` returns one batch's loss. Every ``log_every`` steps, and at the last, the module is put
+    in eval mode for ``validate()`` (named numbers, or None) and {step, train_loss (the window's mean),
+    skipped, **validation} is logged and printed. Returns the log."""
+    opt = torch.optim.AdamW(module.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
+    log: list[dict] = []
+    running, skipped, tic = 0.0, 0, time.time()
+    for step in range(1, steps + 1):
+        loss = batch_loss(step)
+        skipped += not _step_if_finite(opt, loss, module.parameters(), clip)
+        sched.step()
+        running += loss.item() if torch.isfinite(loss) else 0.0
+        if step % log_every == 0 or step == steps:
+            module.eval()
+            val = validate() if validate is not None else {}
+            module.train()
+            entry = {"step": step, "train_loss": running / log_every, "skipped": skipped, **val}
+            log.append(entry)
+            shown = "  ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}" for k, v in val.items())
+            print(
+                f"step {step:6d}  train {entry['train_loss']:.4f}  {shown}"
+                + (f"  skipped {skipped}" if skipped else "")
+                + f"  ({time.time() - tic:.0f}s)",
+                flush=True,
+            )
+            running = 0.0
+    return log
 
 
 # ---------------------------------------------------------------- the task module
@@ -730,7 +792,7 @@ def train_task(args, policy, device, rng):
             save_module(args, "task", task, f"{args.name}_step{parts['step']}", step=parts["step"])
         return val
 
-    save(args, "task", task, train_module(task, args.steps, args.lr, batch_loss, validate, args.log_every))
+    save(args, "task", task, _train_module(task, args.steps, args.lr, batch_loss, validate, args.log_every))
 
 
 # ---------------------------------------------------------------- the user module
@@ -763,14 +825,14 @@ def train_user(args, policy, model, device, rng):
             val.update({f"closed_{k}": v for k, v in expert_check(policy, closed["val"], args, user).items()})
         return val
 
-    save(args, "user", user, train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every))
+    save(args, "user", user, _train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every))
 
 
 # ---------------------------------------------------------------- main
 
 
 def save(args, kind, module, log):
-    """The module in lerobot's `save_adapter_module` format (kind, config, weights, meta: the arguments and the
+    """The module in lerobot's `AdapterModules.save_module` format (kind, config, weights, meta: the arguments and the
     task's obstacle) and its training log, under checkpoints/adapters/<name>/."""
     path, saved = save_module(args, kind, module, args.name)
     with open(adapter_dir(args.name) / "train_log.json", "w") as f:
@@ -779,7 +841,7 @@ def save(args, kind, module, log):
 
 
 def save_module(args, kind, module, name, **extra):
-    """checkpoints/adapters/<name>/adapter.pt in lerobot's `save_adapter_module` format, `extra` added to its meta;
+    """checkpoints/adapters/<name>/adapter.pt in lerobot's `AdapterModules.save_module` format, `extra` added to its meta;
     returns its path and the saved arguments."""
     # the reductions travel in the module's buffers
     saved = {k: v for k, v in vars(args).items() if k not in ("view_reduction", "scene_reduction")}
@@ -787,7 +849,7 @@ def save_module(args, kind, module, name, **extra):
     center = args.scene_center if args.token_source == "vlm_views" or reduced else None
     store = None if args.scene_store is None else store_name(args.token_source, args.render_size, encoder_digest(args.vlm))
     augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")}
-    path = save_adapter_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
+    path = AdapterModules.save_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
                                                               teacher=args.teacher, teacher_demos=getattr(args, "teacher_demos", None),

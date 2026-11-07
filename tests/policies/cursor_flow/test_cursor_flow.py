@@ -26,10 +26,10 @@ from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowCon
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.steering import (
+    AdapterModules,
     Flow,
     LearnedTaskModule,
     LearnedUserModule,
-    load_adapter_module,
 )
 
 CONVERTER = (
@@ -158,9 +158,9 @@ def test_converter_is_idempotent(tmp_path):
     first = converter.convert_tree(tmp_path)
     assert first == {"policies": 2, "adapters": 2, "tasks": 1, "skipped": 0}
 
-    _, kind, meta = load_adapter_module(tmp_path / "adapters" / "u" / "adapter.pt")
+    _, kind, meta = AdapterModules.load_module(tmp_path / "adapters" / "u" / "adapter.pt")
     assert kind == "user" and meta == {"args": {}, "obstacle": None}
-    task, kind, meta = load_adapter_module(tmp_path / "adapters" / "group" / "t" / "adapter.pt")
+    task, kind, meta = AdapterModules.load_module(tmp_path / "adapters" / "group" / "t" / "adapter.pt")
     assert kind == "task" and isinstance(task, LearnedTaskModule) and meta["obstacle"]["kind"] == "disc"
     assert (tmp_path / "adapters" / "u" / "adapter.pt.orig").is_file()
     assert json.loads((tmp_path / "policies" / "flow" / "config.json").read_text())["type"] == "cursor_flow"
@@ -211,7 +211,7 @@ def test_adapter_conversion_survives_a_crash(tmp_path, monkeypatch):
     }
     for p, b in before.items():
         assert (tmp_path / p.with_name(p.name + ".orig")).read_bytes() == b
-        load_adapter_module(tmp_path / p)
+        AdapterModules.load_module(tmp_path / p)
     assert not list(tmp_path.rglob("*.tmp"))
 
 

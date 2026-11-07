@@ -16,7 +16,7 @@ from lerobot.envs.cursor import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
-from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule
 from train import train_adapter
 from _view_stub import TokenStub, ViewStub
 
@@ -281,7 +281,7 @@ def test_the_teacher_loop_is_guarded(trained, monkeypatch):
     with pytest.raises(ValueError, match="obstacle"):  # the teacher was trained on a disc
         demos("--obstacle", RING, "--teacher", "t")
     meta = dict(obstacle={"kind": "disc", "radius": 0.03, "along": 0.5})
-    save_adapter_module(LearnedTaskModule(horizon=16, token_source="cnn", image_size=64), trained / "t_cnn" / "adapter.pt", "task", meta=meta)
+    AdapterModules.save_module(LearnedTaskModule(horizon=16, token_source="cnn", image_size=64), trained / "t_cnn" / "adapter.pt", "task", meta=meta)
     with pytest.raises(ValueError, match="discs"):  # an image module is not a teacher
         demos("--obstacle", DISC, "--teacher", "t_cnn")
     calls = []

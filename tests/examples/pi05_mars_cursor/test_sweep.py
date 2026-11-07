@@ -16,7 +16,7 @@ from lerobot.envs.cursor import TaskConfig, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import SharedController, steered_chunk
-from lerobot.policies.steering import LearnedTaskModule, save_adapter_module
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule
 import run_sweep
 from run_sweep import (attach_scene, cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
                        with_setting)
@@ -247,7 +247,7 @@ def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn", geometry="absolute
     import cursor_sa.session as session_mod
 
     monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
-    save_adapter_module(
+    AdapterModules.save_module(
         LearnedTaskModule(horizon=16, token_source="cnn", image_size=64, token_geometry=geometry),
         tmp_path / "ckpt" / "adapters" / name / "adapter.pt",
         "task",
@@ -396,7 +396,7 @@ def _view_sweep(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
     for name, span in (("image/v05", 0.5), ("image/v10", 1.0)):
-        save_adapter_module(LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=2048, scene_tokens=512, image_size=56,
+        AdapterModules.save_module(LearnedTaskModule(horizon=16, token_source="vlm_views", scene_dim=2048, scene_tokens=512, image_size=56,
                                               wrist_span=span, scene_rank=2), tmp_path / "ckpt" / "adapters" / name / "adapter.pt", "task")
     (tmp_path / "tiny.yaml").write_text(
         "name: tiny_views\nagent: expert_chunk\narm: condition_grid.yaml\nmethods:\n"

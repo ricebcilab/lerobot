@@ -22,7 +22,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from lerobot.policies.steering import reduce_tokens
+from lerobot.policies.steering import LearnedTaskModule
 
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, layouts_on_screen, move_actions, move_layouts
 
@@ -251,7 +251,7 @@ class DemoSampler:
     (`SceneDataset.gather`) into a host buffer (pinned, allocated for the largest batch seen, when `device` is CUDA),
     copies them to the device without blocking and puts them in obs["scene"][source], the same values the layouts'
     `scene` would give; `layouts.scene` is not read. With `reduction` = (mean, basis) the gathered batch is reduced on
-    the device (`reduce_tokens`)."""
+    the device (`LearnedTaskModule.reduce`)."""
 
     def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None, jitter=0.0, jitter_steps=4,
                  store=None, reduction=None):
@@ -333,4 +333,4 @@ class DemoSampler:
             self._copied.record()
         else:
             tokens = token_store.gather(rows)   # a fresh tensor: on the CPU no copy would separate it from a buffer
-        return tokens if self.reduction is None else reduce_tokens(tokens, *self.reduction)
+        return tokens if self.reduction is None else LearnedTaskModule.reduce(tokens, *self.reduction)

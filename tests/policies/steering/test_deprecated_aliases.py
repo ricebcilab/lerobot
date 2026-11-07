@@ -17,6 +17,7 @@
 the same inputs, and says it is deprecated."""
 
 import numpy as np
+import pytest
 import torch
 
 import lerobot.policies.steering as steering
@@ -156,3 +157,96 @@ def test_paired_chunks_alias_restores_the_generator_as_the_method():
         "paired_chunks",
     ):
         assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name
+
+
+# ---------------------------------------------------------------- the adapter modules
+
+
+def _perturbed(module, seed):
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in module.parameters():
+            p.add_(0.1 * torch.randn(p.shape, generator=g))
+    return module
+
+
+def test_module_method_aliases_equal_the_methods():
+    from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule
+
+    g = torch.Generator().manual_seed(5)
+    user = _perturbed(LearnedUserModule(6, n_dims=2, d=16, tdim=8, cross_step_rank=1), 1)
+    task = _perturbed(LearnedTaskModule(horizon=6, d=16, tdim=8, heads=2, layers=1), 2)
+    x, v, t = torch.randn(3, 6, 2, generator=g), torch.randn(3, 6, 2, generator=g), torch.rand(3, generator=g)
+    matrices = lambda x_t, t_: torch.eye(2).expand(3, 6, 2, 2) * 1.5  # noqa: E731 (a callable without velocity)
+    for u in (user, matrices):
+        assert torch.equal(
+            steering.apply_user_module(u, x, t, v), LearnedUserModule.apply_correction(u, x, t, v)
+        )
+    velocity = lambda x_t, t_: torch.tanh(x_t)  # noqa: E731
+    latent, target, weight = (
+        torch.randn(3, 6, 2, generator=g),
+        torch.randn(3, 6, 2, generator=g),
+        torch.ones(3),
+    )
+    for kw in ({}, {"task": task, "weight": weight}):
+        assert torch.equal(
+            steering.user_field_loss(user, velocity, latent, target, t, **kw),
+            LearnedUserModule.field_loss(user, velocity, latent, target, t, **kw),
+        )
+    old, new = (
+        fn(task, velocity, target, latent, t, 0.1, 2)
+        for fn in (steering.task_field_loss, LearnedTaskModule.field_loss)
+    )
+    assert torch.equal(old[0], new[0]) and old[1] == new[1]
+    tokens, mean, basis = (
+        torch.randn(2, 4, 16, generator=g),
+        torch.randn(16, generator=g),
+        torch.randn(16, 3, generator=g),
+    )
+    assert torch.equal(
+        steering.reduce_tokens(tokens, mean, basis), LearnedTaskModule.reduce(tokens, mean, basis)
+    )
+    for name in (
+        "apply_user_module",
+        "user_field_loss",
+        "task_field_loss",
+        "reduce_tokens",
+        "save_adapter_module",
+        "load_adapter_module",
+        "convert_cursor_module",
+    ):
+        assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name
+
+
+def test_checkpoint_aliases_write_and_read_the_same_files(tmp_path):
+    from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
+
+    user = _perturbed(LearnedUserModule(6, n_dims=2, d=16, tdim=8), 3)
+    a = steering.save_adapter_module(user, tmp_path / "a.pt", "user", meta={"k": 1})
+    b = AdapterModules.save_module(user, tmp_path / "b.pt", "user", meta={"k": 1})
+    c = AdapterModules(user=user).save(tmp_path / "c.pt", meta={"k": 1})  # the one learned module's slot
+    saved = [
+        torch.load(p, weights_only=True) for p in (a, b, c)
+    ]  # the zip records each file's name: compare contents
+    for ckpt in saved[1:]:
+        assert {k: v for k, v in ckpt.items() if k != "state_dict"} == {
+            k: v for k, v in saved[0].items() if k != "state_dict"
+        }
+        assert all(torch.equal(v, ckpt["state_dict"][k]) for k, v in saved[0]["state_dict"].items())
+    old, new = steering.load_adapter_module(a), AdapterModules.load_module(a)
+    assert old[1:] == new[1:] == ("user", {"k": 1})
+    assert all(torch.equal(v, new[0].state_dict()[k]) for k, v in old[0].state_dict().items())
+    loaded = AdapterModules.load(c)
+    assert loaded.kind == "user" and loaded.meta == {"k": 1} and not loaded.training
+    with pytest.raises(ValueError, match="kind must be one of"):
+        AdapterModules(user=user).save(tmp_path / "d.pt", "task")
+    with pytest.raises(ValueError, match="needs a kind"):
+        AdapterModules(user=user, task=LearnedTaskModule(horizon=6)).save(tmp_path / "e.pt")
+    cursor = {"config": {"horizon": 6, "d": 16, "tdim": 8}, "state_dict": user.state_dict(), "args": {"x": 1}}
+    assert (
+        steering.convert_cursor_module(cursor).keys() == AdapterModules.from_cursor_checkpoint(cursor).keys()
+    )
+    assert (
+        steering.convert_cursor_module(cursor)["config"]
+        == AdapterModules.from_cursor_checkpoint(cursor)["config"]
+    )

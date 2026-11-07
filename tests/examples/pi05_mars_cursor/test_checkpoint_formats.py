@@ -1,6 +1,6 @@
 """The cursor checkpoints in both formats: the cursor project's .pt files and the converted lerobot ones
 (convert_checkpoints.py). FlowPolicy.load reads both with the same results; adapters are read in lerobot's format
-(ReversalAdapter.load is load_adapter_module), which the trainer writes and the converter produces from old files."""
+(ReversalAdapter.load is AdapterModules.load_module), which the trainer writes and the converter produces from old files."""
 
 import convert_checkpoints
 import pytest
@@ -110,7 +110,7 @@ def test_converted_adapters_load_as_before(tmp_path):
     ):
         (tmp_path / "adapters" / name).mkdir(parents=True)
         torch.save(ckpt, tmp_path / "adapters" / name / "adapter.pt")
-    frozen = lambda m: m.eval().requires_grad_(False)  # as load_adapter_module serves them  # noqa: E731
+    frozen = lambda m: m.eval().requires_grad_(False)  # as load_module serves them  # noqa: E731
     before = {"u": ReversalAdapter(user=frozen(user)), "t": ReversalAdapter(task=frozen(task))}
     assert convert_checkpoints.convert_tree(tmp_path) == {
         "policies": 0,

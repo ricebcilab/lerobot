@@ -25,7 +25,6 @@ from lerobot.policies.steering import (
     LearnedTaskModule,
     LearnedUserModule,
     as_adapter,
-    save_adapter_module,
 )
 
 H = 4
@@ -113,7 +112,7 @@ def test_n_dims_reaches_the_field():
 def test_load_a_saved_user_and_task_module(tmp_path):
     obs, (x, t, v) = _obs(), _xtv()
     for kind, module in (("user", _user()), ("task", _task())):
-        path = save_adapter_module(module, tmp_path / kind / "adapter.pt", kind, meta={"note": kind})
+        path = AdapterModules.save_module(module, tmp_path / kind / "adapter.pt", kind, meta={"note": kind})
         loaded = AdapterModules.load(path)
         assert loaded.kind == kind and not loaded.training
         part = getattr(loaded, kind)
