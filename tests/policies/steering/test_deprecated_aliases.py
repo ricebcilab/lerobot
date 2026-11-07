@@ -250,3 +250,47 @@ def test_checkpoint_aliases_write_and_read_the_same_files(tmp_path):
         steering.convert_cursor_module(cursor)["config"]
         == AdapterModules.from_cursor_checkpoint(cursor)["config"]
     )
+
+
+# ---------------------------------------------------------------- the steering cores
+
+
+def test_core_aliases_equal_the_methods():
+    from types import SimpleNamespace
+
+    from lerobot.policies.steering import AdaptedField, FlowControlSteering, FlowReversalSteering
+
+    assert steering.FlowControlPolicy is FlowControlSteering
+    assert steering.FlowReversalSteeringPolicy is FlowReversalSteering
+    g = torch.Generator().manual_seed(6)
+    x, written = torch.randn(3, 6, 7, generator=g), torch.randn(3, 6, 3, generator=g)
+    steer = torch.tensor([True, False, True])[:, None, None]
+    for step in (0, 2):
+        old = steering.flow_control_write(x.clone(), step, written, 4, 2, slice(0, 3), steer)
+        assert torch.equal(old, FlowControlSteering.write(x.clone(), step, written, 4, 2, slice(0, 3), steer))
+    for dims, pinned in ((("translation",), 2), (None, None), (("translation", "gripper"), None)):
+        assert torch.equal(
+            steering.delegation_mask(6, 9, dims, pinned),
+            FlowReversalSteering.delegation_mask(6, 9, dims, pinned),
+        )
+    stats = {
+        "action": {"q01": np.arange(7.0), "q99": np.arange(7.0) + 2, "mean": np.zeros(7), "std": np.ones(7)}
+    }
+    for mode in (None, "QUANTILES"):
+        post = SimpleNamespace(steps=[SimpleNamespace(stats=stats, norm_map={"ACTION": mode})])
+        old, new = steering.get_action_mean_std(post), FlowControlSteering.action_mean_std(post)
+        assert np.array_equal(old[0], new[0]) and np.array_equal(old[1], new[1])
+    field = AdaptedField(
+        None, task_module=lambda x_t, t, v: (torch.eye(7).expand(3, 6, 7, 7), torch.ones_like(v))
+    )
+    v = torch.randn(3, 6, 7, generator=g)
+    assert torch.equal(
+        steering.task_velocity_hook(field)(0, 0.5, x, v),
+        FlowControlSteering.velocity_hook(field)(0, 0.5, x, v),
+    )
+    assert (
+        steering.task_velocity_hook(None) is None
+        and FlowReversalSteering.velocity_hook(AdaptedField(None)) is None
+    )
+    for name in ("flow_control_write", "delegation_mask", "task_velocity_hook", "get_action_mean_std"):
+        assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name

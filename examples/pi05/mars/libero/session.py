@@ -35,11 +35,10 @@ from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.steering import (
     GRIPPER_DIM,
     N_ACTION_DIMS,
-    FlowControlPolicy,
-    FlowReversalSteeringPolicy,
+    FlowControlSteering,
+    FlowReversalSteering,
     ReversalAdapter,
     check_steps,
-    get_action_mean_std,
 )
 from lerobot.utils.constants import ACTION
 
@@ -143,11 +142,11 @@ class Session:
             else nullcontext()
         )
         if self.operator is not None:
-            self.operator_mean, self.operator_std = get_action_mean_std(self.postprocessor)
+            self.operator_mean, self.operator_std = FlowControlSteering.action_mean_std(self.postprocessor)
 
         self._zero_policy = _ZeroPolicy()
-        self._flow_policy: FlowControlPolicy | None = None
-        self._frs_policy: FlowReversalSteeringPolicy | None = None
+        self._flow_policy: FlowControlSteering | None = None
+        self._frs_policy: FlowReversalSteering | None = None
         self.mode = "policy"
         self._scene_names: dict | None = None
         self.apply_control(control)
@@ -271,7 +270,7 @@ class Session:
     def resolved_matrices(self) -> dict:
         """For run provenance: the matrices in force, as lists (None when off)."""
         m, f = self.chain.corruption.matrix, self.adapter.matrix
-        _, std = get_action_mean_std(self.postprocessor)
+        _, std = FlowControlSteering.action_mean_std(self.postprocessor)
         normalized = self.adapter.normalized_matrix(std[:N_ACTION_DIMS])
         curl = self.chain.corruption.curl
         return {
@@ -434,7 +433,7 @@ class Session:
             kwargs["action_hook"] = _teleop_hook(source, paste_gripper=False)
         elif self.mode == "shared_flow_control":
             if self._flow_policy is None:
-                self._flow_policy = FlowControlPolicy(
+                self._flow_policy = FlowControlSteering(
                     self.policy, source, self.postprocessor, tau=self.tau, lam=self.lam, ic_gain=self.ic_gain
                 )
             self._flow_policy.tau = self.tau
@@ -443,7 +442,7 @@ class Session:
             kwargs["policy"] = self._flow_policy
         elif self.mode == "shared_flow_reversal_steering":
             if self._frs_policy is None:
-                self._frs_policy = FlowReversalSteeringPolicy(
+                self._frs_policy = FlowReversalSteering(
                     self.policy,
                     source,
                     self.postprocessor,

@@ -44,7 +44,7 @@ trained apart and composed here. Flow time runs from t=0 (noise) to t=1 (action)
 the reverse of pi0.5.
 
 The methods themselves are lerobot's: the cursor's chunks come from the same
-`FlowControlPolicy` and `FlowReversalSteeringPolicy` wrappers the robot (pi0.5)
+`FlowControlSteering` and `FlowReversalSteering` cores the robot (pi0.5)
 uses, driving the cursor policy through pi0.5's sampler interface
 (`CursorSampler`, over `FlowPolicy.sample_chunk`); the Euler flows and the user
 and task modules are lerobot's steering core too. This module binds them to the
@@ -56,9 +56,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from lerobot.policies.steering import (AdapterModules, Flow, SceneEncoder, FlowControlPolicy, FlowReversalSteeringPolicy,
-                                             LearnedTaskModule, LearnedUserModule, as_adapter,
-                                             task_velocity_hook)
+from lerobot.policies.steering import (AdapterModules, Flow, SceneEncoder, FlowControlSteering, FlowReversalSteering,
+                                             LearnedTaskModule, LearnedUserModule, as_adapter)
 
 from lerobot.envs.cursor import render_views
 from .readout import DEADBAND, Readout, is_active
@@ -228,7 +227,7 @@ def steering_wrapper(sampler, mode, tau=5, n_reverse_steps=None, dt=0.02, max_sp
     policy and teleop). frs's reference is the command held at constant velocity over the chunk, or a command per
     step, in action units (`to_action`)."""
     if mode == "flow_control":
-        return FlowControlPolicy(sampler, None, tau=tau, lam=lam, ic_gain=ic_gain, deadband=DEADBAND, dims=slice(None))
+        return FlowControlSteering(sampler, None, tau=tau, lam=lam, ic_gain=ic_gain, deadband=DEADBAND, dims=slice(None))
     if mode == "frs":
         policy, horizon = sampler.policy, sampler.config.chunk_size
 
@@ -236,7 +235,7 @@ def steering_wrapper(sampler, mode, tau=5, n_reverse_steps=None, dt=0.02, max_sp
             per_step = commands if commands.dim() == 3 else commands[:, None].expand(-1, horizon, -1)
             return to_action(per_step, policy, dt, max_speed)
 
-        return FlowReversalSteeringPolicy(sampler, None, n_reversal_steps=n_reverse_steps, operator_dims=None,
+        return FlowReversalSteering(sampler, None, n_reversal_steps=n_reverse_steps, operator_dims=None,
                                           pinned_steps=pinned_steps, deadband=DEADBAND, reference_fn=reference)
     return None
 
@@ -244,7 +243,7 @@ def steering_wrapper(sampler, mode, tau=5, n_reverse_steps=None, dt=0.02, max_sp
 def _chunk(sampler, wrapper, obs, commands, field, noise=None):
     """A normalized chunk [B, H, 2]: the wrapper's for the commands, or the policy's own (with the task module)."""
     if wrapper is None:
-        hook = task_velocity_hook(field)
+        hook = FlowControlSteering.velocity_hook(field)
         return sampler.predict_action_chunk(obs, noise=noise, **({} if hook is None else {"velocity_hook": hook}))
     return wrapper.steered_chunk(obs, commands, field=field)[0]
 

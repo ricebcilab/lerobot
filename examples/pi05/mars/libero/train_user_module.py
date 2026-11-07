@@ -290,7 +290,7 @@ def train(args) -> None:
     from config import load_experiment_settings
     from session import Session
 
-    from lerobot.policies.steering import get_action_mean_std
+    from lerobot.policies.steering import FlowControlSteering
 
     settings = load_experiment_settings(args.config, {})
     control = settings.session.control
@@ -302,7 +302,7 @@ def train(args) -> None:
     session = Session(settings.session)
     policy, cfg = session.policy, session.policy.config
     device = next(policy.parameters()).device
-    mean, std = get_action_mean_std(session.postprocessor)
+    mean, std = FlowControlSteering.action_mean_std(session.postprocessor)
     mean, std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
 
     if args.states:

@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-autonomy steering of a flow-matching sampler: ``FlowControlPolicy`` (Kao et al. 2026) and
-``FlowReversalSteeringPolicy`` (Tang et al. 2026) over any policy with pi0.5's sampler interface, the MARS
+"""Shared-autonomy steering of a flow-matching sampler: ``FlowControlSteering`` (Kao et al. 2026) and
+``FlowReversalSteering`` (Tang et al. 2026) over any policy with pi0.5's sampler interface, the MARS
 adapters (``LearnedUserModule``, ``LearnedTaskModule``, the holder ``ReversalAdapter`` and the composed
 ``AdapterModules`` with ``as_adapter``) with their checkpoints, losses and training loop, the one Euler
 integrator of either flow-time convention, and each method's core. The settings and specs are
@@ -557,7 +557,7 @@ class LearnedTaskModule(nn.Module):
 
 
 class ReversalAdapter(MatrixHolder):
-    """The MARS adapter of ``FlowReversalSteeringPolicy``: a user module (``matrix``, a fixed
+    """The MARS adapter of ``FlowReversalSteering``: a user module (``matrix``, a fixed
     environment-space F, or ``user_module``, a learned U(x_t, t) or any (x_t, t) -> (B, H, n, n)
     callable) applied in the reversal only, and a ``task_module`` ((x_t, t, v) -> (A, b)) applied in
     both directions. All None = off (plain FRS). Consumers read the holder on every use."""
@@ -685,7 +685,7 @@ class AdapterModules(nn.Module):
     at test time. ``adapt`` applies the task module in both directions and the user part in the backward
     pass: forward task(v), backward user(task(v)). ``field(obs)`` is the ``AdaptedField`` that ``adapt``
     and the flows use, acting on ``n_dims`` dims (None: each module's own ``n_dims``); ``load`` reads one
-    module from a module checkpoint (``save_module``) into its slot. ``FlowReversalSteeringPolicy``'s
+    module from a module checkpoint (``save_module``) into its slot. ``FlowReversalSteering``'s
     holder is ``ReversalAdapter``, a different class."""
 
     KINDS: dict[str, type[nn.Module]] = {
@@ -1034,68 +1034,11 @@ class Flow:
         return chunk, plain
 
 
-# ---------------------------------------------------------------- chunks and losses, t = 0 noise convention
-#
-# Everything in this section is in the cursor's flow-time convention: t = 0 is noise, t = 1 the action,
-# and flow times reach `velocity` and the adapter as (B,) float32 tensors (``integrate``'s ``batch_time``).
-
-
 # ---------------------------------------------------------------- the steering methods, one core each
 #
 # The steering wrappers below run these, on pi0.5 and on the cursor policy alike, so a method's mechanics (what is
 # written or reversed, where, and the forward schedule) are decided in one place. Either flow-time convention:
 # ``noise_time`` 1.0 is pi0.5's (t = 1 noise, t = 0 action), 0.0 the cursor's.
-
-
-def flow_control_write(
-    x_t: torch.Tensor,
-    step: int,
-    written: torch.Tensor,
-    tau: int,
-    lam: int,
-    dims=slice(None),
-    steer: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Flow control's one rule (Kao et al. 2026): at the start of each of the first ``lam`` (lambda) Euler steps
-    of a chunk's denoising, the first ``tau`` chunk steps of ``x_t``'s ``dims`` take ``written``, the command
-    already in the noise prior's units ((n,) for every row, or (B, H, n) per row and step), in the rows where
-    ``steer`` (B, 1, 1, bool) holds (all rows without it); the flow itself runs unmodified. lambda 1 writes the
-    initial condition only (Kao et al.'s method), 0 nothing, more re-writes as the flow proceeds (the lab's
-    variant). ``x_t`` is written in place and returned."""
-    if step >= lam:
-        return x_t
-    w = written[:, :tau] if written.dim() == 3 else written
-    region = x_t[:, :tau, dims]
-    x_t[:, :tau, dims] = w if steer is None else torch.where(steer, w.expand_as(region), region)
-    return x_t
-
-
-# ---------------------------------------------------------------- FlowControlPolicy
-
-
-def get_action_mean_std(postprocessor) -> tuple[np.ndarray, np.ndarray]:
-    """The affine (mean, std) of the checkpoint's action normalization: normalized = (x - mean) / std.
-
-    Read from the unnormalizer step's stats and its normalization mode: mean/std as is,
-    quantiles and min/max as the equivalent affine map onto [-1, 1].
-    """
-    for step in postprocessor.steps:
-        stats = getattr(step, "stats", None)
-        if not stats or "action" not in stats:
-            continue
-        action = {k: np.asarray(v, dtype=np.float64) for k, v in stats["action"].items()}
-        mode = getattr(getattr(step, "norm_map", None), "get", lambda *_: None)("ACTION")
-        mode = getattr(mode, "value", mode) or "MEAN_STD"
-        if mode == "QUANTILES":
-            lo, hi = action["q01"], action["q99"]
-        elif mode == "QUANTILE10":
-            lo, hi = action["q10"], action["q90"]
-        elif mode == "MIN_MAX":
-            lo, hi = action["min"], action["max"]
-        else:
-            return action["mean"], np.maximum(action["std"], 1e-6)
-        return (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-6)
-    raise RuntimeError("No action stats in the postprocessor; the shared flow modes need them.")
 
 
 class _ChunkSteering:
@@ -1161,24 +1104,49 @@ class _ChunkSteering:
         self.last_policy_action = self._policy_queue.popleft()
         return self._queue.popleft()
 
+    @staticmethod
+    def action_mean_std(postprocessor) -> tuple[np.ndarray, np.ndarray]:
+        """The affine (mean, std) of the checkpoint's action normalization: normalized = (x - mean) / std.
 
-def task_velocity_hook(field):
-    """The velocity hook a field's task module needs in every forward pass (the policy's own plan too), or None."""
-    if field is None or getattr(field, "task_module", None) is None:
-        return None
+        Read from the unnormalizer step's stats and its normalization mode: mean/std as is,
+        quantiles and min/max as the equivalent affine map onto [-1, 1].
+        """
+        for step in postprocessor.steps:
+            stats = getattr(step, "stats", None)
+            if not stats or "action" not in stats:
+                continue
+            action = {k: np.asarray(v, dtype=np.float64) for k, v in stats["action"].items()}
+            mode = getattr(getattr(step, "norm_map", None), "get", lambda *_: None)("ACTION")
+            mode = getattr(mode, "value", mode) or "MEAN_STD"
+            if mode == "QUANTILES":
+                lo, hi = action["q01"], action["q99"]
+            elif mode == "QUANTILE10":
+                lo, hi = action["q10"], action["q90"]
+            elif mode == "MIN_MAX":
+                lo, hi = action["min"], action["max"]
+            else:
+                return action["mean"], np.maximum(action["std"], 1e-6)
+            return (lo + hi) / 2, np.maximum((hi - lo) / 2, 1e-6)
+        raise RuntimeError("No action stats in the postprocessor; the shared flow modes need them.")
 
-    @torch.compiler.disable
-    def hook(step: int, time_: float, x_t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return field.adapt(x_t, time_, v, backward=False)
+    @staticmethod
+    def velocity_hook(field):
+        """The velocity hook a field's task module needs in every forward pass (the policy's own plan too), or None."""
+        if field is None or getattr(field, "task_module", None) is None:
+            return None
 
-    return hook
+        @torch.compiler.disable
+        def hook(step: int, time_: float, x_t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            return field.adapt(x_t, time_, v, backward=False)
+
+        return hook
 
 
-class FlowControlPolicy(_ChunkSteering):
+class FlowControlSteering(_ChunkSteering):
     """Shared flow control (Kao et al. 2026) on any flow policy with pi0.5's sampler interface; the pi0.5 wrapper.
 
     While the operator pushes, the command is written into ``x_t`` as the chunk's initial condition
-    (``flow_control_write``): scaled by ``ic_gain`` into the noise prior's units (a full push writes ``ic_gain``
+    (``write``): scaled by ``ic_gain`` into the noise prior's units (a full push writes ``ic_gain``
     sigma), into the commanded ``dims`` (pi0.5's translation, the first 3, by default) of the first ``tau`` chunk
     steps, at the start of each of the first ``lam`` (lambda) Euler steps of the chunk's denoising. The flow itself
     runs unmodified, so the executed action is entirely the model's output. ``lam`` 1 writes the initial condition
@@ -1204,7 +1172,7 @@ class FlowControlPolicy(_ChunkSteering):
         super().__init__(policy, source, deadband)
         self._mean = self._std = None
         if postprocessor is not None:
-            mean, std = get_action_mean_std(postprocessor)
+            mean, std = self.action_mean_std(postprocessor)
             self._mean, self._std = mean[:3], std[:3]
         self.tau = tau  # the setters validate against the policy's config
         self.lam = lam
@@ -1248,6 +1216,29 @@ class FlowControlPolicy(_ChunkSteering):
             raise ValueError(f"ic_gain must be a positive number or 'action', got {value!r}")
         self._ic_gain = float(value)
 
+    @staticmethod
+    def write(
+        x_t: torch.Tensor,
+        step: int,
+        written: torch.Tensor,
+        tau: int,
+        lam: int,
+        dims=slice(None),
+        steer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Flow control's one rule (Kao et al. 2026): at the start of each of the first ``lam`` (lambda) Euler steps
+        of a chunk's denoising, the first ``tau`` chunk steps of ``x_t``'s ``dims`` take ``written``, the command
+        already in the noise prior's units ((n,) for every row, or (B, H, n) per row and step), in the rows where
+        ``steer`` (B, 1, 1, bool) holds (all rows without it); the flow itself runs unmodified. lambda 1 writes the
+        initial condition only (Kao et al.'s method), 0 nothing, more re-writes as the flow proceeds (the lab's
+        variant). ``x_t`` is written in place and returned."""
+        if step >= lam:
+            return x_t
+        w = written[:, :tau] if written.dim() == 3 else written
+        region = x_t[:, :tau, dims]
+        x_t[:, :tau, dims] = w if steer is None else torch.where(steer, w.expand_as(region), region)
+        return x_t
+
     def reset(self) -> None:
         super().reset()
         self.guided_steps = 0
@@ -1272,14 +1263,12 @@ class FlowControlPolicy(_ChunkSteering):
             )  # (B, n): one per row, every step
         steer = None if self._pending_steer is None else self._pending_steer.to(x_t.device)
         self.guided_steps += 1
-        return flow_control_write(
-            x_t, step, self._pending_target, self._tau, self._lam, dims=self._dims, steer=steer
-        )
+        return self.write(x_t, step, self._pending_target, self._tau, self._lam, dims=self._dims, steer=steer)
 
     def steered_chunk(self, batch, commands, field=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The chunk for ``commands`` ((B, n), or (B, H, n) per step; None: every row idle) and the policy's own
         plan from the same noise. ``field`` (an ``AdaptedField``) adds its task module to every forward pass."""
-        hook = task_velocity_hook(field)
+        hook = self.velocity_hook(field)
         common = {} if hook is None else {"velocity_hook": hook}
         steer = None if commands is None else self._active(commands)
         if steer is None or not bool(steer.any()):
@@ -1299,32 +1288,7 @@ class FlowControlPolicy(_ChunkSteering):
         return self.steered_chunk(batch, None if command is None else np.asarray(command)[None])
 
 
-def delegation_mask(
-    chunk_size: int, max_action_dim: int, operator_dims: tuple[str, ...] | None, pinned_steps: int | None
-) -> torch.Tensor:
-    """(chunk_size, max_action_dim) bool mask of the reference elements left to the policy.
-
-    True = delegated: the dims outside ``operator_dims`` (names from OPERATOR_DIM_GROUPS; None = every dim is
-    commanded, as on the cursor), the padding dims beyond the env's 7, and every dim of the steps from
-    ``pinned_steps`` on (None = the whole chunk stays pinned).
-    """
-    if operator_dims is None:
-        mask = torch.zeros(chunk_size, max_action_dim, dtype=torch.bool)
-    else:
-        unknown = [d for d in operator_dims if d not in OPERATOR_DIM_GROUPS]
-        if unknown:
-            raise ValueError(
-                f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
-            )
-        mask = torch.ones(chunk_size, max_action_dim, dtype=torch.bool)
-        for name in operator_dims:
-            mask[:, OPERATOR_DIM_GROUPS[name]] = False
-    if pinned_steps is not None:
-        mask[pinned_steps:, :] = True
-    return mask
-
-
-class FlowReversalSteeringPolicy(_ChunkSteering):
+class FlowReversalSteering(_ChunkSteering):
     """Flow Reversal Steering (Tang et al. 2026) on any flow policy with pi0.5's sampler interface; the pi0.5
     wrapper (shared_flow_reversal_steering).
 
@@ -1381,17 +1345,42 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
         self._adapter_cache: tuple | None = None
         self._mean = self._std = None
         if postprocessor is not None:
-            mean, std = get_action_mean_std(postprocessor)
+            mean, std = self.action_mean_std(postprocessor)
             self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
             self._gripper_ref = self._normalize_gripper(gripper_open)
         elif reference_fn is None:
             raise ValueError(
-                "a FlowReversalSteeringPolicy needs the postprocessor's action statistics or a reference_fn"
+                "a FlowReversalSteering needs the postprocessor's action statistics or a reference_fn"
             )
         self._pending_reference: torch.Tensor | None = None
         self._last_reference: torch.Tensor | None = None
         self.steered_chunks = 0  # per-rollout count of chunks started from inverted noise
         self.reconstruction_errors: list[float] = []  # per steered chunk, in std units
+
+    @staticmethod
+    def delegation_mask(
+        chunk_size: int, max_action_dim: int, operator_dims: tuple[str, ...] | None, pinned_steps: int | None
+    ) -> torch.Tensor:
+        """(chunk_size, max_action_dim) bool mask of the reference elements left to the policy.
+
+        True = delegated: the dims outside ``operator_dims`` (names from OPERATOR_DIM_GROUPS; None = every dim is
+        commanded, as on the cursor), the padding dims beyond the env's 7, and every dim of the steps from
+        ``pinned_steps`` on (None = the whole chunk stays pinned).
+        """
+        if operator_dims is None:
+            mask = torch.zeros(chunk_size, max_action_dim, dtype=torch.bool)
+        else:
+            unknown = [d for d in operator_dims if d not in OPERATOR_DIM_GROUPS]
+            if unknown:
+                raise ValueError(
+                    f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
+                )
+            mask = torch.ones(chunk_size, max_action_dim, dtype=torch.bool)
+            for name in operator_dims:
+                mask[:, OPERATOR_DIM_GROUPS[name]] = False
+        if pinned_steps is not None:
+            mask[pinned_steps:, :] = True
+        return mask
 
     @property
     def operator_dims(self) -> tuple[str, ...] | None:
@@ -1401,7 +1390,7 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
     def operator_dims(self, value) -> None:
         cfg = self._policy.config
         dims = None if value is None else tuple(value)
-        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps)
+        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps)
         self._operator_dims = dims
 
     @property
@@ -1412,7 +1401,7 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
     def pinned_steps(self, value: int | None) -> None:
         cfg = self._policy.config
         check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
-        self._delegated = delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
+        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
         self._pinned_steps = value
 
     @property
@@ -1629,3 +1618,20 @@ convert_cursor_module = deprecated_alias(
     AdapterModules.from_cursor_checkpoint, "convert_cursor_module", "AdapterModules.from_cursor_checkpoint"
 )
 _MODULE_KINDS = AdapterModules.KINDS  # deprecated: AdapterModules.KINDS
+
+FlowControlPolicy = FlowControlSteering  # deprecated alias, kept for one round: FlowControlSteering
+FlowReversalSteeringPolicy = (
+    FlowReversalSteering  # deprecated alias, kept for one round: FlowReversalSteering
+)
+flow_control_write = deprecated_alias(
+    FlowControlSteering.write, "flow_control_write", "FlowControlSteering.write"
+)
+delegation_mask = deprecated_alias(
+    FlowReversalSteering.delegation_mask, "delegation_mask", "FlowReversalSteering.delegation_mask"
+)
+task_velocity_hook = deprecated_alias(
+    FlowControlSteering.velocity_hook, "task_velocity_hook", "FlowControlSteering.velocity_hook"
+)
+get_action_mean_std = deprecated_alias(
+    FlowControlSteering.action_mean_std, "get_action_mean_std", "FlowControlSteering.action_mean_std"
+)
