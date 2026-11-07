@@ -14,12 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-autonomy steering of a flow-matching sampler: ``FlowControlSteering`` (Kao et al. 2026) and
-``FlowReversalSteering`` (Tang et al. 2026) over any policy with pi0.5's sampler interface, the MARS
-adapters (``LearnedUserModule``, ``LearnedTaskModule``, the holder ``ReversalAdapter`` and the composed
-``AdapterModules`` with ``as_adapter``) with their checkpoints, losses and training loop, the one Euler
-integrator of either flow-time convention, and each method's core. The settings and specs are
-``configuration_steering``'s; this folder's README describes the methods."""
+"""Shared-autonomy steering of a flow-matching sampler: ``SteeringPolicy``, the lerobot policy, and the cores it
+wraps: ``FlowControlSteering`` (Kao et al. 2026) and ``FlowReversalSteering`` (Tang et al. 2026) over any policy with
+pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTaskModule``, the holder
+``ReversalAdapter`` and the composed ``AdapterModules`` with ``as_adapter``) with their checkpoints and losses, and
+``Flow``, the one Euler integrator of either flow-time convention. The settings and specs are
+``configuration_steering``'s, the pre-processing ``processor_steering``'s; this folder's README describes the
+methods. The module-level functions at the end are deprecated aliases of the methods that replaced them."""
 
 import math
 from collections import deque
@@ -48,7 +49,6 @@ from .configuration_steering import (
     TeleopSource,
     check_steps,
     deprecated_alias,
-    format_matrix,
 )
 
 # ---------------------------------------------------------------- MARS: modular reversal adapters
@@ -608,7 +608,7 @@ class ReversalAdapter(MatrixHolder):
         parts = []
         if self._matrix is not None:
             identity = " (identity, a no-op)" if np.allclose(self._matrix, np.eye(N_ACTION_DIMS)) else ""
-            parts.append(f"fixed user matrix F = {self.label}{identity} = {format_matrix(self._matrix)}")
+            parts.append(f"fixed user matrix F = {self.label}{identity} = {self.format()}")
         if self.user_module is not None:
             parts.append(f"learned user module {self.user_label or type(self.user_module).__name__}")
         if self.task_module is not None:

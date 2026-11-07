@@ -58,7 +58,7 @@ from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings,
 from session import VIDEO_FPS, Session
 from teleop import build_corruption, build_curl, read_matrix_spec
 
-from lerobot.policies.steering import parse_adapter_spec
+from lerobot.policies.steering import AdapterSpec
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
@@ -249,7 +249,7 @@ def cmd_adapter(session: Session, tokens: list[str]) -> None:
     corruption = session.chain.corruption
     basis = corruption.curl.steady_state() if corruption.curl is not None else corruption.matrix
     if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
-        spec = parse_adapter_spec(read_matrix_spec(tokens[1]), basis)
+        spec = AdapterSpec.parse(read_matrix_spec(tokens[1]), basis)
         if spec.user_path or spec.task_path:  # learned MARS modules
             session.adapter.matrix = spec.matrix
             session.adapter.user_module = session.adapter.task_module = None
@@ -259,7 +259,7 @@ def cmd_adapter(session: Session, tokens: list[str]) -> None:
             print(session.adapter.describe())
             return
     session.adapter.user_module = session.adapter.task_module = None
-    build = lambda spec: parse_adapter_spec(spec, basis).matrix  # noqa: E731
+    build = lambda spec: AdapterSpec.parse(spec, basis).matrix  # noqa: E731
     _cmd_matrix(session, tokens, "adapter", session.adapter, build)
 
 

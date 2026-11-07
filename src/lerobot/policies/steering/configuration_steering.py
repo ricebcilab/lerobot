@@ -18,7 +18,8 @@
 (LIBERO's OSC_POSE: three translation, three rotation and one gripper dim) and the operator's view of it
 (``TeleopSource``, ``DEADBAND``, ``OPERATOR_DIM_GROUPS``), the one check of the step knobs, the matrix specs of a
 command corruption or a fixed reversal adapter, and the ``reversal_adapter`` specs (a fixed F and/or the paths of
-learned modules). ``modeling_steering`` holds the methods; this folder's README describes them."""
+learned modules), and ``SteeringConfig``, the steering policy's config. ``modeling_steering`` holds the methods;
+this folder's README describes them. The module-level matrix functions at the end are deprecated aliases."""
 
 import functools
 from collections.abc import Callable
@@ -90,97 +91,7 @@ def deprecated_alias(target: Callable[..., Any], name: str, new: str) -> Callabl
 # ---------------------------------------------------------------- matrices
 
 
-def validate_matrix(matrix, size: int, where: str) -> np.ndarray:
-    """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
-    try:
-        m = np.asarray(matrix, dtype=np.float64)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{where}: entries must be numbers ({e})") from e
-    if m.shape != (size, size):
-        raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
-    if not np.all(np.isfinite(m)):
-        raise ValueError(f"{where}: entries must be finite")
-    return m
-
-
-def rotation_about_z(degrees: float) -> np.ndarray:
-    """3x3 rotation of a translation command about the z axis."""
-    c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def translation_matrix(spec, where: str = "matrix", literal_key: str = "M") -> np.ndarray:
-    """Build a 3x3 from a spec: {rotation_z_deg: d}, {scale: [sx, sy, sz]}, {M: rows} or bare rows."""
-    if isinstance(spec, dict):
-        keys = set(spec)
-        if keys == {"rotation_z_deg"}:
-            return rotation_about_z(float(spec["rotation_z_deg"]))
-        if keys == {"scale"}:
-            scale = np.asarray(spec["scale"], dtype=np.float64)
-            if scale.shape != (3,) or not np.all(np.isfinite(scale)):
-                raise ValueError(f"{where}: scale must be three finite numbers, got {spec['scale']!r}")
-            return np.diag(scale)
-        if keys == {literal_key}:
-            return validate_matrix(spec[literal_key], 3, f"{where}.{literal_key}")
-        raise ValueError(
-            f"{where}: expected exactly one of rotation_z_deg, scale or {literal_key}, got {sorted(keys)}"
-        )
-    return validate_matrix(spec, 3, where)
-
-
 _BLOCK_CHOICES = ("identity", "zero")
-
-
-def build_reversal_adapter(
-    spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
-) -> np.ndarray | None:
-    """Build the 7x7 reversal adapter F from a spec, or None when the spec is None.
-
-    Forms: ``{F: rows}`` (literal), or blocks ``translation`` (``corruption`` to
-    copy the 3x3 command corruption, ``corruption_inverse`` for its inverse, the
-    adapter that recovers a curl field's steady state on the cursor task,
-    ``identity``, ``zero``, or any ``translation_matrix`` spec), ``orientation``
-    and ``gripper`` (``identity`` or ``zero``). Missing blocks are identity.
-    """
-    if spec is None:
-        return None
-    if not isinstance(spec, dict):
-        raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
-    if "F" in spec:
-        if set(spec) != {"F"}:
-            raise ValueError(f"{where}: a literal F cannot be combined with block keys")
-        return validate_matrix(spec["F"], N_ACTION_DIMS, f"{where}.F")
-    unknown = set(spec) - {"translation", "orientation", "gripper"}
-    if unknown:
-        raise ValueError(
-            f"{where}: unknown keys {sorted(unknown)} (expected translation, orientation, gripper)"
-        )
-
-    f = np.eye(N_ACTION_DIMS)
-    translation = spec.get("translation", "identity")
-    if translation in ("corruption", "corruption_inverse"):
-        if corruption is None:
-            raise ValueError(f"{where}.translation: '{translation}' requested but control.corruption is null")
-        f[:3, :3] = corruption if translation == "corruption" else np.linalg.inv(corruption)
-    elif translation == "zero":
-        f[:3, :3] = 0.0
-    elif translation != "identity":
-        f[:3, :3] = translation_matrix(translation, f"{where}.translation")
-    for key, dims in (
-        ("orientation", OPERATOR_DIM_GROUPS["rotation"]),
-        ("gripper", OPERATOR_DIM_GROUPS["gripper"]),
-    ):
-        choice = spec.get(key, "identity")
-        if choice not in _BLOCK_CHOICES:
-            raise ValueError(f"{where}.{key}: expected identity or zero, got {choice!r}")
-        if choice == "zero":
-            f[dims, dims] = 0.0
-    return f
-
-
-def format_matrix(matrix: np.ndarray) -> str:
-    """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
-    return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
 
 
 class MatrixHolder:
@@ -203,7 +114,16 @@ class MatrixHolder:
 
     @matrix.setter
     def matrix(self, value) -> None:
-        self._matrix = None if value is None else validate_matrix(value, self.size, self.where)
+        self._matrix = None if value is None else AdapterSpec.validate(value, self.size, self.where)
+
+    def format(self) -> str:
+        """The holder's matrix on one line, for the terminal (``format_rows``); "off" when it holds none."""
+        return "off" if self._matrix is None else self.format_rows(self._matrix)
+
+    @staticmethod
+    def format_rows(matrix: np.ndarray) -> str:
+        """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
+        return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
 
 
 # ---------------------------------------------------------------- reversal-adapter specs
@@ -213,7 +133,8 @@ class MatrixHolder:
 class AdapterSpec:
     """A parsed ``reversal_adapter`` spec: a fixed user matrix F (environment space) and/or the paths
     of learned modules. The session loads the modules; the matrix is rebuilt per trial when the
-    corruption is random."""
+    corruption is random. ``parse`` reads a spec, ``build`` its fixed matrix; ``validate``, ``rotation`` and
+    ``translation`` are the matrix helpers of the specs (a command corruption's too)."""
 
     matrix: np.ndarray | None = None
     user_path: str | None = None
@@ -227,48 +148,133 @@ class AdapterSpec:
         )
         return same_matrix and (self.user_path, self.task_path) == (other.user_path, other.task_path)
 
+    @staticmethod
+    def validate(matrix, size: int, where: str) -> np.ndarray:
+        """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
+        try:
+            m = np.asarray(matrix, dtype=np.float64)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{where}: entries must be numbers ({e})") from e
+        if m.shape != (size, size):
+            raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
+        if not np.all(np.isfinite(m)):
+            raise ValueError(f"{where}: entries must be finite")
+        return m
 
-def _module_path(value, where: str) -> str:
-    if not isinstance(value, str | Path) or not str(value):
-        raise ValueError(f"{where}: expected a checkpoint path, got {value!r}")
-    return str(value)
+    @staticmethod
+    def rotation(degrees: float) -> np.ndarray:
+        """3x3 rotation of a translation command about the z axis."""
+        c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
-
-def parse_adapter_spec(
-    spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
-) -> AdapterSpec:
-    """Parse a reversal-adapter spec into fixed matrix / module paths.
-
-    Forms: ``null``; a fixed user matrix as ``build_reversal_adapter`` takes it (blocks or ``{F: rows}``);
-    ``{learned: <path>}`` (a learned user module); or the composite ``{user: <fixed spec | {learned: path}
-    | null>, task: <path | null>}`` (MARS = user + task; one slot alone is MARS-U or MARS-T).
-    """
-    if spec is None:
-        return AdapterSpec()
-    if not isinstance(spec, dict):
-        raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
-    keys = set(spec)
-    if keys == {"learned"}:
-        return AdapterSpec(user_path=_module_path(spec["learned"], f"{where}.learned"))
-    if keys and keys <= {"user", "task"}:
-        user, task = spec.get("user"), spec.get("task")
-        task_path = None if task is None else _module_path(task, f"{where}.task")
-        if user is None:
-            return AdapterSpec(task_path=task_path)
-        if isinstance(user, dict) and "learned" in user:
-            if set(user) != {"learned"}:
-                raise ValueError(f"{where}.user: a learned module cannot be combined with a fixed matrix")
-            return AdapterSpec(
-                user_path=_module_path(user["learned"], f"{where}.user.learned"), task_path=task_path
+    @staticmethod
+    def translation(spec, where: str = "matrix", literal_key: str = "M") -> np.ndarray:
+        """Build a 3x3 from a spec: {rotation_z_deg: d}, {scale: [sx, sy, sz]}, {M: rows} or bare rows."""
+        if isinstance(spec, dict):
+            keys = set(spec)
+            if keys == {"rotation_z_deg"}:
+                return AdapterSpec.rotation(float(spec["rotation_z_deg"]))
+            if keys == {"scale"}:
+                scale = np.asarray(spec["scale"], dtype=np.float64)
+                if scale.shape != (3,) or not np.all(np.isfinite(scale)):
+                    raise ValueError(f"{where}: scale must be three finite numbers, got {spec['scale']!r}")
+                return np.diag(scale)
+            if keys == {literal_key}:
+                return AdapterSpec.validate(spec[literal_key], 3, f"{where}.{literal_key}")
+            raise ValueError(
+                f"{where}: expected exactly one of rotation_z_deg, scale or {literal_key}, got {sorted(keys)}"
             )
-        return AdapterSpec(
-            matrix=build_reversal_adapter(user, corruption, f"{where}.user"), task_path=task_path
-        )
-    if keys & {"learned", "user", "task"}:
-        raise ValueError(
-            f"{where}: expected null, a fixed matrix spec, {{learned: path}} or {{user: ..., task: ...}}, got {sorted(keys)}"
-        )
-    return AdapterSpec(matrix=build_reversal_adapter(spec, corruption, where))
+        return AdapterSpec.validate(spec, 3, where)
+
+    @classmethod
+    def build(
+        cls, spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
+    ) -> np.ndarray | None:
+        """Build the 7x7 reversal adapter F from a spec, or None when the spec is None.
+
+        Forms: ``{F: rows}`` (literal), or blocks ``translation`` (``corruption`` to
+        copy the 3x3 command corruption, ``corruption_inverse`` for its inverse, the
+        adapter that recovers a curl field's steady state on the cursor task,
+        ``identity``, ``zero``, or any ``translation`` spec), ``orientation``
+        and ``gripper`` (``identity`` or ``zero``). Missing blocks are identity.
+        """
+        if spec is None:
+            return None
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
+        if "F" in spec:
+            if set(spec) != {"F"}:
+                raise ValueError(f"{where}: a literal F cannot be combined with block keys")
+            return cls.validate(spec["F"], N_ACTION_DIMS, f"{where}.F")
+        unknown = set(spec) - {"translation", "orientation", "gripper"}
+        if unknown:
+            raise ValueError(
+                f"{where}: unknown keys {sorted(unknown)} (expected translation, orientation, gripper)"
+            )
+
+        f = np.eye(N_ACTION_DIMS)
+        translation = spec.get("translation", "identity")
+        if translation in ("corruption", "corruption_inverse"):
+            if corruption is None:
+                raise ValueError(
+                    f"{where}.translation: '{translation}' requested but control.corruption is null"
+                )
+            f[:3, :3] = corruption if translation == "corruption" else np.linalg.inv(corruption)
+        elif translation == "zero":
+            f[:3, :3] = 0.0
+        elif translation != "identity":
+            f[:3, :3] = cls.translation(translation, f"{where}.translation")
+        for key, dims in (
+            ("orientation", OPERATOR_DIM_GROUPS["rotation"]),
+            ("gripper", OPERATOR_DIM_GROUPS["gripper"]),
+        ):
+            choice = spec.get(key, "identity")
+            if choice not in _BLOCK_CHOICES:
+                raise ValueError(f"{where}.{key}: expected identity or zero, got {choice!r}")
+            if choice == "zero":
+                f[dims, dims] = 0.0
+        return f
+
+    @staticmethod
+    def _module_path(value, where: str) -> str:
+        if not isinstance(value, str | Path) or not str(value):
+            raise ValueError(f"{where}: expected a checkpoint path, got {value!r}")
+        return str(value)
+
+    @classmethod
+    def parse(
+        cls, spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
+    ) -> "AdapterSpec":
+        """Parse a reversal-adapter spec into fixed matrix / module paths.
+
+        Forms: ``null``; a fixed user matrix as ``build`` takes it (blocks or ``{F: rows}``);
+        ``{learned: <path>}`` (a learned user module); or the composite ``{user: <fixed spec | {learned: path}
+        | null>, task: <path | null>}`` (MARS = user + task; one slot alone is MARS-U or MARS-T).
+        """
+        if spec is None:
+            return cls()
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
+        keys = set(spec)
+        if keys == {"learned"}:
+            return cls(user_path=cls._module_path(spec["learned"], f"{where}.learned"))
+        if keys and keys <= {"user", "task"}:
+            user, task = spec.get("user"), spec.get("task")
+            task_path = None if task is None else cls._module_path(task, f"{where}.task")
+            if user is None:
+                return cls(task_path=task_path)
+            if isinstance(user, dict) and "learned" in user:
+                if set(user) != {"learned"}:
+                    raise ValueError(f"{where}.user: a learned module cannot be combined with a fixed matrix")
+                return cls(
+                    user_path=cls._module_path(user["learned"], f"{where}.user.learned"), task_path=task_path
+                )
+            return cls(matrix=cls.build(user, corruption, f"{where}.user"), task_path=task_path)
+        if keys & {"learned", "user", "task"}:
+            raise ValueError(
+                f"{where}: expected null, a fixed matrix spec, {{learned: path}} or {{user: ..., task: ...}}, got {sorted(keys)}"
+            )
+        return cls(matrix=cls.build(spec, corruption, where))
 
 
 SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")
@@ -458,3 +464,15 @@ class SteeringConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+
+# ---------------------------------------------------------------- deprecated aliases (one round)
+
+validate_matrix = deprecated_alias(AdapterSpec.validate, "validate_matrix", "AdapterSpec.validate")
+rotation_about_z = deprecated_alias(AdapterSpec.rotation, "rotation_about_z", "AdapterSpec.rotation")
+translation_matrix = deprecated_alias(
+    AdapterSpec.translation, "translation_matrix", "AdapterSpec.translation"
+)
+build_reversal_adapter = deprecated_alias(AdapterSpec.build, "build_reversal_adapter", "AdapterSpec.build")
+parse_adapter_spec = deprecated_alias(AdapterSpec.parse, "parse_adapter_spec", "AdapterSpec.parse")
+format_matrix = deprecated_alias(MatrixHolder.format_rows, "format_matrix", "MatrixHolder.format_rows")

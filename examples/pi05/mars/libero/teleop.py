@@ -39,9 +39,8 @@ from lerobot.policies.steering import (
     GRIPPER_CLOSE,
     GRIPPER_DIM,
     GRIPPER_OPEN,
+    AdapterSpec,
     MatrixHolder,
-    format_matrix,
-    translation_matrix,
 )
 from lerobot.teleoperators import readout
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
@@ -430,12 +429,14 @@ class CommandCorruption(MatrixHolder):
             return f"Command corruption: curl field on x/y/z, {self._curl.label()}."
         if self._matrix is None:
             return "Command corruption: off."
-        return f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {format_matrix(self._matrix)}."
+        return (
+            f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {self.format()}."
+        )
 
 
 def build_corruption(spec, where: str = "corruption") -> np.ndarray | None:
     """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows) or None."""
-    return None if spec is None else translation_matrix(spec, where)
+    return None if spec is None else AdapterSpec.translation(spec, where)
 
 
 def read_matrix_spec(path: str | Path):

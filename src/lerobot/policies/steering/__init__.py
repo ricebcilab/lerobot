@@ -14,7 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-autonomy steering of flow-matching policies: flow control, Flow Reversal Steering and MARS."""
+"""Shared-autonomy steering of flow-matching policies: flow control, Flow Reversal Steering and MARS.
+
+The package keeps lerobot's layout for a policy:
+
+- ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``), the action space and the operator's
+  view of it (``TeleopSource``, ``DEADBAND``, ``OPERATOR_DIM_GROUPS``), ``AdapterSpec`` (a ``reversal_adapter``
+  spec: ``parse``, ``build`` and the matrix helpers) and ``MatrixHolder``.
+- ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy) and the cores it wraps: the MARS modules
+  (``LearnedUserModule``, ``LearnedTaskModule``, the composed ``AdapterModules`` with their checkpoints and the
+  holder ``ReversalAdapter``), ``AdaptedField``, ``Flow`` (the one Euler integrator and what is built on it) and
+  the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``.
+- ``processor_steering``: ``SceneEncoder``, the steps ``SteeringSceneTokensProcessorStep`` and
+  ``SteeringCommandProcessorStep``, and ``make_steering_pre_post_processors``.
+
+The module-level functions and the two ``...Policy`` core names these classes replaced stay importable for one round
+as deprecated aliases (each says so in its docstring; ``FlowControlPolicy`` is ``FlowControlSteering``,
+``FlowReversalSteeringPolicy`` is ``FlowReversalSteering``). The modules' training loop is not the package's: it
+lives in the trainers that run it."""
 
 from .configuration_steering import (
     ACTION_DIMS,
@@ -86,45 +103,51 @@ from .processor_steering import (
 )
 
 __all__ = [
-    "ACTION_DIMS",
+    # the policy, its config and its processors
+    "SteeringConfig",
+    "SteeringPolicy",
+    "SteeringCommandProcessorStep",
+    "SteeringSceneTokensProcessorStep",
+    "make_steering_pre_post_processors",
+    # the cores and the module classes
     "AdaptedField",
     "AdapterModules",
     "AdapterSpec",
     "Flow",
-    "DEADBAND",
-    "FlowControlPolicy",
     "FlowControlSteering",
     "FlowReversalSteering",
-    "FlowReversalSteeringPolicy",
-    "GRIPPER_CLOSE",
-    "GRIPPER_DIM",
-    "GRIPPER_OPEN",
     "LearnedTaskModule",
     "LearnedUserModule",
     "MatrixHolder",
+    "ReversalAdapter",
+    "SceneEncoder",
+    "TeleopSource",
+    "as_adapter",
+    "check_steps",
+    "scene_spec",
+    "sinusoidal_time_embedding",
+    # the action space and the scene specs
+    "ACTION_DIMS",
+    "DEADBAND",
+    "GRIPPER_CLOSE",
+    "GRIPPER_DIM",
+    "GRIPPER_OPEN",
     "N_ACTION_DIMS",
     "OPERATOR_DIM_GROUPS",
-    "ReversalAdapter",
     "SCENE_SOURCES",
-    "VLM_VIEWS_TOKENS",
-    "reduce_tokens",
     "TOKEN_GEOMETRIES",
-    "SceneEncoder",
-    "SteeringCommandProcessorStep",
-    "SteeringConfig",
-    "SteeringPolicy",
-    "SteeringSceneTokensProcessorStep",
-    "TeleopSource",
+    "VLM_VIEWS_TOKENS",
+    # deprecated aliases, kept for one round
+    "FlowControlPolicy",
+    "FlowReversalSteeringPolicy",
     "apply_user_module",
-    "as_adapter",
     "build_reversal_adapter",
-    "check_steps",
     "convert_cursor_module",
     "delegation_mask",
-    "flow_control_write",
-    "format_matrix",
     "encode_views",
     "fit_token_reduction",
+    "flow_control_write",
+    "format_matrix",
     "forward_flow",
     "frs_latent",
     "frs_schedule",
@@ -132,16 +155,14 @@ __all__ = [
     "heading_cosine",
     "integrate",
     "load_adapter_module",
-    "make_steering_pre_post_processors",
     "paired_chunks",
     "parse_adapter_spec",
+    "reduce_tokens",
     "regenerate",
     "reverse_flow",
     "rotation_about_z",
     "save_adapter_module",
     "scene_for",
-    "scene_spec",
-    "sinusoidal_time_embedding",
     "task_field_loss",
     "task_velocity_hook",
     "translation_matrix",

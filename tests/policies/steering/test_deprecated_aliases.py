@@ -294,3 +294,107 @@ def test_core_aliases_equal_the_methods():
     )
     for name in ("flow_control_write", "delegation_mask", "task_velocity_hook", "get_action_mean_std"):
         assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name
+
+
+# ---------------------------------------------------------------- the configuration
+
+
+def test_configuration_aliases_equal_the_methods():
+    from lerobot.policies.steering import AdapterSpec, MatrixHolder
+
+    m = [[0.9, -0.1, 0.0], [0.2, 1.1, 0.0], [0.0, 0.0, 1.0]]
+    assert np.array_equal(steering.validate_matrix(m, 3, "m"), AdapterSpec.validate(m, 3, "m"))
+    assert np.array_equal(steering.rotation_about_z(30.0), AdapterSpec.rotation(30.0))
+    for spec in ({"rotation_z_deg": 15}, {"scale": [1.0, 2.0, 0.5]}, {"M": m}, m):
+        assert np.array_equal(steering.translation_matrix(spec, "c"), AdapterSpec.translation(spec, "c"))
+    corruption = AdapterSpec.rotation(40.0)
+    for spec in (None, {"F": np.eye(7).tolist()}, {"translation": "corruption_inverse", "gripper": "zero"}):
+        old, new = steering.build_reversal_adapter(spec, corruption), AdapterSpec.build(spec, corruption)
+        assert (old is None and new is None) or np.array_equal(old, new)
+    for spec in (
+        None,
+        {"learned": "u.pt"},
+        {"user": {"learned": "u.pt"}, "task": "t.pt"},
+        {"user": {"translation": "corruption"}},
+        {"translation": {"rotation_z_deg": 10}},
+    ):
+        parsed = AdapterSpec.parse(spec, corruption)
+        assert isinstance(parsed, AdapterSpec) and steering.parse_adapter_spec(spec, corruption) == parsed
+    with pytest.raises(ValueError, match="learned module cannot be combined"):
+        AdapterSpec.parse({"user": {"learned": "u.pt", "F": []}})
+    assert steering.format_matrix(np.array(m)) == MatrixHolder.format_rows(np.array(m))
+
+    class Holder(MatrixHolder):
+        size, where = 3, "holder"
+
+    assert Holder(m).format() == MatrixHolder.format_rows(np.array(m)) and Holder().format() == "off"
+    for name in (
+        "validate_matrix",
+        "rotation_about_z",
+        "translation_matrix",
+        "build_reversal_adapter",
+        "parse_adapter_spec",
+        "format_matrix",
+    ):
+        assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name
+
+
+def test_every_name_the_package_exported_still_resolves():
+    names = [
+        "ACTION_DIMS",
+        "AdaptedField",
+        "AdapterModules",
+        "AdapterSpec",
+        "DEADBAND",
+        "FlowControlPolicy",
+        "FlowReversalSteeringPolicy",
+        "GRIPPER_CLOSE",
+        "GRIPPER_DIM",
+        "GRIPPER_OPEN",
+        "LearnedTaskModule",
+        "LearnedUserModule",
+        "MatrixHolder",
+        "N_ACTION_DIMS",
+        "OPERATOR_DIM_GROUPS",
+        "ReversalAdapter",
+        "SCENE_SOURCES",
+        "VLM_VIEWS_TOKENS",
+        "reduce_tokens",
+        "TOKEN_GEOMETRIES",
+        "SceneEncoder",
+        "TeleopSource",
+        "apply_user_module",
+        "as_adapter",
+        "build_reversal_adapter",
+        "check_steps",
+        "convert_cursor_module",
+        "delegation_mask",
+        "flow_control_write",
+        "format_matrix",
+        "encode_views",
+        "fit_token_reduction",
+        "forward_flow",
+        "frs_latent",
+        "frs_schedule",
+        "get_action_mean_std",
+        "heading_cosine",
+        "integrate",
+        "load_adapter_module",
+        "paired_chunks",
+        "parse_adapter_spec",
+        "regenerate",
+        "reverse_flow",
+        "rotation_about_z",
+        "save_adapter_module",
+        "scene_for",
+        "scene_spec",
+        "sinusoidal_time_embedding",
+        "task_field_loss",
+        "task_velocity_hook",
+        "translation_matrix",
+        "uniform_reference",
+        "user_field_loss",
+        "validate_matrix",
+    ]  # the round-4d __all__ before Task E, less the training loop
+    assert all(hasattr(steering, n) for n in names) and set(names) <= set(steering.__all__)
+    assert not hasattr(steering, "train_module") and not hasattr(steering, "step_if_finite")
