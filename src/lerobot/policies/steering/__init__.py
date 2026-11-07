@@ -42,6 +42,7 @@ from .configuration_steering import (
 from .modeling_steering import (
     AdaptedField,
     AdapterModules,
+    Flow,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     LearnedTaskModule,
@@ -87,6 +88,7 @@ __all__ = [
     "AdaptedField",
     "AdapterModules",
     "AdapterSpec",
+    "Flow",
     "DEADBAND",
     "FlowControlPolicy",
     "FlowReversalSteeringPolicy",

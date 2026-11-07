@@ -26,9 +26,9 @@ from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowCon
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.steering import (
+    Flow,
     LearnedTaskModule,
     LearnedUserModule,
-    integrate,
     load_adapter_module,
 )
 
@@ -106,7 +106,8 @@ def test_predict_action_chunk_is_the_plain_policy_chunk():
     torch.manual_seed(7)
     noise = torch.randn(3, model.horizon, 2)
     expected = (
-        integrate(noise, lambda x, t: model(obs, x, t), 0.0, 0.1, 10, batch_time=True) * model.action_scale
+        Flow(lambda x, t: model(obs, x, t), batch_time=True).integrate(noise, 0.0, 0.1, 10)
+        * model.action_scale
     )
     torch.manual_seed(7)
     chunk = policy.predict_action_chunk(obs)

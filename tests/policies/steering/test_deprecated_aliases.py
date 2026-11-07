@@ -69,3 +69,90 @@ def test_scene_encoder_aliases_equal_its_methods():
         new = SceneEncoder.fit_reduction(iter(x.split(200)), 3, center)
         old = steering.fit_token_reduction(iter(x.split(200)), 3, center=center)
         assert torch.equal(new[0], old[0]) and torch.equal(new[1], old[1]) and new[2] == old[2]
+
+
+# ---------------------------------------------------------------- Flow
+
+
+def _field():
+    g = torch.Generator().manual_seed(3)
+    w = torch.randn(7, 7, generator=g) * 0.3
+
+    def velocity(x, t):
+        t = torch.as_tensor(t, dtype=x.dtype).reshape(-1, 1, 1) if torch.is_tensor(t) else t
+        return torch.tanh(x @ w) * (1 + t)
+
+    return velocity, torch.randn(3, 6, 7, generator=g), torch.eye(7) + 0.1 * torch.randn(7, 7, generator=g)
+
+
+def test_flow_aliases_equal_its_methods():
+    from lerobot.policies.steering import Flow
+
+    velocity, x, f = _field()
+    for batch_time in (False, True):
+        for backward in (False, True):
+            assert torch.equal(
+                steering.integrate(x, velocity, 0.2, 0.1, 4, f, backward=backward, batch_time=batch_time),
+                Flow(velocity, f, batch_time=batch_time).integrate(x, 0.2, 0.1, 4, backward=backward),
+            )
+    for n in (None, 3):
+        assert torch.equal(steering.reverse_flow(x, velocity, 5, f, n), Flow(velocity, f).reverse(x, 5, n))
+        assert torch.equal(steering.forward_flow(x, velocity, 5, n, f), Flow(velocity, f).forward(x, 5, n))
+        for noise_time in (1.0, 0.0):
+            assert steering.frs_schedule(5, n, noise_time) == Flow.schedule(5, n, noise_time)
+            delegated = torch.zeros(6, 7, dtype=torch.bool)
+            delegated[:, 3:] = True
+            noise = torch.randn(3, 6, 7, generator=torch.Generator().manual_seed(4))
+            assert torch.equal(
+                steering.frs_latent(velocity, x, noise, 5, n, f, delegated, noise_time, batch_time=True),
+                Flow(velocity, f, noise_time, batch_time=True).latent(x, noise, 5, n, delegated),
+            )
+    for noise_time in (1.0, 0.0):
+        assert torch.equal(
+            steering.regenerate(velocity, x, 4, f, noise_time), Flow(velocity, f, noise_time).regenerate(x, 4)
+        )
+    assert torch.equal(steering.heading_cosine(x, x.flip(0)), Flow.heading_cosine(x, x.flip(0)))
+    args = (np.array([[0.3, -0.2, 0.1]]), 0.5, np.zeros(7), np.ones(7) * 2, 6, 9)
+    assert torch.equal(steering.uniform_reference(*args), Flow.uniform_reference(*args))
+    v = velocity(x, 0.3)
+    assert torch.equal(
+        steering.modeling_steering._adapt_velocity(f, x, 0.3, v, True),
+        Flow.adapt_velocity(f, x, 0.3, v, True),
+    )
+
+
+def test_a_cursor_convention_flow_reverses_and_runs_forward_from_t_one():
+    from lerobot.policies.steering import Flow
+
+    velocity, x, f = _field()
+    flow = Flow(velocity, f, noise_time=0.0, batch_time=True)
+    assert torch.equal(flow.reverse(x, 5, 3), flow.integrate(x, 1.0, -1.0 / 5, 3, backward=True))
+    assert torch.equal(flow.forward(x, 5, 2), flow.integrate(x, 0.0, 1.0 / 5, 3))
+
+
+def test_paired_chunks_alias_restores_the_generator_as_the_method():
+    from lerobot.policies.steering import Flow
+
+    class Sampler:
+        def predict_action_chunk(self, batch, **kw):
+            return torch.randn(2, 3) + kw.get("shift", 0.0)
+
+    for fn in (steering.paired_chunks, Flow.paired_chunks):
+        torch.manual_seed(0)
+        steered, plain = fn(Sampler(), None, True, None, shift=1.0)
+        after = torch.randn(1)
+        torch.manual_seed(0)
+        assert torch.equal(steered - 1.0, plain) and torch.equal(torch.randn(2, 3), plain)
+        assert torch.equal(torch.randn(1), after)
+    for name in (
+        "integrate",
+        "reverse_flow",
+        "forward_flow",
+        "frs_latent",
+        "frs_schedule",
+        "regenerate",
+        "uniform_reference",
+        "heading_cosine",
+        "paired_chunks",
+    ):
+        assert getattr(steering, name).__doc__.startswith("Deprecated alias of"), name

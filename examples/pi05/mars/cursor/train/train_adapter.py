@@ -136,8 +136,8 @@ from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
                                 reverse_flow, to_action)
 
-from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, SceneEncoder,  # noqa: E402
-                                       heading_cosine, load_adapter_module, reduce_tokens, regenerate,
+from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, Flow, SceneEncoder,  # noqa: E402
+                                       load_adapter_module, reduce_tokens,
                                        save_adapter_module, scene_spec, task_field_loss, train_module,
                                        user_field_loss)
 
@@ -628,9 +628,9 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
     variants = [("none", None, None), ("user", user, None)] + ([("composed", user, task)] if task is not None else [])
     for name, u, tm in variants:
         adapter = ReversalAdapter(user=u, task=tm) if u is not None or tm is not None else None
-        regen = regenerate(lambda x, t_: policy(free, x, t_), bci, args.flow_steps, None if adapter is None else adapter.field(free),
-                           noise_time=0.0, batch_time=True) * policy.action_scale
-        out[f"heading_cos_{name}"] = float(heading_cosine(regen, chunk, n_dims=2)[active].mean())
+        regen = Flow(lambda x, t_: policy(free, x, t_), None if adapter is None else adapter.field(free), noise_time=0.0,
+                     batch_time=True).regenerate(bci, args.flow_steps) * policy.action_scale
+        out[f"heading_cos_{name}"] = float(Flow.heading_cosine(regen, chunk, n_dims=2)[active].mean())
         if obs["obstacle_mask"].any():
             rows = active & obs["obstacle_mask"].any(1)
             out[f"collide_{name}"] = float(collides(rows_of(obs, rows), regen[rows]).float().mean())

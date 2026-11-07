@@ -51,13 +51,10 @@ from lerobot.policies.steering import (  # noqa: E402
     GRIPPER_OPEN,
     N_ACTION_DIMS,
     AdaptedField,
+    Flow,
     LearnedUserModule,
-    heading_cosine,
-    regenerate,
-    reverse_flow,
     save_adapter_module,
     train_module,
-    uniform_reference,
     user_field_loss,
 )
 from lerobot.teleoperators import readout  # noqa: E402
@@ -211,7 +208,7 @@ def label_states(session, states: list[dict], generic_prompt: str, control, mean
         padded[0, :, :n_out] = chunk
         with session.autocast_ctx:
             velocity = policy.velocity_field(session.policy_batch(state["observation"], generic_prompt))
-            z_l = reverse_flow(padded, velocity, cfg.num_inference_steps)
+            z_l = Flow(velocity).reverse(padded, cfg.num_inference_steps)
         state.update(
             label=chunk.cpu(),
             latent=z_l[0].float().cpu(),
@@ -273,7 +270,7 @@ def train(args) -> None:
             velocity = policy.velocity_field(batch)
         sigma = rng.uniform(args.sigma[0], args.sigma[1], size=len(rows))
         served = serve(np.stack([r["core"] for r in rows]), np.stack([r["raw"] for r in rows]), sigma, rng)
-        a_bci = uniform_reference(
+        a_bci = Flow.uniform_reference(
             served,
             np.array([r["gripper_normalized"] for r in rows]),
             mean,
@@ -299,9 +296,12 @@ def train(args) -> None:
     def validate():
         velocity, a_bci, _, label, active = batch_of(val_idx[: args.batch])
         with torch.no_grad(), session.autocast_ctx:
-            cos_none = heading_cosine(regenerate(velocity, a_bci, cfg.num_inference_steps).float(), label)
-            cos_user = heading_cosine(
-                regenerate(velocity, a_bci, cfg.num_inference_steps, AdaptedField(None, user)).float(), label
+            cos_none = Flow.heading_cosine(
+                Flow(velocity).regenerate(a_bci, cfg.num_inference_steps).float(), label
+            )
+            cos_user = Flow.heading_cosine(
+                Flow(velocity, AdaptedField(None, user)).regenerate(a_bci, cfg.num_inference_steps).float(),
+                label,
             )
         return {
             "heading_cos_none": float(cos_none[active].mean()) if active.any() else None,

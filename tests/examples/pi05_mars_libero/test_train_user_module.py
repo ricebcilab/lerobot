@@ -8,8 +8,8 @@ from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_OPEN,
+    Flow,
     LearnedUserModule,
-    uniform_reference,
     user_field_loss,
 )
 
@@ -70,13 +70,13 @@ def test_field_loss_is_zero_for_the_exact_path_velocity_and_scales_otherwise():
 def test_regenerate_round_trips_a_constant_field_and_heading_cosine():
     field = lambda x_t, t: torch.ones_like(x_t)  # noqa: E731
     a = torch.randn(3, CHUNK, MAX_DIM)
-    torch.testing.assert_close(tum.regenerate(field, a, 10), a, atol=1e-5, rtol=0)
+    torch.testing.assert_close(Flow(field).regenerate(a, 10), a, atol=1e-5, rtol=0)
     chunk = torch.zeros(1, CHUNK, MAX_DIM)
     chunk[0, :, 0] = 1.0
     other = torch.zeros(1, CHUNK, MAX_DIM)
     other[0, :, 1] = 1.0
-    assert tum.heading_cosine(chunk, chunk).item() == pytest.approx(1.0)
-    assert tum.heading_cosine(chunk, other).item() == pytest.approx(0.0, abs=1e-6)
+    assert Flow.heading_cosine(chunk, chunk).item() == pytest.approx(1.0)
+    assert Flow.heading_cosine(chunk, other).item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_stack_batches_and_batched_reference():
@@ -84,7 +84,7 @@ def test_stack_batches_and_batched_reference():
     b2 = {"observation.state": torch.ones(1, 2), "task": ["b"]}
     stacked = tum.stack_batches([b1, b2])
     assert stacked["observation.state"].shape == (2, 2) and stacked["task"] == ["a", "b"]
-    ref = uniform_reference(
+    ref = Flow.uniform_reference(
         np.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.0]]),
         np.array([-1.0, 1.0]),
         np.zeros(7),

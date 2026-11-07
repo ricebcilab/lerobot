@@ -56,9 +56,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from lerobot.policies.steering import (AdapterModules, SceneEncoder, FlowControlPolicy, FlowReversalSteeringPolicy,
+from lerobot.policies.steering import (AdapterModules, Flow, SceneEncoder, FlowControlPolicy, FlowReversalSteeringPolicy,
                                              LearnedTaskModule, LearnedUserModule, as_adapter,
-                                             integrate, task_velocity_hook)
+                                             task_velocity_hook)
 
 from lerobot.envs.cursor import render_views
 from .readout import DEADBAND, Readout, is_active
@@ -180,9 +180,9 @@ def _field(adapter, obs, device):
 def flow(policy, obs, x, t0, h, n, adapter=None):
     """n Euler steps of signed size h from flow time t0 through the policy's field, adapted by
     `adapter` (the task module in both directions, the user module when h < 0). Differentiable,
-    for training; `reverse_flow` and `forward_flow` are its no-grad forms. The core's `integrate`."""
-    return integrate(x, lambda x_t, t: policy(obs, x_t, t), t0, h, n, _field(adapter, obs, x.device), backward=h < 0,
-                     grad=True, batch_time=True)
+    for training; `reverse_flow` and `forward_flow` are its no-grad forms. The core's `Flow.integrate`."""
+    return Flow(lambda x_t, t: policy(obs, x_t, t), _field(adapter, obs, x.device), noise_time=0.0,
+                batch_time=True).integrate(x, t0, h, n, backward=h < 0, grad=True)
 
 
 @torch.no_grad()

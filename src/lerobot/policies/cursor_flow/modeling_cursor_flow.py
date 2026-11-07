@@ -48,7 +48,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.steering import integrate
+from lerobot.policies.steering import Flow
 
 from .configuration_cursor_flow import CursorFlowConfig
 
@@ -186,7 +186,9 @@ class FlowPolicy(nn.Module):
         """Euler-integrate the flow on normalized chunks x from time t0 to t1.
         0 -> 1 turns noise into a chunk (mu_theta in the steering README);
         1 -> 0 runs it backward, mapping a chunk to its latent noise."""
-        return integrate(x, lambda x_t, t: self(obs, x_t, t), t0, (t1 - t0) / steps, steps, batch_time=True)
+        return Flow(lambda x_t, t: self(obs, x_t, t), batch_time=True).integrate(
+            x, t0, (t1 - t0) / steps, steps
+        )
 
     @torch.no_grad()
     def sample(self, obs, steps=10, z=None):

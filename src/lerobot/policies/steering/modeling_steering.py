@@ -42,6 +42,7 @@ from .configuration_steering import (
     MatrixHolder,
     TeleopSource,
     check_steps,
+    deprecated_alias,
     format_matrix,
 )
 
@@ -742,54 +743,214 @@ def as_adapter(adapter, device="cpu", n_dims: int | None = 2) -> AdapterModules 
     return AdapterModules(matrix=torch.as_tensor(adapter, dtype=torch.float32, device=device), n_dims=n_dims)
 
 
-def _adapt_velocity(adapter, x_t, t, v, backward: bool):
-    """`adapter` is None, a normalized (n, n) or per-trial (B, n, n) matrix (the legacy fixed-F form), an
-    AdaptedField, or a ReversalAdapter holder without a fixed matrix used directly (a holder's matrix is in
-    environment units: convert the holder with ``field(std, like)`` first)."""
-    if adapter is None:
-        return v
-    if isinstance(adapter, torch.Tensor):
-        if not backward:
+class Flow:
+    """A velocity field and an adapter in one flow-time convention: the one Euler integrator of the steering
+    methods and the trainers, and what is built on it (FRS's latent and schedule, the validation's regeneration).
+
+    ``velocity(x, t)`` is the policy's field; ``adapter`` is anything ``adapt_velocity`` takes (None, a normalized
+    (n, n) or per-trial (B, n, n) matrix F, an ``AdaptedField``, or a ``ReversalAdapter`` holder without a fixed
+    matrix). ``noise_time`` is the flow time of noise: 1.0 is pi0.5's convention (t = 1 noise, t = 0 the action),
+    0.0 the cursor's. With ``batch_time`` the flow times reach ``velocity`` and the adapter as (B,) float32
+    tensors (the cursor policy's form), else as floats. ``reverse`` and ``forward`` are the reversal toward noise
+    and the unsteered forward pass at the policy's own step of 1/N; the statics ``schedule``,
+    ``uniform_reference``, ``heading_cosine`` and ``paired_chunks`` need no field."""
+
+    def __init__(
+        self,
+        velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
+        adapter=None,
+        noise_time: float = 1.0,
+        batch_time: bool = False,
+    ):
+        self.velocity, self.adapter, self.noise_time, self.batch_time = (
+            velocity,
+            adapter,
+            noise_time,
+            batch_time,
+        )
+
+    @staticmethod
+    def adapt_velocity(adapter, x_t, t, v, backward: bool):
+        """`adapter` is None, a normalized (n, n) or per-trial (B, n, n) matrix (the legacy fixed-F form), an
+        AdaptedField, or a ReversalAdapter holder without a fixed matrix used directly (a holder's matrix is in
+        environment units: convert the holder with ``field(std, like)`` first)."""
+        if adapter is None:
             return v
-        n = adapter.shape[-1]
-        return torch.cat([v[..., :n] @ adapter.transpose(-1, -2), v[..., n:]], dim=-1)
-    if isinstance(adapter, ReversalAdapter):
-        if adapter.matrix is not None:
+        if isinstance(adapter, torch.Tensor):
+            if not backward:
+                return v
+            n = adapter.shape[-1]
+            return torch.cat([v[..., :n] @ adapter.transpose(-1, -2), v[..., n:]], dim=-1)
+        if isinstance(adapter, ReversalAdapter):
+            if adapter.matrix is not None:
+                raise ValueError(
+                    "a ReversalAdapter's fixed matrix is in environment units; pass its field(std, like) instead"
+                )
+            if adapter.kind == "none":
+                return v
+            adapter = AdaptedField(None, adapter.user_module, adapter.task_module)
+        return adapter.adapt(x_t, t, v, backward)
+
+    def integrate(
+        self, x: torch.Tensor, t0: float, h: float, n: int, backward: bool = False, grad: bool = False
+    ) -> torch.Tensor:
+        """``n`` Euler steps ``x <- x + h * adapt(v(x, t))`` at flow times ``t = t0 + i * h``, in either time
+        convention: the sign of ``h`` picks the direction of flow time, ``backward`` whether the adapter's user part
+        (the fixed matrix F and/or the user module) acts (the reversal toward noise); a task module acts in both
+        directions. ``t`` is passed to ``velocity`` and the adapter as the float ``t0 + i * h``, or with
+        ``batch_time`` as a (B,) float32 tensor of it on ``x``'s device. With ``grad`` False the loop runs under
+        ``torch.no_grad()``; with it True the caller's grad mode holds (differentiable when grad is enabled, for
+        training)."""
+        with torch.enable_grad() if grad and torch.is_grad_enabled() else torch.no_grad():
+            for i in range(n):
+                t = t0 + i * h
+                if self.batch_time:
+                    t = torch.full((len(x),), t, device=x.device)
+                x = x + h * Flow.adapt_velocity(self.adapter, x, t, self.velocity(x, t), backward=backward)
+        return x
+
+    def reverse(self, x: torch.Tensor, num_steps: int, n_reversal_steps: int | None = None) -> torch.Tensor:
+        """Integrate the flow backward (Euler) from a clean chunk toward its latent noise: in pi0.5's convention
+        t: 0 -> 1 with dt = +1/num_steps (PI05Pytorch.sample_actions steps the same field with dt = -1/num_steps
+        from t=1, noise, to t=0, the action), in the cursor's t: 1 -> 0. This is the inversion of Flow Reversal
+        Steering (Tang et al. 2026, arXiv:2606.13675).
+
+        The step size is always 1/`num_steps`, i.e. the policy's own schedule. `n_reversal_steps` is how many of
+        those steps to take: the default (None) runs the whole way to pure noise, while a smaller count stops early
+        and returns a chunk at n_reversal_steps / num_steps of the way, still carrying some of the reference. The
+        caller must then start the forward flow at that time. The adapter acts as in the backward pass (MARS: task
+        module, then user module; a fixed F, x_t += h * (F @ v) on the first n action dims, F = I an exact no-op).
+        Differentiable when grad is enabled."""
+        steps = num_steps if n_reversal_steps is None else n_reversal_steps
+        h = 1.0 / num_steps if self.noise_time == 1.0 else -1.0 / num_steps
+        return self.integrate(x, 1.0 - self.noise_time, h, steps, backward=True, grad=True)
+
+    def forward(self, x: torch.Tensor, num_steps: int, stop_at: int | None = None) -> torch.Tensor:
+        """Integrate the flow forward (Euler) from noise toward the action, stopping at stop_at / num_steps of the
+        reversal's way. Mirrors PI05Pytorch.sample_actions without hooks: x_{t-h} = x_t - h * v(x_t, t). With
+        ``stop_at`` None it runs all the way to the action (the unsteered chunk); with ``stop_at = n`` it takes
+        ``num_steps - n`` steps and returns the unsteered state where a reversal stopped after ``n`` steps would
+        sit. The adapter applies its task module only: the user module acts on the reversal alone."""
+        steps = num_steps if stop_at is None else num_steps - stop_at
+        h = -(1.0 / num_steps) if self.noise_time == 1.0 else 1.0 / num_steps
+        return self.integrate(x, self.noise_time, h, steps, grad=True)
+
+    @staticmethod
+    def schedule(steps: int, n_reverse_steps: int | None, noise_time: float = 1.0) -> tuple[float, int]:
+        """Where FRS's forward pass starts and how many Euler steps it takes once the reference has been reversed
+        n of the policy's N = ``steps`` steps (None: all of them): from the reversal's landing time back to the
+        action in n steps of the policy's own 1/N, mirroring the reversal (n = N: from pure noise in N steps). A
+        steered chunk costs 2n velocity evaluations (n back, n forward), N + n when a partial reversal hands steps
+        back to the policy (N - n more for the unsteered latent)."""
+        if noise_time not in (0.0, 1.0):
             raise ValueError(
-                "a ReversalAdapter's fixed matrix is in environment units; pass its field(std, like) instead"
+                f"noise_time must be 1.0 (pi0.5: t = 1 noise) or 0.0 (the cursor: t = 0 noise), got {noise_time}"
             )
-        if adapter.kind == "none":
-            return v
-        adapter = AdaptedField(None, adapter.user_module, adapter.task_module)
-    return adapter.adapt(x_t, t, v, backward)
+        n = steps if n_reverse_steps is None else n_reverse_steps
+        check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
+        action_time = 1.0 - noise_time
+        return action_time + (noise_time - action_time) * n / steps, n
 
+    def latent(
+        self,
+        reference: torch.Tensor,
+        noise: torch.Tensor,
+        steps: int,
+        n_reverse_steps: int | None = None,
+        delegated: torch.Tensor | None = None,
+        grad: bool = False,
+    ) -> torch.Tensor:
+        """Flow Reversal Steering's (and MARS's) latent: the ``reference`` chunk integrated backward n of N =
+        ``steps`` Euler steps of 1/N toward noise (the adapter's user part acting; None: all the way, Tang et al.'s
+        method), then the elements ``delegated`` marks (a bool mask broadcastable to the chunk: the dims the
+        operator does not command, padding, the steps past the pinned prefix) replaced by the unsteered latent at
+        the same flow time -- the chunk's own ``noise`` for a full reversal, else ``noise`` run forward N - n
+        steps -- for the policy to fill in (Tang et al.'s noise-space in-painting, App. D.1). The forward pass
+        starts from it on ``schedule``'s schedule."""
+        _, n = Flow.schedule(steps, n_reverse_steps, self.noise_time)
+        action_time = 1.0 - self.noise_time
+        h = (self.noise_time - action_time) / steps  # toward noise
+        latent = self.integrate(reference, action_time, h, n, backward=True, grad=grad)
+        if delegated is not None and bool(delegated.any()):
+            unsteered = (
+                noise if n == steps else self.integrate(noise, self.noise_time, -h, steps - n, grad=grad)
+            )
+            latent = torch.where(delegated.to(latent.device), unsteered, latent)
+        return latent
 
-def integrate(
-    x: torch.Tensor,
-    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
-    t0: float,
-    h: float,
-    n: int,
-    adapter=None,
-    backward: bool = False,
-    grad: bool = False,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """``n`` Euler steps ``x <- x + h * adapt(v(x, t))`` at flow times ``t = t0 + i * h``, through any
-    velocity field, in either time convention: the sign of ``h`` picks the direction of flow time,
-    ``backward`` whether the adapter's user part (the fixed matrix F and/or the user module) acts
-    (the reversal toward noise); a task module acts in both directions. ``adapter`` is
-    anything ``_adapt_velocity`` takes. ``t`` is passed to ``velocity`` and the adapter as the float
-    ``t0 + i * h``, or with ``batch_time`` as a (B,) float32 tensor of it on ``x``'s device (the
-    cursor policy's form). With ``grad`` False the loop runs under ``torch.no_grad()``; with it True
-    the caller's grad mode holds (differentiable when grad is enabled, for training)."""
-    with torch.enable_grad() if grad and torch.is_grad_enabled() else torch.no_grad():
-        for i in range(n):
-            t = t0 + i * h
-            if batch_time:
-                t = torch.full((len(x),), t, device=x.device)
-            x = x + h * _adapt_velocity(adapter, x, t, velocity(x, t), backward=backward)
-    return x
+    @torch.no_grad()
+    def regenerate(self, chunk: torch.Tensor, num_steps: int) -> torch.Tensor:
+        """FRS at full reversal: ``chunk`` reversed through the adapted backward field (task and user modules) all
+        the way to noise, then regenerated through the forward field (the task module alone: ``AdaptedField``
+        applies the user part backward only). The trainers' validation: what the policy makes of the operator's
+        command through the modules."""
+        h = (
+            2 * self.noise_time - 1
+        ) / num_steps  # toward noise: +1/N in pi0.5's convention, -1/N in the cursor's
+        z = self.integrate(chunk, 1 - self.noise_time, h, num_steps, backward=True)
+        return self.integrate(z, self.noise_time, -h, num_steps)
+
+    @staticmethod
+    def uniform_reference(
+        command, gripper_normalized, mean: np.ndarray, std: np.ndarray, chunk_size: int, max_action_dim: int
+    ) -> torch.Tensor:
+        """The reference chunk FRS steers toward: env-space translation ``command`` ((3,) or (B, 3)) held at
+        uniform velocity over the chunk, rotation zero, the gripper at ``gripper_normalized`` (a float or
+        (B,)), in the model's normalized padded space: (B, chunk_size, max_action_dim)."""
+        command = np.atleast_2d(np.asarray(command, dtype=np.float64))
+        env_action = np.zeros((command.shape[0], N_ACTION_DIMS))
+        env_action[:, :3] = command
+        normalized = (env_action - mean) / std
+        normalized[:, GRIPPER_DIM] = np.asarray(gripper_normalized, dtype=np.float64)
+        ref = torch.zeros(command.shape[0], chunk_size, max_action_dim, dtype=torch.float32)
+        ref[..., :N_ACTION_DIMS] = torch.as_tensor(normalized, dtype=torch.float32)[:, None, :]
+        return ref
+
+    @staticmethod
+    def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor, n_dims: int = 3) -> torch.Tensor:
+        """Cosine between two chunks' total displacements (the sum over steps of their first ``n_dims`` dims), per
+        sample: how well a regenerated chunk heads where its label does."""
+        return nn.functional.cosine_similarity(
+            chunk_a[..., :n_dims].sum(1), chunk_b[..., :n_dims].sum(1), dim=-1
+        )
+
+    @staticmethod
+    def _rng_state() -> tuple:
+        """CPU and CUDA generator states, so a second sampling pass can reuse the first one's noise."""
+        cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        return torch.get_rng_state(), cuda
+
+    @staticmethod
+    def _set_rng_state(state: tuple) -> None:
+        cpu, cuda = state
+        torch.set_rng_state(cpu)
+        if cuda:
+            torch.cuda.set_rng_state_all(cuda)
+
+    @staticmethod
+    def paired_chunks(
+        policy, batch, steered: bool, common: dict | None = None, **steer_kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The steered chunk and the policy's own plan for the same observation and the same noise.
+
+        Returns (steered, plain). When `steered` is False the two are the same tensor: no
+        second pass. Otherwise the generator state is restored between the passes so the
+        plain chunk starts from the Gaussian sample the steered one used, and the state
+        after the steered pass is restored afterwards, so a run's random stream is exactly
+        what it would be without the second pass. `common` kwargs go to both passes (a MARS
+        task module shapes the policy's own plan too); `steer_kwargs` only to the steered one.
+        """
+        common = common or {}
+        if not steered:
+            chunk = policy.predict_action_chunk(batch, **common)
+            return chunk, chunk
+        before = Flow._rng_state()
+        chunk = policy.predict_action_chunk(batch, **common, **steer_kwargs)
+        after = Flow._rng_state()
+        Flow._set_rng_state(before)
+        plain = policy.predict_action_chunk(batch, **common)
+        Flow._set_rng_state(after)
+        return chunk, plain
 
 
 # ---------------------------------------------------------------- chunks and losses, t = 0 noise convention
@@ -826,59 +987,6 @@ def flow_control_write(
     region = x_t[:, :tau, dims]
     x_t[:, :tau, dims] = w if steer is None else torch.where(steer, w.expand_as(region), region)
     return x_t
-
-
-def frs_schedule(steps: int, n_reverse_steps: int | None, noise_time: float = 1.0) -> tuple[float, int]:
-    """Where FRS's forward pass starts and how many Euler steps it takes once the reference has been reversed
-    n of the policy's N = ``steps`` steps (None: all of them): from the reversal's landing time back to the
-    action in n steps of the policy's own 1/N, mirroring the reversal (n = N: from pure noise in N steps). A
-    steered chunk costs 2n velocity evaluations (n back, n forward), N + n when a partial reversal hands steps
-    back to the policy (N - n more for the unsteered latent)."""
-    if noise_time not in (0.0, 1.0):
-        raise ValueError(
-            f"noise_time must be 1.0 (pi0.5: t = 1 noise) or 0.0 (the cursor: t = 0 noise), got {noise_time}"
-        )
-    n = steps if n_reverse_steps is None else n_reverse_steps
-    check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
-    action_time = 1.0 - noise_time
-    return action_time + (noise_time - action_time) * n / steps, n
-
-
-def frs_latent(
-    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
-    reference: torch.Tensor,
-    noise: torch.Tensor,
-    steps: int,
-    n_reverse_steps: int | None = None,
-    adapter=None,
-    delegated: torch.Tensor | None = None,
-    noise_time: float = 1.0,
-    grad: bool = False,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """Flow Reversal Steering's (and MARS's) latent: the ``reference`` chunk integrated backward n of N =
-    ``steps`` Euler steps of 1/N toward noise (the adapter's user part acting; None: all the way, Tang et al.'s
-    method), then the elements ``delegated`` marks (a bool mask broadcastable to the chunk: the dims the
-    operator does not command, padding, the steps past the pinned prefix) replaced by the unsteered latent at
-    the same flow time -- the chunk's own ``noise`` for a full reversal, else ``noise`` run forward N - n
-    steps -- for the policy to fill in (Tang et al.'s noise-space in-painting, App. D.1). The forward pass
-    starts from it on ``frs_schedule``'s schedule."""
-    _, n = frs_schedule(steps, n_reverse_steps, noise_time)
-    action_time = 1.0 - noise_time
-    h = (noise_time - action_time) / steps  # toward noise
-    latent = integrate(
-        reference, velocity, action_time, h, n, adapter, backward=True, grad=grad, batch_time=batch_time
-    )
-    if delegated is not None and bool(delegated.any()):
-        unsteered = (
-            noise
-            if n == steps
-            else integrate(
-                noise, velocity, noise_time, -h, steps - n, adapter, grad=grad, batch_time=batch_time
-            )
-        )
-        latent = torch.where(delegated.to(latent.device), unsteered, latent)
-    return latent
 
 
 def user_field_loss(
@@ -941,33 +1049,6 @@ def task_field_loss(
     return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
 
 
-def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor, n_dims: int = 3) -> torch.Tensor:
-    """Cosine between two chunks' total displacements (the sum over steps of their first ``n_dims`` dims), per
-    sample: how well a regenerated chunk heads where its label does."""
-    return nn.functional.cosine_similarity(chunk_a[..., :n_dims].sum(1), chunk_b[..., :n_dims].sum(1), dim=-1)
-
-
-@torch.no_grad()
-def regenerate(
-    velocity,
-    chunk: torch.Tensor,
-    num_steps: int,
-    adapter=None,
-    noise_time: float = 1.0,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """FRS at full reversal: ``chunk`` reversed through the adapted backward field (task and user modules) all
-    the way to noise, then regenerated through the forward field (the task module alone: ``AdaptedField``
-    applies the user part backward only). Either time convention (``noise_time`` and ``batch_time`` as in
-    ``integrate``). The trainers' validation: what the policy makes of the operator's command through the
-    modules."""
-    h = (2 * noise_time - 1) / num_steps  # toward noise: +1/N in pi0.5's convention, -1/N in the cursor's
-    z = integrate(
-        chunk, velocity, 1 - noise_time, h, num_steps, adapter, backward=True, batch_time=batch_time
-    )
-    return integrate(z, velocity, noise_time, -h, num_steps, adapter, batch_time=batch_time)
-
-
 def step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
     """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
     blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
@@ -1022,44 +1103,6 @@ def train_module(
             )
             running = 0.0
     return log
-
-
-def _rng_state() -> tuple:
-    """CPU and CUDA generator states, so a second sampling pass can reuse the first one's noise."""
-    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-    return torch.get_rng_state(), cuda
-
-
-def _set_rng_state(state: tuple) -> None:
-    cpu, cuda = state
-    torch.set_rng_state(cpu)
-    if cuda:
-        torch.cuda.set_rng_state_all(cuda)
-
-
-def paired_chunks(
-    policy, batch, steered: bool, common: dict | None = None, **steer_kwargs
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The steered chunk and the policy's own plan for the same observation and the same noise.
-
-    Returns (steered, plain). When `steered` is False the two are the same tensor: no
-    second pass. Otherwise the generator state is restored between the passes so the
-    plain chunk starts from the Gaussian sample the steered one used, and the state
-    after the steered pass is restored afterwards, so a run's random stream is exactly
-    what it would be without the second pass. `common` kwargs go to both passes (a MARS
-    task module shapes the policy's own plan too); `steer_kwargs` only to the steered one.
-    """
-    common = common or {}
-    if not steered:
-        chunk = policy.predict_action_chunk(batch, **common)
-        return chunk, chunk
-    before = _rng_state()
-    chunk = policy.predict_action_chunk(batch, **common, **steer_kwargs)
-    after = _rng_state()
-    _set_rng_state(before)
-    plain = policy.predict_action_chunk(batch, **common)
-    _set_rng_state(after)
-    return chunk, plain
 
 
 # ---------------------------------------------------------------- FlowControlPolicy
@@ -1281,7 +1324,7 @@ class FlowControlPolicy(_ChunkSteering):
         self._pending_command = commands
         self._pending_target = None  # resolved on the device by the first write
         self._pending_steer = None if bool(steer.all()) else steer[:, None, None]
-        chunk, plain = paired_chunks(self._policy, batch, True, common, x_t_hook=self._x_t_hook)
+        chunk, plain = Flow.paired_chunks(self._policy, batch, True, common, x_t_hook=self._x_t_hook)
         return self._per_row(chunk, plain, steer), plain
 
     def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1289,67 +1332,6 @@ class FlowControlPolicy(_ChunkSteering):
         # matching FRS and the synthetic operator's refresh cadence.
         command = self._read_command(read=bool(self._lam))
         return self.steered_chunk(batch, None if command is None else np.asarray(command)[None])
-
-
-def reverse_flow(
-    x: torch.Tensor,
-    velocity,
-    num_steps: int,
-    adapter=None,
-    n_reversal_steps: int | None = None,
-) -> torch.Tensor:
-    """Integrate the flow backward (Euler, t: 0 -> 1) from a clean chunk toward its latent noise.
-
-    Mirrors PI05Pytorch.sample_actions, which integrates x_{t+dt} = x_t + dt * v(x_t, t)
-    with dt = -1/num_steps from t=1 (noise) to t=0 (action); here the same field is
-    stepped with dt = +1/num_steps starting at t=0. This is the inversion of Flow
-    Reversal Steering (Tang et al. 2026, arXiv:2606.13675).
-
-    The step size is always 1/`num_steps`, i.e. the policy's own schedule.
-    `n_reversal_steps` is how many of those steps to take: the default (None) runs
-    the whole way to t=1, pure noise, while a smaller count stops early and
-    returns a chunk at t = n_reversal_steps / num_steps, still carrying some of
-    the reference. The caller must then start the forward flow at that time.
-
-    `adapter` is None, an (n, n) matrix F already in normalized coordinates (the
-    fixed user module: x_t += h * (F @ v) on the first n action dims, the env's 7,
-    leaving the padding dims alone; F = I is an exact no-op) or an ``AdaptedField``
-    (MARS: task module, then user module, since this is the backward pass).
-    """
-    steps = num_steps if n_reversal_steps is None else n_reversal_steps
-    return integrate(x, velocity, 0.0, 1.0 / num_steps, steps, adapter, backward=True, grad=True)
-
-
-def forward_flow(
-    x: torch.Tensor, velocity, num_steps: int, stop_at: int | None = None, adapter=None
-) -> torch.Tensor:
-    """Integrate the flow forward (Euler) from noise at t=1 down to t = stop_at / num_steps.
-
-    Mirrors PI05Pytorch.sample_actions without hooks: x_{t-h} = x_t - h * v(x_t, t). With
-    ``stop_at`` None it runs all the way to t=0 (the unsteered action chunk); with
-    ``stop_at = n`` it takes ``num_steps - n`` steps and returns the unsteered state at
-    t = n / num_steps, i.e. where a reversal stopped after ``n`` steps would sit.
-    ``adapter`` (an ``AdaptedField``) applies its task module only: the user module
-    acts on the reversal alone.
-    """
-    steps = num_steps if stop_at is None else num_steps - stop_at
-    return integrate(x, velocity, 1.0, -(1.0 / num_steps), steps, adapter, grad=True)
-
-
-def uniform_reference(
-    command, gripper_normalized, mean: np.ndarray, std: np.ndarray, chunk_size: int, max_action_dim: int
-) -> torch.Tensor:
-    """The reference chunk FRS steers toward: env-space translation ``command`` ((3,) or (B, 3)) held at
-    uniform velocity over the chunk, rotation zero, the gripper at ``gripper_normalized`` (a float or
-    (B,)), in the model's normalized padded space: (B, chunk_size, max_action_dim)."""
-    command = np.atleast_2d(np.asarray(command, dtype=np.float64))
-    env_action = np.zeros((command.shape[0], N_ACTION_DIMS))
-    env_action[:, :3] = command
-    normalized = (env_action - mean) / std
-    normalized[:, GRIPPER_DIM] = np.asarray(gripper_normalized, dtype=np.float64)
-    ref = torch.zeros(command.shape[0], chunk_size, max_action_dim, dtype=torch.float32)
-    ref[..., :N_ACTION_DIMS] = torch.as_tensor(normalized, dtype=torch.float32)[:, None, :]
-    return ref
 
 
 def delegation_mask(
@@ -1385,8 +1367,8 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
     commanded direction, rotation zero, gripper held at the model's last executed command, `gripper_open` before the
     first chunk; any ``reference_fn(commands) -> (B, H, D)`` in the model's normalized space otherwise) is
     integrated *backward* through the policy's own velocity field to the latent noise that maps to it
-    (``frs_latent``); the normal forward flow then denoises from that noise instead of a random one, on
-    ``frs_schedule``'s schedule. The executed action is entirely the model's output -- the reference only picks the
+    (``Flow.latent``); the normal forward flow then denoises from that noise instead of a random one, on
+    ``Flow.schedule``'s schedule. The executed action is entirely the model's output -- the reference only picks the
     starting noise, so what comes out is the generalist action mode nearest your intent. Idle input = pure policy.
 
     An optional adapter (MARS) adapts the velocity field: a `ReversalAdapter` here (its user module, a fixed 7x7
@@ -1495,7 +1477,7 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
         if self._reference_fn is not None:
             return self._reference_fn(command)
         cfg = self._policy.config
-        return uniform_reference(
+        return Flow.uniform_reference(
             command, self._gripper_ref, self._mean, self._std, cfg.chunk_size, cfg.max_action_dim
         )
 
@@ -1543,15 +1525,12 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
             # reference and must stay eager. The shared core: the reversal, then the delegated elements on the
             # unsteered flow (from noise: the chunk's own Gaussian sample; Tang et al., App. D).
             reference = self._pending_reference.to(device=noise.device, dtype=noise.dtype)
-            return frs_latent(
-                velocity,
+            return Flow(velocity, adapted(noise), self._noise_time).latent(
                 reference,
                 noise,
                 cfg.num_inference_steps,
                 self._n_reversal_steps,
-                adapter=adapted(noise),
                 delegated=self._delegated,
-                noise_time=self._noise_time,
                 grad=True,
             )
 
@@ -1565,11 +1544,11 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
         self._pending_reference = self.reference_chunk(commands)
         schedule = {}  # the full reversal: the usual schedule from noise in N steps
         if self._n_reversal_steps is not None:  # part-way: from the reversal's landing time, n steps of 1/N
-            start, n = frs_schedule(
+            start, n = Flow.schedule(
                 cfg.num_inference_steps, self._n_reversal_steps, noise_time=self._noise_time
             )
             schedule = {"flow_start_time": start, "num_forward_steps": n}
-        chunk, plain = paired_chunks(self._policy, batch, True, common, noise_fn=noise_fn, **schedule)
+        chunk, plain = Flow.paired_chunks(self._policy, batch, True, common, noise_fn=noise_fn, **schedule)
         return self._per_row(chunk, plain, steer), plain
 
     def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1589,3 +1568,78 @@ class FlowReversalSteeringPolicy(_ChunkSteering):
             target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
             self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
         return chunk, plain
+
+
+# ---------------------------------------------------------------- deprecated aliases (one round)
+#
+# The module-level functions these methods replaced, each calling its method; a later round removes them.
+
+
+def integrate(
+    x: torch.Tensor,
+    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
+    t0: float,
+    h: float,
+    n: int,
+    adapter=None,
+    backward: bool = False,
+    grad: bool = False,
+    batch_time: bool = False,
+) -> torch.Tensor:
+    """Deprecated alias of ``Flow(velocity, adapter, batch_time=batch_time).integrate(x, t0, h, n, backward,
+    grad)``, kept for one round."""
+    return Flow(velocity, adapter, batch_time=batch_time).integrate(x, t0, h, n, backward=backward, grad=grad)
+
+
+def reverse_flow(
+    x: torch.Tensor, velocity, num_steps: int, adapter=None, n_reversal_steps: int | None = None
+) -> torch.Tensor:
+    """Deprecated alias of ``Flow(velocity, adapter).reverse(x, num_steps, n_reversal_steps)``, kept for one
+    round."""
+    return Flow(velocity, adapter).reverse(x, num_steps, n_reversal_steps)
+
+
+def forward_flow(
+    x: torch.Tensor, velocity, num_steps: int, stop_at: int | None = None, adapter=None
+) -> torch.Tensor:
+    """Deprecated alias of ``Flow(velocity, adapter).forward(x, num_steps, stop_at)``, kept for one round."""
+    return Flow(velocity, adapter).forward(x, num_steps, stop_at)
+
+
+def frs_latent(
+    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
+    reference: torch.Tensor,
+    noise: torch.Tensor,
+    steps: int,
+    n_reverse_steps: int | None = None,
+    adapter=None,
+    delegated: torch.Tensor | None = None,
+    noise_time: float = 1.0,
+    grad: bool = False,
+    batch_time: bool = False,
+) -> torch.Tensor:
+    """Deprecated alias of ``Flow(velocity, adapter, noise_time, batch_time).latent(reference, noise, steps,
+    n_reverse_steps, delegated, grad)``, kept for one round."""
+    return Flow(velocity, adapter, noise_time, batch_time).latent(
+        reference, noise, steps, n_reverse_steps, delegated=delegated, grad=grad
+    )
+
+
+def regenerate(
+    velocity,
+    chunk: torch.Tensor,
+    num_steps: int,
+    adapter=None,
+    noise_time: float = 1.0,
+    batch_time: bool = False,
+) -> torch.Tensor:
+    """Deprecated alias of ``Flow(velocity, adapter, noise_time, batch_time).regenerate(chunk, num_steps)``, kept
+    for one round."""
+    return Flow(velocity, adapter, noise_time, batch_time).regenerate(chunk, num_steps)
+
+
+_adapt_velocity = deprecated_alias(Flow.adapt_velocity, "_adapt_velocity", "Flow.adapt_velocity")
+frs_schedule = deprecated_alias(Flow.schedule, "frs_schedule", "Flow.schedule")
+uniform_reference = deprecated_alias(Flow.uniform_reference, "uniform_reference", "Flow.uniform_reference")
+heading_cosine = deprecated_alias(Flow.heading_cosine, "heading_cosine", "Flow.heading_cosine")
+paired_chunks = deprecated_alias(Flow.paired_chunks, "paired_chunks", "Flow.paired_chunks")
