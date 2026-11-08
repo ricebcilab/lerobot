@@ -47,6 +47,12 @@ the store and rank: `docs/superpowers/plans/2026-11-06-mars-round4c-token-store-
   symlinked to the main tree; the refactor's acceptance check re-runs one grid cell (U1xT2, fixed settings) on the
   refactored code and must reproduce the pinned numbers.
 
+- R-G5. The T5 module trains with the curl user (U4) in the loop, and the trainer refused rigid copies under a curl (a
+  mirror flips a curl's handedness). Ruling: unmirrored copies (rotations and shifts only) under a curl corruption,
+  commit 3a6215b7; the module's meta records `rigid_mirror: false`. T5's augmentation is therefore half the symmetry
+  group of the others'. Costs if wrong: T5's vision rows (4 cells x 5 seeds) weaker than a mirror-including recipe
+  could give; a per-task check at the gate's level is the remedy.
+
 ## Files
 
 - `examples/pi05/mars/cursor/configs/sweeps/grid_vision.yaml`, `grid_vision_decoy.yaml` (committed).
