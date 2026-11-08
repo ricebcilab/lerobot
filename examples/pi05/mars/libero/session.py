@@ -38,7 +38,6 @@ from lerobot.policies.steering import (
     FlowControlSteering,
     FlowReversalSteering,
     ReversalAdapter,
-    check_steps,
 )
 from lerobot.utils.constants import ACTION
 
@@ -296,16 +295,18 @@ class Session:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
         if lam is not None:
-            check_steps("lambda", lam, 0, self.policy.config.num_inference_steps, "Euler steps")
+            FlowReversalSteering.check_steps(
+                "lambda", lam, 0, self.policy.config.num_inference_steps, "Euler steps"
+            )
             self.lam = lam
         if tau is not None:
-            check_steps("tau", tau, 1, self.policy.config.chunk_size, "chunk steps")
+            FlowReversalSteering.check_steps("tau", tau, 1, self.policy.config.chunk_size, "chunk steps")
             self.tau = tau
         if ic_gain is not None:
             self.ic_gain = ic_gain  # validated by the wrapper
         if n_reversal_steps is not None:
             total = self.policy.config.num_inference_steps
-            check_steps("n_reversal_steps", n_reversal_steps, 1, total, "Euler steps")
+            FlowReversalSteering.check_steps("n_reversal_steps", n_reversal_steps, 1, total, "Euler steps")
             self.n_reversal_steps = n_reversal_steps
         self.mode = mode
         if mode != "policy" and self.operator is None:
@@ -331,7 +332,7 @@ class Session:
         self.chain.noisy.input_noise = control.input_noise
         self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
         self.chain.gain.gain = control.resolved_input_gain
-        check_steps(
+        FlowReversalSteering.check_steps(
             "n_reversal_steps",
             control.n_reversal_steps,
             1,

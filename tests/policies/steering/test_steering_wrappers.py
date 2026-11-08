@@ -10,12 +10,12 @@ from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_DIM,
     N_ACTION_DIMS,
-    AdapterSpec,
     FlowControlPolicy,
     FlowReversalSteeringPolicy,
     LearnedTaskModule,
     LearnedUserModule,
     ReversalAdapter,
+    SteeringConfig,
     build_reversal_adapter,
     delegation_mask,
     forward_flow,
@@ -179,17 +179,19 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
 
 def test_parse_adapter_spec_forms():
     m = rotation_about_z(20)
-    assert parse_adapter_spec(None, m) == AdapterSpec()
+    assert parse_adapter_spec(None, m) == SteeringConfig()
     fixed = parse_adapter_spec({"translation": "corruption", "gripper": "zero"}, m)
-    np.testing.assert_allclose(fixed.matrix[:3, :3], m)
-    assert fixed.user_path is None and fixed.task_path is None
-    assert parse_adapter_spec({"learned": "u.pt"}, m) == AdapterSpec(user_path="u.pt")
+    np.testing.assert_allclose(fixed.fixed_matrix[:3, :3], m)
+    assert fixed.adapter_user is None and fixed.adapter_task is None
+    assert parse_adapter_spec({"learned": "u.pt"}, m) == SteeringConfig(adapter_user="u.pt")
     composed = parse_adapter_spec({"user": {"translation": "corruption"}, "task": "t.pt"}, m)
-    np.testing.assert_allclose(composed.matrix[:3, :3], m)
-    assert composed.task_path == "t.pt" and composed.user_path is None
-    assert parse_adapter_spec({"user": {"learned": "u.pt"}, "task": None}, m) == AdapterSpec(user_path="u.pt")
-    assert parse_adapter_spec({"user": None, "task": "t.pt"}, m) == AdapterSpec(task_path="t.pt")
-    np.testing.assert_allclose(parse_adapter_spec({"F": np.eye(7).tolist()}, m).matrix, np.eye(7))
+    np.testing.assert_allclose(composed.fixed_matrix[:3, :3], m)
+    assert composed.adapter_task == "t.pt" and composed.adapter_user is None
+    assert parse_adapter_spec({"user": {"learned": "u.pt"}, "task": None}, m) == SteeringConfig(
+        adapter_user="u.pt"
+    )
+    assert parse_adapter_spec({"user": None, "task": "t.pt"}, m) == SteeringConfig(adapter_task="t.pt")
+    np.testing.assert_allclose(parse_adapter_spec({"F": np.eye(7).tolist()}, m).fixed_matrix, np.eye(7))
     for bad in (
         {"user": {"learned": "u"}, "F": np.eye(7).tolist()},
         {"learned": 1},

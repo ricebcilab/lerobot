@@ -46,18 +46,12 @@ from lerobot.processor import (
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-from .configuration_steering import (
-    DEADBAND,
-    PI05_TOKENIZER,
-    SCENE_PROMPT,
-    SCENE_VLM_PATH,
-    VLM_SCENE_DIM,
-    VLM_SCENE_TOKENS,
-    SteeringConfig,
-    deprecated_alias,
-    scene_spec,
-)
-from .modeling_steering import LearnedTaskModule
+from .configuration_steering import SteeringConfig
+from .modeling_steering import DEADBAND, VLM_SCENE_DIM, VLM_SCENE_TOKENS, LearnedTaskModule, deprecated_alias
+
+SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
+SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
+PI05_TOKENIZER = "google/paligemma-3b-pt-224"  # the tokenizer pi0.5's processor uses
 
 STORED_SCENE_SOURCES = ("vlm_image", "vlm_prefix")  # the sources with one token array per layout
 
@@ -225,7 +219,7 @@ class SceneEncoder:
         directly and has no scene array."""
         if source == "discs":  # nosec B105
             raise ValueError("source 'discs' reads the layouts' obstacles; it has no scene array")
-        scene_spec(source, size)  # the source and size checks
+        LearnedTaskModule.spec(source, size)  # the source and size checks
         images = render_layouts(layouts, size)
         if source == "cnn":  # nosec B105
             return images
@@ -309,7 +303,7 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
     def __post_init__(self) -> None:
         if self.source not in STORED_SCENE_SOURCES:
             raise ValueError(f"source must be one of {STORED_SCENE_SOURCES}, got {self.source!r}")
-        scene_spec(self.source, self.render_size)  # the size check
+        LearnedTaskModule.spec(self.source, self.render_size)  # the size check
         self._encoder = self.encoder
 
     def scene_encoder(self) -> Any:
@@ -478,15 +472,15 @@ def make_steering_pre_post_processors(
         ),
     ]
     task = config.task_module
-    if task is None and config.adapter is not None and config.adapter.task_path is not None:
-        task = torch.load(config.adapter.task_path, map_location="cpu", weights_only=True)["config"]
+    if task is None and config.adapter_task is not None:
+        task = torch.load(config.adapter_task, map_location="cpu", weights_only=True)["config"]
     scene = config.scene_settings(task)  # the task module's, where the config leaves them unset
     if task is not None and scene["scene_source"] in STORED_SCENE_SOURCES:
         input_steps.append(
             SteeringSceneTokensProcessorStep(
                 source=scene["scene_source"],
                 render_size=scene["render_size"] or SCENE_SIZE,
-                vlm_path=config.vlm_path,
+                vlm_path=config.vlm_path or SCENE_VLM_PATH,
                 device=config.device,
             )
         )

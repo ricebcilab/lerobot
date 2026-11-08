@@ -5,7 +5,6 @@ from lerobot.policies.steering import (
     TOKEN_GEOMETRIES,
     AdapterModules,
     LearnedTaskModule,
-    scene_spec,
 )
 from lerobot.policies.steering.modeling_steering import SCENE_SOURCES
 
@@ -230,7 +229,7 @@ def _reduction(dim=32, rank=4):
 
 def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_path):
     assert "vlm_views" in SCENE_SOURCES
-    assert scene_spec("vlm_views", 224, wrist_span=0.5, scene_rank=256) == {
+    assert LearnedTaskModule.spec("vlm_views", 224, wrist_span=0.5, scene_rank=256) == {
         "token_source": "vlm_views",
         "scene_dim": 2048,
         "scene_tokens": 512,
@@ -238,8 +237,13 @@ def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_pa
         "wrist_span": 0.5,
         "scene_rank": 256,
     }
-    assert scene_spec("vlm_views", 224, wrist_span=1.0)["scene_rank"] is None
-    assert set(scene_spec("vlm_image")) == {"token_source", "scene_dim", "scene_tokens", "image_size"}
+    assert LearnedTaskModule.spec("vlm_views", 224, wrist_span=1.0)["scene_rank"] is None
+    assert set(LearnedTaskModule.spec("vlm_image")) == {
+        "token_source",
+        "scene_dim",
+        "scene_tokens",
+        "image_size",
+    }
     full, red = _views(), _views(rank=4)
     assert (
         full.config["wrist_span"] == 0.5
@@ -265,16 +269,16 @@ def test_a_views_module_keeps_its_span_and_reduction_through_a_checkpoint(tmp_pa
 def test_scene_rank_is_legal_for_the_image_sources_and_relative_tokens_add_the_geometry_after_the_projection(
     tmp_path,
 ):
-    assert scene_spec("vlm_image", 224, scene_rank=256) == {
+    assert LearnedTaskModule.spec("vlm_image", 224, scene_rank=256) == {
         "token_source": "vlm_image",
         "scene_dim": 2048,
         "scene_tokens": 256,
         "image_size": 224,
         "scene_rank": 256,
     }
-    assert scene_spec("vlm_prefix", 224, scene_rank=8)["scene_rank"] == 8 and "scene_rank" not in scene_spec(
-        "vlm_prefix"
-    )
+    assert LearnedTaskModule.spec("vlm_prefix", 224, scene_rank=8)[
+        "scene_rank"
+    ] == 8 and "scene_rank" not in LearnedTaskModule.spec("vlm_prefix")
     for source, kw in (
         ("discs", {}),
         ("cnn", {}),
@@ -282,9 +286,9 @@ def test_scene_rank_is_legal_for_the_image_sources_and_relative_tokens_add_the_g
         ("vlm_image", {"scene_rank": 0}),
     ):
         with pytest.raises(ValueError, match="scene_rank"):
-            scene_spec(source, 64, **({"scene_rank": 8} | kw))
+            LearnedTaskModule.spec(source, 64, **({"scene_rank": 8} | kw))
     with pytest.raises(ValueError, match="wrist_span"):
-        scene_spec("vlm_image", 224, wrist_span=0.5, scene_rank=8)
+        LearnedTaskModule.spec("vlm_image", 224, wrist_span=0.5, scene_rank=8)
     prefix = LearnedTaskModule(
         horizon=16, token_source="vlm_prefix", scene_dim=32, scene_tokens=16, scene_rank=4
     )
@@ -396,7 +400,7 @@ def test_the_modules_refuse_what_they_cannot_read():
             lambda: LearnedTaskModule(horizon=16, token_source="cnn", image_size=64, scene_rank=4),
             "scene_rank",
         ),
-        (lambda: scene_spec("vlm_image", 224, wrist_span=0.5), None),
+        (lambda: LearnedTaskModule.spec("vlm_image", 224, wrist_span=0.5), None),
     ):
         with pytest.raises(ValueError, match=match):
             build()
@@ -407,4 +411,4 @@ def test_the_modules_refuse_what_they_cannot_read():
         {"wrist_span": 0.5, "scene_rank": 0},
     ):
         with pytest.raises(ValueError):
-            scene_spec("vlm_views", 224, **bad)
+            LearnedTaskModule.spec("vlm_views", 224, **bad)

@@ -21,7 +21,7 @@ from config import (
     spec_label,
 )
 
-from lerobot.policies.steering import AdapterSpec
+from lerobot.policies.steering import SteeringConfig
 
 CONDITIONS = sorted(
     p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if not p.name.startswith("base")
@@ -106,15 +106,15 @@ def test_arm_files_resolve():
     mars = load_experiment_settings(CONFIG_DIR / "experiment" / "mars_rotz20.yaml", {})
     c = mars.session.control
     assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
-    np.testing.assert_allclose(c.corruption_matrix, AdapterSpec.rotation(20))
-    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], AdapterSpec.rotation(20))
+    np.testing.assert_allclose(c.corruption_matrix, SteeringConfig.rotation(20))
+    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], SteeringConfig.rotation(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[3:, 3:], np.eye(4))  # orientation/gripper: identity
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, 3:], 0)
     np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :3], 0)
     assert spec_label(c.corruption) == "rotation_z_deg=20"
     native = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml", {})
     assert native.session.control.reversal_adapter_matrix is None
-    np.testing.assert_allclose(native.session.control.corruption_matrix, AdapterSpec.rotation(20))
+    np.testing.assert_allclose(native.session.control.corruption_matrix, SteeringConfig.rotation(20))
     fc = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml", {})
     assert fc.session.control.mode == "shared_flow_control"
     assert (fc.session.control.tau, fc.session.control.lam, fc.session.control.ic_gain) == (None, 1, "action")
@@ -169,7 +169,7 @@ def test_learned_and_composed_adapter_specs(tmp_path):
     assert c.reversal_adapter_matrix is None
     spec = f"  reversal_adapter: {{user: {{translation: corruption}}, task: {task}}}\n"
     c = load_experiment_settings(_write(tmp_path, "b.yaml", base + spec), {}).session.control
-    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], AdapterSpec.rotation(20))
+    np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], SteeringConfig.rotation(20))
     assert c.reversal_adapter_task_path == str(task) and c.reversal_adapter_user_path is None
     spec = f"  reversal_adapter: {{user: {{learned: {user}}}, task: {task}}}\n"
     c = load_experiment_settings(_write(tmp_path, "c.yaml", base + spec), {}).session.control

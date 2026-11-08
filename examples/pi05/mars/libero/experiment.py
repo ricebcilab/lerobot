@@ -51,7 +51,7 @@ from reproducibility import TrialSpec, corruption_rng, trial_specs
 from session import VIDEO_FPS, Session
 from teleop import CorruptionDraw, TeleopChain
 
-from lerobot.policies.steering import N_ACTION_DIMS, AdapterSpec
+from lerobot.policies.steering import N_ACTION_DIMS, SteeringConfig
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
@@ -91,7 +91,11 @@ def trial_matrices(control: ControlSettings, spec: TrialSpec) -> TrialMatrices:
     if control.corruption_family is None:
         return TrialMatrices(control.corruption_matrix, control.reversal_adapter_matrix, None)
     draw = control.corruption_family.sample(corruption_rng(spec))
-    return TrialMatrices(draw.matrix, AdapterSpec.parse(control.reversal_adapter, draw.matrix).matrix, draw)
+    return TrialMatrices(
+        draw.matrix,
+        SteeringConfig.from_spec(control.reversal_adapter, draw.matrix, device="cpu").fixed_matrix,
+        draw,
+    )
 
 
 def build_schedule(task_ids: list[int], n_trials: int, order: str, seed: int) -> list[int]:

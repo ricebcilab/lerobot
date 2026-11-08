@@ -11,7 +11,6 @@ from train import train_adapter
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, sample_layouts
 from lerobot.policies.steering import (
     AdapterModules,
-    AdapterSpec,
     LearnedTaskModule,
     LearnedUserModule,
     SteeringConfig,
@@ -56,18 +55,19 @@ ADAPTERS = ("none", "matrix", "user", "task", "user_task")
 
 
 def _adapters(kind, paths):
-    """The example's adapter and the config's spec for one adapter kind."""
+    """The example's adapter and the config's adapter fields for one adapter kind."""
     f = np.array([[0.8, -0.3], [0.4, 1.1]])
     user_path, task_path = (str(p) for p in paths)
     if kind == "none":
-        return None, None
+        return None, {}
     if kind == "matrix":
-        return f, AdapterSpec(matrix=f)
+        return f, {"adapter_matrix": f}
     user = AdapterModules.load(user_path).user if "user" in kind else None
     task = AdapterModules.load(task_path).task if "task" in kind else None
-    spec = AdapterSpec(
-        user_path=user_path if user is not None else None, task_path=task_path if task is not None else None
-    )
+    spec = {
+        "adapter_user": user_path if user is not None else None,
+        "adapter_task": task_path if task is not None else None,
+    }
     return ReversalAdapter(user=user, task=task), spec
 
 
@@ -88,7 +88,7 @@ def test_predict_action_chunk_is_the_examples_steered_chunk(setup, mode, adapter
         reference=reference if per_step else None,
         **knobs,
     )
-    config = SteeringConfig(mode=mode, adapter=spec, device="cpu")
+    config = SteeringConfig(mode=mode, **spec, device="cpu")
     if per_step:
         config.tau, config.n_reversal_steps, config.lam, config.ic_gain, config.pinned_steps = (
             4,
@@ -115,7 +115,7 @@ def test_forward_is_the_trainers_losses(setup):
     task = AdapterModules.load(paths[1]).task
     user = AdapterModules.load(paths[0]).user
     config = SteeringConfig(
-        adapter=AdapterSpec(user_path=str(paths[0]), task_path=str(paths[1])), lambda_id=0.01, device="cpu"
+        adapter_user=str(paths[0]), adapter_task=str(paths[1]), lambda_id=0.01, device="cpu"
     )
     steering = SteeringPolicy(config, base_policy=policy)
     loss, parts = steering({**obs, "kind": "task", "chunk": chunk, "noise": z, "time": t})
@@ -138,7 +138,7 @@ def test_the_adapters_change_the_steered_chunk(setup):
     chunks = {}
     for kind in ("none", "user_task"):
         steering = SteeringPolicy(
-            SteeringConfig(adapter=_adapters(kind, paths)[1], device="cpu"), base_policy=policy
+            SteeringConfig(**_adapters(kind, paths)[1], device="cpu"), base_policy=policy
         )
         torch.manual_seed(3)
         chunks[kind] = steering.predict_action_chunk({**obs, "command": command})

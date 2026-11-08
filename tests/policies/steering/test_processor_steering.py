@@ -27,7 +27,6 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import (
     DEADBAND,
     AdapterModules,
-    AdapterSpec,
     LearnedTaskModule,
     SceneEncoder,
     SteeringCommandProcessorStep,
@@ -35,7 +34,6 @@ from lerobot.policies.steering import (
     SteeringPolicy,
     SteeringSceneTokensProcessorStep,
     make_steering_pre_post_processors,
-    scene_spec,
 )
 from lerobot.policies.steering.processor_steering import (
     COMMAND,
@@ -94,13 +92,15 @@ def _transition(observation=None, complementary=None):
 
 
 def _config(task_module=None, **kw):
-    adapter = None if task_module is None else AdapterSpec(task_path=str(task_module))
-    return SteeringConfig(adapter=adapter, device="cpu", **kw)
+    adapter = {} if task_module is None else {"adapter_task": str(task_module)}
+    return SteeringConfig(**adapter, device="cpu", **kw)
 
 
 def _task_module(root, source, **kw):
     """A task module checkpoint of ``source`` on SIZE renders (tiny), as the trainer saves one."""
-    module = LearnedTaskModule(horizon=16, d=16, tdim=8, heads=2, layers=1, **scene_spec(source, SIZE), **kw)
+    module = LearnedTaskModule(
+        horizon=16, d=16, tdim=8, heads=2, layers=1, **LearnedTaskModule.spec(source, SIZE), **kw
+    )
     return AdapterModules.save_module(module, root / f"{source}.pt", "task")
 
 

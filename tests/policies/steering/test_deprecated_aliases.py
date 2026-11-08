@@ -300,16 +300,19 @@ def test_core_aliases_equal_the_methods():
 
 
 def test_configuration_aliases_equal_the_methods():
-    from lerobot.policies.steering import AdapterSpec, MatrixHolder
+    from lerobot.policies.steering import MatrixHolder, SteeringConfig
 
     m = [[0.9, -0.1, 0.0], [0.2, 1.1, 0.0], [0.0, 0.0, 1.0]]
-    assert np.array_equal(steering.validate_matrix(m, 3, "m"), AdapterSpec.validate(m, 3, "m"))
-    assert np.array_equal(steering.rotation_about_z(30.0), AdapterSpec.rotation(30.0))
+    assert np.array_equal(steering.validate_matrix(m, 3, "m"), SteeringConfig.checked_matrix(m, 3, "m"))
+    assert np.array_equal(steering.rotation_about_z(30.0), SteeringConfig.rotation(30.0))
     for spec in ({"rotation_z_deg": 15}, {"scale": [1.0, 2.0, 0.5]}, {"M": m}, m):
-        assert np.array_equal(steering.translation_matrix(spec, "c"), AdapterSpec.translation(spec, "c"))
-    corruption = AdapterSpec.rotation(40.0)
+        assert np.array_equal(steering.translation_matrix(spec, "c"), SteeringConfig.translation(spec, "c"))
+    corruption = SteeringConfig.rotation(40.0)
     for spec in (None, {"F": np.eye(7).tolist()}, {"translation": "corruption_inverse", "gripper": "zero"}):
-        old, new = steering.build_reversal_adapter(spec, corruption), AdapterSpec.build(spec, corruption)
+        old, new = (
+            steering.build_reversal_adapter(spec, corruption),
+            SteeringConfig.build_adapter(spec, corruption),
+        )
         assert (old is None and new is None) or np.array_equal(old, new)
     for spec in (
         None,
@@ -318,10 +321,10 @@ def test_configuration_aliases_equal_the_methods():
         {"user": {"translation": "corruption"}},
         {"translation": {"rotation_z_deg": 10}},
     ):
-        parsed = AdapterSpec.parse(spec, corruption)
-        assert isinstance(parsed, AdapterSpec) and steering.parse_adapter_spec(spec, corruption) == parsed
+        parsed = SteeringConfig.from_spec(spec, corruption)
+        assert isinstance(parsed, SteeringConfig) and steering.parse_adapter_spec(spec, corruption) == parsed
     with pytest.raises(ValueError, match="learned module cannot be combined"):
-        AdapterSpec.parse({"user": {"learned": "u.pt", "F": []}})
+        SteeringConfig.from_spec({"user": {"learned": "u.pt", "F": []}})
     assert steering.format_matrix(np.array(m)) == MatrixHolder.format_rows(np.array(m))
 
     class Holder(MatrixHolder):
@@ -344,7 +347,6 @@ def test_every_name_the_package_exported_still_resolves():
         "ACTION_DIMS",
         "AdaptedField",
         "AdapterModules",
-        "AdapterSpec",
         "DEADBAND",
         "FlowControlPolicy",
         "FlowReversalSteeringPolicy",
@@ -366,7 +368,6 @@ def test_every_name_the_package_exported_still_resolves():
         "apply_user_module",
         "as_adapter",
         "build_reversal_adapter",
-        "check_steps",
         "convert_cursor_module",
         "delegation_mask",
         "flow_control_write",
@@ -387,7 +388,6 @@ def test_every_name_the_package_exported_still_resolves():
         "rotation_about_z",
         "save_adapter_module",
         "scene_for",
-        "scene_spec",
         "sinusoidal_time_embedding",
         "task_field_loss",
         "task_velocity_hook",

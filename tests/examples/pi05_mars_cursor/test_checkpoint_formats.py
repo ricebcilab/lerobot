@@ -169,11 +169,16 @@ def test_a_converted_image_task_module_keeps_its_scene_settings(tmp_path):
         LearnedTaskModule,
         SteeringPolicy,
         SteeringSceneTokensProcessorStep,
-        scene_spec,
     )
 
     task = LearnedTaskModule(
-        horizon=16, d=16, tdim=8, heads=2, layers=1, token_geometry="relative", **scene_spec("vlm_image", 48)
+        horizon=16,
+        d=16,
+        tdim=8,
+        heads=2,
+        layers=1,
+        token_geometry="relative",
+        **LearnedTaskModule.spec("vlm_image", 48),
     )
     AdapterModules.save_module(task, tmp_path / "adapters" / "t" / "adapter.pt", "task")
     assert convert_checkpoints.convert_tree(tmp_path, steering=True)["steering"] == 1

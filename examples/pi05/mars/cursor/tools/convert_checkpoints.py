@@ -38,7 +38,7 @@ from pathlib import Path
 import torch
 
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
-from lerobot.policies.steering import (AdapterModules, AdapterSpec, LearnedTaskModule, LearnedUserModule, SteeringConfig,
+from lerobot.policies.steering import (AdapterModules, LearnedTaskModule, LearnedUserModule, SteeringConfig,
                                        SteeringPolicy, make_steering_pre_post_processors)
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
@@ -143,8 +143,8 @@ def convert_adapter_to_policy(path, base_policy_path=None):
         return False
     adapter = AdapterModules.load(path)
     kind = adapter.kind
-    spec = AdapterSpec(user_path=str(path)) if kind == "user" else AdapterSpec(task_path=str(path))
-    config = SteeringConfig(mode="frs", adapter=spec, base_policy_path=None if base_policy_path is None else str(base_policy_path),
+    slot = {"adapter_user": str(path)} if kind == "user" else {"adapter_task": str(path)}
+    config = SteeringConfig(mode="frs", **slot, base_policy_path=None if base_policy_path is None else str(base_policy_path),
                             device="cpu")
     policy = SteeringPolicy(config)
     tmp = Path(tempfile.mkdtemp(prefix=".convert-", dir=path.parent))

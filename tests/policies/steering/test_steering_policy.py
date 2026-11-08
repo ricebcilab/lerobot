@@ -28,7 +28,6 @@ from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy, Flo
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.steering import (
     AdapterModules,
-    AdapterSpec,
     FlowControlSteering,
     FlowReversalSteering,
     LearnedTaskModule,
@@ -93,10 +92,7 @@ def test_the_config_has_the_feature_less_contract():
     ):
         with pytest.raises(ValueError):
             SteeringConfig(**bad)
-    assert (
-        not SteeringConfig().has_task_module
-        and SteeringConfig(adapter=AdapterSpec(task_path="t.pt")).has_task_module
-    )
+    assert not SteeringConfig().has_task_module and SteeringConfig(adapter_task="t.pt").has_task_module
 
 
 def test_the_factory_knows_the_policy():
@@ -132,7 +128,7 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
     user_path, task_path = _modules(tmp_path)
     f = np.array([[0.9, -0.2], [0.3, 1.1]])
     config = SteeringConfig(
-        adapter=AdapterSpec(matrix=f, user_path=str(user_path), task_path=str(task_path)), device="cpu"
+        adapter_matrix=f, adapter_user=str(user_path), adapter_task=str(task_path), device="cpu"
     )
     steering = SteeringPolicy(config, base_policy=_policy())
     assert config.user_module == AdapterModules.load(user_path).user.config  # recorded when read
@@ -143,7 +139,7 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
     user_path.unlink()
     task_path.unlink()  # the saved policy no longer needs the module checkpoints
     loaded = SteeringPolicy.from_pretrained(tmp_path / "steering", base_policy=_policy())
-    assert np.array_equal(loaded.config.adapter.matrix, f) and loaded.config.user_module == config.user_module
+    assert np.array_equal(loaded.config.fixed_matrix, f) and loaded.config.user_module == config.user_module
     assert loaded.state_dict().keys() == steering.state_dict().keys()
     assert all(torch.equal(v, loaded.state_dict()[k]) for k, v in steering.state_dict().items())
     assert not any(
@@ -207,7 +203,7 @@ def test_the_batch_may_carry_the_observation_under_its_prefix(tmp_path):
 def test_forward_needs_the_module_of_its_kind(tmp_path):
     user_path, task_path = _modules(tmp_path)
     steering = SteeringPolicy(
-        SteeringConfig(adapter=AdapterSpec(user_path=str(user_path)), device="cpu"), base_policy=_policy()
+        SteeringConfig(adapter_user=str(user_path), device="cpu"), base_policy=_policy()
     )
     with pytest.raises(ValueError, match="needs a task module"):
         steering({**_obs(), "kind": "task", "chunk": torch.zeros(3, 16, 2)})
@@ -223,7 +219,7 @@ def test_forward_needs_the_module_of_its_kind(tmp_path):
     loss.backward()
     assert parts["field"] == loss.item() and all(p.grad is not None for p in trainable.get_optim_params())
     with pytest.raises(ValueError, match="holds a task module"):
-        SteeringPolicy(SteeringConfig(adapter=AdapterSpec(user_path=str(task_path)), device="cpu"))
+        SteeringPolicy(SteeringConfig(adapter_user=str(task_path), device="cpu"))
 
 
 class _SamplerBase:

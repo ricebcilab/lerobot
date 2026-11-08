@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
-from lerobot.policies.steering.configuration_steering import VLM_SCENE_DIM, VLM_SCENE_TOKENS
+from lerobot.policies.steering import VLM_SCENE_DIM, VLM_SCENE_TOKENS
 from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SceneEncoder
 
 ENCODE_CHUNK = 256  # layouts rendered and encoded at a time

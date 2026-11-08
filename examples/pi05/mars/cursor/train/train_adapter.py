@@ -140,7 +140,7 @@ from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward
                                 reverse_flow, to_action)
 
 from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, AdapterModules, Flow,  # noqa: E402
-                                       LearnedTaskModule, LearnedUserModule, SceneEncoder, scene_spec)
+                                       LearnedTaskModule, LearnedUserModule, SceneEncoder)
 
 # ---------------------------------------------------------------- data
 
@@ -320,7 +320,7 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
     tic = time.time()
     demo, step, start = frame_steps(lengths, args.view_stride)
     pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
-    spec = scene_spec("vlm_views", args.render_size, wrist_span=args.wrist_span)
+    spec = LearnedTaskModule.spec("vlm_views", args.render_size, wrist_span=args.wrist_span)
     rng = affine_rng if affine_rng is not None else np.random.default_rng([args.seed, 7])
     workers = args.render_workers
 
@@ -735,7 +735,7 @@ def train_task(args, policy, device, rng):
     if args.token_source in STORED_SOURCES and args.scene_rank:
         views = dict(scene_rank=args.scene_rank)
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
-                      **scene_spec(args.token_source, args.render_size, **views)).to(device)
+                      **LearnedTaskModule.spec(args.token_source, args.render_size, **views)).to(device)
     if views.get("scene_rank"):
         task.set_reduction(*(args.view_reduction if args.token_source == "vlm_views" else args.scene_reduction))
     adapted = ReversalAdapter(task=task)

@@ -28,7 +28,6 @@ from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, render_la
 from lerobot.policies.steering import (
     LearnedTaskModule,
     SceneEncoder,
-    scene_spec,
 )
 
 
@@ -61,7 +60,7 @@ def test_scene_spec_builds_a_module_that_accepts_scene_for():
     lay = _layouts()
     stub = Stub()
     for src in ("vlm_image", "vlm_prefix", "cnn"):
-        spec = scene_spec(src, 112)
+        spec = LearnedTaskModule.spec(src, 112)
         m = LearnedTaskModule(horizon=16, **spec)
         arr = SceneEncoder.scene_array(lay, src, 112, encoder=stub)
         assert arr.shape[0] == 4 and (arr.dtype == np.uint8 if src == "cnn" else arr.dtype == np.float16)
@@ -70,16 +69,17 @@ def test_scene_spec_builds_a_module_that_accepts_scene_for():
         assert a.shape == (4, 16, 2, 2)
     assert (
         stub.calls[0] == (4, 3, 112, 112)
-        and scene_spec("vlm_image")["scene_tokens"] == 256
-        and scene_spec("cnn")["scene_tokens"] == 196
+        and LearnedTaskModule.spec("vlm_image")["scene_tokens"] == 256
+        and LearnedTaskModule.spec("cnn")["scene_tokens"] == 196
     )
     assert (
-        scene_spec("vlm_image", 112)["scene_tokens"] == 256 and scene_spec("cnn", 112)["scene_tokens"] == 49
+        LearnedTaskModule.spec("vlm_image", 112)["scene_tokens"] == 256
+        and LearnedTaskModule.spec("cnn", 112)["scene_tokens"] == 49
     )
     with pytest.raises(ValueError):
         SceneEncoder.scene_array(lay, "discs")
     with pytest.raises(ValueError):
-        scene_spec("cnn", 50)
+        LearnedTaskModule.spec("cnn", 50)
 
 
 def test_steering_imports_without_transformers():

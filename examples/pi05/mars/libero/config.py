@@ -24,7 +24,7 @@ from teleop import (
     check_input_gain,
 )
 
-from lerobot.policies.steering import OPERATOR_DIM_GROUPS, AdapterSpec
+from lerobot.policies.steering import OPERATOR_DIM_GROUPS, SteeringConfig
 
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")
@@ -326,13 +326,16 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             basis = control.corruption_matrix
         else:  # each trial draws its corruption, and the fixed adapter with it: only check the spec here
             basis = np.eye(3)
-    adapter = AdapterSpec.parse(control.reversal_adapter, basis, f"{where}: control.reversal_adapter")
-    control.reversal_adapter_matrix = None if control.corruption_family is not None else adapter.matrix
+    # the spec is read for its adapter fields alone, so the config is a CPU one
+    adapter = SteeringConfig.from_spec(
+        control.reversal_adapter, basis, f"{where}: control.reversal_adapter", device="cpu"
+    )
+    control.reversal_adapter_matrix = None if control.corruption_family is not None else adapter.fixed_matrix
     # Module checkpoints are loaded (and their existence checked) by the session, so a condition file
     # can be inspected (--dry-run, tests) before its modules are trained.
     control.reversal_adapter_user_path, control.reversal_adapter_task_path = (
-        adapter.user_path,
-        adapter.task_path,
+        adapter.adapter_user,
+        adapter.adapter_task,
     )
     control.resolved_input_gain = resolve_input_gain(control, where)
     return control

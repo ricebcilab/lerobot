@@ -18,46 +18,34 @@
 
 The package keeps lerobot's layout for a policy:
 
-- ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``), the action space and the operator's
-  view of it (``TeleopSource``, ``DEADBAND``, ``OPERATOR_DIM_GROUPS``), ``AdapterSpec`` (a ``reversal_adapter``
-  spec: ``parse``, ``build`` and the matrix helpers) and ``MatrixHolder``.
-- ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy) and the cores it wraps: the MARS modules
-  (``LearnedUserModule``, ``LearnedTaskModule``, the composed ``AdapterModules`` with their checkpoints and the
-  holder ``ReversalAdapter``), ``AdaptedField``, ``Flow`` (the one Euler integrator and what is built on it) and
-  the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``.
-- ``processor_steering``: ``SceneEncoder``, the steps ``SteeringSceneTokensProcessorStep`` and
-  ``SteeringCommandProcessorStep``, and ``make_steering_pre_post_processors``.
+- ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``; its adapter fields, ``from_spec`` and
+  the matrix helpers of a ``reversal_adapter`` spec), and the constants its validation reads.
+- ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy) and the cores it wraps: the two methods,
+  ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's ``TeleopSource``; the MARS modules
+  (``LearnedUserModule``, ``LearnedTaskModule``, the composed ``AdapterModules`` with their checkpoints, and the
+  holders ``MatrixHolder`` / ``ReversalAdapter``); ``AdaptedField``; and ``Flow``, the one Euler integrator and what
+  is built on it.
+- ``processor_steering``: ``make_steering_pre_post_processors``, the steps ``SteeringSceneTokensProcessorStep`` and
+  ``SteeringCommandProcessorStep``, and ``SceneEncoder``, the engine of the scene step.
 
-The module-level functions and the two ``...Policy`` core names these classes replaced stay importable for one round
-as deprecated aliases (each says so in its docstring; ``FlowControlPolicy`` is ``FlowControlSteering``,
-``FlowReversalSteeringPolicy`` is ``FlowReversalSteering``). The modules' training loop is not the package's: it
-lives in the trainers that run it."""
+The modules' training loop is not the package's: it lives in the trainers that run it."""
 
 from .configuration_steering import (
     ACTION_DIMS,
-    DEADBAND,
-    GRIPPER_CLOSE,
     GRIPPER_DIM,
-    GRIPPER_OPEN,
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
     SCENE_SOURCES,
     TOKEN_GEOMETRIES,
-    VLM_VIEWS_TOKENS,
-    AdapterSpec,
-    MatrixHolder,
     SteeringConfig,
-    TeleopSource,
-    build_reversal_adapter,
-    check_steps,
-    format_matrix,
-    parse_adapter_spec,
-    rotation_about_z,
-    scene_spec,
-    translation_matrix,
-    validate_matrix,
 )
 from .modeling_steering import (
+    DEADBAND,
+    GRIPPER_CLOSE,
+    GRIPPER_OPEN,
+    VLM_SCENE_DIM,
+    VLM_SCENE_TOKENS,
+    VLM_VIEWS_TOKENS,
     AdaptedField,
     AdapterModules,
     Flow,
@@ -67,13 +55,17 @@ from .modeling_steering import (
     FlowReversalSteeringPolicy,
     LearnedTaskModule,
     LearnedUserModule,
+    MatrixHolder,
     ReversalAdapter,
     SteeringPolicy,
+    TeleopSource,
     apply_user_module,
     as_adapter,
+    build_reversal_adapter,
     convert_cursor_module,
     delegation_mask,
     flow_control_write,
+    format_matrix,
     forward_flow,
     frs_latent,
     frs_schedule,
@@ -82,15 +74,19 @@ from .modeling_steering import (
     integrate,
     load_adapter_module,
     paired_chunks,
+    parse_adapter_spec,
     reduce_tokens,
     regenerate,
     reverse_flow,
+    rotation_about_z,
     save_adapter_module,
     sinusoidal_time_embedding,
     task_field_loss,
     task_velocity_hook,
+    translation_matrix,
     uniform_reference,
     user_field_loss,
+    validate_matrix,
 )
 from .processor_steering import (
     SceneEncoder,
@@ -103,41 +99,40 @@ from .processor_steering import (
 )
 
 __all__ = [
-    # the policy, its config and its processors
+    # the config, the policy and its processors
     "SteeringConfig",
     "SteeringPolicy",
+    "make_steering_pre_post_processors",
     "SteeringCommandProcessorStep",
     "SteeringSceneTokensProcessorStep",
-    "make_steering_pre_post_processors",
     # the cores and the module classes
-    "AdaptedField",
-    "AdapterModules",
-    "AdapterSpec",
-    "Flow",
     "FlowControlSteering",
     "FlowReversalSteering",
-    "LearnedTaskModule",
+    "TeleopSource",
     "LearnedUserModule",
+    "LearnedTaskModule",
+    "AdapterModules",
+    "AdaptedField",
     "MatrixHolder",
     "ReversalAdapter",
+    "Flow",
     "SceneEncoder",
-    "TeleopSource",
     "as_adapter",
-    "check_steps",
-    "scene_spec",
     "sinusoidal_time_embedding",
     # the action space and the scene specs
     "ACTION_DIMS",
-    "DEADBAND",
-    "GRIPPER_CLOSE",
+    "N_ACTION_DIMS",
     "GRIPPER_DIM",
     "GRIPPER_OPEN",
-    "N_ACTION_DIMS",
+    "GRIPPER_CLOSE",
     "OPERATOR_DIM_GROUPS",
+    "DEADBAND",
     "SCENE_SOURCES",
     "TOKEN_GEOMETRIES",
+    "VLM_SCENE_TOKENS",
     "VLM_VIEWS_TOKENS",
-    # deprecated aliases, kept for one round
+    "VLM_SCENE_DIM",
+    # deprecated aliases (removed by the next commit)
     "FlowControlPolicy",
     "FlowReversalSteeringPolicy",
     "apply_user_module",

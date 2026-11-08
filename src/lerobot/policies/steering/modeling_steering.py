@@ -22,34 +22,40 @@ pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTa
 ``configuration_steering``'s, the pre-processing ``processor_steering``'s; this folder's README describes the
 methods. The module-level functions at the end are deprecated aliases of the methods that replaced them."""
 
+import functools
 import math
 from collections import deque
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 
+from lerobot.envs.cursor import SCENE_SIZE
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.teleoperators import readout
 
 from .configuration_steering import (
-    DEADBAND,
     GRIPPER_DIM,
-    GRIPPER_OPEN,
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
     SCENE_SOURCES,
     TOKEN_GEOMETRIES,
-    AdapterSpec,
-    MatrixHolder,
     SteeringConfig,
-    TeleopSource,
-    check_steps,
-    deprecated_alias,
 )
+
+GRIPPER_OPEN = -1.0
+GRIPPER_CLOSE = 1.0
+# the default `deadband` of the cores: below this (env units) the operator counts as idle
+DEADBAND = readout.DEADBAND
+# The task module's image token specs (``LearnedTaskModule.spec``); the scene encoder's are ``processor_steering``'s.
+VLM_SCENE_TOKENS = 256  # SigLIP's patches of the 224 px input every render is resized to
+VLM_VIEWS_TOKENS = 2 * VLM_SCENE_TOKENS  # vlm_views: the overhead view's tokens, then the wrist view's
+VLM_SCENE_DIM = 2048  # the width of pi0.5's prefix (SigLIP after the multimodal projector, and Gemma's)
+CNN_PATCH = 16  # the task module's CNN stem downsamples by 16
 
 # ---------------------------------------------------------------- MARS: modular reversal adapters
 
@@ -428,6 +434,64 @@ class LearnedTaskModule(nn.Module):
             self.register_buffer("scene_mean", torch.zeros(scene_dim))
             self.register_buffer("scene_basis", torch.zeros(scene_dim, scene_rank))
 
+    @classmethod
+    def spec(
+        cls,
+        source: str,
+        size: int = SCENE_SIZE,
+        *,
+        wrist_span: float | None = None,
+        scene_rank: int | None = None,
+    ) -> dict:
+        """The ``LearnedTaskModule`` kwargs for ``source`` on size-``size`` renders: ``discs`` needs none beyond
+        the source; ``vlm_*`` read 256 tokens of width 2048 whatever the size (the encoder resizes every render
+        to 224 for SigLIP; ``size`` is only what is drawn and cached); ``cnn`` reads the render itself,
+        ``(size // 16) ** 2`` tokens (size a multiple of 16); ``vlm_views`` reads both views' tokens (512 of
+        width 2048) and needs the wrist view's ``wrist_span`` (> 0, ``vlm_views`` alone). Every ``vlm_*`` source takes
+        an optional ``scene_rank`` (1..2047), the width of the carried token reduction; ``vlm_views`` always has the
+        key (None: full width), the others only when it is set. ``discs`` and ``cnn`` have no 2048-wide tokens to
+        reduce."""
+        if source not in SCENE_SOURCES:
+            raise ValueError(f"source must be one of {SCENE_SOURCES}, got {source!r}")
+        if source != "vlm_views" and wrist_span is not None:  # nosec B105
+            raise ValueError(f"wrist_span belongs to source 'vlm_views', not {source!r}")
+        if scene_rank is not None:
+            if not source.startswith("vlm_"):
+                raise ValueError(f"scene_rank reduces the vlm_* sources' tokens, not source {source!r}'s")
+            if not 1 <= scene_rank < VLM_SCENE_DIM:
+                raise ValueError(f"scene_rank must be in 1..{VLM_SCENE_DIM - 1}, got {scene_rank}")
+        if source == "discs":  # nosec B105
+            return {"token_source": "discs"}
+        if size <= 0:
+            raise ValueError(f"size must be positive, got {size}")
+        if source == "cnn":  # nosec B105
+            if size % CNN_PATCH:
+                raise ValueError(f"source 'cnn' needs a size that is a multiple of {CNN_PATCH}, got {size}")
+            return {
+                "token_source": "cnn",
+                "scene_dim": None,
+                "scene_tokens": (size // CNN_PATCH) ** 2,
+                "image_size": size,
+            }
+        if source == "vlm_views":  # nosec B105
+            if wrist_span is None or wrist_span <= 0:
+                raise ValueError(f"source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
+            return {
+                "token_source": source,
+                "scene_dim": VLM_SCENE_DIM,
+                "scene_tokens": VLM_VIEWS_TOKENS,
+                "image_size": size,
+                "wrist_span": wrist_span,
+                "scene_rank": scene_rank,
+            }
+        return {
+            "token_source": source,
+            "scene_dim": VLM_SCENE_DIM,
+            "scene_tokens": VLM_SCENE_TOKENS,
+            "image_size": size,
+            **({} if scene_rank is None else {"scene_rank": scene_rank}),
+        }
+
     def set_reduction(self, mean: torch.Tensor, basis: torch.Tensor) -> None:
         """Set the fixed linear token reduction: ``mean`` (scene_dim,), ``basis`` (scene_dim, scene_rank)."""
         if self.scene_rank is None:
@@ -560,6 +624,38 @@ class LearnedTaskModule(nn.Module):
         fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
         identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
         return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
+
+
+class MatrixHolder:
+    """Mutable holder for an optional square matrix (None = off) with a display label.
+
+    Consumers read the holder on every use, so replacing ``matrix`` takes effect
+    immediately; the setter validates the shape.
+    """
+
+    size: int
+    where: str
+
+    def __init__(self, matrix=None, label: str | None = None):
+        self.matrix = matrix
+        self.label = label
+
+    @property
+    def matrix(self) -> np.ndarray | None:
+        return self._matrix
+
+    @matrix.setter
+    def matrix(self, value) -> None:
+        self._matrix = None if value is None else SteeringConfig.checked_matrix(value, self.size, self.where)
+
+    def format(self) -> str:
+        """The holder's matrix on one line, for the terminal (``format_rows``); "off" when it holds none."""
+        return "off" if self._matrix is None else self.format_rows(self._matrix)
+
+    @staticmethod
+    def format_rows(matrix: np.ndarray) -> str:
+        """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
+        return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
 
 
 class ReversalAdapter(MatrixHolder):
@@ -934,7 +1030,7 @@ class Flow:
                 f"noise_time must be 1.0 (pi0.5: t = 1 noise) or 0.0 (the cursor: t = 0 noise), got {noise_time}"
             )
         n = steps if n_reverse_steps is None else n_reverse_steps
-        check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
+        _ChunkSteering.check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
         action_time = 1.0 - noise_time
         return action_time + (noise_time - action_time) * n / steps, n
 
@@ -1047,6 +1143,18 @@ class Flow:
 # ``noise_time`` 1.0 is pi0.5's (t = 1 noise, t = 0 action), 0.0 the cursor's.
 
 
+class TeleopSource(Protocol):
+    """What the steering cores read: the operator's current command."""
+
+    @property
+    def translation(self) -> np.ndarray:  # shape (3,), env units in [-1, 1]
+        ...
+
+    @property
+    def gripper(self) -> float:  # GRIPPER_OPEN or GRIPPER_CLOSE
+        ...
+
+
 class _ChunkSteering:
     """What both steering wrappers share. ``steered_chunk(batch, commands)`` turns a batch of operator commands,
     one per row (a row inside ``deadband`` counts as idle and gets the policy's own chunk), into the steered chunk
@@ -1086,6 +1194,16 @@ class _ChunkSteering:
             .amax(-1)
         )
         return (magnitude.amax(-1) if magnitude.dim() == 2 else magnitude) >= self.deadband
+
+    @staticmethod
+    def check_steps(name: str, value, low: int, high: int, unit: str, optional: bool = False) -> None:
+        """Raise unless ``value`` is an integer (not a bool) in [``low``, ``high``] ``unit``, or None when
+        ``optional``: the one check of the step knobs (tau, lambda, n_reversal_steps, pinned_steps)."""
+        if optional and value is None:
+            return
+        if not (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high):
+            none = "None or " if optional else ""
+            raise ValueError(f"{name} must be {none}an integer in [{low}, {high}] ({unit}), got {value!r}")
 
     @staticmethod
     def _per_row(chunk: torch.Tensor, plain: torch.Tensor, steer: torch.Tensor) -> torch.Tensor:
@@ -1195,7 +1313,7 @@ class FlowControlSteering(_ChunkSteering):
     @tau.setter
     def tau(self, value: int | None) -> None:
         chunk = self._policy.config.chunk_size
-        check_steps("tau", value, 1, chunk, "chunk steps", optional=True)
+        self.check_steps("tau", value, 1, chunk, "chunk steps", optional=True)
         self._tau = chunk if value is None else value
 
     @property
@@ -1204,7 +1322,7 @@ class FlowControlSteering(_ChunkSteering):
 
     @lam.setter
     def lam(self, value: int) -> None:
-        check_steps("lam", value, 0, self._policy.config.num_inference_steps, "Euler steps")
+        self.check_steps("lam", value, 0, self._policy.config.num_inference_steps, "Euler steps")
         self._lam = value
 
     @property
@@ -1406,7 +1524,7 @@ class FlowReversalSteering(_ChunkSteering):
     @pinned_steps.setter
     def pinned_steps(self, value: int | None) -> None:
         cfg = self._policy.config
-        check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
+        self.check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
         self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
         self._pinned_steps = value
 
@@ -1417,7 +1535,7 @@ class FlowReversalSteering(_ChunkSteering):
     @n_reversal_steps.setter
     def n_reversal_steps(self, value: int | None) -> None:
         total = self._policy.config.num_inference_steps
-        check_steps("n_reversal_steps", value, 1, total, "Euler steps", optional=True)
+        self.check_steps("n_reversal_steps", value, 1, total, "Euler steps", optional=True)
         self._n_reversal_steps = None if value == total else value
 
     def _normalize_gripper(self, gripper: float) -> float:
@@ -1591,10 +1709,9 @@ class SteeringPolicy(PreTrainedPolicy):
 
     def __init__(self, config: SteeringConfig, base_policy=None, postprocessor=None, **kwargs: Any):
         super().__init__(config)
-        spec = config.adapter or AdapterSpec()
-        user = self._module("user", config.user_module, spec.user_path)
-        task = self._module("task", config.task_module, spec.task_path)
-        self.adapter = AdapterModules(user=user, task=task, matrix=spec.matrix, n_dims=config.n_dims)
+        user = self._module("user", config.user_module, config.adapter_user)
+        task = self._module("task", config.task_module, config.adapter_task)
+        self.adapter = AdapterModules(user=user, task=task, matrix=config.fixed_matrix, n_dims=config.n_dims)
         object.__setattr__(
             self, "_base_policy", base_policy
         )  # not a submodule: its weights are not this policy's
@@ -1816,6 +1933,21 @@ class SteeringPolicy(PreTrainedPolicy):
 # The module-level functions these methods replaced, each calling its method; a later round removes them.
 
 
+def deprecated_alias(target: Callable[..., Any], name: str, new: str) -> Callable[..., Any]:
+    """A function named ``name`` that calls ``target`` with its arguments: the deprecated alias of ``new`` (a
+    method that replaced a module-level function of this package), kept for one round."""
+
+    @functools.wraps(target)
+    def alias(*args: Any, **kwargs: Any) -> Any:
+        return target(*args, **kwargs)
+
+    alias.__name__ = alias.__qualname__ = name
+    alias.__doc__ = (
+        f"Deprecated alias of ``{new}``, kept for one round: call ``{new}``.\n\n{target.__doc__ or ''}"
+    )
+    return alias
+
+
 def integrate(
     x: torch.Tensor,
     velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
@@ -1922,3 +2054,17 @@ task_velocity_hook = deprecated_alias(
 get_action_mean_std = deprecated_alias(
     FlowControlSteering.action_mean_std, "get_action_mean_std", "FlowControlSteering.action_mean_std"
 )
+validate_matrix = deprecated_alias(
+    SteeringConfig.checked_matrix, "validate_matrix", "SteeringConfig.checked_matrix"
+)
+rotation_about_z = deprecated_alias(SteeringConfig.rotation, "rotation_about_z", "SteeringConfig.rotation")
+translation_matrix = deprecated_alias(
+    SteeringConfig.translation, "translation_matrix", "SteeringConfig.translation"
+)
+build_reversal_adapter = deprecated_alias(
+    SteeringConfig.build_adapter, "build_reversal_adapter", "SteeringConfig.build_adapter"
+)
+parse_adapter_spec = deprecated_alias(
+    SteeringConfig.from_spec, "parse_adapter_spec", "SteeringConfig.from_spec"
+)
+format_matrix = deprecated_alias(MatrixHolder.format_rows, "format_matrix", "MatrixHolder.format_rows")
