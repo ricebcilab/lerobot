@@ -9,6 +9,7 @@ from cursor_sa import paths
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
 from cursor_sa.steering import steered_chunk
 
+from lerobot.policies.cursor_flow import make_cursor_flow_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
@@ -80,7 +81,8 @@ def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens, monkeyp
 
 
 def test_policy_chunk_is_the_lerobot_policy_chunk(tmp_path):
-    """The example's plain policy chunk (steered_chunk in mode "policy") is CursorFlowPolicy.predict_action_chunk."""
+    """The example's plain policy chunk (steered_chunk in mode "policy") is CursorFlowPolicy.predict_action_chunk,
+    through its postprocessor (to screen units)."""
     _old_policy(tmp_path, "p", obstacle_tokens=True)
     convert_checkpoints.convert_tree(tmp_path)
     policy = CursorFlowPolicy.from_pretrained(tmp_path / "policies" / "p", strict=True)
@@ -88,7 +90,8 @@ def test_policy_chunk_is_the_lerobot_policy_chunk(tmp_path):
     torch.manual_seed(11)
     ours = steered_chunk(policy.model, obs, torch.zeros(3, 2), "policy")
     torch.manual_seed(11)
-    assert torch.equal(policy.predict_action_chunk(obs), ours)
+    post = make_cursor_flow_pre_post_processors(policy.config)[1]
+    assert torch.equal(post(policy.predict_action_chunk(obs)), ours)
 
 
 def test_converted_adapters_load_as_before(tmp_path):
@@ -146,22 +149,24 @@ def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_modu
         convert_checkpoints.convert_tree(tmp_path, steering=True)["steering"] == 0
     )  # a re-run converts nothing
     obs, command = _obs(), torch.tensor([[0.5, -0.3], [0.0, 0.0], [-0.7, 0.2]])
+    base = CursorFlowPolicy.wrapping(policy)
+    cursor_post = make_cursor_flow_pre_post_processors(base.config)[1]  # the base's: to screen units
     for n in ("u", "group/t"):
         folder = tmp_path / "adapters" / n
         assert folder.joinpath("adapter.pt").read_bytes() == before[n]  # adapter.pt stays as it was
-        steering = SteeringPolicy.from_pretrained(folder, base_policy=policy)
+        steering = SteeringPolicy.from_pretrained(folder, base_policy=base, postprocessor=cursor_post)
         assert (steering.config.mode, steering.config.base_policy_path) == ("frs", str(tmp_path / "base"))
         adapter = AdapterModules.load(folder / "adapter.pt")  # before the seed: building a module draws
         torch.manual_seed(3)
         want = steered_chunk(policy, obs, command, "frs", adapter=adapter)
         torch.manual_seed(3)
-        assert torch.equal(steering.predict_action_chunk({**obs, "command": command}), want)
+        assert torch.equal(cursor_post(steering.predict_action_chunk({**obs, "command": command})), want)
         pre, post = make_pre_post_processors(
             steering.config, pretrained_path=str(folder)
         )  # the factory's reload
         batch = pre({**{f"observation.{k}": v for k, v in obs.items()}, "command": command})
         torch.manual_seed(3)
-        assert torch.equal(post(steering.predict_action_chunk(batch)), want)
+        assert torch.equal(cursor_post(post(steering.predict_action_chunk(batch))), want)
 
 
 def test_a_converted_image_task_module_keeps_its_scene_settings(tmp_path):

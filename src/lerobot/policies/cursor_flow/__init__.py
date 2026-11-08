@@ -14,5 +14,6 @@
 
 from .configuration_cursor_flow import CursorFlowConfig
 from .modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
+from .processor_cursor_flow import make_cursor_flow_pre_post_processors
 
-__all__ = ["CursorFlowConfig", "CursorFlowPolicy", "FlowPolicy"]
+__all__ = ["CursorFlowConfig", "CursorFlowPolicy", "FlowPolicy", "make_cursor_flow_pre_post_processors"]

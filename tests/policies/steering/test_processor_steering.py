@@ -22,7 +22,7 @@ import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
-from lerobot.policies.cursor_flow import FlowPolicy
+from lerobot.policies.cursor_flow import CursorFlowPolicy, FlowPolicy, make_cursor_flow_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import (
     DEADBAND,
@@ -252,9 +252,13 @@ def test_a_round_trip_through_the_pre_pipeline_into_the_policy(mode):
     """The pre pipeline's batch (the cursor's observation under ``observation.``, the operator's raw command) gives
     the chunk the policy makes of the observation and the command directly."""
     torch.manual_seed(0)
-    base = FlowPolicy(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123).eval()
+    base = CursorFlowPolicy.wrapping(
+        FlowPolicy(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123).eval()
+    )
     config = _config(mode=mode)
-    policy = SteeringPolicy(config, base_policy=base)
+    policy = SteeringPolicy(
+        config, base_policy=base, postprocessor=make_cursor_flow_pre_post_processors(base.config)[1]
+    )
     pre, post = make_steering_pre_post_processors(config)
     g = torch.Generator().manual_seed(1)
     obs = {

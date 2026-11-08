@@ -29,7 +29,7 @@ from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamWConfig, LRSchedulerConfig, OptimizerConfig
 from lerobot.teleoperators import readout
 
-STEERING_MODES = ("flow_control", "frs")
+STEERING_MODES = ("none", "flow_control", "frs")
 SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")
 # absolute: a learned position per image token (round 1); relative: the token centre's offset from the cursor
 # through the disc-token MLP
@@ -64,8 +64,9 @@ class SteeringConfig(PreTrainedConfig):
     too).
 
     Args:
-        mode: ``"flow_control"`` (Kao et al. 2026) or ``"frs"`` (Flow Reversal Steering, Tang et al. 2026; MARS
-            with an adapter).
+        mode: ``"flow_control"`` (Kao et al. 2026), ``"frs"`` (Flow Reversal Steering, Tang et al. 2026; MARS
+            with an adapter), or ``"none"`` (the base policy's own chunk through the task module's velocity hook, the
+            command ignored; no steering core).
         tau: Flow control: the chunk steps the command is written into (None: the whole chunk).
         lam: Flow control: the Euler steps the command is written at (lambda; 1 = the initial condition only).
         ic_gain: Flow control: the command's scale in the noise prior (a full push writes ``ic_gain`` sigma).
@@ -87,11 +88,15 @@ class SteeringConfig(PreTrainedConfig):
         lambda_id: The task module's pull of A, b toward the identity in ``forward``.
         n_dims: The action dims the adapter acts on, and the most dims an operator's command may have (the command
             step refuses a wider one): 2 on the cursor, 3 for a pi0.5 base's translation.
-        horizon: The base policy's chunk length (when it does not say).
-        num_inference_steps: The base policy's Euler steps per chunk (a ``sample_chunk`` policy's, as the cursor's).
-        n_action_steps: The chunk steps executed per replan.
-        max_speed: The command's speed at full deflection, in action units per second (FRS's reference).
-        dt: The control period in seconds (FRS's reference: a full push moves ``max_speed * dt`` per step).
+        horizon: The base policy's chunk length, as recorded; ``SteeringPolicy`` reads the base's own
+            (``config.chunk_size``, the sampler contract's).
+        num_inference_steps: The base policy's Euler steps per chunk, as recorded; ``SteeringPolicy`` reads the
+            base's own (``config.num_inference_steps``).
+        n_action_steps: The chunk steps executed per replan, as recorded; ``SteeringPolicy.select_action`` serves the
+            base's own (``config.n_action_steps``).
+        max_speed: The command's speed at full deflection, in action units per second (FRS's reference in an action
+            space without the 7-D operator space's gripper dim, the cursor's; pi0.5's uses the command as is).
+        dt: The control period in seconds (that reference: a full push moves ``max_speed * dt`` per step).
         base_policy_type: The registered type of the policy whose chunks are steered.
         base_policy_path: Its checkpoint (a directory or a Hub repo id), loaded when no base policy is passed.
         scene_source: The task module's token source (``SCENE_SOURCES``).

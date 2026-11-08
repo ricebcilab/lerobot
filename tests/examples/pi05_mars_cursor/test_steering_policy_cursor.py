@@ -9,6 +9,7 @@ from cursor_sa.steering import observation, steered_chunk
 from train import train_adapter
 
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, sample_layouts
+from lerobot.policies.cursor_flow import CursorFlowPolicy, make_cursor_flow_pre_post_processors
 from lerobot.policies.steering import (
     AdapterModules,
     LearnedTaskModule,
@@ -97,13 +98,15 @@ def test_predict_action_chunk_is_the_examples_steered_chunk(setup, mode, adapter
             1.5,
             12,
         )
-    steering = SteeringPolicy(config, base_policy=policy)
+    base = CursorFlowPolicy.wrapping(policy)
+    post = make_cursor_flow_pre_post_processors(base.config)[1]
+    steering = SteeringPolicy(config, base_policy=base, postprocessor=post)
     torch.manual_seed(3)
-    got = steering.predict_action_chunk({**obs, "command": reference if per_step else command})
+    got = post(steering.predict_action_chunk({**obs, "command": reference if per_step else command}))
     assert torch.isfinite(want).all() and torch.equal(got, want)
     torch.manual_seed(3)
     assert torch.equal(
-        steering.select_action({**obs, "command": reference if per_step else command}), want[:, 0]
+        post(steering.select_action({**obs, "command": reference if per_step else command})), want[:, 0]
     )
 
 
@@ -117,7 +120,9 @@ def test_forward_is_the_trainers_losses(setup):
     config = SteeringConfig(
         adapter_user=str(paths[0]), adapter_task=str(paths[1]), lambda_id=0.01, device="cpu"
     )
-    steering = SteeringPolicy(config, base_policy=policy)
+    base = CursorFlowPolicy.wrapping(policy)
+    post = make_cursor_flow_pre_post_processors(base.config)[1]
+    steering = SteeringPolicy(config, base_policy=base, postprocessor=post)
     loss, parts = steering({**obs, "kind": "task", "chunk": chunk, "noise": z, "time": t})
     want, want_parts = train_adapter.task_loss(policy, task, obs, chunk, z, t, 0.01)
     assert torch.equal(loss, want) and parts == want_parts
@@ -136,9 +141,11 @@ def test_forward_is_the_trainers_losses(setup):
 def test_the_adapters_change_the_steered_chunk(setup):
     policy, paths, obs, command, _ = setup
     chunks = {}
+    base = CursorFlowPolicy.wrapping(policy)
+    post = make_cursor_flow_pre_post_processors(base.config)[1]
     for kind in ("none", "user_task"):
         steering = SteeringPolicy(
-            SteeringConfig(**_adapters(kind, paths)[1], device="cpu"), base_policy=policy
+            SteeringConfig(**_adapters(kind, paths)[1], device="cpu"), base_policy=base, postprocessor=post
         )
         torch.manual_seed(3)
         chunks[kind] = steering.predict_action_chunk({**obs, "command": command})

@@ -24,7 +24,8 @@ import torch
 
 from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowConfig
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
-from lerobot.policies.factory import get_policy_class, make_policy_config
+from lerobot.policies.cursor_flow.processor_cursor_flow import make_cursor_flow_pre_post_processors
+from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.policies.steering import (
     AdapterModules,
     Flow,
@@ -64,7 +65,8 @@ def _obs(b: int = 3, n_targets: int = 4, n_obstacles: int = 2, seed: int = 1) ->
     goal = torch.zeros(b, n_targets, dtype=torch.bool)
     goal[:, 0] = True
     obstacle_mask = torch.ones(b, n_obstacles, dtype=torch.bool)
-    obstacle_mask[1] = False
+    if b > 1:
+        obstacle_mask[1] = False
     return {
         "pos": torch.rand(b, 2, generator=g),
         "hist": 0.01 * torch.randn(b, 4, 2, generator=g),
@@ -103,25 +105,119 @@ def test_round_trip_is_exact(tmp_path, obstacle_tokens):
 
 
 def test_predict_action_chunk_is_the_plain_policy_chunk():
-    """The plain policy chunk: noise drawn first, then the core's 10-step Euler flow in the t = 0 noise convention
-    (``FlowPolicy.sample_chunk``, the loop the steering wrappers drive), times the action scale."""
+    """The plain policy chunk, normalized: noise drawn first, then the core's 10-step Euler flow in the t = 0 noise
+    convention (``FlowPolicy.sample_chunk``, the loop the steering wrappers drive); the postprocessor scales it to
+    screen units."""
     model = _small_policy(True)
     policy = CursorFlowPolicy(CursorFlowConfig(**model.config, action_scale=0.0123, device="cpu"))
     policy.model.load_state_dict(model.state_dict())
+    _, post = make_cursor_flow_pre_post_processors(policy.config)
     obs = _obs()
     torch.manual_seed(7)
     noise = torch.randn(3, model.horizon, 2)
-    expected = (
-        Flow(lambda x, t: model(obs, x, t), batch_time=True).integrate(noise, 0.0, 0.1, 10)
-        * model.action_scale
-    )
+    expected = Flow(lambda x, t: model(obs, x, t), batch_time=True).integrate(noise, 0.0, 0.1, 10)
     torch.manual_seed(7)
     chunk = policy.predict_action_chunk(obs)
     assert chunk.shape == (3, 16, 2) and torch.equal(chunk, expected)
+    assert torch.equal(post(chunk), expected * model.action_scale)
     torch.manual_seed(7)
     assert torch.equal(policy.select_action(obs), expected[:, 0])
     with pytest.raises(NotImplementedError, match="train_policy.py"):
         policy.forward(obs)
+
+
+def _contract_policy() -> CursorFlowPolicy:
+    torch.manual_seed(0)
+    return CursorFlowPolicy(
+        CursorFlowConfig(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123)
+    ).eval()
+
+
+def test_predict_action_chunk_is_normalized_and_passes_hooks():
+    policy = CursorFlowPolicy(CursorFlowConfig(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123))
+    obs = _obs()
+    z = torch.randn(3, policy.config.horizon, 2)
+    seen = {}
+
+    def hook(step, t, x):
+        return seen.setdefault("steps", []).append(step) or x
+
+    chunk = policy.predict_action_chunk(obs, noise=z, x_t_hook=hook)
+    assert torch.equal(chunk, policy.model.sample_chunk(obs, 10, noise=z))
+    assert seen["steps"] == list(range(10))
+    assert policy.config.chunk_size == policy.horizon and policy.config.noise_time == 0.0
+
+
+def test_the_postprocessor_restores_screen_units_exactly():
+    policy = CursorFlowPolicy(CursorFlowConfig(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123))
+    _, post = make_cursor_flow_pre_post_processors(policy.config)
+    torch.manual_seed(0)
+    chunk = policy.predict_action_chunk(_obs())
+    torch.manual_seed(0)
+    want = policy.model.sample(_obs(), steps=10)
+    assert torch.equal(post(chunk), want)
+
+
+def test_prefixed_and_unbatched_observations():
+    policy = _contract_policy()
+    obs = _obs(b=1)
+    one = {k: v[0] for k, v in obs.items()}  # (2,) pos
+    prefixed = {f"observation.{k}": v for k, v in obs.items()}
+    torch.manual_seed(0)
+    a = policy.predict_action_chunk(obs)
+    torch.manual_seed(0)
+    b = policy.predict_action_chunk(prefixed)
+    torch.manual_seed(0)
+    c = policy.predict_action_chunk(one)
+    assert torch.equal(a, b) and torch.equal(a, c)
+
+
+def test_select_action_serves_n_action_steps_then_replans():
+    policy = _contract_policy()
+    obs = _obs()
+    torch.manual_seed(1)
+    chunk = policy.predict_action_chunk(obs)
+    second = policy.predict_action_chunk(obs)  # the next draw: the replan's
+    torch.manual_seed(1)
+    served = [policy.select_action(obs) for _ in range(policy.config.n_action_steps + 1)]
+    assert policy.config.n_action_steps == 8
+    assert all(torch.equal(a, chunk[:, i]) for i, a in enumerate(served[:8]))
+    assert torch.equal(served[8], second[:, 0])
+    policy.reset()
+    torch.manual_seed(1)
+    assert torch.equal(policy.select_action(obs), chunk[:, 0])
+
+
+def test_velocity_field_is_the_model():
+    policy = _contract_policy()
+    obs = _obs()
+    x, t = torch.randn(3, 16, 2), torch.rand(3)
+    field = policy.velocity_field({f"observation.{k}": v for k, v in obs.items()})
+    assert torch.equal(field(x, t), policy.model(obs, x, t))
+    assert torch.equal(field(x, 0.3), policy.model(obs, x, torch.full((3,), 0.3)))
+
+
+def test_wrapping_shares_the_model():
+    model = _small_policy(True)
+    policy = CursorFlowPolicy.wrapping(model)
+    assert policy.model is model and policy.config.obstacle_tokens is True
+    assert (policy.horizon, policy.hist, policy.config.d_model) == (16, 4, 32)
+    assert policy.action_scale is model.action_scale and policy.config.action_scale == float(
+        model.action_scale
+    )
+    torch.manual_seed(2)
+    want = model.sample_chunk(_obs(), 10)
+    torch.manual_seed(2)
+    assert torch.equal(policy.predict_action_chunk(_obs()), want)
+
+
+def test_regress_mode_returns_the_prediction():
+    torch.manual_seed(0)
+    policy = CursorFlowPolicy(CursorFlowConfig(d_model=32, layers=2, heads=2, d_ff=64, mode="regress")).eval()
+    obs = _obs()
+    assert torch.equal(policy.predict_action_chunk(obs), policy.model(obs))
+    with pytest.raises(ValueError, match="regress"):
+        policy.predict_action_chunk(obs, noise=torch.zeros(3, 16, 2))
 
 
 def test_factory_knows_cursor_flow():
@@ -129,6 +225,11 @@ def test_factory_knows_cursor_flow():
     config = make_policy_config("cursor_flow", device="cpu")
     assert isinstance(config, CursorFlowConfig) and config.type == "cursor_flow"
     assert config.observation_delta_indices is None and config.action_delta_indices is None
+    pre, post = make_pre_post_processors(config)
+    want = make_cursor_flow_pre_post_processors(config)
+    assert [type(s) for s in pre.steps] == [type(s) for s in want[0].steps]
+    assert [type(s) for s in post.steps] == [type(s) for s in want[1].steps]
+    assert post.steps[0].stats["action"]["std"] == [config.action_scale] * 2
 
 
 def _save_old_adapters(root: Path) -> None:

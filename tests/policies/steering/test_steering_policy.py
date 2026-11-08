@@ -15,7 +15,8 @@
 # limitations under the License.
 """SteeringConfig and SteeringPolicy as lerobot's policy contract has them (the cursor_flow precedent): the
 feature-less config, the factory entries, lerobot's save/load format with the base policy outside the weights,
-and the policy's batch forms. Its chunks against the cursor example's are in
+the policy's batch forms, and the one path it drives every base through (pi0.5's sampler interface: the cursor's
+``CursorFlowPolicy`` and a pi0.5-style stub alike). Its chunks against the cursor example's are in
 tests/examples/pi05_mars_cursor/test_steering_policy_cursor.py."""
 
 from pathlib import Path
@@ -27,9 +28,11 @@ import torch
 from lerobot.configs import PreTrainedConfig
 from lerobot.optim import AdamWConfig
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy, FlowPolicy
+from lerobot.policies.cursor_flow.processor_cursor_flow import make_cursor_flow_pre_post_processors
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.steering import (
     AdapterModules,
+    Flow,
     FlowControlSteering,
     FlowReversalSteering,
     LearnedTaskModule,
@@ -69,9 +72,23 @@ def _modules(tmp_path, horizon=16):
     )
 
 
-def _policy(**kw):
+def _policy():
+    """A small cursor base: a ``FlowPolicy`` behind the sampler contract (``CursorFlowPolicy.wrapping``)."""
     torch.manual_seed(0)
-    return FlowPolicy(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123).eval()
+    return CursorFlowPolicy.wrapping(
+        FlowPolicy(d_model=32, layers=2, heads=2, d_ff=64, action_scale=0.0123).eval()
+    )
+
+
+def _post(base):
+    """The cursor base's postprocessor: its action statistics (mean 0, std ``action_scale``)."""
+    return make_cursor_flow_pre_post_processors(base.config)[1]
+
+
+def _steering(config, base=None):
+    """A steering policy over ``base`` (a fresh ``_policy()`` by default) and its postprocessor."""
+    base = _policy() if base is None else base
+    return SteeringPolicy(config, base_policy=base, postprocessor=_post(base))
 
 
 COMMAND = torch.tensor([[0.6, -0.2], [0.0, 0.0], [-0.4, 0.8]])
@@ -105,8 +122,9 @@ def test_the_factory_knows_the_policy():
 def test_the_policy_wraps_the_mode_core_over_the_base_policy(tmp_path):
     base = _policy()
     for mode, core in (("flow_control", FlowControlSteering), ("frs", FlowReversalSteering)):
-        steering = SteeringPolicy(SteeringConfig(mode=mode, device="cpu"), base_policy=base)
-        assert isinstance(steering.core, core) and steering.core._policy.config.noise_time == 0.0
+        steering = _steering(SteeringConfig(mode=mode, device="cpu"), base)
+        assert isinstance(steering.core, core) and steering.core._policy is base
+        assert base.config.noise_time == 0.0
         assert (
             steering.state_dict() == {} and list(steering.get_optim_params()) == []
         )  # the base is not a weight
@@ -114,7 +132,7 @@ def test_the_policy_wraps_the_mode_core_over_the_base_policy(tmp_path):
         chunk = steering.predict_action_chunk({**_obs(), "command": COMMAND})
         assert chunk.shape == (3, 16, 2)
         torch.manual_seed(1)
-        plain = base.sample_chunk(_obs(), 10) * base.action_scale
+        plain = base.predict_action_chunk(_obs())
         assert torch.equal(chunk[1], plain[1]) and not torch.equal(
             chunk[0], plain[0]
         )  # the idle row is the policy's
@@ -131,7 +149,7 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
     config = SteeringConfig(
         adapter_matrix=f, adapter_user=str(user_path), adapter_task=str(task_path), device="cpu"
     )
-    steering = SteeringPolicy(config, base_policy=_policy())
+    steering = _steering(config)
     assert config.user_module == AdapterModules.load(user_path).user.config  # recorded when read
     user_keys = {f"adapter.user.{k}" for k in AdapterModules.load(user_path).user.state_dict()}
     task_keys = {f"adapter.task.{k}" for k in AdapterModules.load(task_path).task.state_dict()}
@@ -139,7 +157,10 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
     steering.save_pretrained(tmp_path / "steering")
     user_path.unlink()
     task_path.unlink()  # the saved policy no longer needs the module checkpoints
-    loaded = SteeringPolicy.from_pretrained(tmp_path / "steering", base_policy=_policy())
+    base = _policy()
+    loaded = SteeringPolicy.from_pretrained(
+        tmp_path / "steering", base_policy=base, postprocessor=_post(base)
+    )
     assert np.array_equal(loaded.config.fixed_matrix, f) and loaded.config.user_module == config.user_module
     assert loaded.state_dict().keys() == steering.state_dict().keys()
     assert all(torch.equal(v, loaded.state_dict()[k]) for k, v in steering.state_dict().items())
@@ -148,8 +169,9 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
     )  # served frozen, as load_module serves a module
     for mode in ("flow_control", "frs"):
         steering.config.mode = loaded.config.mode = mode
-        steering.set_base_policy(_policy())
-        loaded.set_base_policy(_policy())
+        for policy in (steering, loaded):
+            base = _policy()
+            policy.set_base_policy(base, _post(base))
         torch.manual_seed(2)
         want = steering.predict_action_chunk({**_obs(), "command": COMMAND})
         torch.manual_seed(2)
@@ -157,10 +179,13 @@ def test_save_pretrained_carries_the_adapter_and_from_pretrained_rebuilds_it(tmp
 
 
 def test_the_base_policy_loads_from_the_configs_reference(tmp_path):
+    """A cursor base saved with its pipelines (the factory's) loads with them: FRS reads its postprocessor."""
     model = _policy()
-    base = CursorFlowPolicy(CursorFlowConfig(**model.config, action_scale=0.0123, device="cpu"))
-    base.model.load_state_dict(model.state_dict())
+    base = CursorFlowPolicy(CursorFlowConfig(**model.model.config, action_scale=0.0123, device="cpu"))
+    base.model.load_state_dict(model.model.state_dict())
     base.save_pretrained(tmp_path / "base")
+    for pipeline in make_cursor_flow_pre_post_processors(base.config):
+        pipeline.save_pretrained(tmp_path / "base")
     steering = SteeringPolicy(
         SteeringConfig(base_policy_type="cursor_flow", base_policy_path=str(tmp_path / "base"), device="cpu")
     )
@@ -170,42 +195,84 @@ def test_the_base_policy_loads_from_the_configs_reference(tmp_path):
     torch.manual_seed(4)
     assert torch.equal(
         got,
-        SteeringPolicy(SteeringConfig(device="cpu"), base_policy=model).predict_action_chunk(
-            {**_obs(), "command": COMMAND}
-        ),
+        _steering(SteeringConfig(device="cpu"), model).predict_action_chunk({**_obs(), "command": COMMAND}),
     )
     with pytest.raises(ValueError, match="needs a base policy"):
         _ = SteeringPolicy(SteeringConfig(device="cpu")).base_policy
 
 
-def test_the_batch_may_carry_the_observation_under_its_prefix(tmp_path):
-    steering = SteeringPolicy(SteeringConfig(scene_source="vlm_image", device="cpu"), base_policy=_policy())
+def test_observation_has_one_rule(tmp_path):
+    """The base gets the batch less the steering policy's own keys, a cursor batch under its prefix and a pi0.5 batch
+    alike, ``observation.scene_tokens`` put at ``scene[scene_source]``; the adapter's view strips the prefix (the
+    task module reads the cursor's dict), so a prefixed batch steers as the plain one."""
+    steering = _steering(SteeringConfig(scene_source="vlm_image", device="cpu"))
     obs = _obs()
     prefixed = {f"observation.{k}": v for k, v in obs.items()}
     tokens = torch.zeros(3, 256, 8, dtype=torch.float16)
-    seen = steering.observation(
-        {
-            **prefixed,
-            "observation.scene_tokens": tokens,
-            "observation.layouts": object(),
-            "command": COMMAND,
-            "action": None,
-            "next.reward": 0.0,
-        }
-    )
-    assert list(seen) == [*obs, "scene"] and seen["scene"]["vlm_image"] is tokens
-    assert list(steering.observation({**obs, "command": COMMAND, "kind": "task"})) == list(obs)
+    extra = {"observation.layouts": object(), "action": None, "next.reward": 0.0}
+    batch = {**prefixed, "observation.scene_tokens": tokens, **extra, "command": COMMAND, "kind": "task"}
+    seen = steering.observation(batch)
+    assert list(seen) == [*prefixed, *extra, "scene"] and seen["scene"]["vlm_image"] is tokens
+    pi05 = _pi05_batch()
+    assert list(steering.observation({**pi05, "kind": "user"})) == [k for k in pi05 if k != "command"]
+    view = steering._adapter_view(seen)
+    assert list(view) == [*obs, "action", "next.reward", "scene"] and view["pos"] is obs["pos"]
+    with pytest.raises(ValueError, match="needs a scene_source"):
+        _steering(SteeringConfig(device="cpu")).observation({**prefixed, "observation.scene_tokens": tokens})
+    _, task_path = _modules(tmp_path)
+    steering = _steering(SteeringConfig(adapter_task=str(task_path), device="cpu"))
     torch.manual_seed(5)
     want = steering.predict_action_chunk({**obs, "command": COMMAND})
     torch.manual_seed(5)
     assert torch.equal(steering.predict_action_chunk({**prefixed, "command": COMMAND.numpy()}), want)
 
 
+def test_the_cursor_base_goes_through_the_same_path():
+    """No cursor branch: the core is built on the base itself, FRS's reference is the held command in the
+    postprocessor's units (``Flow.held_reference``'s numbers bit for bit), and a base without the contract is refused
+    by name."""
+    names = ("_cursor_base", "_flow_model", "_action_scale", "_reference")
+    base = _policy()
+    steering = _steering(SteeringConfig(device="cpu"), base)
+    assert not any(hasattr(SteeringPolicy, n) or hasattr(steering, n) for n in names)
+    step = steering.config.max_speed * steering.config.dt
+    assert steering.core._policy is base and steering.core._reference_step == step
+    per_step = torch.rand(3, 16, 2) * 2 - 1
+    for command in (COMMAND, per_step):
+        want = Flow.held_reference(command, 16, step, base.action_scale)
+        assert torch.equal(steering.core.reference_chunk(command), want)
+    with pytest.raises(TypeError, match="velocity_field"):
+        SteeringPolicy(SteeringConfig(device="cpu"), base_policy=_SamplerBase())(
+            {"observation.state": torch.zeros(2, 8), "kind": "user"}
+        )
+    with pytest.raises(
+        TypeError, match=r"no predict_action_chunk, reset, config.num_inference_steps.*wrapping"
+    ):
+        _ = SteeringPolicy(SteeringConfig(device="cpu"), base_policy=base.model).core  # a bare FlowPolicy
+
+
+def test_mode_none_ignores_the_command(tmp_path):
+    """Mode none: the base's own chunk through the task module's velocity hook, whatever the command; no core."""
+    _, task_path = _modules(tmp_path)
+    base = _policy()
+    steering = _steering(SteeringConfig(mode="none", adapter_task=str(task_path), device="cpu"), base)
+    with pytest.raises(ValueError, match="mode 'none' has no steering core"):
+        _ = steering.core
+    obs = _obs()
+    torch.manual_seed(3)
+    got = steering.predict_action_chunk({**obs, "command": COMMAND})
+    hook = FlowControlSteering.velocity_hook(steering.adapter.field(obs))
+    torch.manual_seed(3)
+    want = base.predict_action_chunk(obs, velocity_hook=hook)
+    torch.manual_seed(3)
+    assert torch.equal(got, want) and not torch.equal(got, base.predict_action_chunk(obs))
+    torch.manual_seed(3)
+    assert torch.equal(steering.select_action({**obs, "command": COMMAND}), want[:, 0])
+
+
 def test_forward_needs_the_module_of_its_kind(tmp_path):
     user_path, task_path = _modules(tmp_path)
-    steering = SteeringPolicy(
-        SteeringConfig(adapter_user=str(user_path), device="cpu"), base_policy=_policy()
-    )
+    steering = _steering(SteeringConfig(adapter_user=str(user_path), device="cpu"))
     with pytest.raises(ValueError, match="needs a task module"):
         steering({**_obs(), "kind": "task", "chunk": torch.zeros(3, 16, 2)})
     with pytest.raises(ValueError, match="'task' or 'user'"):
@@ -213,7 +280,7 @@ def test_forward_needs_the_module_of_its_kind(tmp_path):
     fresh = SteeringConfig(
         user_module=dict(LearnedUserModule(16, n_dims=2, d=16, tdim=8).config), device="cpu"
     )
-    trainable = SteeringPolicy(fresh, base_policy=_policy())
+    trainable = _steering(fresh)
     loss, parts = trainable(
         {**_obs(), "kind": "user", "latent": torch.randn(3, 16, 2), "bci_target": torch.randn(3, 16, 2)}
     )
@@ -224,45 +291,120 @@ def test_forward_needs_the_module_of_its_kind(tmp_path):
 
 
 class _SamplerBase:
-    """A pi0.5-style base: no ``sample_chunk``, pi0.5's sampler interface itself; records the batches it gets."""
+    """A pi0.5-style base: no ``sample_chunk``, pi0.5's sampler interface itself (no ``noise_time`` in its config:
+    pi0.5's 1.0), a fixed linear field Euler-integrated from t = 1 as ``PI05Pytorch.sample_actions`` integrates, every
+    hook it gets applied; it records the batches and the names of the hooks it gets."""
 
     def __init__(self):
         from types import SimpleNamespace
 
         self.config = SimpleNamespace(num_inference_steps=4, chunk_size=6, max_action_dim=8, n_action_steps=3)
-        self.batches = []
+        self.batches, self.hooks = [], []
 
     def reset(self):
         pass
 
+    @staticmethod
+    def velocity(x_t, t):
+        t = torch.as_tensor(t, dtype=x_t.dtype)
+        return 0.5 * x_t - 0.3 * (t.reshape(-1, 1, 1) if t.dim() else t)
+
     def predict_action_chunk(self, batch, **hooks):
         self.batches.append(batch)
-        return torch.arange(2 * 6 * 8, dtype=torch.float32).reshape(2, 6, 8)
+        self.hooks.append(sorted(k for k, v in hooks.items() if v is not None))
+        noise = hooks.get("noise")
+        x = torch.randn(len(batch["observation.state"]), 6, 8) if noise is None else noise
+        if hooks.get("noise_fn") is not None:
+            x = hooks["noise_fn"](self.velocity, x)
+        start = 1.0 if hooks.get("flow_start_time") is None else float(hooks["flow_start_time"])
+        n = 4 if hooks.get("num_forward_steps") is None else int(hooks["num_forward_steps"])
+        dt = -start / n
+        for step in range(n):
+            t = start + step * dt
+            if hooks.get("x_t_hook") is not None:
+                x = hooks["x_t_hook"](step, t, x)
+            v = self.velocity(x, t)
+            if hooks.get("velocity_hook") is not None:
+                v = hooks["velocity_hook"](step, t, x, v)
+            x = x + dt * v
+        return x
 
 
-def test_a_pi05_style_base_gets_lerobots_batch_as_it_is():
-    base = _SamplerBase()
-    steering = SteeringPolicy(
-        SteeringConfig(mode="flow_control", operator_dims=["translation"], device="cpu"), base_policy=base
-    )
-    batch = {
+def _pi05_batch():
+    return {
         "observation.state": torch.zeros(2, 8),
         "observation.images.top": torch.zeros(2, 3, 4, 4),
         "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
         "task": ["pick", "place"],
-        "command": torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        "command": torch.tensor([[0.5, -0.2, 0.1], [0.0, 0.0, 0.0]]),
     }
+
+
+def _pi05_postprocessor():
+    """A pi0.5-style postprocessor: MEAN_STD statistics over the 8 padded action dims (7 of them the env's)."""
+    from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.processor import (
+        PolicyProcessorPipeline,
+        UnnormalizerProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    stats = {"action": {"mean": 0.1 * torch.arange(8.0), "std": 0.5 + 0.25 * torch.arange(8.0)}}
+    step = UnnormalizerProcessorStep(
+        features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(8,))},
+        norm_map={FeatureType.ACTION: NormalizationMode.MEAN_STD},
+        stats=stats,
+    )
+    return PolicyProcessorPipeline(
+        steps=[step], to_transition=policy_action_to_transition, to_output=transition_to_policy_action
+    )
+
+
+# the hooks the stub got, recorded before the steering policy had one path (21b5ee8c): the steered pass, then the
+# policy's own plan for the idle row
+PI05_HOOKS = {
+    "flow_control": [["velocity_hook", "x_t_hook"], ["velocity_hook"]],
+    "frs": [["noise_fn", "velocity_hook"], ["velocity_hook"]],
+}
+
+
+@pytest.mark.parametrize("mode", ["flow_control", "frs"])
+def test_a_pi05_style_stub_is_driven_unchanged(tmp_path, mode):
+    """A pi0.5-style base gets lerobot's batch as it is and the hooks it got before (``PI05_HOOKS``), and its steered
+    chunk is the mode's core run directly over it (what ``SteeringPolicy`` ran for such a base before), its task module
+    in every pass."""
+    torch.manual_seed(0)
+    task = LearnedTaskModule(horizon=6, d=16, tdim=8, heads=2, layers=1, n_dims=3)
+    with torch.no_grad():
+        for p in task.parameters():
+            p.add_(0.05 * torch.randn(p.shape))
+    path = AdapterModules.save_module(task, tmp_path / "t.pt", "task")
+    config = SteeringConfig(
+        mode=mode, operator_dims=["translation"], n_dims=3, adapter_task=str(path), device="cpu"
+    )
+    base, post = _SamplerBase(), _pi05_postprocessor()
+    steering = SteeringPolicy(config, base_policy=base, postprocessor=post)
+    batch = _pi05_batch()
+    torch.manual_seed(1)
     chunk = steering.predict_action_chunk(batch)
     assert chunk.shape == (2, 6, 8)  # normalized: the postprocessor unnormalizes a pi0.5 chunk
-    assert base.batches and all(
-        list(b) == ["observation.state", "observation.images.top", "observation.language.tokens", "task"]
-        for b in base.batches
-    )
+    keys = ["observation.state", "observation.images.top", "observation.language.tokens", "task"]
+    assert base.hooks == PI05_HOOKS[mode] and all(list(b) == keys for b in base.batches)
+    obs = {k: v for k, v in batch.items() if k != "command"}
+    if mode == "flow_control":
+        core = FlowControlSteering(base, None, post, tau=config.tau, lam=config.lam, ic_gain=config.ic_gain)
+    else:
+        core = FlowReversalSteering(base, None, post, operator_dims=("translation",), pinned_steps=None)
+    torch.manual_seed(1)
+    want = core.steered_chunk(obs, batch["command"], field=steering.adapter.field(obs), paired=False)[0]
+    assert torch.equal(chunk, want) and not torch.equal(chunk[0], chunk[1])
 
 
 def test_select_action_serves_the_chunks_executed_steps_one_per_call():
     base = _policy()
-    steering = SteeringPolicy(SteeringConfig(device="cpu", n_action_steps=3), base_policy=base)
+    base.config.n_action_steps = 3  # the base's: the contract's field
+    steering = _steering(SteeringConfig(device="cpu"), base)
     batch = {**_obs(), "command": COMMAND}
     torch.manual_seed(6)
     chunk = steering.predict_action_chunk(batch)
@@ -375,7 +517,7 @@ def test_a_trainer_batch_through_the_pre_pipeline_reaches_forward_unchanged(tmp_
 
     user_path, task_path = _modules(tmp_path)
     config = SteeringConfig(adapter_user=str(user_path), adapter_task=str(task_path), device="cpu")
-    steering = SteeringPolicy(config, base_policy=_policy())
+    steering = _steering(config)
     pre, _ = make_steering_pre_post_processors(config)
     g = torch.Generator().manual_seed(8)
     obs, prefixed = _obs(), {f"observation.{k}": v for k, v in _obs().items()}
@@ -406,7 +548,7 @@ def test_a_trainer_batch_through_the_pre_pipeline_reaches_forward_unchanged(tmp_
 
 
 def test_a_single_unbatched_trial_gets_its_batch_dimension():
-    steering = SteeringPolicy(SteeringConfig(device="cpu"), base_policy=_policy())
+    steering = _steering(SteeringConfig(device="cpu"))
     one = {k: v[0] for k, v in _obs().items()}
     torch.manual_seed(9)
     want = steering.predict_action_chunk({**{k: v[:1] for k, v in _obs().items()}, "command": COMMAND[:1]})

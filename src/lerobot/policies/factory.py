@@ -471,6 +471,11 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, CursorFlowConfig):
+        from .cursor_flow.processor_cursor_flow import make_cursor_flow_pre_post_processors
+
+        processors = make_cursor_flow_pre_post_processors(config=policy_cfg)
+
     elif isinstance(policy_cfg, SteeringConfig):
         from .steering.processor_steering import make_steering_pre_post_processors
 

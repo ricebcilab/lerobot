@@ -21,9 +21,12 @@ always the model's own output:
 - `FlowControlSteering`, shared flow control (Kao et al. 2026). The command is scaled by `ic_gain` into the noise
   prior's units. It is written into the translation dims of the first `tau` chunk steps of `x_t`, at the start of
   each of the first `lam` Euler steps (`lam` 1 = the initial condition only). The flow itself runs unmodified.
-- `FlowReversalSteering`, Flow Reversal Steering (Tang et al. 2026, arXiv:2606.13675). A uniform-velocity reference
-  chunk built from the command is integrated _backward_ through the policy's velocity field to the latent noise that
-  maps to it. The forward flow then starts from that noise.
+- `FlowReversalSteering`, Flow Reversal Steering (Tang et al. 2026, arXiv:2606.13675). A reference chunk built from
+  the command is integrated _backward_ through the policy's velocity field to the latent noise that maps to it. The
+  forward flow then starts from that noise. The reference is the action space's rule (`reference_chunk`): in the 7-D
+  operator space (pi0.5's) a uniform-velocity chunk with the gripper held (`Flow.uniform_reference`); in an action
+  space without that gripper dim (the cursor's two dims) the command held at `reference_step` (`max_speed * dt`)
+  action units per control step, `(per_step * reference_step - mean) / std`.
 
 Both read an operator `TeleopSource` and take the checkpoint's action statistics from the postprocessor
 (`action_mean_std`). `FlowControlSteering.check_steps` (both cores have it) is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
@@ -80,8 +83,8 @@ The modules and their losses:
 The cores are not pi0.5-specific. They steer any flow policy with pi0.5's sampler interface: a `config`, and a
 `predict_action_chunk` taking `noise_fn`, `flow_start_time`, `num_forward_steps`, `x_t_hook` and `velocity_hook`.
 They work in either flow-time convention, and `steered_chunk(batch, commands)` serves a batch of commands. The cursor
-example drives its own policy through them (`FlowPolicy.sample_chunk`), so the robot and the cursor run one
-implementation of each method.
+policy offers the interface itself (`CursorFlowPolicy`), so the robot and the cursor run one implementation of each
+method; the cursor example's own wiring still drives `FlowPolicy.sample_chunk` through `SampleChunkSampler`.
 
 ## The scene
 
@@ -108,14 +111,25 @@ the local Hugging Face cache: on a machine without a valid HF token, run with `H
 features, as `CursorFlowConfig`.
 
 - Its weights are the adapter modules'. The base policy is passed in, or loaded from `base_policy_path` (a folder or
-  a Hub repo id) together with that folder's processors. A pi0.5-style base needs its postprocessor's action
-  statistics for `frs`; without them, pass it with `set_base_policy(policy, postprocessor=...)`.
+  a Hub repo id) together with that folder's processors.
+- Every base is driven one way, through pi0.5's sampler interface: a `config` with `num_inference_steps`,
+  `chunk_size`, `max_action_dim`, `n_action_steps` and `noise_time`, `predict_action_chunk(batch, **hooks)` (the
+  normalized chunk), `reset()` and `velocity_field(batch)`. `PI05Policy` and `CursorFlowPolicy` offer it
+  (`CursorFlowPolicy.wrapping(model)` puts a bare `FlowPolicy` behind it); a base without it is refused by name.
+- `frs` needs the base's postprocessor, for its action statistics, on every base (a cursor base's is
+  `make_cursor_flow_pre_post_processors(base.config)[1]`); pass it with the base, or with
+  `set_base_policy(policy, postprocessor=...)`.
 - `predict_action_chunk` returns the steered chunk for `batch["command"]`, the operator's deflection: `(B, n)`,
   `(B, H, n)` per chunk step, or `(n,)` for a single unbatched trial. `n` is at most `n_dims` (a pi0.5 base's
-  translation is 3). `select_action` serves the chunk's executed steps one per call.
-- `forward` returns the adapter's training loss on the example trainer's batches: `kind`, `chunk` or `latent` and
-  `bci_target`, `noise`, `time`, `weight`. The pre-processor carries these through untouched, but does not build
-  them.
+  translation is 3). The chunk is normalized, as the base's: the base's postprocessor unnormalizes it.
+  `select_action` serves the chunk's first `n_action_steps` steps (the base's) one per call. Mode `"none"` is the
+  base's own chunk through the task module, the command ignored.
+- The base gets the batch less the steering policy's own keys (`command` and a training batch's). The adapter binds
+  to its own view of it, the task module's input: the `observation.` prefix stripped, the scene step's inputs dropped,
+  `observation.scene_tokens` at `scene[scene_source]`, a single unbatched trial given a batch of one.
+- `forward` returns the adapter's training loss on the example trainer's batches: `kind`, `chunk` (in action units,
+  normalized by the postprocessor's statistics) or `latent` and `bci_target`, `noise`, `time`, `weight`. The
+  pre-processor carries these through untouched, but does not build them.
 - A task module's scene settings become the config's (`SteeringConfig.scene_settings`).
 - The processor factory adds the scene step for a `vlm_image` / `vlm_prefix` task module.
 - The cursor example's `tools/convert_checkpoints.py --steering` writes a `SteeringPolicy` folder and its pipelines
@@ -129,17 +143,18 @@ or with `make_pre_post_processors(config, pretrained_path=...)` for a saved fold
 On the cursor's base:
 
 ```python
-from lerobot.policies.cursor_flow import CursorFlowPolicy
+from lerobot.policies.cursor_flow import CursorFlowPolicy, make_cursor_flow_pre_post_processors
 from lerobot.policies.steering import SteeringConfig, SteeringPolicy, make_steering_pre_post_processors
 
 base = CursorFlowPolicy.from_pretrained("path/to/cursor_policy")  # the policy whose chunks are steered
+_, base_postprocessor = make_cursor_flow_pre_post_processors(base.config)  # its action statistics
 config = SteeringConfig(mode="frs", adapter_user="path/to/adapter.pt", device="cpu")  # MARS-U
-policy = SteeringPolicy(config, base_policy=base)
-preprocessor, postprocessor = make_steering_pre_post_processors(policy.config)
+policy = SteeringPolicy(config, base_policy=base, postprocessor=base_postprocessor)
+preprocessor, _ = make_steering_pre_post_processors(policy.config)
 
 # obs: the cursor's observation dict (pos, hist, targets, mask, goal, ...); deflection: (B, 2) in [-1, 1]
 batch = preprocessor({**{f"observation.{k}": v for k, v in obs.items()}, "command": deflection})
-action = postprocessor(policy.select_action(batch))  # (B, 2), screen units per step
+action = base_postprocessor(policy.select_action(batch))  # (B, 2), screen units per step
 ```
 
 From a converted folder (`convert_checkpoints.py --steering`), or any folder `save_pretrained` and the pipelines'
@@ -148,6 +163,8 @@ From a converted folder (`convert_checkpoints.py --steering`), or any folder `sa
 ```python
 from lerobot.policies.factory import make_pre_post_processors
 
-policy = SteeringPolicy.from_pretrained("path/to/adapters/<name>", base_policy=base)
-preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path="path/to/adapters/<name>")
+policy = SteeringPolicy.from_pretrained(
+    "path/to/adapters/<name>", base_policy=base, postprocessor=base_postprocessor
+)
+preprocessor, _ = make_pre_post_processors(policy.config, pretrained_path="path/to/adapters/<name>")
 ```

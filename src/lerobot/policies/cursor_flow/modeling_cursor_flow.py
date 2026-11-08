@@ -19,7 +19,8 @@
 `FlowPolicy` is the cursor example's transformer flow-matching policy, moved here verbatim
 (``examples/pi05/mars/cursor/cursor_sa/policy.py`` re-exports it). `CursorFlowPolicy` is a thin
 `PreTrainedPolicy` around it, so a trained cursor policy saves as ``config.json`` +
-``model.safetensors`` and loads with ``from_pretrained``; the cursor code uses its ``.model``.
+``model.safetensors`` and loads with ``from_pretrained``, and it offers pi0.5's sampler interface,
+so the steering policy drives it as it drives pi0.5; the cursor code uses its ``.model``.
 
 FlowPolicy's own description:
 
@@ -39,7 +40,8 @@ directly with an MSE loss, so it averages over the variety in the demos.
 """
 
 import math
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
@@ -49,6 +51,7 @@ from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.steering import Flow
+from lerobot.utils.constants import OBS_PREFIX
 
 from .configuration_cursor_flow import CursorFlowConfig
 
@@ -241,51 +244,127 @@ class FlowPolicy(nn.Module):
 
 # ---------------------------------------------------------------- the lerobot policy wrapper
 
-FLOW_STEPS = 10  # Euler steps of a chunk, as the cursor example samples
+
+def _unsqueezed(obs: dict) -> dict:
+    """The observation with a leading batch dim on every tensor (nested dicts too)."""
+    return {
+        k: v[None] if torch.is_tensor(v) else _unsqueezed(v) if isinstance(v, dict) else v
+        for k, v in obs.items()
+    }
 
 
 class CursorFlowPolicy(PreTrainedPolicy):
-    """A `FlowPolicy` as a lerobot policy: saving, loading and the Hub through `PreTrainedPolicy`.
+    """A `FlowPolicy` as a lerobot policy: saving, loading and the Hub through `PreTrainedPolicy`, and pi0.5's
+    sampler interface, which the steering policy (``lerobot.policies.steering``) drives every base through.
 
-    The batch is `FlowPolicy`'s dict observation (``pos``, ``hist``, ``targets``, ``mask``, ``goal`` and
-    optionally ``obstacles`` / ``obstacle_mask``), not dataset features; there is no processor pipeline.
-    Actions are per-step cursor displacements in screen units.
+    The batch is `FlowPolicy`'s dict observation (``pos``, ``hist``, ``targets``, ``mask``, ``goal`` and optionally
+    ``obstacles`` / ``obstacle_mask``), plain or under ``observation.`` (``observation``), not dataset features.
+    Chunks come out normalized, as pi0.5's do: the postprocessor (``processor_cursor_flow``) scales them to screen
+    units per step. ``wrapping`` puts an existing `FlowPolicy` behind the interface without copying it.
     """
 
     config_class = CursorFlowConfig
     name = "cursor_flow"
 
-    def __init__(self, config: CursorFlowConfig, **kwargs: Any):
+    def __init__(self, config: CursorFlowConfig, model: FlowPolicy | None = None, **kwargs: Any):
+        """``model``: an existing `FlowPolicy` to serve (shared, not copied; ``wrapping`` builds its config) instead
+        of a fresh one built from ``config``."""
         super().__init__(config)
-        self.model = FlowPolicy(
-            horizon=config.horizon,
-            hist=config.hist,
-            d_model=config.d_model,
-            layers=config.layers,
-            heads=config.heads,
-            d_ff=config.d_ff,
-            mode=config.mode,
-            action_scale=config.action_scale,
-            obstacle_tokens=config.obstacle_tokens,
+        if model is None:
+            model = FlowPolicy(
+                horizon=config.horizon,
+                hist=config.hist,
+                d_model=config.d_model,
+                layers=config.layers,
+                heads=config.heads,
+                d_ff=config.d_ff,
+                mode=config.mode,
+                action_scale=config.action_scale,
+                obstacle_tokens=config.obstacle_tokens,
+            )
+        self.model = model
+        self._action_queue: deque = deque()
+
+    @classmethod
+    def wrapping(cls, model: FlowPolicy) -> "CursorFlowPolicy":
+        """``model`` behind the sampler interface: its config read from its attributes (the architecture, its
+        ``action_scale`` buffer, on its device), the module itself shared, not copied."""
+        arch = model.config
+        config = CursorFlowConfig(
+            horizon=model.horizon,
+            hist=model.hist,
+            d_model=arch["d_model"],
+            layers=arch["layers"],
+            heads=arch["heads"],
+            d_ff=arch["d_ff"],
+            mode=model.mode,
+            action_scale=float(model.action_scale),
+            obstacle_tokens=model.obstacle_tokens,
+            device=str(model.action_scale.device),
         )
+        return cls(config, model=model)
+
+    @property
+    def horizon(self) -> int:
+        return self.model.horizon
+
+    @property
+    def hist(self) -> int:
+        return self.model.hist
+
+    @property
+    def action_scale(self) -> Tensor:
+        """The model's ``action_scale`` buffer: screen units per normalized action unit."""
+        return self.model.action_scale
 
     def get_optim_params(self) -> Iterator[nn.Parameter]:
         return self.parameters()
 
     def reset(self) -> None:
-        pass
+        """Clears the action queue."""
+        self._action_queue.clear()
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
         raise NotImplementedError("trained by examples/pi05/mars/cursor/train/train_policy.py")
 
+    def observation(self, batch: dict) -> dict:
+        """`FlowPolicy`'s observation in ``batch``: every key with its ``observation.`` prefix stripped (an
+        ``observation.scene_tokens`` is the caller's to place: the model reads no scene), and a single unbatched
+        trial (``pos`` of shape (2,)) given a batch of one, every tensor unsqueezed."""
+        obs = {k.removeprefix(OBS_PREFIX): v for k, v in batch.items()}
+        pos = obs.get("pos")
+        return _unsqueezed(obs) if torch.is_tensor(pos) and pos.dim() == 1 else obs
+
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
-        """An action chunk (B, horizon, 2) in screen units per step. Flow mode: noise drawn as the cursor
-        example draws it, Euler-integrated from t=0 (noise) to t=1 (action) in ``FLOW_STEPS`` steps
-        (``FlowPolicy.sample``), the cursor example's plain policy chunk. Regress mode: the predicted chunk."""
-        return self.model.sample(batch, steps=FLOW_STEPS)
+    def predict_action_chunk(self, batch: dict[str, Tensor], **hooks: Any) -> Tensor:
+        """A normalized action chunk (B, horizon, 2) through pi0.5's sampler interface: ``FlowPolicy.sample_chunk``
+        in ``config.num_inference_steps`` Euler steps, the cursor's flow convention (t = 0 noise), ``hooks`` pi0.5's
+        (``noise``, ``noise_fn``, ``x_t_hook``, ``velocity_hook``, ``flow_start_time``, ``num_forward_steps``).
+        Regress mode: the predicted chunk (it has no flow to hook). The postprocessor scales it to screen units."""
+        obs = self.observation(batch)
+        if self.config.mode == "regress":
+            if any(v is not None for v in hooks.values()):
+                raise ValueError(f"a regress policy has no flow to hook, got {sorted(hooks)}")
+            return self.model(obs)
+        return self.model.sample_chunk(obs, self.config.num_inference_steps, **hooks)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
-        """The first step (B, 2) of a fresh action chunk."""
-        return self.predict_action_chunk(batch)[:, 0]
+        """One normalized action (B, 2) per call: the first ``config.n_action_steps`` steps of a fresh chunk, served
+        one per call; ``reset`` empties the queue."""
+        if not self._action_queue:
+            chunk = self.predict_action_chunk(batch)
+            self._action_queue.extend(chunk[:, : self.config.n_action_steps].transpose(0, 1))
+        return self._action_queue.popleft()
+
+    def velocity_field(self, batch: dict[str, Tensor]) -> Callable[[Tensor, Tensor | float], Tensor]:
+        """The flow field for the batch's observation, ``velocity(x_t, t)`` on normalized chunks (B, H, 2) at a
+        (B,) time or a float one (inversion and the adapter trainers'), in the caller's grad mode."""
+        obs = self.observation(batch)
+
+        def velocity(x: Tensor, t: Tensor | float) -> Tensor:
+            if not torch.is_tensor(t):
+                t = torch.full((len(x),), float(t), device=x.device)
+            return self.model(obs, x, t)
+
+        return velocity

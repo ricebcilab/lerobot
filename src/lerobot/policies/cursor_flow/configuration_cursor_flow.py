@@ -25,22 +25,31 @@ from lerobot.optim import AdamWConfig, LRSchedulerConfig, OptimizerConfig
 class CursorFlowConfig(PreTrainedConfig):
     """Configuration of the cursor task's flow-matching policy (`FlowPolicy`, MARS cursor example).
 
-    The fields mirror `FlowPolicy`'s constructor. The policy reads its own dict observation (cursor
-    position, displacement history, targets, optional obstacles) rather than dataset features, so it has
-    no input/output features, no processor pipeline and no delta indices. It is trained by the example's
-    own trainer (``examples/pi05/mars/cursor/train/train_policy.py``), not by ``lerobot-train``.
+    The architecture fields mirror `FlowPolicy`'s constructor. The policy reads its own dict observation (cursor
+    position, displacement history, targets, optional obstacles) rather than dataset features, so it has no
+    input/output features and no delta indices; its processor pipeline (``processor_cursor_flow``) only unnormalizes
+    its chunks to screen units. It is trained by the example's own trainer
+    (``examples/pi05/mars/cursor/train/train_policy.py``), not by ``lerobot-train``.
+
+    The sampler fields are pi0.5's sampler interface, which the steering policy drives every base through:
+    ``chunk_size`` (``horizon``), ``num_inference_steps``, ``n_action_steps`` and ``max_action_dim`` (``PI05Config``'s
+    names), and ``noise_time`` (pi0.5's is 1.0, the steering cores' default when a config has none).
 
     Args:
-        horizon: Action chunk length, in control steps.
+        horizon: Action chunk length, in control steps (``chunk_size``).
         hist: Number of past cursor displacements in the observation.
         d_model: Transformer width.
         layers: Number of transformer blocks.
         heads: Attention heads per block.
         d_ff: Feed-forward width.
         mode: ``"flow"`` (flow matching) or ``"regress"`` (direct regression baseline).
-        action_scale: Screen units per normalized action unit (the RMS demo step). The trained value is
-            also held in the weights as a buffer, which is what the model uses.
+        action_scale: Screen units per normalized action unit (the RMS demo step): the postprocessor's action std.
+            The trained value is also held in the weights as a buffer, which is what the model uses.
         obstacle_tokens: Whether the policy reads obstacles as tokens.
+        num_inference_steps: Euler steps of a chunk's flow (10, as the cursor example samples).
+        n_action_steps: The chunk steps ``select_action`` serves before it plans the next chunk.
+        noise_time: The flow time of pure noise: 0.0, the cursor's convention (t = 1 is the action).
+        max_action_dim: The action dims of a chunk (the cursor's two, no padding).
     """
 
     horizon: int = 16
@@ -52,11 +61,20 @@ class CursorFlowConfig(PreTrainedConfig):
     mode: str = "flow"
     action_scale: float = 0.01
     obstacle_tokens: bool = False
+    num_inference_steps: int = 10
+    n_action_steps: int = 8
+    noise_time: float = 0.0
+    max_action_dim: int = 2
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.mode not in ("flow", "regress"):
             raise ValueError(f"mode must be 'flow' or 'regress', got {self.mode!r}")
+
+    @property
+    def chunk_size(self) -> int:
+        """The chunk length (``horizon``), under pi0.5's sampler-interface name."""
+        return self.horizon
 
     def get_optimizer_preset(self) -> OptimizerConfig:
         return AdamWConfig()
