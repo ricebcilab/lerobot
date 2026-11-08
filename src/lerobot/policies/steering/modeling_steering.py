@@ -20,7 +20,7 @@ pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTa
 ``ReversalAdapter`` and the composed ``AdapterModules`` with ``as_adapter``) with their checkpoints and losses, and
 ``Flow``, the one Euler integrator of either flow-time convention. The settings and specs are
 ``configuration_steering``'s, the pre-processing ``processor_steering``'s; this folder's README describes the
-methods. The module-level functions at the end are deprecated aliases of the methods that replaced them."""
+methods."""
 
 import math
 from collections import deque

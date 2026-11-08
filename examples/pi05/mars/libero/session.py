@@ -295,12 +295,12 @@ class Session:
         if mode not in MODES:
             raise ValueError(f"unknown mode '{mode}' (expected one of {', '.join(MODES)})")
         if lam is not None:
-            FlowReversalSteering.check_steps(
+            FlowControlSteering.check_steps(
                 "lambda", lam, 0, self.policy.config.num_inference_steps, "Euler steps"
             )
             self.lam = lam
         if tau is not None:
-            FlowReversalSteering.check_steps("tau", tau, 1, self.policy.config.chunk_size, "chunk steps")
+            FlowControlSteering.check_steps("tau", tau, 1, self.policy.config.chunk_size, "chunk steps")
             self.tau = tau
         if ic_gain is not None:
             self.ic_gain = ic_gain  # validated by the wrapper
