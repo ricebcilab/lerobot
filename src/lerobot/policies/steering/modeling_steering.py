@@ -1571,8 +1571,9 @@ class SteeringPolicy(PreTrainedPolicy):
     command by the mode's core (``FlowControlSteering`` or ``FlowReversalSteering``) through the MARS adapter
     (``AdapterModules``, the policy's only weights); saving, loading and the Hub through ``PreTrainedPolicy``.
 
-    The base policy (``base_policy``, or loaded from ``config.base_policy_path`` on first use) is not part of this
-    policy's weights. A policy with ``sample_chunk`` (the cursor's ``FlowPolicy``, or a ``CursorFlowPolicy``
+    The base policy (``base_policy``, or loaded from ``config.base_policy_path`` on first use, onto
+    ``config.device``) is not part of this policy's weights, so ``SteeringPolicy.to`` does not move it: a passed-in
+    base is the caller's (often shared with other code) to place, a loaded one follows ``config.device``. A policy with ``sample_chunk`` (the cursor's ``FlowPolicy``, or a ``CursorFlowPolicy``
     around one) is driven through pi0.5's sampler interface, its chunks scaled to its action units
     (``action_scale``), FRS's reference the command held at ``max_speed``; any other policy is driven as pi0.5 is,
     its ``postprocessor`` giving the action statistics.
@@ -1599,27 +1600,36 @@ class SteeringPolicy(PreTrainedPolicy):
         )  # not a submodule: its weights are not this policy's
         self._postprocessor = postprocessor
         self._core: FlowControlSteering | FlowReversalSteering | None = None
+        self._action_queue: deque = deque()
 
     def _module(self, kind: str, arch: dict | None, path: str | None) -> nn.Module | None:
         """The ``kind`` module: built from its recorded config (its weights come with the policy's), else read from
-        its checkpoint (its config then recorded), else None."""
+        its checkpoint (its config then recorded), else None. A task module's scene settings fill the config's unset
+        ones (``SteeringConfig.scene_settings``, which raises on a contradiction)."""
         if arch is not None:
-            return AdapterModules.KINDS[kind](**arch)
-        if path is None:
+            module = AdapterModules.KINDS[kind](**arch)
+        elif path is None:
             return None
-        module, found, _ = AdapterModules.load_module(path)
-        if found != kind:
-            raise ValueError(f"{path} holds a {found} module, not a {kind} module")
-        setattr(self.config, f"{kind}_module", dict(module.config))
+        else:
+            module, found, _ = AdapterModules.load_module(path)
+            if found != kind:
+                raise ValueError(f"{path} holds a {found} module, not a {kind} module")
+            setattr(self.config, f"{kind}_module", dict(module.config))
+        if kind == "task":
+            for key, value in self.config.scene_settings(module.config).items():
+                setattr(self.config, key, value)
         return module
 
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path, *, base_policy=None, postprocessor=None, **kwargs):
         """``PreTrainedPolicy.from_pretrained``, the base policy (and its postprocessor) passed in or loaded from the
         config's reference on first use. The adapter is served frozen, as ``AdapterModules.load_module`` serves a
-        module checkpoint: ``nn.MultiheadAttention`` (the task module's) computes in a different order when its
-        weights require grad, even under ``torch.no_grad``, so a frozen module is what reproduces the checkpoint's
-        chunks bit for bit. ``policy.adapter.requires_grad_(True)`` to train it further."""
+        module checkpoint, because that is what reproduces the checkpoint's chunks bit for bit: in the task module's
+        attention, ``torch.matmul``'s fold heuristic reads ``requires_grad`` on the transposed batch-first input and
+        picks another evaluation order when the weights require grad, even under ``torch.no_grad`` (a last-bit
+        difference, batch-size dependent: about 3e-7 at B = 2, bit-equal at other sizes). A loaded steering folder
+        therefore has nothing trainable, a departure from the sibling policies that is harmless today (``forward``
+        needs the example trainer's ``kind`` batches); ``policy.adapter.requires_grad_(True)`` to train it further."""
         policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
         policy.adapter.requires_grad_(False)
         policy.set_base_policy(base_policy, postprocessor)
@@ -1644,7 +1654,7 @@ class SteeringPolicy(PreTrainedPolicy):
             policy = get_policy_class(self.config.base_policy_type).from_pretrained(
                 self.config.base_policy_path
             )
-            object.__setattr__(self, "_base_policy", policy.eval())
+            object.__setattr__(self, "_base_policy", policy.to(self.config.device).eval())
         return self._base_policy
 
     def _flow_model(self):
@@ -1707,15 +1717,21 @@ class SteeringPolicy(PreTrainedPolicy):
         return self._core
 
     def observation(self, batch: dict) -> dict:
-        """The base policy's observation in ``batch``: its ``observation.`` keys without the prefix (the
-        pre-processor's form; ``scene_tokens`` becomes ``scene[scene_source]``), else every key but the steering
-        policy's own."""
+        """The base policy's observation in ``batch``. A ``sample_chunk`` policy (the cursor's) reads its own dict:
+        when the batch carries it under ``observation.`` (the pre-processor's form) the prefix is stripped from those
+        keys, the scene step's inputs dropped and ``scene_tokens`` put at ``scene[scene_source]``; otherwise the batch
+        is the dict. Any other policy (pi0.5) reads lerobot's batch as it is: every key but the steering policy's
+        own (``STEERING_BATCH_KEYS``), its ``observation.*`` keys and ``task`` untouched."""
+        if not hasattr(self._flow_model(), "sample_chunk"):
+            return {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
         if any(k.startswith(OBS_PREFIX) for k in batch):
             obs = {k[len(OBS_PREFIX) :]: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
             for key in ("layouts", "scene_images"):  # the scene step's inputs, not the policy's
                 obs.pop(key, None)
             tokens = obs.pop("scene_tokens", None)
             if tokens is not None:
+                if self.config.scene_source is None:
+                    raise ValueError("observation.scene_tokens needs a scene_source (a task module's)")
                 obs["scene"] = {**(obs.get("scene") or {}), self.config.scene_source: tokens}
             return obs
         return {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
@@ -1734,7 +1750,8 @@ class SteeringPolicy(PreTrainedPolicy):
         return self.adapter.parameters()
 
     def reset(self) -> None:
-        """Clears the core's queues (and the base policy's)."""
+        """Clears the action queue and the core's queues (and the base policy's)."""
+        self._action_queue.clear()
         if self._core is not None:
             self._core.reset()
 
@@ -1784,8 +1801,14 @@ class SteeringPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
-        """The first step (B, n) of a fresh steered chunk."""
-        return self.predict_action_chunk(batch)[:, 0]
+        """One action (B, n) per call: a steered chunk for this batch's command when the queue is empty, its first
+        ``n_action_steps`` steps (the core's sampler's) then served one per call, as the cores' own ``select_action``
+        and lerobot's chunking policies serve theirs. ``reset`` empties the queue."""
+        if not self._action_queue:
+            chunk = self.predict_action_chunk(batch)
+            n = self.core._policy.config.n_action_steps
+            self._action_queue.extend(chunk[:, :n].transpose(0, 1))
+        return self._action_queue.popleft()
 
 
 # ---------------------------------------------------------------- deprecated aliases (one round)

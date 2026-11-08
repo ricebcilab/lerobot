@@ -9,6 +9,8 @@ from cursor_sa import paths
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
 from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule, steered_chunk
 
+from lerobot.policies.factory import make_pre_post_processors
+
 
 def _obs(b=3, n=5, k=2):
     g = torch.Generator().manual_seed(0)
@@ -153,3 +155,31 @@ def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_modu
         want = steered_chunk(policy, obs, command, "frs", adapter=adapter)
         torch.manual_seed(3)
         assert torch.equal(steering.predict_action_chunk({**obs, "command": command}), want)
+        pre, post = make_pre_post_processors(
+            steering.config, pretrained_path=str(folder)
+        )  # the factory's reload
+        batch = pre({**{f"observation.{k}": v for k, v in obs.items()}, "command": command})
+        torch.manual_seed(3)
+        assert torch.equal(post(steering.predict_action_chunk(batch)), want)
+
+
+def test_a_converted_image_task_module_keeps_its_scene_settings(tmp_path):
+    from lerobot.policies.steering import (
+        AdapterModules,
+        LearnedTaskModule,
+        SteeringPolicy,
+        SteeringSceneTokensProcessorStep,
+        scene_spec,
+    )
+
+    task = LearnedTaskModule(
+        horizon=16, d=16, tdim=8, heads=2, layers=1, token_geometry="relative", **scene_spec("vlm_image", 48)
+    )
+    AdapterModules.save_module(task, tmp_path / "adapters" / "t" / "adapter.pt", "task")
+    assert convert_checkpoints.convert_tree(tmp_path, steering=True)["steering"] == 1
+    folder = tmp_path / "adapters" / "t"
+    config = SteeringPolicy.from_pretrained(folder).config
+    assert (config.scene_source, config.render_size, config.token_geometry) == ("vlm_image", 48, "relative")
+    pre, _ = make_pre_post_processors(config, pretrained_path=str(folder))
+    (step,) = (s for s in pre.steps if isinstance(s, SteeringSceneTokensProcessorStep))
+    assert (step.source, step.render_size) == ("vlm_image", 48)

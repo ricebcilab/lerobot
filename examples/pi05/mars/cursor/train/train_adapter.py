@@ -668,7 +668,7 @@ def _train_module(
     weight_decay: float = 1e-4,
     clip: float = 1.0,
 ) -> list[dict]:
-    """The MARS modules' training loop, shared by the cursor and the LIBERO trainers: AdamW with a cosine
+    """This trainer's loop for a MARS module (LIBERO's trainer keeps its own copy): AdamW with a cosine
     schedule over ``steps``, gradients clipped to ``clip``, non-finite batches skipped (``_step_if_finite``).
     ``batch_loss(step)`` returns one batch's loss. Every ``log_every`` steps, and at the last, the module is put
     in eval mode for ``validate()`` (named numbers, or None) and {step, train_loss (the window's mean),

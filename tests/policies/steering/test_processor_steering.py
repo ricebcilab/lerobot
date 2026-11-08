@@ -23,8 +23,10 @@ import torch
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
 from lerobot.policies.cursor_flow import FlowPolicy
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import (
     DEADBAND,
+    AdapterModules,
     AdapterSpec,
     LearnedTaskModule,
     SceneEncoder,
@@ -33,6 +35,7 @@ from lerobot.policies.steering import (
     SteeringPolicy,
     SteeringSceneTokensProcessorStep,
     make_steering_pre_post_processors,
+    scene_spec,
 )
 from lerobot.policies.steering.processor_steering import (
     COMMAND,
@@ -90,9 +93,15 @@ def _transition(observation=None, complementary=None):
     }
 
 
-def _config(task_module=None, scene_source="discs", **kw):
-    adapter = None if task_module is None else AdapterSpec(task_path=task_module)
-    return SteeringConfig(adapter=adapter, scene_source=scene_source, render_size=SIZE, device="cpu", **kw)
+def _config(task_module=None, **kw):
+    adapter = None if task_module is None else AdapterSpec(task_path=str(task_module))
+    return SteeringConfig(adapter=adapter, device="cpu", **kw)
+
+
+def _task_module(root, source, **kw):
+    """A task module checkpoint of ``source`` on SIZE renders (tiny), as the trainer saves one."""
+    module = LearnedTaskModule(horizon=16, d=16, tdim=8, heads=2, layers=1, **scene_spec(source, SIZE), **kw)
+    return AdapterModules.save_module(module, root / f"{source}.pt", "task")
 
 
 # ---------------------------------------------------------------- the scene tokens step
@@ -201,7 +210,7 @@ def test_command_step_needs_a_command_and_declares_no_feature():
 # ---------------------------------------------------------------- the factory
 
 
-def test_factory_assembles_the_steps_in_order():
+def test_factory_assembles_the_steps_in_order(tmp_path):
     pre, post = make_steering_pre_post_processors(_config())
     assert pre.name == POLICY_PREPROCESSOR_DEFAULT_NAME and post.name == POLICY_POSTPROCESSOR_DEFAULT_NAME
     assert [type(s) for s in pre.steps] == [
@@ -213,14 +222,14 @@ def test_factory_assembles_the_steps_in_order():
     ]
     assert [type(s) for s in post.steps] == [UnnormalizerProcessorStep, DeviceProcessorStep]
     assert post.steps[1].device == "cpu"
-    pre, _ = make_steering_pre_post_processors(_config(task_module="t.pt", scene_source="vlm_image"))
+    pre, _ = make_steering_pre_post_processors(_config(_task_module(tmp_path, "vlm_image")))
     assert [type(s) for s in pre.steps][3:5] == [
         SteeringSceneTokensProcessorStep,
         SteeringCommandProcessorStep,
     ]
     assert (pre.steps[3].source, pre.steps[3].render_size) == ("vlm_image", SIZE)
     for source in ("discs", "cnn"):  # no scene tokens to encode
-        pre, _ = make_steering_pre_post_processors(_config(task_module="t.pt", scene_source=source))
+        pre, _ = make_steering_pre_post_processors(_config(_task_module(tmp_path, source)))
         assert SteeringSceneTokensProcessorStep not in [type(s) for s in pre.steps]
 
 
@@ -260,3 +269,51 @@ def test_a_round_trip_through_the_pre_pipeline_into_the_policy(mode):
     torch.manual_seed(2)
     want = policy.predict_action_chunk({**obs, COMMAND: torch.as_tensor(raw[:, :2], dtype=torch.float32)})
     assert chunk.shape == (3, 16, 2) and torch.equal(chunk, want)
+
+
+def test_the_scene_settings_are_the_task_modules(tmp_path):
+    """A config naming a vlm_image module with relative geometry gets the module's scene step and settings; an
+    explicit setting that contradicts the module raises, naming both."""
+    path = _task_module(tmp_path, "vlm_image", token_geometry="relative")
+    pre, _ = make_steering_pre_post_processors(_config(path))
+    (step,) = (s for s in pre.steps if isinstance(s, SteeringSceneTokensProcessorStep))
+    assert (step.source, step.render_size) == ("vlm_image", SIZE)
+    config = _config(path)
+    SteeringPolicy(config)
+    assert (config.scene_source, config.render_size, config.token_geometry, config.scene_rank) == (
+        "vlm_image",
+        SIZE,
+        "relative",
+        None,
+    )
+    for bad, named in (
+        ({"scene_source": "vlm_prefix"}, "'vlm_prefix'"),
+        ({"token_geometry": "absolute"}, "'absolute'"),
+        ({"scene_rank": 8}, "8"),
+    ):
+        with pytest.raises(ValueError, match=f"config says {named}"):
+            SteeringPolicy(_config(path, **bad))
+        with pytest.raises(ValueError, match="task module was built with"):
+            make_steering_pre_post_processors(_config(path, **bad))
+    assert _config().scene_settings() == {
+        "scene_source": None,
+        "render_size": None,
+        "token_geometry": None,
+        "scene_rank": None,
+    }
+
+
+def test_a_factory_reload_of_the_pipelines_carries_the_command(tmp_path):
+    config = _config()
+    for pipeline in make_steering_pre_post_processors(config):
+        pipeline.save_pretrained(tmp_path)
+    pre, post = make_pre_post_processors(config, pretrained_path=str(tmp_path))
+    pos = torch.rand(3, 2)
+    batch = pre({"observation.pos": pos, COMMAND: np.array([[0.5, 0.0], [DEADBAND / 2, 0.0], [-0.3, 0.4]])})
+    torch.testing.assert_close(batch[COMMAND], torch.tensor([[0.5, 0.0], [0.0, 0.0], [-0.3, 0.4]]))
+    assert (
+        torch.equal(batch["observation.pos"], pos)
+        and [type(s) for s in pre.steps][3] is SteeringCommandProcessorStep
+    )
+    action = torch.rand(3, 16, 2)
+    assert torch.equal(post(action), action)

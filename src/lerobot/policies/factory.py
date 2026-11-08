@@ -316,13 +316,19 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        to_transition = batch_to_transition
+        if isinstance(policy_cfg, SteeringConfig):
+            # the operator's `command` is not one of batch_to_transition's complementary keys
+            from .steering.processor_steering import steering_batch_to_transition
+
+            to_transition = steering_batch_to_transition
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(
                 "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
             overrides=kwargs.get("preprocessor_overrides", {}),
-            to_transition=batch_to_transition,
+            to_transition=to_transition,
             to_output=transition_to_batch,
             revision=pretrained_revision,
         )

@@ -12,7 +12,9 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
   kept as adapter.pt.orig.
 - with --steering, every adapters/**/adapter.pt (once in that format) also becomes a lerobot `SteeringPolicy`
   directory beside it: config.json + model.safetensors (`save_pretrained`; MARS, mode frs, the module in its slot,
-  its config recorded so the folder loads without adapter.pt), `--base-policy` the policy folder it steers (the
+  its config and scene settings recorded so the folder loads without adapter.pt) and the policy's two processor
+  pipelines (policy_preprocessor.json, policy_postprocessor.json: `make_steering_pre_post_processors`' for that config,
+  which the factory's `make_pre_post_processors(config, pretrained_path=folder)` reloads), `--base-policy` the policy folder it steers (the
   config's base_policy_path; unset by default). adapter.pt stays, and stays loadable by AdapterModules.load.
 
 Each converted file is written to a temporary name, loaded back and its weights compared with the
@@ -36,7 +38,9 @@ from pathlib import Path
 import torch
 
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
-from lerobot.policies.steering import AdapterModules, AdapterSpec, LearnedTaskModule, LearnedUserModule, SteeringConfig, SteeringPolicy
+from lerobot.policies.steering import (AdapterModules, AdapterSpec, LearnedTaskModule, LearnedUserModule, SteeringConfig,
+                                       SteeringPolicy, make_steering_pre_post_processors)
+from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
 
@@ -124,13 +128,15 @@ def convert_adapter(path):
     return kind
 
 
-STEERING_FILES = ("config.json", "model.safetensors")
+STEERING_FILES = ("config.json", "model.safetensors", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+                  f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")  # the files a converted folder has
 
 
 def convert_adapter_to_policy(path, base_policy_path=None):
     """adapters/<name>/adapter.pt (in the `AdapterModules.save_module` format) -> adapters/<name>/{config.json,
-    model.safetensors}, a lerobot `SteeringPolicy` (MARS: mode frs, the module in its slot, its config recorded); True
-    if converted, False when the folder already has one. Written and verified (the module's weights reproduced by
+    model.safetensors, the two processor JSONs}, a lerobot `SteeringPolicy` (MARS: mode frs, the module in its slot,
+    its config and scene settings recorded) and its pipelines; True if converted, False when the folder already has
+    them all. Written and verified (the module's weights reproduced by
     `SteeringPolicy.from_pretrained`) in a temporary folder, then moved into place; adapter.pt is left as it is."""
     path = Path(path)
     if all((path.parent / name).exists() for name in STEERING_FILES):
@@ -144,12 +150,14 @@ def convert_adapter_to_policy(path, base_policy_path=None):
     tmp = Path(tempfile.mkdtemp(prefix=".convert-", dir=path.parent))
     try:
         policy.save_pretrained(tmp)
+        for pipeline in make_steering_pre_post_processors(policy.config):
+            pipeline.save_pretrained(tmp)
         loaded = SteeringPolicy.from_pretrained(tmp, strict=True)
         module = getattr(loaded.adapter, kind)
         if module.config != getattr(adapter, kind).config or not _same_weights(module.state_dict(), getattr(adapter, kind).state_dict()):
             raise RuntimeError(f"{path}: the steering policy does not reproduce the module")
-        for name in STEERING_FILES:
-            os.replace(tmp / name, path.parent / name)
+        for file in sorted(tmp.iterdir()):  # the policy's files and the pipelines' (with any step state)
+            os.replace(file, path.parent / file.name)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return True

@@ -16,7 +16,7 @@
 """SteeringConfig and SteeringPolicy as lerobot's policy contract has them (the cursor_flow precedent): the
 feature-less config, the factory entries, lerobot's save/load format with the base policy outside the weights,
 and the policy's batch forms. Its chunks against the cursor example's are in
-tests/examples/pi05_mars_cursor/test_steering_policy.py."""
+tests/examples/pi05_mars_cursor/test_steering_policy_cursor.py."""
 
 import numpy as np
 import pytest
@@ -224,3 +224,58 @@ def test_forward_needs_the_module_of_its_kind(tmp_path):
     assert parts["field"] == loss.item() and all(p.grad is not None for p in trainable.get_optim_params())
     with pytest.raises(ValueError, match="holds a task module"):
         SteeringPolicy(SteeringConfig(adapter=AdapterSpec(user_path=str(task_path)), device="cpu"))
+
+
+class _SamplerBase:
+    """A pi0.5-style base: no ``sample_chunk``, pi0.5's sampler interface itself; records the batches it gets."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(num_inference_steps=4, chunk_size=6, max_action_dim=8, n_action_steps=3)
+        self.batches = []
+
+    def reset(self):
+        pass
+
+    def predict_action_chunk(self, batch, **hooks):
+        self.batches.append(batch)
+        return torch.arange(2 * 6 * 8, dtype=torch.float32).reshape(2, 6, 8)
+
+
+def test_a_pi05_style_base_gets_lerobots_batch_as_it_is():
+    base = _SamplerBase()
+    steering = SteeringPolicy(
+        SteeringConfig(mode="flow_control", operator_dims=["translation"], device="cpu"), base_policy=base
+    )
+    batch = {
+        "observation.state": torch.zeros(2, 8),
+        "observation.images.top": torch.zeros(2, 3, 4, 4),
+        "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+        "task": ["pick", "place"],
+        "command": torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    }
+    chunk = steering.predict_action_chunk(batch)
+    assert chunk.shape == (2, 6, 8)  # normalized: the postprocessor unnormalizes a pi0.5 chunk
+    assert base.batches and all(
+        list(b) == ["observation.state", "observation.images.top", "observation.language.tokens", "task"]
+        for b in base.batches
+    )
+
+
+def test_select_action_serves_the_chunks_executed_steps_one_per_call():
+    base = _policy()
+    steering = SteeringPolicy(SteeringConfig(device="cpu", n_action_steps=3), base_policy=base)
+    batch = {**_obs(), "command": COMMAND}
+    torch.manual_seed(6)
+    chunk = steering.predict_action_chunk(batch)
+    torch.manual_seed(6)
+    served = [steering.select_action(batch) for _ in range(3)]
+    assert all(torch.equal(a, chunk[:, i]) for i, a in enumerate(served))
+    torch.manual_seed(7)
+    fresh = steering.predict_action_chunk(batch)
+    torch.manual_seed(7)
+    assert torch.equal(steering.select_action(batch), fresh[:, 0])  # the queue ran out: a new chunk
+    steering.reset()
+    torch.manual_seed(6)
+    assert torch.equal(steering.select_action(batch), chunk[:, 0]) and len(steering._action_queue) == 2

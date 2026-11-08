@@ -150,7 +150,7 @@ def UserModule(horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step
     """The core's `LearnedUserModule` with the cursor's dims and defaults: U(x_t, t), one 2x2 matrix per chunk
     step applied to the policy's velocity in the backward pass; it undoes one user's command corruption.
     Initialized to the identity. `step_rank` and `cross_step_rank` (`cross_step_dims`) set its flexibility as the
-    core documents; `velocity(x, t, v)` applies the whole correction (the core's `apply_user_module`),
+    core documents; `velocity(x, t, v)` applies the whole correction (the core's `LearnedUserModule.apply_correction`),
     `forward(x, t)` gives the per-step matrices alone [B, H, 2, 2]."""
     return LearnedUserModule(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding, step_rank=step_rank,
                              cross_step_rank=cross_step_rank, cross_step_dims=cross_step_dims)

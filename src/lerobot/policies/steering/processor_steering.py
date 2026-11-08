@@ -450,7 +450,8 @@ def make_steering_pre_post_processors(
     2. Adding a batch dimension.
     3. Normalizing input and output features based on dataset statistics (none for a base policy that reads
        its own observation dict, as the cursor's).
-    4. Encoding the scene into tokens for a task module with an image source (``vlm_image`` / ``vlm_prefix``).
+    4. Encoding the scene into tokens for a task module with an image source (``vlm_image`` / ``vlm_prefix``; the
+       source and render size are the task module's, read from its checkpoint when the config has not recorded it).
     5. Reading the operator's command (the first ``n_dims`` dims, the idle rows zeroed).
     6. Moving all data to the specified device.
 
@@ -476,11 +477,15 @@ def make_steering_pre_post_processors(
             stats=dataset_stats,
         ),
     ]
-    if config.has_task_module and config.scene_source in STORED_SCENE_SOURCES:
+    task = config.task_module
+    if task is None and config.adapter is not None and config.adapter.task_path is not None:
+        task = torch.load(config.adapter.task_path, map_location="cpu", weights_only=True)["config"]
+    scene = config.scene_settings(task)  # the task module's, where the config leaves them unset
+    if task is not None and scene["scene_source"] in STORED_SCENE_SOURCES:
         input_steps.append(
             SteeringSceneTokensProcessorStep(
-                source=config.scene_source,
-                render_size=config.render_size,
+                source=scene["scene_source"],
+                render_size=scene["render_size"] or SCENE_SIZE,
                 vlm_path=config.vlm_path,
                 device=config.device,
             )

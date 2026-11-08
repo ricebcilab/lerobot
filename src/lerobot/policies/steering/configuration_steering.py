@@ -347,7 +347,9 @@ SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads 
 SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
 STEERING_MODES = ("flow_control", "frs")
 
-# draccus writes and reads an AdapterSpec's fixed matrix (the config's `adapter`) as nested lists
+# draccus writes and reads an AdapterSpec's fixed matrix (the config's `adapter`) as nested lists. The registration
+# is process-wide (draccus keeps one table per type), and additive: draccus had no encoder or decoder for np.ndarray,
+# so no other config's parsing changes; only a field typed np.ndarray, which no other lerobot config has, uses it.
 draccus.encode.register(np.ndarray, lambda array: array.tolist())
 draccus.decode.register(np.ndarray, lambda value: np.asarray(value, dtype=np.float64))
 
@@ -392,6 +394,8 @@ class SteeringConfig(PreTrainedConfig):
         render_size: The size the scene is rendered at for the scene tokens.
         token_geometry: The task module's token geometry (``TOKEN_GEOMETRIES``).
         scene_rank: The width of the task module's token reduction (None: full width).
+            The four scene settings are the task module's: None (unset) takes the module's value when the policy
+            records the module (``scene_settings``); an explicit value that contradicts the module's raises.
         vlm_path: The pi0.5 checkpoint whose vision tokens the ``vlm_*`` sources read.
         normalization_mapping: The normalization of the base policy's features (none for the cursor's).
     """
@@ -416,9 +420,9 @@ class SteeringConfig(PreTrainedConfig):
     dt: float = 0.02
     base_policy_type: str = "cursor_flow"
     base_policy_path: str | None = None
-    scene_source: str = "discs"
-    render_size: int = SCENE_SIZE
-    token_geometry: str = "absolute"
+    scene_source: str | None = None
+    render_size: int | None = None
+    token_geometry: str | None = None
     scene_rank: int | None = None
     vlm_path: str = SCENE_VLM_PATH
     normalization_mapping: dict[str, NormalizationMode] = field(default_factory=dict)
@@ -427,9 +431,9 @@ class SteeringConfig(PreTrainedConfig):
         super().__post_init__()
         if self.mode not in STEERING_MODES:
             raise ValueError(f"mode must be one of {STEERING_MODES}, got {self.mode!r}")
-        if self.scene_source not in SCENE_SOURCES:
+        if self.scene_source is not None and self.scene_source not in SCENE_SOURCES:
             raise ValueError(f"scene_source must be one of {SCENE_SOURCES}, got {self.scene_source!r}")
-        if self.token_geometry not in TOKEN_GEOMETRIES:
+        if self.token_geometry is not None and self.token_geometry not in TOKEN_GEOMETRIES:
             raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {self.token_geometry!r}")
         unknown = [d for d in self.operator_dims or () if d not in OPERATOR_DIM_GROUPS]
         if unknown:
@@ -443,6 +447,35 @@ class SteeringConfig(PreTrainedConfig):
         return self.task_module is not None or (
             self.adapter is not None and self.adapter.task_path is not None
         )
+
+    def scene_settings(self, task: dict | None = None) -> dict[str, Any]:
+        """The scene settings (``scene_source``, ``render_size``, ``token_geometry``, ``scene_rank``): this config's,
+        each unset one (None) taken from the task module's constructor config ``task`` (``LearnedTaskModule.config``:
+        ``token_source``, ``image_size``, ``token_geometry``, ``scene_rank``, absent keys being the module's
+        defaults). Raises ``ValueError`` naming both values when an explicit setting contradicts the module's (a
+        ``render_size`` is not checked against a module without an image size, a ``discs`` one)."""
+        settings = {
+            "scene_source": self.scene_source,
+            "render_size": self.render_size,
+            "token_geometry": self.token_geometry,
+            "scene_rank": self.scene_rank,
+        }
+        if task is None:
+            return settings
+        module = {
+            "scene_source": task.get("token_source", "discs"),
+            "render_size": task.get("image_size"),
+            "token_geometry": task.get("token_geometry", "absolute"),
+            "scene_rank": task.get("scene_rank"),
+        }
+        for key, value in module.items():
+            if settings[key] is None:
+                settings[key] = value
+            elif settings[key] != value and (value is not None or key != "render_size"):
+                raise ValueError(
+                    f"{key}: the config says {settings[key]!r}, the task module was built with {value!r}"
+                )
+        return settings
 
     def get_optimizer_preset(self) -> OptimizerConfig:
         return AdamWConfig()
