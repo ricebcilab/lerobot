@@ -14,7 +14,7 @@ from cursor_sa import config
 from cursor_sa.readout import Readout, corruption_spec
 from lerobot.envs.cursor import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
-from cursor_sa.policy import FlowPolicy
+from cursor_sa.policy import FlowPolicy, load_policy
 from cursor_sa.readout import DEADBAND
 from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule, active_rows
 from train import train_adapter
@@ -47,7 +47,7 @@ def _recording(monkeypatch, name):
 
 
 def _base_policy():
-    return FlowPolicy.load(train_adapter.policy_path(config.load_arm("base.yaml")["model"]), "cpu")
+    return load_policy(train_adapter.policy_path(config.load_arm("base.yaml")["model"]), "cpu").model
 
 
 @pytest.fixture(scope="module")
@@ -421,12 +421,14 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
     ft = ["--init", "base", "--obstacle", RING, "--demo_seconds", "12", *tiny]
     train_policy.main(["--name", "scored", *ft, "--eval_steps", "2", "--eval_trials", "4"])
     train_policy.main(["--name", "plain", *ft])
-    base, scored = (torch.load(trained / n / "policy.pt") for n in ("base", "scored"))
-    assert scored["config"] == {**base["config"], "obstacle_tokens": True} and hasattr(FlowPolicy.load(trained / "scored" / "policy.pt"), "obstacle_in")
-    assert scored["args"]["init"] == "base" and scored["args"]["obstacle"]["kind"] == "ring" and scored["args"]["p_free"] == 0.25
-    torch.testing.assert_close(scored["state_dict"]["action_scale"], base["state_dict"]["action_scale"])  # the base's units
+    base, scored = (load_policy(trained / n).model for n in ("base", "scored"))  # lerobot policy folders
+    assert not any((trained / n / "policy.pt").exists() for n in ("base", "scored", "plain"))
+    assert all((trained / "scored" / f"policy_{p}processor.json").is_file() for p in ("pre", "post"))  # its pipelines
+    assert scored.config == {**base.config, "obstacle_tokens": True} and hasattr(scored, "obstacle_in")
     log, plain = (json.loads((trained / n / "train_log.json").read_text()) for n in ("scored", "plain"))
-    assert log["action_scale"] == pytest.approx(base["state_dict"]["action_scale"].item())
+    assert log["args"]["init"] == "base" and log["args"]["obstacle"]["kind"] == "ring" and log["args"]["p_free"] == 0.25
+    torch.testing.assert_close(scored.action_scale, base.action_scale)  # the base's units
+    assert log["action_scale"] == pytest.approx(base.action_scale.item())
     assert [e["step"] for e in log["eval"]] == [2, 4]  # the step asked for and the last
     assert log["best_step"] == max(log["eval"], key=lambda e: (e["success"], e["step"]))["step"]
     for key in ("train", "val"):  # scoring left the training's random state alone
@@ -436,7 +438,7 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
     data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
                                        *corruption_spec(args.corruption), args.p_free)
     assert 0 < log["args"]["n_demos"] == args.n_demos == len(data["train"].sampler.lengths)
-    monkeypatch.setattr(train_adapter, "policy_path", lambda name: trained / name / "policy.pt")
+    monkeypatch.setattr(train_adapter, "policy_path", lambda name: trained / name)
     train_adapter.train(_args("--kind", "user", *ROT, "--model", "scored", "--name", "u_scored", *COMMON))
     assert torch.load(trained / "u_scored" / "adapter.pt")["meta"]["args"]["model"] == "scored"
 

@@ -36,7 +36,7 @@ def _perturbed_task(seed=1):
     return task.eval()
 
 
-def _chunk(model, obs, mode, command, adapter=None, seed=1):
+def _steered(model, obs, mode, command, adapter=None, seed=1):
     torch.manual_seed(seed)
     return steered_chunk(model, obs, command, mode, tau=3, n_reverse_steps=4, adapter=adapter)
 
@@ -47,11 +47,11 @@ def test_fresh_task_module_is_the_identity_in_every_mode():
     fresh = AdapterModules(task=LearnedTaskModule()).eval()
     assert fresh.kind == "task"
     for mode in MODES:
-        torch.testing.assert_close(_chunk(model, obs, mode, command, fresh), _chunk(model, obs, mode, command))
+        torch.testing.assert_close(_steered(model, obs, mode, command, fresh), _steered(model, obs, mode, command))
     x = torch.randn(3, model.horizon, 2)
     torch.testing.assert_close(reverse_flow(model, obs, x, 4, 10, fresh), reverse_flow(model, obs, x, 4, 10))
     # without obstacle keys in the observation (the tests' plain obs) the module still runs, as the identity
-    torch.testing.assert_close(_chunk(model, _obs(), "frs", command, fresh), _chunk(model, _obs(), "frs", command))
+    torch.testing.assert_close(_steered(model, _obs(), "frs", command, fresh), _steered(model, _obs(), "frs", command))
 
 
 def test_composed_adapter_applies_task_forward_and_user_task_backward():

@@ -4,7 +4,7 @@
 
 DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
 
-- every policies/**/policy.pt (the cursor trainer's {config, state_dict, args}) becomes a lerobot
+- every policies/**/policy.pt (the cursor trainer's {config, state_dict, args}, `read_policy_pt`) becomes a lerobot
   `CursorFlowPolicy` directory beside it: config.json + model.safetensors (`save_pretrained`) and the policy's
   two processor pipelines (policy_preprocessor.json, policy_postprocessor.json and the unnormalizer's statistics:
   `make_cursor_flow_pre_post_processors`, which the factory's `make_pre_post_processors(config, pretrained_path=folder)`
@@ -22,12 +22,13 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
 
 Each converted file is written to a temporary name, loaded back and its weights compared with the
 original; only then is the original copied to *.orig and the new file moved into place (one atomic
-replace for an adapter; a policy's policy.pt, which FlowPolicy.load reads first, is removed last), so an
-interrupted run leaves every checkpoint loadable and can simply be run again. An existing *.orig that
-differs from the file is never overwritten: that file is skipped with a warning. Files already in the new
-format are left untouched, so re-running is a no-op. The policy trainer still writes policy.pt, so run this
-again after training a policy (FlowPolicy.load reads both formats meanwhile); the adapter trainer writes the
-`AdapterModules.save_module` format itself, and AdapterModules.load reads only that.
+replace for an adapter; a policy's policy.pt is removed last), so an interrupted run leaves every checkpoint
+convertible and can simply be run again. An existing *.orig that differs from the file is never overwritten:
+that file is skipped with a warning. Files already in the new format are left untouched, so re-running is a
+no-op. The trainers write lerobot's formats themselves (the policy trainer `CursorFlowPolicy.save_pretrained` and
+the pipelines, the adapter trainer `AdapterModules.save_module`), and the loaders read only those
+(`cursor_sa.policy.load_policy` refuses a folder holding a policy.pt): this is the one reader of the cursor
+project's policy.pt.
 """
 
 import argparse
@@ -90,12 +91,19 @@ def save_pipelines(config, folder):
     return sorted(f.name for f in folder.iterdir() if f.name not in before)
 
 
+def read_policy_pt(path):
+    """The cursor trainer's policy.pt: its {config, state_dict} (FlowPolicy's constructor config and weights; the
+    file's other keys, the run's args, are left out), on the CPU."""
+    ckpt = torch.load(Path(path), map_location="cpu")
+    return {"config": ckpt["config"], "state_dict": ckpt["state_dict"]}
+
+
 def convert_policy(path):
-    """policies/<name>/policy.pt -> policies/<name>/{config.json, model.safetensors, the pipelines' files}; True if
-    converted. The new files are written and verified in a temporary folder and only then moved into place; policy.pt
-    (read first by FlowPolicy.load) is removed last, after its backup, so a crash leaves a loadable folder."""
+    """policies/<name>/policy.pt (`read_policy_pt`) -> policies/<name>/{config.json, model.safetensors, the
+    pipelines' files}; True if converted. The new files are written and verified in a temporary folder and only then
+    moved into place; policy.pt is removed last, after its backup, so a crash leaves a folder this converts again."""
     path = Path(path)
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = read_policy_pt(path)
     state = ckpt["state_dict"]
     config = CursorFlowConfig(**ckpt["config"], action_scale=float(state["action_scale"]), device="cpu")
     policy = CursorFlowPolicy(config)

@@ -134,7 +134,7 @@ from cursor_sa.demos import (  # noqa: E402
 from lerobot.envs.cursor import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
                            sample_layouts)
 from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
-from cursor_sa.policy import FlowPolicy  # noqa: E402
+from cursor_sa.policy import load_policy  # noqa: E402
 from cursor_sa.dataset import SceneDataset, encoder_digest, store_name  # noqa: E402
 from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
 from cursor_sa.steering import forward_flow, hide_goal, reverse_flow, to_action  # noqa: E402
@@ -865,7 +865,7 @@ def save_module(args, kind, module, name, **extra):
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = args.model or config.load_arm("base.yaml")["model"]
-    policy = FlowPolicy.load(policy_path(model), device)
+    policy = load_policy(policy_path(model), device).model  # the FlowPolicy: the trainer calls its field directly
     policy.requires_grad_(False)
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)

@@ -1,12 +1,13 @@
-"""The cursor checkpoints in both formats: the cursor project's .pt files and the converted lerobot ones
-(convert_checkpoints.py). FlowPolicy.load reads both with the same results; adapters are read in lerobot's format
-(AdapterModules.load reads AdapterModules.load_module's format), which the trainer writes and the converter produces from old files."""
+"""The cursor checkpoints in both formats: the cursor project's .pt files, which only the converter reads
+(convert_checkpoints.py), and the converted lerobot ones. load_policy reads a converted policy folder with the
+policy.pt's results; adapters are read in lerobot's format (AdapterModules.load reads AdapterModules.load_module's
+format), which the trainer writes and the converter produces from old files."""
 
 import convert_checkpoints
 import pytest
 import torch
 from cursor_sa import paths
-from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
+from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
 from cursor_sa.steering import steered_chunk
 
 from lerobot.policies.cursor_flow import make_cursor_flow_pre_post_processors
@@ -49,24 +50,26 @@ def _perturb(module, seed):
 
 
 @pytest.mark.parametrize("obstacle_tokens", [False, True])
-def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens, monkeypatch, caplog):
+def test_a_policy_pt_is_the_converters_and_the_converted_folder_loads_alike(
+    tmp_path, obstacle_tokens, monkeypatch
+):
     model = _old_policy(tmp_path, "p", obstacle_tokens=obstacle_tokens)
     d = tmp_path / "policies" / "p"
     monkeypatch.setattr(paths, "CHECKPOINTS", tmp_path)
-    assert paths.policy_path("p") == d and paths.policy_weights("p") == d / "policy.pt"
-    unconverted = FlowPolicy.load(d)  # a trainer's policy.pt in the directory
-    assert isinstance(unconverted, FlowPolicy)
+    assert paths.policy_path("p") == d and paths.policy_weights("p") == d / "model.safetensors"
+    with pytest.raises(ValueError, match=r"policy\.pt.*convert_checkpoints\.py"):
+        load_policy(d)  # a trainer's policy.pt in the directory: the converter's to read
+    ckpt = convert_checkpoints.read_policy_pt(d / "policy.pt")
+    assert ckpt.keys() == {"config", "state_dict"} and ckpt["config"] == model.config
+    assert ckpt["state_dict"].keys() == model.state_dict().keys()
     convert_checkpoints.convert_tree(tmp_path)
-    assert paths.policy_weights("p") == d / "model.safetensors"
-    converted = FlowPolicy.load(d)
+    loaded = load_policy(d)
+    assert isinstance(loaded, CursorFlowPolicy) and not loaded.training and not loaded.model.training
     obs, x, t = _obs(), torch.randn(3, 16, 2), torch.rand(3)
-    ref = model(obs, x, t)
-    for loaded in (unconverted, converted, FlowPolicy.load(d / "policy.pt.orig")):
-        assert loaded.config == model.config and not loaded.training
-        assert torch.equal(loaded(obs, x, t), ref)
-    ckpt = load_checkpoint(d)
-    assert ckpt["config"] == model.config and ckpt["state_dict"].keys() == model.state_dict().keys()
-    # a trainer's newer policy.pt beside the converted files: it is loaded, with a warning
+    assert loaded.model.config == model.config and torch.equal(loaded.model(obs, x, t), model(obs, x, t))
+    orig = convert_checkpoints.read_policy_pt(d / "policy.pt.orig")["state_dict"]
+    assert all(torch.equal(orig[k], v) for k, v in loaded.model.state_dict().items())
+    # a trainer's newer policy.pt beside the converted files: refused until it is converted
     torch.manual_seed(1)
     retrained = FlowPolicy(
         d_model=32, layers=1, heads=2, d_ff=64, action_scale=0.0077, obstacle_tokens=obstacle_tokens
@@ -74,10 +77,10 @@ def test_flow_policy_loads_both_formats_alike(tmp_path, obstacle_tokens, monkeyp
     torch.save(
         {"config": retrained.config, "state_dict": retrained.state_dict(), "args": {}}, d / "policy.pt"
     )
-    with caplog.at_level("WARNING"):
-        loaded = FlowPolicy.load(d)
-    assert "both policy.pt and model.safetensors; loading policy.pt" in caplog.text
-    assert torch.equal(loaded(obs, x, t), retrained(obs, x, t)) and not torch.equal(loaded(obs, x, t), ref)
+    with pytest.raises(ValueError, match=r"convert_checkpoints\.py"):
+        load_policy(d)
+    with pytest.raises(FileNotFoundError, match="no config.json"):
+        load_policy(tmp_path / "policies" / "missing")
 
 
 def test_policy_chunk_is_the_lerobot_policy_chunk(tmp_path):

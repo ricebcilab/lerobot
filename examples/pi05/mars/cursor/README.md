@@ -215,7 +215,7 @@ Names are unified across scripts, configs, log fields, folders and figures:
   initial condition only (Kao et al.'s method, the default), 0 writes nothing (the policy alone), more
   re-writes as the flow proceeds (lerobot's pi0.5 `shared_flow_control`, whose own "tau" is this lambda). The
   human study ran that implementation at its depth 1, which is `tau` 16, `lambda` 1 and the command
-  in the policy's action units (`ic_gain` 2.0843, `steering.action_gain`): Kao et al.'s method with the
+  in the policy's action units (`ic_gain` 2.0843, `steering.to_action` of a full push): Kao et al.'s method with the
   whole chunk written. Its records, and every sweep result before git `029b3ed6`'s successor, say
   `mode: flow_control, tau: 1` for that (no `lambda`, no `ic_gain` field).
   An adapter spec is `{translation: corruption}` (fixed F = M), `{F: rows}`, `{learned: <name>}` (one
@@ -279,10 +279,11 @@ Main parameters (`control:` and `task:` sections):
   steps the reference is reversed (null: all, to noise), and how many leading chunk steps it steers
   (null: the whole chunk); the rest of the latent is handed back to the policy (Tang et al., App. D). The forward
   pass then runs n steps of the policy's own 1/N from where the reversal stopped. The cursor and the robot run one
-  implementation of each method: the cursor's chunks come from lerobot's `FlowControlSteering` and
-  `FlowReversalSteering`, the cores pi0.5 uses, driving the cursor policy through pi0.5's sampler interface
-  (lerobot's `SampleChunkSampler` over `FlowPolicy.sample_chunk`), and one operator readout (`lerobot.teleoperators.readout`:
-  corruption, curl, noise, deadband). Until 2026-10-31 the cursor's forward pass took N − n steps instead, coarse at
+  implementation of each method: the controller (`steering.SharedController`), the sweeps and the `expert_chunk`
+  agent take every chunk from lerobot's `SteeringPolicy` (mode `none` for the policy alone) over the cursor policy
+  (`CursorFlowPolicy`, which offers pi0.5's sampler interface), so from the `FlowControlSteering` and
+  `FlowReversalSteering` cores pi0.5 uses, unnormalized by the policy's postprocessor; and one operator readout
+  (`lerobot.teleoperators.readout`: corruption, curl, noise, deadband). Until 2026-10-31 the cursor's forward pass took N − n steps instead, coarse at
   large depths, so earlier partial-reversal results are not comparable.
   FRS keeps the full reversal, Tang et al.'s method, and tunes `pinned_steps` (their `action_repeats`, fixed at
   5 of 15 there); MARS tunes both, since how far the reversal goes through the user module's field is part of the
@@ -406,16 +407,14 @@ checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapte
 `adapters/refit/` and `adapters/data_efficiency/`, and are not distributed.
 
 `train_adapter.py` writes `adapter.pt` in lerobot's `AdapterModules.save_module` format (kind, config, weights, meta),
-which `AdapterModules.load` reads; the policy trainer still writes the cursor
-project's `policy.pt`, which `FlowPolicy.load` reads alongside lerobot's format, so a fresh policy works before
-it is converted. After training a policy, rerun `convert_checkpoints.py`: its folder becomes a `cursor_flow`
-policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`, and the policy's two
-processor pipelines, whose postprocessor holds the action statistics a steering policy loading the folder by path
-reads; a folder converted before them gets them). The converter also
-rewrites any `adapter.pt` still in the cursor's old format. The originals stay beside them as `*.orig`, and
-running it again changes nothing. When a policy folder holds both formats (a retrained `policy.pt` beside an older
-converted `model.safetensors`), `policy.pt` wins, with a warning, until you convert again. `hub.py upload`
-refuses unconverted folders.
+which `AdapterModules.load` reads; `train_policy.py` writes a `cursor_flow` policy folder (`config.json` +
+`model.safetensors`, `CursorFlowPolicy.save_pretrained`, and the policy's two processor pipelines, whose
+postprocessor holds the action statistics a steering policy loading the folder by path reads), which
+`cursor_sa.policy.load_policy` reads. The cursor project's own formats are `convert_checkpoints.py`'s alone: it turns
+an older trainer's `policy.pt` into that folder (the loader refuses a folder holding a `policy.pt` until it is
+converted), gives a policy folder converted before the pipelines its pipelines, and rewrites any `adapter.pt` still in
+the cursor's old format. The originals stay beside them as `*.orig`, and running it again changes nothing.
+`hub.py upload` refuses unconverted folders, and uploads (and `hub.py download` fetches) a policy's pipelines with it.
 
 ## Research notes
 

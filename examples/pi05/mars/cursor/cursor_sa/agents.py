@@ -20,7 +20,6 @@ import torch
 from .readout import Readout, is_active
 from lerobot.envs.cursor import AVOID_CLEARANCE, densify, plan_route
 from .devices import Keyboard, SpaceMouse, find_spacemouse, spacemouse_full_scale, spacemouse_hid_id
-from .steering import to_deflection
 
 
 class StepAgent:
@@ -168,10 +167,11 @@ class ExpertChunkAgent:
 
     @torch.no_grad()
     def plan(self, ctl, layouts):
-        """The intended chunk [B, H, 2] as a deflection per step (full deflection = max speed)."""
+        """The intended chunk [B, H, 2] as a deflection per step (full deflection = max speed): the controller's
+        plain chunk (`sample_chunk`, screen units per step) per step of max speed."""
         obs = ctl.observation(goal_given=True)
         noise = torch.randn(len(layouts), ctl.policy.horizon, 2, device=obs["pos"].device)
-        return to_deflection(ctl.sample_chunk(obs, noise), ctl.policy, ctl.dt, ctl.max_speed).cpu().numpy()
+        return (ctl.sample_chunk(obs, noise) / (ctl.max_speed * ctl.dt)).cpu().numpy()
 
     def step(self, pos, layouts, ctl):
         new = ctl.t >= ctl.cycle  # the controller starts a chunk at this control step

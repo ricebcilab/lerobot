@@ -11,11 +11,11 @@ from cursor_sa.agents import ExpertAgent
 from cursor_sa.readout import Readout, adapter_spec, matrix_spec
 from cursor_sa.demos import DemoSampler, make_demos, replay
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
-from cursor_sa.policy import FlowPolicy
+from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
 from cursor_sa.records import summarize
 from cursor_sa.session import load_checkpoints
-from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, action_gain, bci_chunk, hide_goal, observation,
-                                to_action, to_deflection)
+from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, bci_chunk, hide_goal, observation, to_action,
+                                to_deflection)
 
 from lerobot.teleoperators import readout as shared_readout
 
@@ -140,8 +140,8 @@ def test_obstacle_tokens_ignore_order_and_padding_and_are_read(mode, tmp_path):
     assert not torch.allclose(model(bare, x, t), ref, atol=1e-4)  # the discs are read
     none = {**obs, "obstacles": torch.zeros(3, 0, 3), "obstacle_mask": torch.zeros(3, 0, dtype=torch.bool)}
     torch.testing.assert_close(model(none, x, t), model(bare, x, t))  # no disc: as without the keys
-    torch.save(dict(config=model.config, state_dict=model.state_dict()), tmp_path / "policy.pt")
-    torch.testing.assert_close(FlowPolicy.load(tmp_path / "policy.pt")(obs, x, t), ref)
+    CursorFlowPolicy.wrapping(model).save_pretrained(tmp_path)
+    torch.testing.assert_close(load_policy(tmp_path).model(obs, x, t), ref)
     plain = FlowPolicy(mode=mode).eval()
     assert "obstacle_tokens" not in plain.config and model.config["obstacle_tokens"] is True
     torch.testing.assert_close(plain(obs, x, t), plain(bare, x, t))  # without tokens the keys are ignored
@@ -344,7 +344,7 @@ def test_shipped_configs_load_and_flags_override_them():
     study_fc = config.load_arm("study_flow_control.yaml")  # the command in action units, at the tuned tau and lambda
     assert study_fc["mode"] == "flow_control" and (study_fc["tau"], study_fc["lambda"]) == (14, 1)
     policy = load_checkpoints({"a": study_fc}, "cpu")[0][study_fc["model"]]
-    assert study_fc["ic_gain"] == pytest.approx(action_gain(policy), abs=1e-4)
+    assert study_fc["ic_gain"] == pytest.approx(float(to_action(1.0, policy)), abs=1e-4)  # a full push's
     base_fc = config.load_arm("flow_control.yaml")
     assert (base_fc["tau"], base_fc["ic_gain"], base_fc["lambda"]) == (8, 2.0, 1)
     assert config.load_arm("flow_control.yaml", {"mode": "shared_flow_control"})["mode"] == "flow_control"

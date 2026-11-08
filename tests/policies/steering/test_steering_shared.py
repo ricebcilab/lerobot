@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
+from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.steering import (
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
@@ -33,7 +33,6 @@ from lerobot.policies.steering import (
     FlowControlSteering,
     FlowReversalSteering,
     ReversalAdapter,
-    SampleChunkSampler,
 )
 
 STEPS, CHUNK = 10, 6
@@ -82,12 +81,14 @@ class FieldFlowPolicy(FlowPolicy):
         return self.field(x, t)
 
 
-class CursorSampler(SampleChunkSampler):
-    """The cursor example's sampler (the package's ``SampleChunkSampler``): ``FlowPolicy.sample_chunk`` behind
-    pi0.5's interface, noise at t = 0, from a fixed noise."""
+class CursorSampler(CursorFlowPolicy):
+    """The cursor policy (``CursorFlowPolicy.wrapping``, the example's ``as_policy``): ``FlowPolicy.sample_chunk``
+    behind pi0.5's interface, noise at t = 0, from a fixed noise."""
 
     def __init__(self, policy, noise):
-        super().__init__(policy, STEPS, CHUNK, noise.shape[-1], 2)
+        config = CursorFlowPolicy.wrapping(policy).config
+        config.num_inference_steps, config.max_action_dim, config.n_action_steps = STEPS, noise.shape[-1], 2
+        super().__init__(config, model=policy)
         self.noise = noise
 
     def predict_action_chunk(self, obs, **hooks):

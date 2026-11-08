@@ -18,12 +18,13 @@ count (_n100 / _n300).
 
 `download` fetches those folders from the repo (default ricebcilab/mars-cursor) into examples/pi05/mars/checkpoints/
 with huggingface_hub.snapshot_download, which re-fetches any file that differs from the repo's copy; it then checks that
-every folder holds the files the loaders open (config.json and model.safetensors of a policy, adapter.pt of an
-adapter) and exits 1, naming them, if any are missing.
-`upload` creates the public model repo if it is missing and uploads each folder's converted files (config.json and
-model.safetensors of a policy, adapter.pt of an adapter, and train_log.json); the *.orig backups and train.out logs
-stay local. It refuses to start if a folder is missing or holds a trainer's unconverted checkpoint: run
-convert_checkpoints.py first.
+every folder holds the files the loaders open (config.json, model.safetensors and the processor pipelines of a policy,
+adapter.pt of an adapter) and exits 1, naming them, if any are missing.
+`upload` creates the public model repo if it is missing and uploads each folder's converted files (config.json,
+model.safetensors and the processor pipelines of a policy, adapter.pt of an adapter, and train_log.json); the *.orig
+backups and train.out logs stay local. It refuses to start if a folder is missing a file or holds a trainer's
+unconverted checkpoint: run convert_checkpoints.py first (it also gives a policy folder converted before the pipelines
+its pipelines).
 """
 
 import argparse
@@ -40,10 +41,15 @@ MANIFEST = ROOT / "hub_manifest.yaml"
 REPO = "ricebcilab/mars-cursor"
 SEEDS = (1, 2, 3, 4)  # the grid's training seeds besides seed 0 (each module's _s0 -> _s<k>, in adapters/)
 GROUPS = ("study", "grid", "grid_seeds")
-POLICY_FILES = ("config.json", "model.safetensors", "train_log.json")
+# a policy's processor pipelines (make_cursor_flow_pre_post_processors, which the trainer and the converter save):
+# the two JSONs and the unnormalizer's statistics, the postprocessor a steering policy loading the folder by path reads
+POLICY_PIPELINE_FILES = ("policy_preprocessor.json", "policy_postprocessor.json",
+                         "policy_postprocessor_step_0_unnormalizer_processor.safetensors")
+POLICY_FILES = ("config.json", "model.safetensors", *POLICY_PIPELINE_FILES, "train_log.json")
 ADAPTER_FILES = ("adapter.pt", "train_log.json")
-# the files the loaders open (FlowPolicy.load, AdapterModules.load / AdapterModules.load_module): a download must bring these
-POLICY_REQUIRED = ("config.json", "model.safetensors")
+# the files the loaders open (load_policy and the policy's pipelines, AdapterModules.load / AdapterModules.load_module):
+# a download must bring these
+POLICY_REQUIRED = ("config.json", "model.safetensors", *POLICY_PIPELINE_FILES)
 ADAPTER_REQUIRED = ("adapter.pt",)
 HEADER = """\
 # The checkpoint folders (under examples/pi05/mars/checkpoints/) that the study and the grid use, on the Hub at
@@ -117,7 +123,8 @@ def upload_files(folders):
             wanted = ADAPTER_FILES
         missing = [f for f in wanted if not (d / f).is_file()]
         if missing:
-            problems.append(f"{folder}: missing {missing}")
+            hint = " (run convert_checkpoints.py)" if set(missing) <= set(POLICY_PIPELINE_FILES) else ""
+            problems.append(f"{folder}: missing {missing}{hint}")
         files += [f"{folder}/{f}" for f in wanted]
     if problems:
         raise ValueError("cannot upload:\n  " + "\n  ".join(problems))

@@ -14,8 +14,8 @@ and knobs so cursor and LIBERO results can be compared:
                   writes nothing (the policy alone), lambda > 1 keeps re-writing as
                   the flow proceeds (lerobot's pi0.5 shared_flow_control, whose
                   "tau" is this lambda, at tau 16 with the command in action units:
-                  ic_gain = action_gain(policy)); the recorded study ran that at
-                  lambda 1
+                  ic_gain = to_action(1, policy), a full deflection's); the recorded study
+                  ran that at lambda 1
     frs           Flow Reversal Steering (Tang et al. 2026): the command's chunk
                   is integrated backward `n_reverse_steps` steps, then forward
                   again (LeRobot: shared_flow_reversal_steering); a partial
@@ -45,21 +45,25 @@ so the forward field is task(v) and the backward field user(task(v)). The two ar
 trained apart and composed here. Flow time runs from t=0 (noise) to t=1 (action),
 the reverse of pi0.5.
 
-The methods themselves are lerobot's: the cursor's chunks come from the same
-`FlowControlSteering` and `FlowReversalSteering` cores the robot (pi0.5)
-uses, driving the cursor policy through pi0.5's sampler interface
-(`SampleChunkSampler`, over `FlowPolicy.sample_chunk`); the Euler flows and the user
-and task modules are lerobot's steering core too. This module binds them to the
-cursor policy's observation, its two action dims and its screen units.
+The methods themselves are lerobot's: every chunk comes from lerobot's
+`SteeringPolicy` (mode none for the policy alone, flow_control, frs) over the
+cursor policy (`CursorFlowPolicy`, `as_policy`), which offers pi0.5's sampler
+interface, so it is the same `FlowControlSteering` and `FlowReversalSteering`
+cores the robot (pi0.5) uses that steer it; the policy's postprocessor
+(`make_cursor_flow_pre_post_processors`) turns the normalized chunks into screen
+units. The Euler flows and the user and task modules are lerobot's steering core
+too. This module binds them to the cursor policy's observation, its two action dims
+and its screen units.
 """
 
 import numpy as np
 import torch
 
-from lerobot.policies.steering import (Flow, FlowControlSteering, FlowReversalSteering, SampleChunkSampler, SceneEncoder,
-                                       as_adapter)
+from lerobot.policies.cursor_flow import make_cursor_flow_pre_post_processors
+from lerobot.policies.steering import AdapterModules, Flow, SceneEncoder, SteeringConfig, SteeringPolicy, as_adapter
 
 from lerobot.envs.cursor import render_views
+from .policy import as_policy
 from .readout import DEADBAND, Readout, is_active
 
 MODES = ("policy", "teleop", "flow_control", "frs")
@@ -158,23 +162,16 @@ def hide_goal(obs):
     return {**obs, "goal": torch.zeros_like(obs["goal"])}
 
 
-# ---------------------------------------------------------------- reversal adapters
-
-
-def _field(adapter, obs, device):
-    """The core's form of an adapter (see `as_adapter`) for this observation, or None."""
-    adapter = as_adapter(adapter, device)
-    return None if adapter is None else adapter.field(obs)
-
-
 # ---------------------------------------------------------------- flows and steered chunks
 
 
 def flow(policy, obs, x, t0, h, n, adapter=None):
     """n Euler steps of signed size h from flow time t0 through the policy's field, adapted by
-    `adapter` (the task module in both directions, the user module when h < 0). Differentiable,
-    for training; `reverse_flow` and `forward_flow` are its no-grad forms. The core's `Flow.integrate`."""
-    return Flow(lambda x_t, t: policy(obs, x_t, t), _field(adapter, obs, x.device), noise_time=0.0,
+    `adapter` (see `as_adapter`; the task module in both directions, the user module when h < 0),
+    bound to `obs`. Differentiable, for training; `reverse_flow` and `forward_flow` are its no-grad
+    forms. The core's `Flow.integrate`."""
+    adapter = as_adapter(adapter, x.device)
+    return Flow(lambda x_t, t: policy(obs, x_t, t), None if adapter is None else adapter.field(obs), noise_time=0.0,
                 batch_time=True).integrate(x, t0, h, n, backward=h < 0, grad=True)
 
 
@@ -190,49 +187,34 @@ def forward_flow(policy, obs, x, t0, t1, steps, adapter=None):
     return flow(policy, obs, x, t0, (t1 - t0) / steps, steps, adapter)
 
 
-def action_gain(policy, dt=0.02, max_speed=MAX_SPEED):
-    """The `ic_gain` that writes the command in the policy's action units (a full push = max_speed * dt), as the
-    lab's variant did: `to_action` for a deflection of 1."""
-    return float(max_speed * dt / float(policy.action_scale))
-
-
-def steering_wrapper(sampler, mode, tau=5, n_reverse_steps=None, dt=0.02, max_speed=MAX_SPEED, ic_gain=1.0, lam=1,
-                     pinned_steps=None):
-    """lerobot's wrapper for a shared mode on the cursor's sampler, every action dim commanded (None in modes
-    policy and teleop). frs's reference is the command held at constant velocity over the chunk, or a command per
-    step, in action units (`Flow.held_reference`, `to_action`'s units)."""
-    if mode == "flow_control":
-        return FlowControlSteering(sampler, None, tau=tau, lam=lam, ic_gain=ic_gain, deadband=DEADBAND, dims=slice(None))
-    if mode == "frs":
-        policy, horizon = sampler.model, sampler.config.chunk_size
-        return FlowReversalSteering(
-            sampler, None, n_reversal_steps=n_reverse_steps, operator_dims=None, pinned_steps=pinned_steps,
-            deadband=DEADBAND,
-            reference_fn=lambda commands: Flow.held_reference(commands, horizon, max_speed * dt, policy.action_scale))
-    return None
-
-
-def _chunk(sampler, wrapper, obs, commands, field, noise=None):
-    """A normalized chunk [B, H, 2]: the wrapper's for the commands, or the policy's own (with the task module)."""
-    if wrapper is None:
-        hook = FlowControlSteering.velocity_hook(field)
-        return sampler.predict_action_chunk(obs, noise=noise, **({} if hook is None else {"velocity_hook": hook}))
-    return wrapper.steered_chunk(obs, commands, field=field, paired=False)[0]
+def _steering(policy, config, adapter, device):
+    """lerobot's `SteeringPolicy` for `config` (`SharedController.steering_config`) over `policy` (a
+    `CursorFlowPolicy`), its adapter `adapter` (see `as_adapter`; None: none), and the policy's postprocessor
+    (`make_cursor_flow_pre_post_processors`), which the steering policy's FRS reference reads and which turns its
+    normalized chunks into screen units: (steering policy, postprocessor)."""
+    postprocessor = make_cursor_flow_pre_post_processors(policy.config)[1]
+    steering = SteeringPolicy(config, base_policy=policy, postprocessor=postprocessor)
+    adapter = as_adapter(adapter, device)
+    steering.adapter = AdapterModules() if adapter is None else adapter
+    return steering, postprocessor
 
 
 @torch.no_grad()
 def steered_chunk(policy, obs, command, mode, tau=5, n_reverse_steps=None, steps=10, dt=0.02,
                   max_speed=MAX_SPEED, adapter=None, reference=None, ic_gain=1.0, lam=1, pinned_steps=None):
-    """One action chunk [B, H, 2] in screen units per step, for commands [B, 2]: lerobot's steering wrapper for
-    `mode` on this policy (`steering_wrapper`), its adapter bound to `obs`. The reference the shared modes steer
+    """One action chunk [B, H, 2] in screen units per step (on the CPU, where the policy's postprocessor leaves it),
+    for commands [B, 2]: one call of lerobot's `SteeringPolicy` for `mode` (`SharedController.steering_config`) on
+    this policy (`as_policy`: a `FlowPolicy` or a `CursorFlowPolicy`, sampled in `steps` Euler steps), its adapter
+    bound to `obs`, the chunk unnormalized by the policy's postprocessor. The reference the shared modes steer
     toward is the command held constant over the chunk, or `reference` [B, H, 2] (a deflection per step, e.g. the
     chunk an expert_chunk agent means). Rows whose command (or whole reference) is inside the deadband get the
-    plain policy chunk, from the same noise."""
-    sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, 8)  # 8 executed steps: unused by steered_chunk
-    wrapper = steering_wrapper(sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam, pinned_steps)
-    chunk = _chunk(sampler, wrapper, obs, command if reference is None else reference,
-                   _field(adapter, obs, command.device))
-    return chunk * policy.action_scale
+    plain policy chunk, from the same noise; modes policy and teleop give the policy's own chunk."""
+    steering, postprocessor = _steering(
+        as_policy(policy, num_inference_steps=steps),
+        SharedController.steering_config(mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam, pinned_steps,
+                                         command.device),
+        adapter, command.device)
+    return postprocessor(steering.predict_action_chunk({**obs, "command": command if reference is None else reference}))
 
 
 class SharedController:
@@ -260,6 +242,13 @@ class SharedController:
     arrays (e.g. `view_scene_fn`) adds a scene of the current positions to every observation, asked for again only
     when the positions or `active` (None, or a bool [B] of the trials still running, which the caller sets) have
     changed, so observations at one position share it.
+
+    The chunks are lerobot's `SteeringPolicy`'s (`self.steering`, `steering_config`'s mode: none for the policy
+    alone, flow_control or frs) over the cursor policy (`self.policy`, `as_policy` of `policy`, a `CursorFlowPolicy`
+    or a bare `FlowPolicy`, with `steps` Euler steps and `execute` steps per chunk on a config of its own), the
+    adapter in the steering policy's adapter slot, every chunk unnormalized by the policy's postprocessor
+    (`self.postprocessor`) into screen units. Teleop's actions are the command's, but its steering policy (mode
+    none) still serves `sample_chunk`, the expert_chunk agent's intent.
     """
 
     def __init__(self, policy, layouts, mode, tau=5, n_reverse_steps=None, steps=10, execute=8,
@@ -269,7 +258,7 @@ class SharedController:
         assert speed_gain > 0, speed_gain
         assert gain_mode in GAIN_MODES, gain_mode
         self.gain, self.gain_mode, self.adapter = speed_gain, gain_mode, as_adapter(adapter, device)
-        self.policy, self.mode = policy, mode
+        self.policy, self.mode = as_policy(policy, num_inference_steps=steps, n_action_steps=execute), mode
         self.execute, self.dt, self.max_speed, self.device = execute, dt, max_speed, device
         self.layouts = layouts
         # what every observation repeats, on the device once (`observation` adds the positions and histories), with
@@ -288,11 +277,25 @@ class SharedController:
         self.moved, self.played = {}, {}      # per planned step under way: the displacement so far, the share so far
         self.chunks = 0
         self.steered_chunks = np.zeros(len(layouts), dtype=int)
-        self.sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, execute)  # the mode's wrapper drives it
-        self.wrapper = steering_wrapper(self.sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam,
-                                        pinned_steps)
+        self.steering, self.postprocessor = _steering(
+            self.policy, self.steering_config(mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam, pinned_steps,
+                                              device), self.adapter, device)
+        if self.steering.config.mode != "none":
+            _ = self.steering.core  # built now: its knobs are checked when the controller is made
         self.scene_fn, self.active = scene_fn, None
         self._scene = None                    # the last scene asked for: (positions, active, arrays)
+
+    @staticmethod
+    def steering_config(mode, tau=5, n_reverse_steps=None, dt=0.02, max_speed=MAX_SPEED, ic_gain=1.0, lam=1,
+                        pinned_steps=None, device="cpu"):
+        """The `SteeringConfig` of a controller mode: modes policy and teleop are the steering policy's mode none
+        (the policy's own chunk through the task module), flow_control and frs their own, every action dim
+        commanded (the cursor's two), the readout's deadband; frs's reference is the command held at `max_speed *
+        dt` per step, in action units. The flow's Euler steps and the chunk are the base policy's config's
+        (`as_policy`)."""
+        return SteeringConfig(mode="none" if mode in ("policy", "teleop") else mode, tau=tau, lam=lam, ic_gain=ic_gain,
+                              n_reversal_steps=n_reverse_steps, pinned_steps=pinned_steps, deadband=DEADBAND,
+                              n_dims=2, max_speed=max_speed, dt=dt, device=str(device))
 
     def steps_of(self, t):
         """The planned steps control step t of a chunk plays, as (index, share of the step) pairs: in mode
@@ -321,8 +324,10 @@ class SharedController:
 
     @torch.no_grad()
     def sample_chunk(self, obs, z=None):
-        """A chunk [B, H, 2] (normalized units) from the task-adapted forward flow, from noise z."""
-        return _chunk(self.sampler, None, obs, None, _field(self.adapter, obs, obs["pos"].device), noise=z)
+        """A chunk [B, H, 2] in screen units per step (on the CPU) from the task-adapted forward flow, from noise z
+        (None: drawn): the steering policy's chunk for no command (the policy's own), unnormalized by the policy's
+        postprocessor."""
+        return self.postprocessor(self.steering.predict_action_chunk(obs, noise=z))
 
     def act(self, command, reference=None):
         """Actions [B, 2] for this control step. `reference` [B, H, 2] (a deflection per step)
@@ -333,8 +338,8 @@ class SharedController:
                 obs = self.observation()
                 commands = _f32(command if reference is None else reference, self.device)
                 with torch.no_grad():
-                    chunk = _chunk(self.sampler, self.wrapper, obs, commands, _field(self.adapter, obs, self.device))
-                self.chunk = (chunk * self.policy.action_scale).cpu().numpy()
+                    chunk = self.steering.predict_action_chunk({**obs, "command": commands})
+                self.chunk = self.postprocessor(chunk).numpy()
                 self.chunks += 1
                 if self.mode != "policy":
                     # the trials steering: the command outside the deadband, or any step of the reference chunk

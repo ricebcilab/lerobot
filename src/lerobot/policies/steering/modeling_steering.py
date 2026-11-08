@@ -26,7 +26,6 @@ import math
 from collections import deque
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Protocol
 
 import numpy as np
@@ -1737,30 +1736,6 @@ def _obs_rows(obs: dict) -> int | None:
     return None
 
 
-class SampleChunkSampler:
-    """A flow policy with ``FlowPolicy.sample_chunk`` (the cursor's) behind pi0.5's sampler interface, so the steering
-    cores drive it exactly as they drive pi0.5: ``config`` gives the flow's Euler steps, the chunk, the action dims,
-    the steps executed per replan and the flow time of noise (0, the cursor's convention). The cursor example's own
-    wiring drives the cores through it; ``SteeringPolicy`` drives a ``CursorFlowPolicy``, which offers the interface
-    itself."""
-
-    def __init__(self, model: nn.Module, steps: int, chunk_size: int, n_dims: int, n_action_steps: int):
-        self.model = model
-        self.config = SimpleNamespace(
-            num_inference_steps=steps,
-            chunk_size=chunk_size,
-            max_action_dim=n_dims,
-            n_action_steps=n_action_steps,
-            noise_time=0.0,
-        )
-
-    def reset(self) -> None:
-        pass
-
-    def predict_action_chunk(self, obs: dict, **hooks) -> torch.Tensor:
-        return self.model.sample_chunk(obs, self.config.num_inference_steps, **hooks)
-
-
 class SteeringPolicy(PreTrainedPolicy):
     """Shared-autonomy steering as a lerobot policy: a frozen base policy's chunks steered toward the operator's
     command by the mode's core (``FlowControlSteering`` or ``FlowReversalSteering``; mode ``"none"``: the base's own
@@ -2073,17 +2048,24 @@ class SteeringPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
-        """The steered chunk (B, H, n) for ``batch["command"]`` (None, or rows inside the deadband: the policy's
-        own chunk, from the same noise; in mode ``"none"`` ignored: the base's own chunk), the adapter bound to its
-        view of the observation; normalized, as the base's (its postprocessor unnormalizes it)."""
+        """The steered chunk (B, H, n) for ``batch["command"]`` (None: the base's own chunk; rows inside the
+        deadband: the policy's own chunk, from the same noise; in mode ``"none"`` ignored: the base's own chunk), the
+        adapter bound to its view of the observation; normalized, as the base's (its postprocessor unnormalizes it).
+        ``noise`` (pi0.5's keyword: the flow's starting noise, (B, H, n)) is the base's own chunk's (mode ``"none"``,
+        or no command); a steered chunk draws its own, so a command with ``noise`` raises ``ValueError``."""
         obs = self.observation(batch)
         view = self._adapter_view(obs)
         command = self._command(batch.get(COMMAND), view)  # checked in every mode, mode "none" too
         field = self._field(view)
-        if self.config.mode == "none":
-            hook = FlowControlSteering.velocity_hook(field)
+        noise = kwargs.get("noise")
+        if self.config.mode == "none" or command is None:  # the base's own chunk, through the task module
+            hooks = {"velocity_hook": FlowControlSteering.velocity_hook(field), "noise": noise}
             return self._sampler().predict_action_chunk(
-                obs, **({} if hook is None else {"velocity_hook": hook})
+                obs, **{k: v for k, v in hooks.items() if v is not None}
+            )
+        if noise is not None:
+            raise ValueError(
+                "noise starts the base policy's own chunk (mode 'none', or no command); a steered chunk draws its own"
             )
         # the steered chunk alone: the policy's own plan is not drawn when every row steers
         return self.core.steered_chunk(obs, command, field=field, paired=False)[0]

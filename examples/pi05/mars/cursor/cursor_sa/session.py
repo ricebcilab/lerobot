@@ -22,7 +22,7 @@ from . import config
 from .readout import Readout
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, sample_layouts
 from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
-from .policy import FlowPolicy
+from .policy import load_policy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
                       outcome_of, read_manifest, read_records, rounded, trial_record, write_manifest)
 from .steering import SharedController, view_scene_fn
@@ -100,8 +100,9 @@ def arm_task(arm):
 
 
 def load_checkpoints(arms, device):
-    """One policy per model name and one adapter checkpoint per name the arms reference."""
-    policies = {name: FlowPolicy.load(policy_path(name), device) for name in {a["model"] for a in arms.values()}}
+    """One policy per model name (a `CursorFlowPolicy`, `load_policy`) and one adapter checkpoint per name the arms
+    reference."""
+    policies = {name: load_policy(policy_path(name), device) for name in {a["model"] for a in arms.values()}}
     adapters = {name: AdapterModules.load(adapter_path(name), device)
                 for name in {n for a in arms.values() for n in config.adapter_names(a)}}
     return policies, adapters
@@ -139,8 +140,10 @@ def readout_for(arm, rng=None, input_noise=None, off=False):
 def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None, scene_encoder=None):
     """Step len(layouts) trials in lockstep until all are done; return one record per trial.
 
-    With a renderer the trials run in real time (one at a time: len(layouts) must
-    be 1), with a ready gate before and feedback after. Raises Aborted if the
+    `policy` (a `CursorFlowPolicy`, `load_checkpoints`', or a bare `FlowPolicy`) goes to the controller
+    (`SharedController`), which takes every chunk from lerobot's `SteeringPolicy` over it. With a renderer
+    the trials run in real time (one at a time: len(layouts) must be 1), with a ready gate before and
+    feedback after. Raises Aborted if the
     person quits. When the arm's task module reads vlm_views, `scene_encoder` (an
     encoder, or a zero-argument factory of one, called once) is required: the
     running trials' two views are encoded at every observation (`view_scene_fn`).

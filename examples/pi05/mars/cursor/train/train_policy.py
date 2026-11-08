@@ -18,9 +18,12 @@ trainer draws them (train_adapter.budget_demos), so a task module given the same
 ones. --eval_steps picks how long the policy trains: at those steps and the last it scores the EMA weights alone
 with the goal given on layouts of its task (`goal_given_scorer`, apart from the sweeps' trials) and keeps the best.
 
-Saves the EMA weights (with --eval_steps, the best scored) to checkpoints/policies/<name>/policy.pt and the loss
-curve (and the scores) to checkpoints/policies/<name>/train_log.json. convert_checkpoints.py turns policy.pt into
-the lerobot policy directory (config.json + model.safetensors); FlowPolicy.load reads both.
+Saves the EMA weights (with --eval_steps, the best scored) as the lerobot policy directory
+checkpoints/policies/<name>/ (`CursorFlowPolicy.save_pretrained`: config.json + model.safetensors, and the policy's
+processor pipelines, `make_cursor_flow_pre_post_processors`: policy_preprocessor.json, policy_postprocessor.json and
+the unnormalizer's statistics), which `policy.load_policy` reads, and the loss curve (and the scores, and the run's
+arguments) to checkpoints/policies/<name>/train_log.json. A policy.pt left in that folder by an earlier trainer (the
+cursor format) is removed, as that trainer would have overwritten it.
 """
 
 import sys
@@ -44,8 +47,9 @@ from cursor_sa import config
 from cursor_sa.agents import make_agent
 from cursor_sa.demos import DemoSampler, make_demos
 from lerobot.envs.cursor import obstacle_spec, sample_layouts
+from lerobot.policies.cursor_flow import make_cursor_flow_pre_post_processors
 from cursor_sa.paths import policy_path
-from cursor_sa.policy import FlowPolicy, load_checkpoint
+from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
 from cursor_sa.session import arm_task, readout_for, run_trials
 from train.train_adapter import budget_demos, layouts_for
 
@@ -105,8 +109,10 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     args.obstacle = obstacle_spec(args.obstacle, "--obstacle")
-    base = load_checkpoint(policy_path(args.init)) if args.init else None
-    if base is not None:  # the base policy's architecture
+    base = None
+    if args.init:  # the base policy's architecture (and its weights, below)
+        init = load_policy(policy_path(args.init)).model
+        base = dict(config=init.config, state_dict=init.state_dict())
         for key in ("horizon", "hist", "d_model", "layers", "heads", "mode"):
             setattr(args, key, base["config"][key])
 
@@ -181,11 +187,24 @@ def main(argv=None):
             running = 0.0
 
     weights = ema.state_dict() if best is None else best[2]
-    torch.save(dict(config=model.config, state_dict=weights, args=vars(args)), out / "policy.pt")
+    save_policy(ema, weights, out)
     scored_log = {} if best is None else dict(eval=scores, best_step=best[1])
     with open(out / "train_log.json", "w") as f:
         json.dump(dict(args=vars(args), action_scale=action_scale, log=log, **scored_log), f, indent=1)
-    print(f"saved {out / 'policy.pt'}" + ("" if best is None else f" (step {best[1]}: {100 * best[0]:.1f}% alone, goal given)"))
+    print(f"saved {out}" + ("" if best is None else f" (step {best[1]}: {100 * best[0]:.1f}% alone, goal given)"))
+
+
+def save_policy(model, weights, out):
+    """`model` with `weights` (a FlowPolicy state dict) as the lerobot policy directory `out`: config.json and
+    model.safetensors (`CursorFlowPolicy.save_pretrained`, on the CPU) and the policy's processor pipelines
+    (`make_cursor_flow_pre_post_processors`); a stale policy.pt there (an earlier trainer's) is removed."""
+    model = copy.deepcopy(model).cpu()
+    model.load_state_dict(weights)
+    policy = CursorFlowPolicy.wrapping(model)
+    policy.save_pretrained(out)
+    for pipeline in make_cursor_flow_pre_post_processors(policy.config):
+        pipeline.save_pretrained(out)
+    (Path(out) / "policy.pt").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

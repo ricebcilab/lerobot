@@ -84,7 +84,7 @@ The cores are not pi0.5-specific. They steer any flow policy with pi0.5's sample
 `predict_action_chunk` taking `noise_fn`, `flow_start_time`, `num_forward_steps`, `x_t_hook` and `velocity_hook`.
 They work in either flow-time convention, and `steered_chunk(batch, commands)` serves a batch of commands. The cursor
 policy offers the interface itself (`CursorFlowPolicy`), so the robot and the cursor run one implementation of each
-method; the cursor example's own wiring still drives `FlowPolicy.sample_chunk` through `SampleChunkSampler`.
+method: the cursor example's controller, sweeps and agents take their chunks from `SteeringPolicy` over it.
 
 ## The scene
 
@@ -125,7 +125,9 @@ features, as `CursorFlowConfig`.
   `(B, H, n)` per chunk step, or `(n,)` for a single unbatched trial. `n` is at most `n_dims` (a pi0.5 base's
   translation is 3). The chunk is normalized, as the base's: the base's postprocessor unnormalizes it.
   `select_action` serves the chunk's first `n_action_steps` steps (the base's) one per call. Mode `"none"` is the
-  base's own chunk through the task module, the command ignored.
+  base's own chunk through the task module, the command ignored; so is a batch without a command, in any mode, and
+  `noise` (pi0.5's keyword) starts that chunk from a given noise (a steered chunk draws its own: a command with
+  `noise` raises).
 - The base gets the batch untouched less the steering policy's own keys (`command` and a training batch's). The
   adapter binds to its own view of it, the task module's input: the `observation.` prefix stripped, the scene step's
   inputs dropped, `observation.scene_tokens` at `scene[scene_source]`, a single unbatched trial given a batch of one.

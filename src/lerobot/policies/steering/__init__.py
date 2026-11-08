@@ -21,9 +21,9 @@ The package keeps lerobot's layout for a policy:
 - ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``; its adapter fields, ``from_spec`` and
   the matrix helpers of a ``reversal_adapter`` spec), and the constants its validation reads.
 - ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy, driving every base through pi0.5's sampler
-  interface, which ``PI05Policy`` and ``CursorFlowPolicy`` offer) and the cores it wraps: the two methods,
-  ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's ``TeleopSource``, and
-  ``SampleChunkSampler`` (a bare ``FlowPolicy`` behind that interface, the cursor example's wiring); the MARS modules
+  interface, which ``PI05Policy`` and ``CursorFlowPolicy`` offer; the cursor example runs it) and the cores it
+  wraps: the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's
+  ``TeleopSource``; the MARS modules
   (``LearnedUserModule``, ``LearnedTaskModule``, the composed ``AdapterModules`` with their checkpoints, and the
   holders ``MatrixHolder`` / ``ReversalAdapter``); ``AdaptedField``; and ``Flow``, the one Euler integrator and what
   is built on it.
@@ -57,7 +57,6 @@ from .modeling_steering import (
     LearnedUserModule,
     MatrixHolder,
     ReversalAdapter,
-    SampleChunkSampler,
     SteeringPolicy,
     TeleopSource,
     active_rows,
@@ -81,7 +80,6 @@ __all__ = [
     # the cores and the module classes
     "FlowControlSteering",
     "FlowReversalSteering",
-    "SampleChunkSampler",
     "TeleopSource",
     "active_rows",
     "LearnedUserModule",

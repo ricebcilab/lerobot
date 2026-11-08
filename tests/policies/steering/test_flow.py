@@ -19,12 +19,11 @@ by test_steering_core.py and test_steering_wrappers.py)."""
 import pytest
 import torch
 
-from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
+from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
 from lerobot.policies.steering import (
     Flow,
     FlowControlSteering,
     FlowReversalSteering,
-    SampleChunkSampler,
     active_rows,
 )
 
@@ -74,7 +73,8 @@ def test_a_steered_chunk_without_the_plan_is_the_paired_one_and_leaves_the_same_
     """``paired=False`` skips the plain pass when every row steers: the chunk and the generator state afterwards are
     the paired call's (with an idle row the plan is still drawn, for that row)."""
     policy = _FieldPolicy().eval()
-    sampler = SampleChunkSampler(policy, 5, 6, 2, 2)
+    sampler = CursorFlowPolicy.wrapping(policy)  # the cursor policy behind pi0.5's interface, 5 Euler steps
+    sampler.config.num_inference_steps, sampler.config.n_action_steps = 5, 2
     obs = {"pos": torch.zeros(2, 2)}
     cores = (
         FlowControlSteering(sampler, None, tau=4, lam=2, ic_gain=1.5, dims=slice(None)),

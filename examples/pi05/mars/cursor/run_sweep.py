@@ -315,8 +315,9 @@ def parse_setting(key):
 
 
 def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters, device, seed, scene_encoder=None):
-    """One method at one setting over all noises of a level at once; per-noise records. `scene_encoder` (an encoder
-    or a factory of one) goes to `run_trials`, which needs it for a vlm_views task module."""
+    """One method at one setting over all noises of a level at once; per-noise records. `policy` (the arm's
+    `CursorFlowPolicy`, `load_checkpoints`') goes to `run_trials`, whose controller steers it through lerobot's
+    `SteeringPolicy`; `scene_encoder` (an encoder or a factory of one) too, which it needs for a vlm_views task module."""
     n = len(layouts)
     off = sweep["methods"][method].get("readout") in ("off", False)  # YAML reads `off` as False
     readout = readout_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)

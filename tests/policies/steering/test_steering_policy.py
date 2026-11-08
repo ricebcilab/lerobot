@@ -276,6 +276,33 @@ def test_mode_none_ignores_the_command(tmp_path):
         steering.predict_action_chunk({**obs, "command": COMMAND[:2]})  # checked though ignored
 
 
+@pytest.mark.parametrize("mode", ["none", "flow_control", "frs"])
+def test_no_command_is_the_bases_own_chunk_from_the_noise_given(tmp_path, mode):
+    """Without a command, in every mode, the chunk is the base's own through the task module, and ``noise`` (pi0.5's
+    keyword) starts it; a steered chunk draws its own noise, so a command with ``noise`` raises."""
+    _, task_path = _modules(tmp_path)
+    base = _policy()
+    steering = _steering(SteeringConfig(mode=mode, adapter_task=str(task_path), device="cpu"), base)
+    obs = _obs()
+    hook = FlowControlSteering.velocity_hook(steering.adapter.field(obs))
+    z = torch.randn(3, base.horizon, 2, generator=torch.Generator().manual_seed(4))
+    got = steering.predict_action_chunk(obs, noise=z)
+    assert torch.equal(got, base.predict_action_chunk(obs, noise=z, velocity_hook=hook))
+    torch.manual_seed(5)
+    drawn = steering.predict_action_chunk(obs)
+    torch.manual_seed(5)
+    assert torch.equal(drawn, base.predict_action_chunk(obs, velocity_hook=hook)) and not torch.equal(
+        drawn, got
+    )
+    if mode == "none":
+        assert torch.equal(
+            steering.predict_action_chunk({**obs, "command": COMMAND}, noise=z), got
+        )  # ignored
+    else:
+        with pytest.raises(ValueError, match="a steered chunk draws its own"):
+            steering.predict_action_chunk({**obs, "command": COMMAND}, noise=z)
+
+
 def test_forward_needs_the_module_of_its_kind(tmp_path):
     user_path, task_path = _modules(tmp_path)
     steering = _steering(SteeringConfig(adapter_user=str(user_path), device="cpu"))

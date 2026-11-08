@@ -14,7 +14,8 @@ from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.readout import Readout
 import lerobot.envs.cursor
 from lerobot.envs.cursor import TaskConfig, sample_layouts
-from cursor_sa.policy import FlowPolicy
+import cursor_sa.steering
+from cursor_sa.policy import CursorFlowPolicy, FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import SharedController, steered_chunk
 from lerobot.policies.steering import AdapterModules, LearnedTaskModule
@@ -73,6 +74,13 @@ def test_the_expert_chunk_agent_plans_goal_given_chunks_and_holds_each_planned_s
     np.testing.assert_allclose(moves[0], 0.5 * raws[0] * ctl.max_speed * ctl.dt)
     np.testing.assert_allclose(ctl.hist[:, -2], raws[0] * ctl.max_speed * ctl.dt, rtol=1e-6)
     np.testing.assert_allclose(ctl.hist[:, -1], raws[2] * ctl.max_speed * ctl.dt, rtol=1e-6)
+
+
+def test_load_checkpoints_serves_cursor_flow_policies_and_the_hand_built_wrapper_is_gone():
+    arm = config.load_arm("teleop.yaml")
+    policies, _ = load_checkpoints({arm["name"]: arm}, "cpu")
+    assert policies and all(isinstance(p, CursorFlowPolicy) and not p.training for p in policies.values())
+    assert not hasattr(cursor_sa.steering, "steering_wrapper")
 
 
 def test_every_shipped_sweep_resolves_every_method():

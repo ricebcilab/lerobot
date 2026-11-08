@@ -89,7 +89,7 @@ def test_upload_creates_the_repo_and_sends_only_converted_files(tmp_path, monkey
     root = tmp_path / "checkpoints"
     pol, ada = root / "policies" / "p", root / "adapters" / "a"
     for d, files in (
-        (pol, ["config.json", "model.safetensors", "train_log.json", "policy.pt.orig", "train.out"]),
+        (pol, [*hub.POLICY_FILES, "policy.pt.orig", "train.out"]),
         (ada, ["adapter.pt", "adapter.pt.orig", "train_log.json"]),
     ):
         d.mkdir(parents=True)
@@ -122,10 +122,20 @@ def test_upload_creates_the_repo_and_sends_only_converted_files(tmp_path, monkey
         "exist_ok": True,
     }
     assert upload["repo_id"] == "ricebcilab/mars-cursor" and Path(upload["folder_path"]) == root
+    pipelines = (
+        "policy_preprocessor.json",
+        "policy_postprocessor.json",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    )  # the policy's processor pipelines go with it: a downloaded base loads with its postprocessor
+    assert set(pipelines) <= set(hub.POLICY_REQUIRED)
     assert sorted(upload["allow_patterns"]) == sorted(
-        [f"policies/p/{f}" for f in ("config.json", "model.safetensors", "train_log.json")]
+        [f"policies/p/{f}" for f in ("config.json", "model.safetensors", *pipelines, "train_log.json")]
         + ["adapters/a/adapter.pt", "adapters/a/train_log.json"]
     )
     calls.clear()
+    (pol / pipelines[2]).unlink()  # a folder converted before the pipelines: refused, naming the converter
+    assert hub.main(["upload"]) == 1 and calls == []
+    assert f"policies/p: missing ['{pipelines[2]}'] (run convert_checkpoints.py)" in capsys.readouterr().out
+    (pol / pipelines[2]).write_text("x")
     (pol / "policy.pt").write_text("x")  # a trainer's unconverted policy: refuse before touching the Hub
     assert hub.main(["upload"]) == 1 and calls == []

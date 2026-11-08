@@ -4,13 +4,17 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
+from cursor_sa.policy import FlowPolicy, as_policy
 from cursor_sa.records import OUTCOMES, load_run, read_records
 from cursor_sa.session import (Aborted, Run, balanced_latin_square, block_order, block_permutation, layout_seed,
                                make_layout_sets)
-from lerobot.envs.cursor import TaskConfig
+from cursor_sa.steering import SharedController, steered_chunk
+from lerobot.envs.cursor import TaskConfig, sample_layouts
+from lerobot.policies.steering import SteeringPolicy
 
 PROTOCOL = dict(name="tiny", arms={"teleop": "teleop.yaml", "flow_control": "flow_control.yaml"},
                 blocks={"trials": 3, "practice": 1, "order": "latin_square"},
@@ -147,3 +151,42 @@ def test_logged_copies_what_is_printed_into_the_log_and_restores_the_console(tmp
         print("resumed")
     assert (tmp_path / "log.txt").read_text().endswith("resumed\n")
     assert "inside" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- the controller's steering policy
+
+
+@pytest.fixture
+def small_policy():
+    torch.manual_seed(0)
+    return as_policy(FlowPolicy(d_model=32, layers=1, heads=2, d_ff=64).eval())
+
+
+@pytest.fixture
+def layouts():
+    return sample_layouts(np.random.default_rng(1), 3, (2, 4), TaskConfig())
+
+
+def test_the_controller_runs_a_steering_policy(small_policy, layouts):
+    ctl = SharedController(small_policy, layouts, "frs", n_reverse_steps=4, device="cpu")
+    assert isinstance(ctl.steering, SteeringPolicy) and ctl.steering.config.mode == "frs"
+    assert ctl.steering.base_policy is as_policy(small_policy) or ctl.steering.base_policy.model is small_policy.model
+
+
+def test_policy_mode_is_mode_none(small_policy, layouts):
+    ctl = SharedController(small_policy, layouts, "policy", device="cpu")
+    assert ctl.steering.config.mode == "none"
+
+
+@pytest.mark.parametrize("mode", ["policy", "flow_control", "frs"])
+def test_steered_chunk_matches_the_controller_bit_for_bit(small_policy, layouts, mode):
+    """The controller's chunk (screen units per step) is the example's steered_chunk for the same observation and
+    command under one seed; one row idle."""
+    ctl = SharedController(small_policy, layouts, mode, n_reverse_steps=4, device="cpu")
+    command = np.array([[0.8, 0.1], [0.0, 0.01], [-0.5, 0.6]])
+    torch.manual_seed(0)
+    ctl.act(command)
+    torch.manual_seed(0)
+    want = steered_chunk(small_policy, ctl.observation(), torch.as_tensor(command, dtype=torch.float32), mode,
+                         n_reverse_steps=4)
+    assert np.array_equal(ctl.chunk, want.numpy() * 1)
