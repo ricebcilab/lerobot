@@ -79,7 +79,7 @@ tools/                hub.py (the checkpoints on the Hugging Face Hub: download,
                       Obstacle specs take `decoy: true` (the obstacle on the reach to a random non-goal target; the goal-leak sweep
                       `grid_task_check_rel_leak`), see the design addendum of 2026-11-05 in docs/superpowers/specs
 train/                train_policy.py, train_adapter.py
-reports/              report_grid_image.py (gate verdicts and grid tables of the image task modules);
+reports/              report_grid_image.py (the image task modules' gate verdicts, scan, recipe choice and width check), report_grid_vision.py (the vision grid and its decoy control);
                       build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or
                       study_group.pdf for several (paper-style figures)
 ../paper/figures/     (examples/pi05/mars/paper/figures/) the paper's figures, PDF + PNG, and build_figures.py (one script; `--only fig1 fig2 fig3`):

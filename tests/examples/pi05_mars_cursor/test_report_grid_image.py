@@ -11,9 +11,7 @@ from report_grid_image import (
     crossing,
     first_count,
     gate_table,
-    join_ft,
     main as report_main,
-    pooled_over_seeds,
     scan_rows,
     select_recipe,
     width_check,
@@ -120,65 +118,9 @@ def test_the_gate_table_reports_wrong_targets(tmp_path):
     wrong = [gate["T2"][k] for k in ("wrong_target", "hidden_wrong_target", "ref_hidden_wrong_target")]
     assert wrong == [0.04, 0.476, 0.30] and gate["T4"]["wrong_target"] is None
     assert gate["T3"]["hidden_hits"] is None and gate["T3"]["flag"] is False
-    assert "Gate" in md and "Pooled" not in md and report["pooled"] == {}  # the gate before the grid exists
-
-
-def test_join_ft_checks_the_trials_then_pools_over_seeds(tmp_path):
-    ms = ["teleop", "mars", "mars_vlm"]
-    grid = dict(
-        test={f"U{u}xT{t}|1.0": _cell(ms, [0.2, 0.7, 0.6 + 0.01 * u]) for u in (1, 2) for t in (2, 3)}
-    )
-    ft, ft_cells = (
-        ["teleop", "ft_mars_user"],
-        {k: _cell(["teleop", "ft_mars_user"], [0.2, 0.4]) for k in grid["test"]},
-    )
-    ft_cells.update({f"U{u}xT1|1.0": _cell(ft, [0.2, 0.9]) for u in (1, 2)})  # extra cells
-    joined = join_ft(grid, dict(test=ft_cells))
-    assert set(joined["test"]) == set(grid["test"])  # the grid's cells only
-    assert joined["test"]["U2xT3|1.0"]["metrics"]["ft_mars_user"]["success"] == 0.4
-    for key, bad, match in (
-        ("U2xT3|1.0", None, "U2xT3"),
-        ("U1xT2|1.0", _cell(ft, [0.2, 0.4], side=[-1] * 10), "side"),
-        ("U1xT2|1.0", _cell(ft, [0.3, 0.4]), "teleop"),
-    ):
-        cells = {k: v for k, v in ft_cells.items() if k != key or bad is not None}
-        with pytest.raises(ValueError, match=match):
-            join_ft(grid, dict(test={**cells, **({key: bad} if bad else {})}))
-    pooled = pooled_over_seeds([joined, joined], "mars_vlm")
-    assert pooled["mean"] == pytest.approx(61.5) and len(pooled["per_seed"]) == 2
-    low, high = ({"test": {k: _cell(["teleop", "mars"], [0.2, h]) for k in grid["test"]}} for h in (0.5, 0.9))
-    pooled = pooled_over_seeds([low, high], "mars")
-    half = 12.7062 * np.std([50.0, 90.0], ddof=1) / np.sqrt(2)  # a t-interval of two: t(0.975, 1) sd / sqrt 2
-    assert pooled["per_seed"] == pytest.approx([50.0, 90.0]) and pooled["mean"] == pytest.approx(70.0)
-    assert [pooled["lo"], pooled["hi"]] == pytest.approx([70.0 - half, 70.0 + half], rel=1e-3)
-    for runs in ([low] * 3, [low]):  # identical seeds, or one seed: the degenerate interval
-        same = pooled_over_seeds(runs, "mars")
-        assert same["lo"] == same["hi"] == same["mean"] == pytest.approx(50.0)
-    _write(tmp_path, check=dict(test={}), g0=grid, f0=dict(test=ft_cells))
-    md, report = _report(tmp_path, "--check", "check", "--grid", "g0", "--ft", "f0")
-    assert "mars_vlm" in md and "ft_mars_user" in md and report["gate"] == []
-
-
-def test_the_per_cell_tables_mark_the_trained_cells_and_one_seed_has_no_interval(tmp_path):
-    ms = ["teleop", "mars", "mars_vlm"]
-    grid = {"U1xT2|1.0": _cell(ms, [0.2, 0.7, 0.6], train_cell=True), "U1xT3|1.0": _cell(ms, [0.2, 0.5, 0.4])}
-    _write(tmp_path, check=dict(test={}), g0=dict(test=grid))
-    md, report = _report(tmp_path, "--check", "check", "--grid", "g0")
-    assert "| cell | train |" in md and "| U1xT2\\|1.0 | train |" in md and "| U1xT3\\|1.0 |  |" in md
-    unescaped = lambda line: len(re.findall(r"(?<!\\)\|", line))  # noqa: E731
-    lines, tables = md.splitlines(), 0
-    for i, line in enumerate(
-        lines
-    ):  # every row of a table has its header's columns: the cells' pipes escaped
-        if line.startswith("|") and i + 1 < len(lines) and lines[i + 1].startswith("|---"):
-            tables += 1
-            for row in lines[i + 2 :]:
-                if not row.startswith("|"):
-                    break
-                assert unescaped(row) == unescaped(line), row
-    assert tables >= 2 and "| mars | 60.0 | n/a | n/a |" in md
-    one = report["pooled"]["mars"]
-    assert one["lo"] == one["hi"] == one["mean"]  # the JSON keeps the degenerate interval
+    assert "Gate" in md and set(report) == {
+        "gate"
+    }  # the gate alone; the grid's tables are report_grid_vision.py's
 
 
 def test_scan_rows_level_band_flag_and_first_counts():
@@ -328,7 +270,6 @@ def test_rules_refuse_a_run_that_lacks_a_row(tmp_path, capsys):
     for argv in (
         [],  # one mode is required
         ["--select", "scan300", "--width", "scan300"],  # and only one
-        ["--check", "check", "--ft", "x"],  # --ft pairs with --grid
         ["--scan", *scans],  # two runs with the same count
         ["--scan", *rels],  # a rel run read with the default prefix
     ):
