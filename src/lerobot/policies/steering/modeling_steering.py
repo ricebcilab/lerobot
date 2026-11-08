@@ -36,6 +36,11 @@ from torch import Tensor, nn
 from lerobot.envs.cursor import SCENE_SIZE
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.teleoperators import readout
+from lerobot.utils.constants import (
+    OBS_PREFIX,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 from .configuration_steering import (
     GRIPPER_DIM,
@@ -338,26 +343,13 @@ class LearnedTaskModule(nn.Module):
             raise ValueError(
                 f"relative token_geometry needs token_source vlm_image or cnn, got {token_source!r}"
             )
-        if token_source not in SCENE_SOURCES:
-            raise ValueError(f"token_source must be one of {SCENE_SOURCES}, got {token_source!r}")
+        self._check_scene(token_source, image_size, wrist_span, scene_rank, width=None)
         if token_source.startswith("vlm") and (scene_dim is None or scene_tokens is None):
             raise ValueError(f"token_source {token_source!r} needs scene_dim and scene_tokens")
-        if token_source == "vlm_views" and (wrist_span is None or wrist_span <= 0):  # nosec B105
-            raise ValueError(f"token_source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
-        if token_source != "vlm_views" and wrist_span is not None:  # nosec B105
-            raise ValueError(f"wrist_span belongs to token_source 'vlm_views', not {token_source!r}")
-        if scene_rank is not None and not token_source.startswith("vlm"):
-            raise ValueError(
-                f"scene_rank reduces the vlm_* sources' tokens, not token_source {token_source!r}'s"
-            )
         if scene_rank is not None and not 1 <= scene_rank < scene_dim:
             raise ValueError(f"scene_rank must be in 1..{scene_dim - 1}, got {scene_rank}")
         if token_source == "cnn":  # nosec B105
-            if image_size is None or image_size <= 0 or image_size % 16:
-                raise ValueError(
-                    f"token_source 'cnn' needs an image_size that is a multiple of 16, got {image_size}"
-                )
-            scene_tokens = (image_size // 16) ** 2
+            scene_tokens = (image_size // CNN_PATCH) ** 2
         grid = math.isqrt(scene_tokens) if token_geometry == "relative" else 0  # nosec B105
         if token_geometry == "relative" and grid * grid != scene_tokens:  # nosec B105
             raise ValueError(f"relative token_geometry needs a square token grid, got {scene_tokens} tokens")
@@ -433,6 +425,33 @@ class LearnedTaskModule(nn.Module):
             self.register_buffer("scene_mean", torch.zeros(scene_dim))
             self.register_buffer("scene_basis", torch.zeros(scene_dim, scene_rank))
 
+    @staticmethod
+    def _check_scene(
+        source: str,
+        size: int | None,
+        wrist_span: float | None,
+        scene_rank: int | None,
+        width: int | None = VLM_SCENE_DIM,
+    ) -> None:
+        """The scene checks the module and ``spec`` share: ``source`` one of ``SCENE_SOURCES``; ``wrist_span`` (> 0)
+        exactly for ``vlm_views``; ``scene_rank`` only for a ``vlm_*`` source and, with ``width``, in 1..width - 1;
+        ``cnn`` renders a positive multiple of ``CNN_PATCH`` in ``size``."""
+        if source not in SCENE_SOURCES:
+            raise ValueError(f"token_source must be one of {SCENE_SOURCES}, got {source!r}")
+        if source == "vlm_views" and (wrist_span is None or wrist_span <= 0):  # nosec B105
+            raise ValueError(f"token_source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
+        if source != "vlm_views" and wrist_span is not None:  # nosec B105
+            raise ValueError(f"wrist_span belongs to token_source 'vlm_views', not {source!r}")
+        if scene_rank is not None:
+            if not source.startswith("vlm_"):
+                raise ValueError(
+                    f"scene_rank reduces the vlm_* sources' tokens, not token_source {source!r}'s"
+                )
+            if width is not None and not 1 <= scene_rank < width:
+                raise ValueError(f"scene_rank must be in 1..{width - 1}, got {scene_rank}")
+        if source == "cnn" and (size is None or size <= 0 or size % CNN_PATCH):  # nosec B105
+            raise ValueError(f"token_source 'cnn' needs a size that is a multiple of {CNN_PATCH}, got {size}")
+
     @classmethod
     def spec(
         cls,
@@ -450,22 +469,12 @@ class LearnedTaskModule(nn.Module):
         an optional ``scene_rank`` (1..2047), the width of the carried token reduction; ``vlm_views`` always has the
         key (None: full width), the others only when it is set. ``discs`` and ``cnn`` have no 2048-wide tokens to
         reduce."""
-        if source not in SCENE_SOURCES:
-            raise ValueError(f"source must be one of {SCENE_SOURCES}, got {source!r}")
-        if source != "vlm_views" and wrist_span is not None:  # nosec B105
-            raise ValueError(f"wrist_span belongs to source 'vlm_views', not {source!r}")
-        if scene_rank is not None:
-            if not source.startswith("vlm_"):
-                raise ValueError(f"scene_rank reduces the vlm_* sources' tokens, not source {source!r}'s")
-            if not 1 <= scene_rank < VLM_SCENE_DIM:
-                raise ValueError(f"scene_rank must be in 1..{VLM_SCENE_DIM - 1}, got {scene_rank}")
+        cls._check_scene(source, size, wrist_span, scene_rank)
         if source == "discs":  # nosec B105
             return {"token_source": "discs"}
         if size <= 0:
             raise ValueError(f"size must be positive, got {size}")
         if source == "cnn":  # nosec B105
-            if size % CNN_PATCH:
-                raise ValueError(f"source 'cnn' needs a size that is a multiple of {CNN_PATCH}, got {size}")
             return {
                 "token_source": "cnn",
                 "scene_dim": None,
@@ -473,8 +482,6 @@ class LearnedTaskModule(nn.Module):
                 "image_size": size,
             }
         if source == "vlm_views":  # nosec B105
-            if wrist_span is None or wrist_span <= 0:
-                raise ValueError(f"source 'vlm_views' needs a positive wrist_span, got {wrist_span}")
             return {
                 "token_source": source,
                 "scene_dim": VLM_SCENE_DIM,
@@ -615,14 +622,25 @@ class LearnedTaskModule(nn.Module):
             L = || A v + b - (a - z) ||^2 + lambda_id (||A - I||^2 + ||b||^2),   v = velocity(x_t, t) (no grad),
 
         ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. Returns the loss and its
-        two parts (``fm``, ``identity``) as floats."""
+        two parts (``fm``, ``identity``) as detached tensors (the caller converts them when it logs: no host sync
+        per step here)."""
         x = (1 - t[:, None, None]) * z + t[:, None, None] * chunk
         with torch.no_grad():
             v = velocity(x, t)
         mat, b = task(x, t, v)
         fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
         identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
-        return fm + lambda_id * identity, {"fm": fm.item(), "identity": identity.item()}
+        return fm + lambda_id * identity, {"fm": fm.detach(), "identity": identity.detach()}
+
+
+def _adapter_kind(has_user: bool, has_task: bool) -> str:
+    """An adapter's kind from which parts it has: composed, user, task or none."""
+    return {
+        (True, True): "composed",
+        (True, False): "user",
+        (False, True): "task",
+        (False, False): "none",
+    }[(has_user, has_task)]
 
 
 class MatrixHolder:
@@ -675,14 +693,9 @@ class ReversalAdapter(MatrixHolder):
 
     @property
     def kind(self) -> str:
-        user = self._matrix is not None or self.user_module is not None
-        task = self.task_module is not None
-        return {
-            (True, True): "composed",
-            (True, False): "user",
-            (False, True): "task",
-            (False, False): "none",
-        }[(user, task)]
+        return _adapter_kind(
+            self._matrix is not None or self.user_module is not None, self.task_module is not None
+        )
 
     def load_modules(self, user_path=None, task_path=None, device="cpu") -> None:
         """Load learned modules from checkpoints into the user and/or task slot (None leaves a slot alone)."""
@@ -802,13 +815,7 @@ class AdapterModules(nn.Module):
 
     @property
     def kind(self) -> str:
-        user = self.user is not None or self.matrix is not None
-        return {
-            (True, True): "composed",
-            (True, False): "user",
-            (False, True): "task",
-            (False, False): "none",
-        }[(user, self.task is not None)]
+        return _adapter_kind(self.user is not None or self.matrix is not None, self.task is not None)
 
     def field(self, obs: dict) -> AdaptedField:
         """The ``AdaptedField`` for this observation: the fixed matrix on the observation's device (its first
@@ -820,17 +827,6 @@ class AdapterModules(nn.Module):
 
     def adapt(self, obs: dict, x: torch.Tensor, t, v: torch.Tensor, backward: bool) -> torch.Tensor:
         return self.field(obs).adapt(x, t, v, backward)
-
-    def save(self, path, kind: str | None = None, meta: dict | None = None) -> Path:
-        """Save the module in slot ``kind`` (user or task; None: the one learned module this adapter holds) as a
-        module checkpoint (``save_module``): the format ``load`` and ``load_module`` read."""
-        if kind is None:
-            filled = [k for k in self.KINDS if getattr(self, k) is not None]
-            if len(filled) != 1:
-                raise ValueError(f"save needs a kind: this adapter holds the modules {filled}")
-            kind = filled[0]
-        module = getattr(self, kind) if kind in self.KINDS else None
-        return AdapterModules.save_module(module, path, kind, meta)
 
     @classmethod
     def load(cls, path, device="cpu") -> "AdapterModules":
@@ -858,10 +854,11 @@ class AdapterModules(nn.Module):
         return path
 
     @staticmethod
-    def load_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
-        """Load a MARS module checkpoint: (module in eval mode, kind, meta). Task checkpoints written while
-        there were two task module classes carry ``arch``: ``"obstacle"`` is this ``LearnedTaskModule``;
-        ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO files) is the removed MLP module."""
+    def read_checkpoint(path, device="cpu") -> dict:
+        """A MARS module checkpoint as saved (``save_module``'s dict: kind, config, state_dict, meta), its kind
+        checked. Task checkpoints written while there were two task module classes carry ``arch``: ``"obstacle"`` is
+        this ``LearnedTaskModule``; ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO files) is the
+        removed MLP module, which raises."""
         ckpt = torch.load(
             Path(path), map_location=device, weights_only=True
         )  # tensors, numbers, strings only
@@ -875,6 +872,13 @@ class AdapterModules(nn.Module):
                 f"{path}: a task module of arch {ckpt.get('arch', 'mlp')!r}, the MLP task module, which was removed; "
                 "retrain it as a LearnedTaskModule"
             )
+        return ckpt
+
+    @staticmethod
+    def load_module(path, device="cpu") -> tuple[nn.Module, str, dict]:
+        """Load a MARS module checkpoint (``read_checkpoint``): (module in eval mode, kind, meta)."""
+        ckpt = AdapterModules.read_checkpoint(path, device)
+        kind = ckpt["kind"]
         module = AdapterModules.KINDS[kind](**ckpt["config"])
         module.load_state_dict(ckpt["state_dict"])
         return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
@@ -959,11 +963,8 @@ class Flow:
         if adapter is None:
             return v
         if isinstance(adapter, torch.Tensor):
-            if not backward:
-                return v
-            n = adapter.shape[-1]
-            return torch.cat([v[..., :n] @ adapter.transpose(-1, -2), v[..., n:]], dim=-1)
-        if isinstance(adapter, ReversalAdapter):
+            adapter = AdaptedField(adapter)
+        elif isinstance(adapter, ReversalAdapter):
             if adapter.matrix is not None:
                 raise ValueError(
                     "a ReversalAdapter's fixed matrix is in environment units; pass its field(std, like) instead"
@@ -972,6 +973,11 @@ class Flow:
                 return v
             adapter = AdaptedField(None, adapter.user_module, adapter.task_module)
         return adapter.adapt(x_t, t, v, backward)
+
+    def toward_noise(self, steps: int) -> float:
+        """The signed Euler step of ``steps`` per unit of flow time, toward noise: +1/N in pi0.5's convention, -1/N in
+        the cursor's (the reversal's step; the forward pass takes its negative)."""
+        return (2 * self.noise_time - 1) / steps
 
     def integrate(
         self, x: torch.Tensor, t0: float, h: float, n: int, backward: bool = False, grad: bool = False
@@ -1004,8 +1010,9 @@ class Flow:
         module, then user module; a fixed F, x_t += h * (F @ v) on the first n action dims, F = I an exact no-op).
         Differentiable when grad is enabled."""
         steps = num_steps if n_reversal_steps is None else n_reversal_steps
-        h = 1.0 / num_steps if self.noise_time == 1.0 else -1.0 / num_steps
-        return self.integrate(x, 1.0 - self.noise_time, h, steps, backward=True, grad=True)
+        return self.integrate(
+            x, 1.0 - self.noise_time, self.toward_noise(num_steps), steps, backward=True, grad=True
+        )
 
     def forward(self, x: torch.Tensor, num_steps: int, stop_at: int | None = None) -> torch.Tensor:
         """Integrate the flow forward (Euler) from noise toward the action, stopping at stop_at / num_steps of the
@@ -1014,8 +1021,7 @@ class Flow:
         ``num_steps - n`` steps and returns the unsteered state where a reversal stopped after ``n`` steps would
         sit. The adapter applies its task module only: the user module acts on the reversal alone."""
         steps = num_steps if stop_at is None else num_steps - stop_at
-        h = -(1.0 / num_steps) if self.noise_time == 1.0 else 1.0 / num_steps
-        return self.integrate(x, self.noise_time, h, steps, grad=True)
+        return self.integrate(x, self.noise_time, -self.toward_noise(num_steps), steps, grad=True)
 
     @staticmethod
     def schedule(steps: int, n_reverse_steps: int | None, noise_time: float = 1.0) -> tuple[float, int]:
@@ -1050,9 +1056,8 @@ class Flow:
         steps -- for the policy to fill in (Tang et al.'s noise-space in-painting, App. D.1). The forward pass
         starts from it on ``schedule``'s schedule."""
         _, n = Flow.schedule(steps, n_reverse_steps, self.noise_time)
-        action_time = 1.0 - self.noise_time
-        h = (self.noise_time - action_time) / steps  # toward noise
-        latent = self.integrate(reference, action_time, h, n, backward=True, grad=grad)
+        h = self.toward_noise(steps)
+        latent = self.integrate(reference, 1.0 - self.noise_time, h, n, backward=True, grad=grad)
         if delegated is not None and bool(delegated.any()):
             unsteered = (
                 noise if n == steps else self.integrate(noise, self.noise_time, -h, steps - n, grad=grad)
@@ -1066,11 +1071,7 @@ class Flow:
         the way to noise, then regenerated through the forward field (the task module alone: ``AdaptedField``
         applies the user part backward only). The trainers' validation: what the policy makes of the operator's
         command through the modules."""
-        h = (
-            2 * self.noise_time - 1
-        ) / num_steps  # toward noise: +1/N in pi0.5's convention, -1/N in the cursor's
-        z = self.integrate(chunk, 1 - self.noise_time, h, num_steps, backward=True)
-        return self.integrate(z, self.noise_time, -h, num_steps)
+        return self.forward(self.reverse(chunk, num_steps), num_steps)
 
     @staticmethod
     def uniform_reference(
@@ -1087,6 +1088,15 @@ class Flow:
         ref = torch.zeros(command.shape[0], chunk_size, max_action_dim, dtype=torch.float32)
         ref[..., :N_ACTION_DIMS] = torch.as_tensor(normalized, dtype=torch.float32)[:, None, :]
         return ref
+
+    @staticmethod
+    def held_reference(commands: torch.Tensor, horizon: int, step: float, action_scale) -> torch.Tensor:
+        """The reference FRS steers a ``sample_chunk`` policy (the cursor's) toward: ``commands`` in the operator's
+        units ((B, n), held over the ``horizon`` chunk steps, or (B, H, n) one per step), a full deflection moving
+        ``step`` action units per control step (max speed x dt), in the policy's normalized units (``action_scale``
+        action units each): ``command * step / action_scale``."""
+        per_step = commands if commands.dim() == 3 else commands[:, None].expand(-1, horizon, -1)
+        return per_step * step / action_scale
 
     @staticmethod
     def heading_cosine(chunk_a: torch.Tensor, chunk_b: torch.Tensor, n_dims: int = 3) -> torch.Tensor:
@@ -1111,21 +1121,17 @@ class Flow:
 
     @staticmethod
     def paired_chunks(
-        policy, batch, steered: bool, common: dict | None = None, **steer_kwargs
+        policy, batch, common: dict | None = None, **steer_kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The steered chunk and the policy's own plan for the same observation and the same noise.
 
-        Returns (steered, plain). When `steered` is False the two are the same tensor: no
-        second pass. Otherwise the generator state is restored between the passes so the
-        plain chunk starts from the Gaussian sample the steered one used, and the state
-        after the steered pass is restored afterwards, so a run's random stream is exactly
-        what it would be without the second pass. `common` kwargs go to both passes (a MARS
-        task module shapes the policy's own plan too); `steer_kwargs` only to the steered one.
+        Returns (steered, plain), the steered pass first. The generator state is restored between the passes so the
+        plain chunk starts from the Gaussian sample the steered one used, and the state after the steered pass is
+        restored afterwards, so a run's random stream is exactly what it would be without the second pass. `common`
+        kwargs go to both passes (a MARS task module shapes the policy's own plan too); `steer_kwargs` only to the
+        steered one.
         """
         common = common or {}
-        if not steered:
-            chunk = policy.predict_action_chunk(batch, **common)
-            return chunk, chunk
         before = Flow._rng_state()
         chunk = policy.predict_action_chunk(batch, **common, **steer_kwargs)
         after = Flow._rng_state()
@@ -1154,10 +1160,20 @@ class TeleopSource(Protocol):
         ...
 
 
+def active_rows(commands, deadband: float) -> torch.Tensor:
+    """(B,) bool: the rows of ``commands`` ((B, n) commands, or (B, H, n) a command per chunk step, active when any
+    step is; a tensor or anything ``np.asarray`` takes) whose largest deflection is at least ``deadband``."""
+    magnitude = (
+        torch.as_tensor(commands if torch.is_tensor(commands) else np.asarray(commands)).abs().amax(-1)
+    )
+    return (magnitude.amax(-1) if magnitude.dim() == 2 else magnitude) >= deadband
+
+
 class _ChunkSteering:
     """What both steering wrappers share. ``steered_chunk(batch, commands)`` turns a batch of operator commands,
     one per row (a row inside ``deadband`` counts as idle and gets the policy's own chunk), into the steered chunk
-    and the policy's own plan for the same noise. As a policy (pi0.5's ``select_action``), once per chunk the
+    and the policy's own plan for the same noise; with ``paired=False`` the plan is None when every row steers (one
+    pass, the same chunk and the same generator state). As a policy (pi0.5's ``select_action``), once per chunk the
     operator's command is read from ``source`` and held, and the chunk's first ``n_action_steps`` steps are served
     one per call (``last_policy_action`` the plan's step).
 
@@ -1185,14 +1201,8 @@ class _ChunkSteering:
         return command if command is not None and np.max(np.abs(command)) >= self.deadband else None
 
     def _active(self, commands) -> torch.Tensor:
-        """(B,) bool: the rows of ``commands`` ((B, n) commands, or (B, H, n) a command per chunk step, active when
-        any step is) outside the deadband."""
-        magnitude = (
-            torch.as_tensor(np.asarray(commands) if not torch.is_tensor(commands) else commands)
-            .abs()
-            .amax(-1)
-        )
-        return (magnitude.amax(-1) if magnitude.dim() == 2 else magnitude) >= self.deadband
+        """(B,) bool: the rows of ``commands`` outside the deadband (``active_rows``)."""
+        return active_rows(commands, self.deadband)
 
     @staticmethod
     def check_steps(name: str, value, low: int, high: int, unit: str, optional: bool = False) -> None:
@@ -1388,9 +1398,12 @@ class FlowControlSteering(_ChunkSteering):
         self.guided_steps += 1
         return self.write(x_t, step, self._pending_target, self._tau, self._lam, dims=self._dims, steer=steer)
 
-    def steered_chunk(self, batch, commands, field=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def steered_chunk(
+        self, batch, commands, field=None, paired: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The chunk for ``commands`` ((B, n), or (B, H, n) per step; None: every row idle) and the policy's own
-        plan from the same noise. ``field`` (an ``AdaptedField``) adds its task module to every forward pass."""
+        plan from the same noise (None when ``paired`` is False and every row steers: the plan is then not drawn).
+        ``field`` (an ``AdaptedField``) adds its task module to every forward pass."""
         hook = self.velocity_hook(field)
         common = {} if hook is None else {"velocity_hook": hook}
         steer = None if commands is None else self._active(commands)
@@ -1400,8 +1413,11 @@ class FlowControlSteering(_ChunkSteering):
             return chunk, chunk
         self._pending_command = commands
         self._pending_target = None  # resolved on the device by the first write
-        self._pending_steer = None if bool(steer.all()) else steer[:, None, None]
-        chunk, plain = Flow.paired_chunks(self._policy, batch, True, common, x_t_hook=self._x_t_hook)
+        every = bool(steer.all())
+        self._pending_steer = None if every else steer[:, None, None]
+        if every and not paired:
+            return self._policy.predict_action_chunk(batch, **common, x_t_hook=self._x_t_hook), None
+        chunk, plain = Flow.paired_chunks(self._policy, batch, common, x_t_hook=self._x_t_hook)
         return self._per_row(chunk, plain, steer), plain
 
     def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1493,11 +1509,7 @@ class FlowReversalSteering(_ChunkSteering):
         if operator_dims is None:
             mask = torch.zeros(chunk_size, max_action_dim, dtype=torch.bool)
         else:
-            unknown = [d for d in operator_dims if d not in OPERATOR_DIM_GROUPS]
-            if unknown:
-                raise ValueError(
-                    f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
-                )
+            SteeringConfig.check_operator_dims(operator_dims)
             mask = torch.ones(chunk_size, max_action_dim, dtype=torch.bool)
             for name in operator_dims:
                 mask[:, OPERATOR_DIM_GROUPS[name]] = False
@@ -1582,9 +1594,12 @@ class FlowReversalSteering(_ChunkSteering):
             self._adapter_cache = (key, self._adapter.field(self._std, like))
         return self._adapter_cache[1]
 
-    def steered_chunk(self, batch, commands, field=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def steered_chunk(
+        self, batch, commands, field=None, paired: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The chunk for ``commands`` ((B, n), or (B, H, n) per step; None: every row idle) and the policy's own
-        plan from the same noise. ``field`` (an ``AdaptedField``) replaces the wrapper's adapter for this call."""
+        plan from the same noise (None when ``paired`` is False and every row steers: the plan is then not drawn).
+        ``field`` (an ``AdaptedField``) replaces the wrapper's adapter for this call."""
         cfg = self._policy.config
 
         def adapted(like: torch.Tensor) -> AdaptedField | None:
@@ -1625,7 +1640,9 @@ class FlowReversalSteering(_ChunkSteering):
                 cfg.num_inference_steps, self._n_reversal_steps, noise_time=self._noise_time
             )
             schedule = {"flow_start_time": start, "num_forward_steps": n}
-        chunk, plain = Flow.paired_chunks(self._policy, batch, True, common, noise_fn=noise_fn, **schedule)
+        if not paired and bool(steer.all()):
+            return self._policy.predict_action_chunk(batch, **common, noise_fn=noise_fn, **schedule), None
+        chunk, plain = Flow.paired_chunks(self._policy, batch, common, noise_fn=noise_fn, **schedule)
         return self._per_row(chunk, plain, steer), plain
 
     def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1649,18 +1666,11 @@ class FlowReversalSteering(_ChunkSteering):
 
 # ---------------------------------------------------------------- the lerobot policy wrapper
 
-# The steering policy's own batch keys, not the observation's: the operator's command, and the training batch's
-STEERING_BATCH_KEYS = (
-    "command",
-    "kind",
-    "chunk",
-    "latent",
-    "noise",
-    "time",
-    "weight",
-    "bci_target",
-)
-OBS_PREFIX = "observation."
+# The steering policy's own batch keys, not the observation's: the operator's command, and a training batch's
+# (``SteeringPolicy.forward``'s, which the pre-processor carries through untouched)
+COMMAND = "command"
+TRAINING_KEYS = ("kind", "chunk", "latent", "noise", "time", "weight", "bci_target")
+STEERING_BATCH_KEYS = (COMMAND, *TRAINING_KEYS)
 
 
 def _unsqueezed(obs: dict) -> dict:
@@ -1682,10 +1692,10 @@ def _obs_rows(obs: dict) -> int | None:
     return None
 
 
-class _SampleChunkSampler:
-    """A flow policy with ``FlowPolicy.sample_chunk`` (the cursor's) behind pi0.5's sampler interface, as the cursor
-    example's ``CursorSampler``: ``config`` gives the flow's Euler steps, the chunk, the action dims, the steps
-    executed per replan and the flow time of noise (0, the cursor's convention)."""
+class SampleChunkSampler:
+    """A flow policy with ``FlowPolicy.sample_chunk`` (the cursor's) behind pi0.5's sampler interface, so the steering
+    cores drive it exactly as they drive pi0.5: ``config`` gives the flow's Euler steps, the chunk, the action dims,
+    the steps executed per replan and the flow time of noise (0, the cursor's convention)."""
 
     def __init__(self, model: nn.Module, steps: int, chunk_size: int, n_dims: int, n_action_steps: int):
         self.model = model
@@ -1732,8 +1742,7 @@ class SteeringPolicy(PreTrainedPolicy):
 
     def __init__(self, config: SteeringConfig, base_policy=None, postprocessor=None, **kwargs: Any):
         super().__init__(config)
-        user = self._module("user", config.user_module, config.adapter_user)
-        task = self._module("task", config.task_module, config.adapter_task)
+        user, task = self._module("user"), self._module("task")
         self.adapter = AdapterModules(user=user, task=task, matrix=config.fixed_matrix, n_dims=config.n_dims)
         object.__setattr__(
             self, "_base_policy", base_policy
@@ -1743,19 +1752,40 @@ class SteeringPolicy(PreTrainedPolicy):
         self._core: FlowControlSteering | FlowReversalSteering | None = None
         self._action_queue: deque = deque()
 
-    def _module(self, kind: str, arch: dict | None, path: str | None) -> nn.Module | None:
-        """The ``kind`` module: built from its recorded config (its weights come with the policy's), else read from
-        its checkpoint (its config then recorded), else None. A task module's scene settings fill the config's unset
-        ones (``SteeringConfig.scene_settings``, which raises on a contradiction)."""
+    @staticmethod
+    def resolve_module(
+        config: SteeringConfig, kind: str, build: bool = True
+    ) -> tuple[nn.Module | None, dict | None]:
+        """The ``kind`` module of ``config`` and its constructor config: built from the config recorded on ``config``
+        (``user_module`` / ``task_module``; its weights come with the policy's), else read from its checkpoint
+        (``adapter_user`` / ``adapter_task``; one ``torch.load``), else (None, None). With ``build`` False only the
+        constructor config is resolved (the module is not built, so no generator is drawn from): the processor
+        factory's form. Raises when the checkpoint holds the other kind of module."""
+        arch, path = getattr(config, f"{kind}_module"), getattr(config, f"adapter_{kind}")
         if arch is not None:
-            module = AdapterModules.KINDS[kind](**arch)
-        elif path is None:
-            return None
-        else:
+            return (AdapterModules.KINDS[kind](**arch) if build else None), arch
+        if path is None:
+            return None, None
+        if build:
             module, found, _ = AdapterModules.load_module(path)
-            if found != kind:
-                raise ValueError(f"{path} holds a {found} module, not a {kind} module")
-            setattr(self.config, f"{kind}_module", dict(module.config))
+            arch = module.config
+        else:
+            module, ckpt = None, AdapterModules.read_checkpoint(path)
+            found, arch = ckpt["kind"], ckpt["config"]
+        if found != kind:
+            raise ValueError(f"{path} holds a {found} module, not a {kind} module")
+        return module, arch
+
+    def _module(self, kind: str) -> nn.Module | None:
+        """The ``kind`` module (``resolve_module``), its config recorded when it was read from its checkpoint. A task
+        module's scene settings fill the config's unset ones (``SteeringConfig.scene_settings``, which raises on a
+        contradiction)."""
+        recorded = getattr(self.config, f"{kind}_module") is not None
+        module, arch = self.resolve_module(self.config, kind)
+        if module is None:
+            return None
+        if not recorded:
+            setattr(self.config, f"{kind}_module", dict(arch))
         if kind == "task":
             for key, value in self.config.scene_settings(module.config).items():
                 setattr(self.config, key, value)
@@ -1808,7 +1838,8 @@ class SteeringPolicy(PreTrainedPolicy):
             policy = get_policy_class(self.config.base_policy_type).from_pretrained(path)
             object.__setattr__(self, "_base_policy", policy.to(self.config.device).eval())
             pipelines = [
-                Path(path) / f"{name}.json" for name in ("policy_preprocessor", "policy_postprocessor")
+                Path(path) / f"{name}.json"
+                for name in (POLICY_PREPROCESSOR_DEFAULT_NAME, POLICY_POSTPROCESSOR_DEFAULT_NAME)
             ]
             if self._postprocessor is None and all(p.is_file() for p in pipelines):
                 self._base_preprocessor, self._postprocessor = make_pre_post_processors(
@@ -1828,26 +1859,32 @@ class SteeringPolicy(PreTrainedPolicy):
         model = getattr(self.base_policy, "model", None)
         return model if hasattr(model, "sample_chunk") else self.base_policy
 
+    @property
+    def _cursor_base(self) -> bool:
+        """Whether the base policy's flow model has ``sample_chunk`` (the cursor's), driven through
+        ``SampleChunkSampler``; otherwise it has pi0.5's sampler interface itself."""
+        return hasattr(self._flow_model(), "sample_chunk")
+
     def _action_scale(self):
         """Action units per normalized unit of a ``sample_chunk`` policy, or None (pi0.5: the postprocessor's)."""
-        model = self._flow_model()
-        return getattr(model, "action_scale", None) if hasattr(model, "sample_chunk") else None
+        return getattr(self._flow_model(), "action_scale", None) if self._cursor_base else None
 
     def _reference(self, commands: torch.Tensor) -> torch.Tensor:
         """FRS's reference for commands in the operator's units: held over the chunk (or one per step) at
-        ``max_speed``, in the policy's normalized units (the cursor example's ``to_action``)."""
+        ``max_speed`` (``Flow.held_reference``)."""
         horizon = self.core._policy.config.chunk_size
-        per_step = commands if commands.dim() == 3 else commands[:, None].expand(-1, horizon, -1)
-        return per_step * (self.config.max_speed * self.config.dt) / self._action_scale()
+        return Flow.held_reference(
+            commands, horizon, self.config.max_speed * self.config.dt, self._action_scale()
+        )
 
     @property
     def core(self) -> "FlowControlSteering | FlowReversalSteering":
         """The mode's steering core over the base policy's sampler, built on first use."""
         if self._core is None:
             cfg, model = self.config, self._flow_model()
-            if hasattr(model, "sample_chunk"):
+            if self._cursor_base:
                 horizon = getattr(model, "horizon", cfg.horizon)
-                sampler = _SampleChunkSampler(
+                sampler = SampleChunkSampler(
                     model, cfg.num_inference_steps, horizon, cfg.n_dims, cfg.n_action_steps
                 )
             else:
@@ -1896,9 +1933,7 @@ class SteeringPolicy(PreTrainedPolicy):
         keys, the scene step's inputs dropped and ``scene_tokens`` put at ``scene[scene_source]``; otherwise the batch
         is the dict. Any other policy (pi0.5) reads lerobot's batch as it is: every key but the steering policy's
         own (``STEERING_BATCH_KEYS``), its ``observation.*`` keys and ``task`` untouched."""
-        if not hasattr(self._flow_model(), "sample_chunk"):
-            return {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
-        if any(k.startswith(OBS_PREFIX) for k in batch):
+        if self._cursor_base and any(k.startswith(OBS_PREFIX) for k in batch):
             obs = {k[len(OBS_PREFIX) :]: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
             for key in ("layouts", "scene_images"):  # the scene step's inputs, not the policy's
                 obs.pop(key, None)
@@ -1945,9 +1980,10 @@ class SteeringPolicy(PreTrainedPolicy):
             t = batch.get("time")
             t = torch.rand(len(chunk), device=chunk.device) if t is None else t
             task = self.adapter.task.bind(obs)
-            return LearnedTaskModule.field_loss(
+            loss, parts = LearnedTaskModule.field_loss(
                 task, velocity, chunk, z, t, self.config.lambda_id, self.config.n_dims
             )
+            return loss, {k: v.item() for k, v in parts.items()}
         if kind == "user":
             if self.adapter.user is None:
                 raise ValueError("a user batch needs a user module")
@@ -1971,7 +2007,8 @@ class SteeringPolicy(PreTrainedPolicy):
         if command is not None and not torch.is_tensor(command):
             command = torch.as_tensor(np.asarray(command), dtype=torch.float32)
         obs, command = self._batched(obs, command)
-        chunk = self.core.steered_chunk(obs, command, field=self._field(obs))[0]
+        # the steered chunk alone: the policy's own plan is not drawn when every row steers
+        chunk = self.core.steered_chunk(obs, command, field=self._field(obs), paired=False)[0]
         scale = self._action_scale()
         return chunk if scale is None else chunk * scale
 
@@ -1981,11 +2018,7 @@ class SteeringPolicy(PreTrainedPolicy):
         command): a cursor observation whose ``pos`` is (2,) has every tensor unsqueezed, a 1-D command becomes
         (1, n). Raises ``ValueError`` naming the shapes when the command is not (B, n) or (B, H, n) for the
         observation's batch B."""
-        if (
-            hasattr(self._flow_model(), "sample_chunk")
-            and torch.is_tensor(obs.get("pos"))
-            and obs["pos"].dim() == 1
-        ):
+        if self._cursor_base and torch.is_tensor(obs.get("pos")) and obs["pos"].dim() == 1:
             obs = _unsqueezed(obs)
         if command is None:
             return obs, command

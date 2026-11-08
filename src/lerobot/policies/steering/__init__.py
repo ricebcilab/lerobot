@@ -55,8 +55,10 @@ from .modeling_steering import (
     LearnedUserModule,
     MatrixHolder,
     ReversalAdapter,
+    SampleChunkSampler,
     SteeringPolicy,
     TeleopSource,
+    active_rows,
     as_adapter,
     sinusoidal_time_embedding,
 )
@@ -77,7 +79,9 @@ __all__ = [
     # the cores and the module classes
     "FlowControlSteering",
     "FlowReversalSteering",
+    "SampleChunkSampler",
     "TeleopSource",
+    "active_rows",
     "LearnedUserModule",
     "LearnedTaskModule",
     "AdapterModules",

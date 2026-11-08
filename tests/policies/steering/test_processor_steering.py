@@ -62,13 +62,13 @@ class TokenStub:
         self.images = 0
         self.weight = torch.randn(3, 2048, generator=torch.Generator().manual_seed(0))
 
-    def image_tokens(self, images):
+    def image_tokens(self, images, batch=64):
         self.images += len(images)
         x = torch.as_tensor(images).float() / 255
         pooled = torch.nn.functional.adaptive_avg_pool2d(x, 16).flatten(2).transpose(1, 2)
         return torch.tanh(3 * pooled @ self.weight).to(torch.float16).numpy()
 
-    def prefix_tokens(self, images):
+    def prefix_tokens(self, images, batch=64):
         return -self.image_tokens(images)
 
 
@@ -155,7 +155,7 @@ def test_scene_tokens_step_refuses_what_it_cannot_encode():
 
 def test_scene_tokens_step_builds_its_encoder_on_first_use_only():
     step = SteeringSceneTokensProcessorStep(vlm_path="some/repo", device="cpu")
-    assert step._encoder is None
+    assert step.encoder is None
     encoder = step.scene_encoder()
     assert isinstance(encoder, SceneEncoder) and encoder._policy is None  # constructing it loads nothing
     assert (encoder.path, encoder.device) == ("some/repo", "cpu") and step.scene_encoder() is encoder

@@ -19,6 +19,7 @@ engine of the scene step), the two steering steps (``SteeringSceneTokensProcesso
 MARS task module; ``SteeringCommandProcessorStep``, the operator's command), and
 ``make_steering_pre_post_processors``, the pipelines around them."""
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,10 +45,23 @@ from lerobot.processor import (
     transition_to_policy_action,
 )
 from lerobot.types import EnvTransition, TransitionKey
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    OBS_PREFIX,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 from .configuration_steering import SteeringConfig
-from .modeling_steering import DEADBAND, VLM_SCENE_DIM, VLM_SCENE_TOKENS, LearnedTaskModule
+from .modeling_steering import (
+    COMMAND,
+    DEADBAND,
+    TRAINING_KEYS,
+    VLM_SCENE_DIM,
+    VLM_SCENE_TOKENS,
+    LearnedTaskModule,
+    SteeringPolicy,
+    active_rows,
+)
 
 SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
 SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
@@ -55,12 +69,11 @@ PI05_TOKENIZER = "google/paligemma-3b-pt-224"  # the tokenizer pi0.5's processor
 
 STORED_SCENE_SOURCES = ("vlm_image", "vlm_prefix")  # the sources with one token array per layout
 
-OBS_LAYOUTS = "observation.layouts"  # the scene step's input: the trials' layouts (a ``Layouts``) ...
-OBS_SCENE_IMAGES = "observation.scene_images"  # ... or their pictures, uint8 [B, 3, S, S]
-OBS_SCENE_TOKENS = "observation.scene_tokens"  # the scene step's output, float16 [B, 256, width]
-COMMAND = "command"  # the operator's command, in the complementary data
-# A training batch's keys (``SteeringPolicy.forward``'s), carried through the pre-processor untouched
-TRAINING_KEYS = ("kind", "chunk", "latent", "noise", "time", "weight", "bci_target")
+OBS_LAYOUTS = f"{OBS_PREFIX}layouts"  # the scene step's input: the trials' layouts (a ``Layouts``) ...
+OBS_SCENE_IMAGES = f"{OBS_PREFIX}scene_images"  # ... or their pictures, uint8 [B, 3, S, S]
+OBS_SCENE_TOKENS = f"{OBS_PREFIX}scene_tokens"  # the scene step's output, float16 [B, 256, width]
+# ``COMMAND`` (the operator's command) and ``TRAINING_KEYS`` (a training batch's, carried through the pre-processor
+# untouched) are the policy's batch keys, ``modeling_steering``'s
 
 
 class SceneEncoder:
@@ -71,11 +84,10 @@ class SceneEncoder:
     on the layout alone). Both take uint8 ``[B, 3, S, S]``, resized with padding to pi0.5's resolution when S
     differs, and return float16 ``[B, 256, 2048]`` on the CPU.
 
-    ``SceneEncoder.scene_for(layouts, source, size)`` is a layout batch's scene array through this encoder and
-    ``SceneEncoder.encode_views(images, batch)`` the tokens of several views per scene; their static forms,
-    ``SceneEncoder.scene_array`` and ``SceneEncoder.view_tokens``, take any object with the encoder's methods
-    (``scene_array`` none for the ``cnn`` render). ``SceneEncoder.fit_reduction`` is the PCA of token batches a
-    reduced task module carries.
+    ``SceneEncoder.scene_array(layouts, source, size, encoder)`` is a layout batch's scene array and
+    ``SceneEncoder.view_tokens(images, encoder)`` the tokens of several views per scene, through any object with the
+    encoder's methods (``scene_array`` none for the ``cnn`` render). ``SceneEncoder.fit_reduction`` is the PCA of token
+    batches a reduced task module carries.
 
     Lazy: constructing it loads nothing; the first call loads ``path`` (``PI05Policy.from_pretrained``) and
     imports pi0.5 and ``transformers``, after checking that its ``model.safetensors`` is on disk. ``close``
@@ -203,22 +215,18 @@ class SceneEncoder:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def scene_for(self, layouts: Layouts, source: str, size: int = SCENE_SIZE) -> np.ndarray:
-        """The per-layout scene array for ``source`` through this encoder (``scene_array`` with it)."""
-        return SceneEncoder.scene_array(layouts, source, size, self)
-
-    def encode_views(self, images: np.ndarray, batch: int = 256) -> torch.Tensor:
-        """The tokens of uint8 ``[B, V, 3, S, S]`` views through this encoder (``view_tokens`` with it)."""
-        return SceneEncoder.view_tokens(images, self, batch)
-
     @staticmethod
     def scene_array(
-        layouts: Layouts, source: str, size: int = SCENE_SIZE, encoder: "SceneEncoder | None" = None
+        layouts: Layouts,
+        source: str,
+        size: int = SCENE_SIZE,
+        encoder: "SceneEncoder | None" = None,
+        batch: int | None = None,
     ) -> np.ndarray:
         """The per-layout scene array for ``source``, ``[B, ...]``: ``cnn`` the render (uint8 ``[B, 3, size,
-        size]``), ``vlm_image`` / ``vlm_prefix`` the encoder's ``image_tokens`` / ``prefix_tokens`` of it (float16
-        ``[B, 256, 2048]``, cast to float16 whatever the encoder returns). ``encoder`` is anything with those two
-        methods, typically one ``SceneEncoder`` built once by the caller. ``discs`` reads the layouts' obstacles
+        size]``), ``vlm_image`` / ``vlm_prefix`` the encoder's ``image_tokens`` / ``prefix_tokens`` of it
+        (``_encode``). ``encoder`` is anything with those two methods, typically one ``SceneEncoder`` built once by
+        the caller; ``batch`` (None: the encoder's default) goes to them. ``discs`` reads the layouts' obstacles
         directly and has no scene array."""
         if source == "discs":  # nosec B105
             raise ValueError("source 'discs' reads the layouts' obstacles; it has no scene array")
@@ -228,8 +236,15 @@ class SceneEncoder:
             return images
         if encoder is None:
             raise ValueError(f"source {source!r} needs an encoder (e.g. a SceneEncoder)")
-        tokens = encoder.image_tokens(images) if source == "vlm_image" else encoder.prefix_tokens(images)  # nosec B105
-        return np.asarray(tokens, dtype=np.float16)
+        return SceneEncoder._encode(encoder, source, images, batch)
+
+    @staticmethod
+    def _encode(encoder, source: str, images: np.ndarray, batch: int | None = None) -> np.ndarray:
+        """The tokens of uint8 ``[B, 3, S, S]`` pictures for a stored source: the encoder's ``image_tokens``
+        (``vlm_image``) or ``prefix_tokens`` (``vlm_prefix``), ``batch`` pictures at a time (None: its default),
+        float16 ``[B, 256, 2048]`` whatever the encoder returns."""
+        encode = encoder.image_tokens if source == "vlm_image" else encoder.prefix_tokens  # nosec B105
+        return np.asarray(encode(images) if batch is None else encode(images, batch), dtype=np.float16)
 
     @staticmethod
     def view_tokens(images: np.ndarray, encoder, batch: int = 256) -> torch.Tensor:
@@ -264,15 +279,13 @@ class SceneEncoder:
             count += len(x)
         if total is None or second is None or count < 2:
             raise ValueError("fit_reduction needs at least two tokens")
-        if not center:
-            values, vectors = torch.linalg.eigh(second / count)  # ascending
-            values = values.clamp_min(0)
-            kept = float(values[-rank:].sum() / values.sum())
-            zeros = torch.zeros(second.shape[0], dtype=torch.float32, device=second.device)
-            return zeros, vectors[:, -rank:].flip(1).float().contiguous(), kept
-        mean = total / count
-        cov = (second - count * torch.outer(mean, mean)) / (count - 1)
-        values, vectors = torch.linalg.eigh(cov)  # ascending
+        if center:
+            mean = total / count
+            moment = (second - count * torch.outer(mean, mean)) / (count - 1)  # the covariance
+        else:
+            mean = torch.zeros(second.shape[0], dtype=torch.float64, device=second.device)
+            moment = second / count  # the uncentred second moment
+        values, vectors = torch.linalg.eigh(moment)  # ascending
         values = values.clamp_min(0)
         kept = float(values[-rank:].sum() / values.sum())
         return mean.float(), vectors[:, -rank:].flip(1).float().contiguous(), kept
@@ -291,7 +304,8 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
     ``observation.scene_tokens``: float16 ``[B, 256, 2048]``, the ``SceneEncoder``'s tokens of ``source``, or
     ``[B, 256, rank]`` when the step holds a task module's ``reduction`` (``(mean, basis)``, applied as the module
     applies it). The encoder (``vlm_path`` on ``device``, ``batch`` pictures at a time) is built on first use, or
-    given as ``encoder`` (any object with ``image_tokens`` / ``prefix_tokens``)."""
+    given as ``encoder`` (any object with ``image_tokens`` / ``prefix_tokens`` taking the pictures and ``batch``).
+    The last layouts' tokens are kept, so a replan on the same trials encodes nothing (``reset`` clears them)."""
 
     source: str = "vlm_image"
     render_size: int = SCENE_SIZE
@@ -301,19 +315,32 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
     reduction: tuple[torch.Tensor, torch.Tensor] | None = None
     encoder: Any | None = None
 
-    _encoder: Any = field(default=None, init=False, repr=False)
+    _last: tuple[str, np.ndarray] | None = field(
+        default=None, init=False, repr=False
+    )  # (layouts' digest, array)
 
     def __post_init__(self) -> None:
         if self.source not in STORED_SCENE_SOURCES:
             raise ValueError(f"source must be one of {STORED_SCENE_SOURCES}, got {self.source!r}")
         LearnedTaskModule.spec(self.source, self.render_size)  # the size check
-        self._encoder = self.encoder
 
     def scene_encoder(self) -> Any:
         """The encoder, built on first use."""
-        if self._encoder is None:
-            self._encoder = SceneEncoder(self.vlm_path, self.device)
-        return self._encoder
+        if self.encoder is None:
+            self.encoder = SceneEncoder(self.vlm_path, self.device)
+        return self.encoder
+
+    @staticmethod
+    def _digest(layouts: Layouts) -> str:
+        """A sha256 over what a render of ``layouts`` is drawn from (start, targets, mask, obstacles, their mask)."""
+        h = hashlib.sha256()
+        for a in (layouts.start, layouts.targets, layouts.mask, layouts.obstacles, layouts.obstacle_mask):
+            a = np.ascontiguousarray(a)
+            h.update(f"{a.dtype.str}{a.shape}".encode() + a.tobytes())
+        return h.hexdigest()
+
+    def reset(self) -> None:
+        self._last = None
 
     def tokens(self, observation: dict[str, Any]) -> torch.Tensor:
         """The scene tokens of an observation's layouts or pictures, float16, reduced when the step holds a
@@ -323,13 +350,17 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
             raise ValueError(
                 f"SteeringSceneTokensProcessorStep needs {OBS_LAYOUTS!r} or {OBS_SCENE_IMAGES!r} in the observation"
             )
-        encoder = self.scene_encoder()
         if layouts is not None:
-            array = SceneEncoder.scene_array(layouts, self.source, self.render_size, encoder)
+            digest = self._digest(layouts)
+            if self._last is None or self._last[0] != digest:
+                array = SceneEncoder.scene_array(
+                    layouts, self.source, self.render_size, self.scene_encoder(), self.batch
+                )
+                self._last = (digest, array)
+            array = self._last[1]
         else:
             pictures = np.asarray(images.cpu() if torch.is_tensor(images) else images, dtype=np.uint8)
-            encode = encoder.image_tokens if self.source == "vlm_image" else encoder.prefix_tokens  # nosec B105
-            array = np.asarray(encode(pictures), dtype=np.float16)
+            array = SceneEncoder._encode(self.scene_encoder(), self.source, pictures, self.batch)
         tokens = torch.as_tensor(array)
         if self.reduction is not None:
             mean, basis = self.reduction
@@ -404,8 +435,7 @@ class SteeringCommandProcessorStep(ProcessorStep):
                 f"n_dims is {self.n_dims}: set n_dims to the commanded dims (a pi0.5 base's translation is 3)"
             )
         command = command.to(torch.float32)
-        magnitude = command.abs().amax(-1)
-        active = (magnitude.amax(-1) if magnitude.dim() == 2 else magnitude) >= self.deadband
+        active = active_rows(command, self.deadband)
         shape = (-1,) + (1,) * (command.dim() - 1)
         return torch.where(active.reshape(shape), command, torch.zeros_like(command))
 
@@ -486,9 +516,7 @@ def make_steering_pre_post_processors(
             stats=dataset_stats,
         ),
     ]
-    task = config.task_module
-    if task is None and config.adapter_task is not None:
-        task = torch.load(config.adapter_task, map_location="cpu", weights_only=True)["config"]
+    _, task = SteeringPolicy.resolve_module(config, "task", build=False)
     scene = config.scene_settings(task)  # the task module's, where the config leaves them unset
     if task is not None and scene["scene_source"] in STORED_SCENE_SOURCES:
         input_steps.append(

@@ -143,11 +143,7 @@ class SteeringConfig(PreTrainedConfig):
             raise ValueError(f"scene_source must be one of {SCENE_SOURCES}, got {self.scene_source!r}")
         if self.token_geometry is not None and self.token_geometry not in TOKEN_GEOMETRIES:
             raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {self.token_geometry!r}")
-        unknown = [d for d in self.operator_dims or () if d not in OPERATOR_DIM_GROUPS]
-        if unknown:
-            raise ValueError(
-                f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
-            )
+        self.check_operator_dims(self.operator_dims or ())
         if (
             self.adapter_matrix is not None
         ):  # a square of numbers, kept as lists so the config compares and serializes
@@ -158,11 +154,6 @@ class SteeringConfig(PreTrainedConfig):
     def fixed_matrix(self) -> np.ndarray | None:
         """``adapter_matrix`` as a float64 array, or None."""
         return None if self.adapter_matrix is None else np.asarray(self.adapter_matrix, dtype=np.float64)
-
-    @property
-    def has_task_module(self) -> bool:
-        """Whether the adapter has a task module (built from ``task_module`` or read from its checkpoint)."""
-        return self.task_module is not None or self.adapter_task is not None
 
     def scene_settings(self, task: dict | None = None) -> dict[str, Any]:
         """The scene settings (``scene_source``, ``render_size``, ``token_geometry``, ``scene_rank``): this config's,
@@ -192,6 +183,15 @@ class SteeringConfig(PreTrainedConfig):
                     f"{key}: the config says {settings[key]!r}, the task module was built with {value!r}"
                 )
         return settings
+
+    @staticmethod
+    def check_operator_dims(operator_dims) -> None:
+        """Raise unless every name in ``operator_dims`` is one of ``OPERATOR_DIM_GROUPS``."""
+        unknown = [d for d in operator_dims if d not in OPERATOR_DIM_GROUPS]
+        if unknown:
+            raise ValueError(
+                f"operator_dims: unknown {unknown} (expected from {', '.join(OPERATOR_DIM_GROUPS)})"
+            )
 
     # ---------------------------------------------------------------- the adapter spec
 

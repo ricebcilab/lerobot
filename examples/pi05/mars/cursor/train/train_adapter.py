@@ -140,7 +140,8 @@ from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward
                                 reverse_flow, to_action)
 
 from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, AdapterModules, Flow,  # noqa: E402
-                                       LearnedTaskModule, LearnedUserModule, SceneEncoder)
+                                       LearnedTaskModule, LearnedUserModule, SceneEncoder, active_rows)
+from lerobot.policies.steering.processor_steering import SCENE_VLM_PATH, STORED_SCENE_SOURCES  # noqa: E402
 
 # ---------------------------------------------------------------- data
 
@@ -246,7 +247,6 @@ VIEW_AFFINE_DEGREES = 5.0     # --view-affine: a moved picture turns by up to th
 VIEW_AFFINE_TRANSLATE = 0.05  # and shifts by up to this share of its side per axis
 REDUCTION_SAMPLE = 2000       # frames (vlm_views) or scenes (vlm_image, vlm_prefix) the token reduction is fitted on
 REDUCTION_CHUNK = 64          # scenes per batch of the reduction's fit (its float64 sums take 8 bytes a value)
-STORED_SOURCES = ("vlm_image", "vlm_prefix")   # one token array per layout: --scene-store, --scene-rank
 VIEW_CHUNK = 256              # frames rendered and encoded at a time
 VIEW_GPU_BYTES = 12 * 2**30   # a split's frame table above this stays in RAM
 
@@ -462,7 +462,7 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
             stored = (store, rows, args.token_source)
         elif args.token_source != "discs":
             layouts.scene = {args.token_source: SceneEncoder.scene_array(layouts, args.token_source, args.render_size, encoder)}
-        if args.token_source in STORED_SOURCES and args.scene_rank:
+        if args.token_source in STORED_SCENE_SOURCES and args.scene_rank:
             if split == "train" and getattr(args, "scene_reduction", None) is None:
                 tokens_of = ((lambda idx: stored[0].gather(stored[1][idx])) if stored is not None
                              else (lambda idx: layouts.scene[args.token_source][idx]))
@@ -565,7 +565,7 @@ def draw_sigma(args, n, device):
 
 
 def active_of(push):
-    return push.abs().amax(-1) >= DEADBAND
+    return active_rows(push, DEADBAND)
 
 
 # ---------------------------------------------------------------- losses and checks
@@ -732,7 +732,7 @@ def train_task(args, policy, device, rng):
         if encoder is not None:
             encoder.close()
     views = dict(wrist_span=args.wrist_span, scene_rank=args.scene_rank or None) if args.token_source == "vlm_views" else {}
-    if args.token_source in STORED_SOURCES and args.scene_rank:
+    if args.token_source in STORED_SCENE_SOURCES and args.scene_rank:
         views = dict(scene_rank=args.scene_rank)
     task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
                       **LearnedTaskModule.spec(args.token_source, args.render_size, **views)).to(device)
@@ -769,7 +769,7 @@ def train_task(args, policy, device, rng):
         _, parts = task_loss(policy, task, obs, chunk, torch.randn_like(chunk), torch.rand(n, device=device), 0.0)
         hidden, _ = sampler.sample(n, 1.0)
         given, _ = sampler.sample(n, 0.0)
-        val = dict(val_fm=parts["fm"], chunk_collision_hidden=chunk_collision(policy, adapted, hidden, args.flow_steps),
+        val = dict(val_fm=parts["fm"].item(), chunk_collision_hidden=chunk_collision(policy, adapted, hidden, args.flow_steps),
                    chunk_collision_given=chunk_collision(policy, adapted, given, args.flow_steps),
                    chunk_collision_policy_hidden=chunk_collision(policy, None, hidden, args.flow_steps),
                    chunk_collision_policy_given=chunk_collision(policy, None, given, args.flow_steps))
@@ -777,6 +777,7 @@ def train_task(args, policy, device, rng):
         return val
 
     def window_mean(values):
+        values = [v.item() if torch.is_tensor(v) else v for v in values]   # the parts are converted here, once a window
         finite = [v for v in values if np.isfinite(v)]   # as train_loss, a non-finite batch adds nothing
         return float(np.mean(finite)) if finite else None
 
@@ -845,7 +846,7 @@ def save_module(args, kind, module, name, **extra):
     returns its path and the saved arguments."""
     # the reductions travel in the module's buffers
     saved = {k: v for k, v in vars(args).items() if k not in ("view_reduction", "scene_reduction")}
-    reduced = args.token_source in STORED_SOURCES and bool(args.scene_rank)
+    reduced = args.token_source in STORED_SCENE_SOURCES and bool(args.scene_rank)
     center = args.scene_center if args.token_source == "vlm_views" or reduced else None
     store = None if args.scene_store is None else store_name(args.token_source, args.render_size, encoder_digest(args.vlm))
     augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")}
@@ -938,7 +939,7 @@ def parse_args(argv=None):
                    "resampled to the policy's step rate) instead of the scripted expert's")
     p.add_argument("--teacher-chunk", type=int, default=500, help="task: layouts per teacher rollout batch")
     p.add_argument("--render-size", type=int, default=SCENE_SIZE, help="task: side of the rendered scene in pixels (cnn: a multiple of 16)")
-    p.add_argument("--vlm", default="lerobot/pi05_base", help="task: the pi0.5 checkpoint whose vision tokens vlm_* sources use "
+    p.add_argument("--vlm", default=SCENE_VLM_PATH, help="task: the pi0.5 checkpoint whose vision tokens vlm_* sources use "
                                                               "(loaded offline from the HF cache)")
     p.add_argument("--d", type=int, default=128, help="task: width")
     p.add_argument("--layers", type=int, default=2, help="task: cross-attention layers")
@@ -996,7 +997,7 @@ def parse_args(argv=None):
         p.error("--scene-rank must be in 0..2047 (0: full width)")
     if args.scene_center == "no" and not args.scene_rank:
         p.error("--scene-center no fits the token reduction of a vlm_* source: not without a --scene-rank or with 0")
-    if args.scene_store is not None and args.token_source not in STORED_SOURCES:
+    if args.scene_store is not None and args.token_source not in STORED_SCENE_SOURCES:
         p.error("--scene-store holds the tokens of --token-source vlm_image or vlm_prefix (vlm_views has its frame table, "
                 "discs and cnn no tokens)")
     if args.save_every and (args.kind != "task" or args.save_every < 0 or args.save_every % args.log_every):

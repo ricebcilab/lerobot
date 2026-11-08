@@ -56,7 +56,7 @@ def _layouts(n=4, seed=0, obstacle=None):
     )
 
 
-def test_scene_spec_builds_a_module_that_accepts_scene_for():
+def test_scene_spec_builds_a_module_that_accepts_scene_array():
     lay = _layouts()
     stub = Stub()
     for src in ("vlm_image", "vlm_prefix", "cnn"):
@@ -116,8 +116,8 @@ def test_encoder_without_weights_raises_before_building_a_policy(where, tmp_path
 )
 def test_real_pi05_image_tokens_have_the_documented_shape():
     enc = SceneEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
-    tok = enc.scene_for(_layouts(2), "vlm_image", SCENE_SIZE)
-    pre = enc.scene_for(_layouts(2), "vlm_prefix", SCENE_SIZE)
+    tok = SceneEncoder.scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
+    pre = SceneEncoder.scene_array(_layouts(2), "vlm_prefix", SCENE_SIZE, enc)
     assert (
         tok.shape == (2, 256, 2048) and tok.dtype == np.float16 and np.isfinite(tok.astype(np.float32)).all()
     )
@@ -126,7 +126,7 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert np.array_equal(enc.encode(images).cpu().numpy(), enc.image_tokens(images))
     assert np.isfinite(pre.astype(np.float32)).all()
     # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
-    other = enc.scene_for(_layouts(2, seed=1), "vlm_image", SCENE_SIZE)
+    other = SceneEncoder.scene_array(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, enc)
     # T3 wall against T2 disc at one seed: the same targets and an unrendered start, so only the obstacles differ
     wall_spec = {
         "kind": "wall",
@@ -138,8 +138,8 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     }
     wall_layouts = _layouts(2, obstacle=wall_spec)
     assert np.array_equal(wall_layouts.targets, _layouts(2).targets)
-    wall = enc.scene_for(wall_layouts, "vlm_image", SCENE_SIZE)
-    again = enc.scene_for(_layouts(2), "vlm_image", SCENE_SIZE)
+    wall = SceneEncoder.scene_array(wall_layouts, "vlm_image", SCENE_SIZE, enc)
+    again = SceneEncoder.scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
     assert not np.array_equal(tok, other) and not np.array_equal(tok, wall)
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)

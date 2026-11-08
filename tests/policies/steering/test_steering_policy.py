@@ -94,7 +94,6 @@ def test_the_config_has_the_feature_less_contract():
     ):
         with pytest.raises(ValueError):
             SteeringConfig(**bad)
-    assert not SteeringConfig().has_task_module and SteeringConfig(adapter_task="t.pt").has_task_module
 
 
 def test_the_factory_knows_the_policy():

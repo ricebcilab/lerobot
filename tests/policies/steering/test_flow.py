@@ -45,7 +45,7 @@ def test_paired_chunks_reuses_the_noise_and_restores_the_generator():
             return torch.randn(2, 3) + kw.get("shift", 0.0)
 
     torch.manual_seed(0)
-    steered, plain = Flow.paired_chunks(Sampler(), None, True, None, shift=1.0)
+    steered, plain = Flow.paired_chunks(Sampler(), None, None, shift=1.0)
     after = torch.randn(1)
     torch.manual_seed(0)
     assert torch.equal(steered - 1.0, plain) and torch.equal(torch.randn(2, 3), plain)

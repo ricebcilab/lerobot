@@ -31,10 +31,9 @@ import torch
 
 from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
 from lerobot.policies.steering import VLM_SCENE_DIM, VLM_SCENE_TOKENS
-from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SceneEncoder
+from lerobot.policies.steering.processor_steering import SCENE_PROMPT, STORED_SCENE_SOURCES, SceneEncoder
 
 ENCODE_CHUNK = 256  # layouts rendered and encoded at a time
-STORED_SOURCES = ("vlm_image", "vlm_prefix")  # the sources whose scene is one [256, 2048] token array per layout
 
 
 def encoder_digest(vlm_path: str) -> str:
@@ -74,8 +73,8 @@ class SceneDataset:
     every layout is stored."""
 
     def __init__(self, dir, source: str, size: int, encoder_digest: str, encoder_path: str | None = None):
-        if source not in STORED_SOURCES:
-            raise ValueError(f"a token store holds the sources {STORED_SOURCES}, not {source!r}")
+        if source not in STORED_SCENE_SOURCES:
+            raise ValueError(f"a token store holds the sources {STORED_SCENE_SOURCES}, not {source!r}")
         self.source, self.size, self.encoder_digest, self.encoder_path = source, int(size), encoder_digest, encoder_path
         self.tokens, self.width = VLM_SCENE_TOKENS, VLM_SCENE_DIM
         self.row_bytes = self.tokens * self.width * 2
