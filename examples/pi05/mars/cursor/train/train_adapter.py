@@ -635,11 +635,11 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
 
 # ---------------------------------------------------------------- the training loop
 #
-# Moved verbatim from lerobot.policies.steering (train_module, step_if_finite), which keeps no training loop.
+# Moved from lerobot.policies.steering (train_module, step_if_finite), which keeps no training loop.
 
 
-def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0,
-                    finite: bool = True) -> bool:
+def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0, *,
+                    finite: bool) -> bool:
     """One optimizer step, unless the loss (`finite`: whether it is, as the caller read it) or the clipped gradient
     norm is not finite (a batch where a flow blew up): then the step is skipped and the weights stay whole. Returns
     whether a step was taken."""
@@ -678,7 +678,7 @@ def _train_module(
         loss = batch_loss(step)
         value = loss.item()  # the step's one read of the loss
         finite = math.isfinite(value)
-        skipped += not _step_if_finite(opt, loss, module.parameters(), clip, finite)
+        skipped += not _step_if_finite(opt, loss, module.parameters(), clip, finite=finite)
         sched.step()
         running += value if finite else 0.0
         if step % log_every == 0 or step == steps:

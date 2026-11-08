@@ -16,6 +16,7 @@
 """``Flow`` in the cursor's convention and ``Flow.paired_chunks``' generator restore (pi0.5's convention is pinned
 by test_steering_core.py and test_steering_wrappers.py)."""
 
+import pytest
 import torch
 
 from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
@@ -95,3 +96,15 @@ def test_a_steered_chunk_without_the_plan_is_the_paired_one_and_leaves_the_same_
             alone, none = core.steered_chunk(obs, commands, paired=False)
             assert torch.equal(alone, paired) and torch.equal(torch.get_rng_state(), after)
             assert (none is None) == bool(active_rows(commands, core.deadband).all()) and plan is not None
+
+
+def test_a_flow_takes_only_the_two_time_conventions():
+    """noise_time is 1.0 (pi0.5) or 0.0 (the cursor): any other value would make the shared Euler step 0."""
+    velocity, _, _ = _field()
+    assert (
+        Flow(velocity, noise_time=1).toward_noise(5) == 0.2
+        and Flow(velocity, noise_time=0.0).toward_noise(5) == -0.2
+    )
+    for bad in (0.5, -1.0, 2.0):
+        with pytest.raises(ValueError, match="noise_time must be 1.0"):
+            Flow(velocity, noise_time=bad)

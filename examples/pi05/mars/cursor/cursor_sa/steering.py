@@ -97,17 +97,33 @@ def _f32(a, device):
     return torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)
 
 
-def observation(layouts, pos, hist, device="cpu", goal_given=False, scene=None):
+def static_arrays(layouts, device="cpu", sources=None):
+    """What every observation of `layouts` repeats, on `device`: the targets, the mask, the goal flags given and hidden
+    (`goal`: {True: ..., False: ...}), the obstacles and their mask, and `scene`, the layouts' scene arrays of `sources`
+    (None: all of them; the arrays keep their dtype, uint8 render or float16 tokens), None when the layouts have no
+    scene or `sources` keeps none of it."""
+    scene = None if layouts.scene is None else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()
+                                                if sources is None or k in sources}
+    return dict(targets=_f32(layouts.targets, device), mask=torch.as_tensor(layouts.mask, device=device),
+                goal={False: torch.as_tensor(np.zeros(layouts.mask.shape, dtype=bool), device=device),
+                      True: torch.as_tensor(layouts.goal_mask(), device=device)},
+                obstacles=_f32(layouts.obstacles, device),
+                obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device),
+                scene=None if sources is not None and not scene else scene)
+
+
+def observation(layouts, pos, hist, device="cpu", goal_given=False, scene=None, static=None):
     """The policy's observation of a batch of trials: cursor positions [B, 2], their last
     displacements [B, h, 2], the targets, the goal flags (all False unless goal_given), and the
     task's obstacles (which the policy ignores and a task module reads) and, when the layouts have one, their scene;
-    `scene` (source -> array, e.g. a scene provider's tokens of this step) joins the layouts' own."""
-    goal = layouts.goal_mask() if goal_given else np.zeros(layouts.mask.shape, dtype=bool)
-    obs = dict(pos=_f32(pos, device), hist=_f32(hist, device), targets=_f32(layouts.targets, device),
-               mask=torch.as_tensor(layouts.mask, device=device), goal=torch.as_tensor(goal, device=device),
-               obstacles=_f32(layouts.obstacles, device), obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
-    if layouts.scene is not None or scene is not None:  # the scene arrays keep their dtype (uint8 render, float16 tokens)
-        obs["scene"] = {k: torch.as_tensor(v, device=device) for k, v in {**(layouts.scene or {}), **(scene or {})}.items()}
+    `scene` (source -> array, e.g. a scene provider's tokens of this step) joins the layouts' own. `static` is
+    `static_arrays(layouts, device, ...)` made once for many observations (a controller's); without it they are
+    made here, every layout scene array included."""
+    static = static_arrays(layouts, device) if static is None else static
+    obs = dict(pos=_f32(pos, device), hist=_f32(hist, device), targets=static["targets"], mask=static["mask"],
+               goal=static["goal"][bool(goal_given)], obstacles=static["obstacles"], obstacle_mask=static["obstacle_mask"])
+    if static["scene"] is not None or scene is not None:
+        obs["scene"] = {**(static["scene"] or {}), **{k: torch.as_tensor(v, device=device) for k, v in (scene or {}).items()}}
     return obs
 
 
@@ -212,7 +228,7 @@ def steered_chunk(policy, obs, command, mode, tau=5, n_reverse_steps=None, steps
     toward is the command held constant over the chunk, or `reference` [B, H, 2] (a deflection per step, e.g. the
     chunk an expert_chunk agent means). Rows whose command (or whole reference) is inside the deadband get the
     plain policy chunk, from the same noise."""
-    sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, 8)  # lerobot's sampler over sample_chunk
+    sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, 8)  # 8 executed steps: unused by steered_chunk
     wrapper = steering_wrapper(sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam, pinned_steps)
     chunk = _chunk(sampler, wrapper, obs, command if reference is None else reference,
                    _field(adapter, obs, command.device))
@@ -256,17 +272,12 @@ class SharedController:
         self.policy, self.mode = policy, mode
         self.execute, self.dt, self.max_speed, self.device = execute, dt, max_speed, device
         self.layouts = layouts
-        # what every observation repeats, on the device once (`observation` adds the positions and histories): the
-        # targets, the goal flags given and hidden, the obstacles and the layouts' scene arrays the task module reads
+        # what every observation repeats, on the device once (`observation` adds the positions and histories), with
+        # the layouts' scene arrays the task module reads: none without one, every one for a module without a source
         task = None if self.adapter is None else self.adapter.task
-        source = getattr(task, "token_source", None)  # a module without one: every array, as it may read any
-        self._static = dict(targets=_f32(layouts.targets, device), mask=torch.as_tensor(layouts.mask, device=device))
-        self._goal = {False: torch.as_tensor(np.zeros(layouts.mask.shape, dtype=bool), device=device),
-                      True: torch.as_tensor(layouts.goal_mask(), device=device)}
-        self._obstacles = dict(obstacles=_f32(layouts.obstacles, device),
-                               obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
-        self._layout_scene = {k: torch.as_tensor(v, device=device) for k, v in (layouts.scene or {}).items()
-                              if task is not None and source in (None, k)}
+        source = getattr(task, "token_source", None)
+        sources = () if task is None else tuple(layouts.scene or ()) if source is None else (source,)
+        self._static = static_arrays(layouts, device, sources)
         self.pos = layouts.start.copy()
         self.hist = np.zeros((len(layouts), policy.hist, 2))
         self.chunk = None
@@ -295,8 +306,8 @@ class SharedController:
         return [(i, s) for i, s in shares if s > 1e-9]
 
     def observation(self, goal_given=False):
-        """The policy's observation of the current state (`observation`'s, the static arrays uploaded once); the goal
-        is hidden unless asked for. With a `scene_fn` its scene of these positions joins it, reused while the
+        """The policy's observation of the current state (`observation`, the static arrays uploaded once in
+        `__init__`); the goal is hidden unless asked for. With a `scene_fn` its scene of these positions joins it, reused while the
         positions and `active` are unchanged."""
         scene = None
         if self.scene_fn is not None:
@@ -306,11 +317,7 @@ class SharedController:
                 active = None if self.active is None else np.array(self.active, copy=True)
                 cached = self._scene = (self.pos.copy(), active, self.scene_fn(self.layouts, self.pos, self.active))
             scene = cached[2]
-        obs = dict(pos=_f32(self.pos, self.device), hist=_f32(self.hist, self.device), **self._static,
-                   goal=self._goal[bool(goal_given)], **self._obstacles)
-        if self._layout_scene or scene is not None:
-            obs["scene"] = {**self._layout_scene, **{k: torch.as_tensor(v, device=self.device) for k, v in (scene or {}).items()}}
-        return obs
+        return observation(self.layouts, self.pos, self.hist, self.device, goal_given, scene, static=self._static)
 
     @torch.no_grad()
     def sample_chunk(self, obs, z=None):

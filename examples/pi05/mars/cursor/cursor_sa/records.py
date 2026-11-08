@@ -93,13 +93,18 @@ def file_sha256(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def atomic_write_json(path, obj, indent=None):
-    """Write `obj` as JSON to `path` whole or not at all: to a temporary name beside it (the writer's pid in it), then
-    renamed into place, so a crash or a full disk leaves the last complete file."""
+def atomic_write_text(path, text):
+    """Write `text` to `path` whole or not at all: to the hidden temporary `.<name>.tmp` beside it, then renamed into
+    place, so a crash or a full disk leaves the last complete file."""
     path = Path(path)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(obj, indent=indent))
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
     os.replace(tmp, path)
+
+
+def atomic_write_json(path, obj, indent=None):
+    """`obj` as JSON to `path`, whole or not at all (`atomic_write_text`)."""
+    atomic_write_text(path, json.dumps(obj, indent=indent))
 
 
 def git_commit(cwd):

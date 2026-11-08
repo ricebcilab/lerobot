@@ -132,7 +132,8 @@ class SceneDataset:
     def _write_meta(self) -> None:
         atomic_write_json(self._path / "meta.json", dict(rows=self.n_rows, tokens=self.tokens, width=self.width,
                                                          dtype="float16", source=self.source, size=self.size,
-                                                         encoder=self.encoder_path, encoder_digest=self.encoder_digest))
+                                                         encoder=self.encoder_path, encoder_digest=self.encoder_digest),
+                          indent=1)
 
     def _append(self, digests: list[str], tokens: np.ndarray) -> None:
         """Rows for `digests` (not stored when another writer stored them meanwhile), then the index, then the meta."""

@@ -184,3 +184,42 @@ def test_the_digests_are_the_recorded_ones():
         "bd8e8f283ae8",
         "bcc792092d7f",
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the pinned staging runs on CUDA only")
+def test_a_cuda_sampler_stages_the_store_and_a_ram_frame_table_bit_for_bit(tmp_path):
+    """On CUDA a DemoSampler copies a store's rows, and a frame table held in RAM, through one pinned buffer per source
+    (`DemoSampler._staged`). Successive batches of growing and shrinking size (a reallocation, then refills), read only
+    once all of them are drawn (no sync between them: the buffer's event must hold each refill back), are the CPU
+    sampler's tokens of the same demos and steps, bit for bit."""
+    from cursor_sa.demos import DemoSampler, frame_steps, make_demos
+
+    task = TaskConfig(obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5}))
+    lay = _layouts(0, 12)
+    store = _store(tmp_path)
+    rows = store.rows_for(lay, TokenStub())
+    actions, lengths = make_demos(np.random.default_rng(0), lay, task, allow_failed=True)
+    frames, _, start = frame_steps(lengths, 2)
+    table = torch.randn(len(frames), 4, 8, generator=torch.Generator().manual_seed(1)).to(torch.float16)
+    samplers = {
+        device: DemoSampler(
+            lay,
+            actions,
+            lengths,
+            16,
+            4,
+            device,
+            frames={"vlm_views": (table, start, 2)},
+            store=(store, rows, "vlm_image"),
+        )
+        for device in ("cpu", "cuda")
+    }
+    assert samplers["cuda"].frames["vlm_views"][0].device.type == "cpu"  # the table stays in RAM
+    torch.manual_seed(0)
+    drawn = [samplers["cuda"].sample(n, indexed=True) for n in (7, 64, 13, 33, 1, 64, 2)]
+    cpu = samplers["cpu"]
+    for obs, _, i, k in drawn:
+        i, k = i.cpu(), k.cpu()
+        assert obs["scene"]["vlm_image"].device.type == "cuda"
+        assert torch.equal(obs["scene"]["vlm_image"].cpu(), cpu._gathered(i))
+        assert torch.equal(obs["scene"]["vlm_views"].cpu(), table[cpu.frames["vlm_views"][1][i] + k // 2])

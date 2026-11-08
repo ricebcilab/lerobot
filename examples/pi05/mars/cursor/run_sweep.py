@@ -90,7 +90,7 @@ from lerobot.envs.cursor import ROUTE_CLEARANCE, TaskConfig, center_out, curl_st
 from cursor_sa import paths as cursor_paths
 from cursor_sa.paths import RESULTS
 from cursor_sa.dataset import array_head, render_spec
-from cursor_sa.records import atomic_write_json, logged, summarize
+from cursor_sa.records import atomic_write_json, atomic_write_text, logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
 from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SCENE_VLM_PATH, SceneEncoder
@@ -998,23 +998,17 @@ def run(args, sweep, out, encoder_factory=None):
         tuned = lambda k, m: tuning[k][m][setting_key(tuned_settings(tuning[k])[m])]["success"]
         return max(tuning, key=lambda k: (tuned(k, focus) - max(tuned(k, m) for m in against), -tuned(k, against[0])))
 
-    def write(name, dump):
-        """Write out/name whole or not at all (a temporary file renamed into place), so a crash or a full disk
-        leaves the last complete save for --resume."""
-        tmp = out / f".{name}.tmp"
-        with open(tmp, "w") as f:
-            dump(f)
-        os.replace(tmp, out / name)
-
     def save():
+        """The run's files, each written whole or not at all, so a crash or a full disk leaves the last complete save
+        for --resume."""
         settings = {k: tuned_settings(v) for k, v in tuning.items()}
         atomic_write_json(out / "tuning.json", dict(args=run_args, tuning=tuning, settings=settings), indent=1)
         if fixed is not None:  # the settings tested are the input's
             if Path(args.fixed_settings).resolve() != (out / "settings.yaml").resolve():
-                write("settings.yaml", lambda f: f.write(Path(args.fixed_settings).read_text()))
+                atomic_write_text(out / "settings.yaml", Path(args.fixed_settings).read_text())
         else:  # merged fixed-setting parts have no tuning: their cells keep the settings they were tested at
             settings.update({k: v["settings"] for k, v in test.items() if k not in settings})
-            write("settings.yaml", lambda f: yaml.safe_dump(settings, f, sort_keys=False))
+            atomic_write_text(out / "settings.yaml", yaml.safe_dump(settings, sort_keys=False))
         atomic_write_json(out / "test.json", dict(args=run_args, showcase=showcase(), skipped=skipped, test=test),
                           indent=1)
 

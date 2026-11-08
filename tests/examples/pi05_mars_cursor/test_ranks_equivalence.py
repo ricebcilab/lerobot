@@ -55,7 +55,7 @@ def _reference(seed, scale=0.1, **ranks):
 
 
 def _twin(old):
-    """The example's UserModule with the reference's weights, through the core's checkpoint conversion."""
+    """The package's LearnedUserModule with the reference's weights, through the core's checkpoint conversion."""
     new = core.LearnedUserModule(
         **core.AdapterModules.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict()}
@@ -123,7 +123,7 @@ def test_reversal_through_the_policy_matches_the_cursor(exact, ranks):
 
 def test_a_cursor_checkpoint_loads_into_the_same_module(exact, tmp_path):
     old = _reference(5, step_rank=None, cross_step_rank=2)
-    torch.save(  # the reference's checkpoint, as convert_checkpoints.py rewrites it (ReversalAdapter.load reads that)
+    torch.save(  # the reference's checkpoint, as convert_checkpoints.py rewrites it (AdapterModules.load reads that)
         core.AdapterModules.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict(), "args": {}}
         ),

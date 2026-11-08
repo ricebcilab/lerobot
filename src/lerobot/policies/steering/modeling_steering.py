@@ -277,7 +277,7 @@ class _BoundTaskModule:
 
 
 class LearnedTaskModule(nn.Module):
-    """MARS task module (the cursor example's ``TaskModule``): A(x_t, t, v[, obstacles]) v + b, one affine
+    """MARS task module (the cursor example's task module): A(x_t, t, v[, obstacles]) v + b, one affine
     map of the policy's velocity per chunk step, in BOTH directions of the flow; it reshapes the frozen
     policy's chunk distribution toward a task. The chunk's steps attend (masked cross-attention) to a
     learned null token and, when the observation has them, one token per obstacle (position relative to
@@ -450,7 +450,9 @@ class LearnedTaskModule(nn.Module):
             if width is not None and not 1 <= scene_rank < width:
                 raise ValueError(f"scene_rank must be in 1..{width - 1}, got {scene_rank}")
         if source == "cnn" and (size is None or size <= 0 or size % CNN_PATCH):  # nosec B105
-            raise ValueError(f"token_source 'cnn' needs a size that is a multiple of {CNN_PATCH}, got {size}")
+            raise ValueError(
+                f"token_source 'cnn' needs a size (image_size) that is a multiple of {CNN_PATCH}, got {size}"
+            )
 
     @classmethod
     def spec(
@@ -854,13 +856,14 @@ class AdapterModules(nn.Module):
         return path
 
     @staticmethod
-    def read_checkpoint(path, device="cpu") -> dict:
+    def read_checkpoint(path, device="cpu", mmap: bool = False) -> dict:
         """A MARS module checkpoint as saved (``save_module``'s dict: kind, config, state_dict, meta), its kind
-        checked. Task checkpoints written while there were two task module classes carry ``arch``: ``"obstacle"`` is
-        this ``LearnedTaskModule``; ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO files) is the
-        removed MLP module, which raises."""
+        checked. With ``mmap`` the tensors are memory-mapped, not read (a read of the config alone: only the small
+        pickle comes off the disk). Task checkpoints written while there were two task module classes carry ``arch``:
+        ``"obstacle"`` is this ``LearnedTaskModule``; ``"mlp"`` (and an MLP's weights with no arch, the first LIBERO
+        files) is the removed MLP module, which raises."""
         ckpt = torch.load(
-            Path(path), map_location=device, weights_only=True
+            Path(path), map_location=device, weights_only=True, mmap=mmap
         )  # tensors, numbers, strings only
         kind = ckpt.get("kind")
         if kind not in AdapterModules.KINDS:
@@ -948,12 +951,21 @@ class Flow:
         noise_time: float = 1.0,
         batch_time: bool = False,
     ):
+        Flow.check_noise_time(noise_time)  # any other value would make toward_noise's step 0
         self.velocity, self.adapter, self.noise_time, self.batch_time = (
             velocity,
             adapter,
             noise_time,
             batch_time,
         )
+
+    @staticmethod
+    def check_noise_time(noise_time: float) -> None:
+        """Raise unless ``noise_time`` is one of the two conventions: 1.0 (pi0.5) or 0.0 (the cursor)."""
+        if noise_time not in (0.0, 1.0):
+            raise ValueError(
+                f"noise_time must be 1.0 (pi0.5: t = 1 noise) or 0.0 (the cursor: t = 0 noise), got {noise_time}"
+            )
 
     @staticmethod
     def adapt_velocity(adapter, x_t, t, v, backward: bool):
@@ -1030,10 +1042,7 @@ class Flow:
         action in n steps of the policy's own 1/N, mirroring the reversal (n = N: from pure noise in N steps). A
         steered chunk costs 2n velocity evaluations (n back, n forward), N + n when a partial reversal hands steps
         back to the policy (N - n more for the unsteered latent)."""
-        if noise_time not in (0.0, 1.0):
-            raise ValueError(
-                f"noise_time must be 1.0 (pi0.5: t = 1 noise) or 0.0 (the cursor: t = 0 noise), got {noise_time}"
-            )
+        Flow.check_noise_time(noise_time)
         n = steps if n_reverse_steps is None else n_reverse_steps
         _ChunkSteering.check_steps("n_reverse_steps", n, 1, steps, "Euler steps")
         action_time = 1.0 - noise_time
@@ -1770,7 +1779,7 @@ class SteeringPolicy(PreTrainedPolicy):
             module, found, _ = AdapterModules.load_module(path)
             arch = module.config
         else:
-            module, ckpt = None, AdapterModules.read_checkpoint(path)
+            module, ckpt = None, AdapterModules.read_checkpoint(path, mmap=True)  # the config alone
             found, arch = ckpt["kind"], ckpt["config"]
         if found != kind:
             raise ValueError(f"{path} holds a {found} module, not a {kind} module")
