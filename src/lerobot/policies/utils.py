@@ -246,3 +246,18 @@ def validate_visual_features_consistency(
 
     if not (policy_subset_of_dataset or dataset_subset_of_policy):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
+def batched_trial(obs: dict) -> dict:
+    """A dict observation with its batch dim: a single unbatched trial (a 1-D ``pos``, as the cursor's dict has for
+    one trial) gets a batch of one, every tensor unsqueezed (nested dicts too); any other observation as it is.
+    The one rule ``CursorFlowPolicy.observation`` and the steering policy's adapter view share."""
+
+    def unsqueezed(d: dict) -> dict:
+        return {
+            k: v[None] if torch.is_tensor(v) else unsqueezed(v) if isinstance(v, dict) else v
+            for k, v in d.items()
+        }
+
+    pos = obs.get("pos")
+    return unsqueezed(obs) if torch.is_tensor(pos) and pos.dim() == 1 else obs

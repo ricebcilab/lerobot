@@ -35,6 +35,7 @@ from torch import Tensor, nn
 
 from lerobot.envs.cursor import SCENE_SIZE
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import batched_trial
 from lerobot.teleoperators import readout
 from lerobot.utils.constants import (
     OBS_PREFIX,
@@ -1562,11 +1563,16 @@ class FlowReversalSteering(_ChunkSteering):
         self.check_steps("n_reversal_steps", value, 1, total, "Euler steps", optional=True)
         self._n_reversal_steps = None if value == total else value
 
+    @staticmethod
+    def has_gripper_dim(mean: np.ndarray | None) -> bool:
+        """Whether action statistics (their ``mean``) span the 7-D operator space, its gripper dim included (pi0.5's;
+        the cursor's two dims do not): the space whose reference rule is ``Flow.uniform_reference``."""
+        return mean is not None and mean.shape[0] > GRIPPER_DIM
+
     @property
     def _has_gripper(self) -> bool:
-        """Whether the action statistics have the gripper dim of the 7-D operator space (pi0.5's; the cursor's two
-        dims have none): only then is a gripper reference held."""
-        return self._mean is not None and self._mean.shape[0] > GRIPPER_DIM
+        """Whether this core's action statistics have the gripper dim: only then is a gripper reference held."""
+        return self.has_gripper_dim(self._mean)
 
     def _normalize_gripper(self, gripper: float) -> float:
         return float((gripper - self._mean[GRIPPER_DIM]) / self._std[GRIPPER_DIM])
@@ -1596,6 +1602,11 @@ class FlowReversalSteering(_ChunkSteering):
             return self._reference_fn(command)
         cfg = self._policy.config
         if self._reference_step is None:
+            if not self._has_gripper:
+                raise ValueError(
+                    "an action space without the gripper dim needs a reference_step or a reference_fn (its "
+                    f"statistics have {self._mean.shape[0]} dims; Flow.uniform_reference is the 7-D operator space's)"
+                )
             return Flow.uniform_reference(
                 command, self._gripper_ref, self._mean, self._std, cfg.chunk_size, cfg.max_action_dim
             )
@@ -1718,14 +1729,6 @@ STEERING_BATCH_KEYS = (COMMAND, *TRAINING_KEYS)
 SAMPLER_CONFIG_FIELDS = ("num_inference_steps", "chunk_size", "max_action_dim", "n_action_steps")
 
 
-def _unsqueezed(obs: dict) -> dict:
-    """The observation with a leading batch dim on every tensor (nested dicts too)."""
-    return {
-        k: v[None] if torch.is_tensor(v) else _unsqueezed(v) if isinstance(v, dict) else v
-        for k, v in obs.items()
-    }
-
-
 def _obs_rows(obs: dict) -> int | None:
     """The batch size of an observation: its first tensor's leading dim, or None."""
     for value in obs.values():
@@ -1777,12 +1780,13 @@ class SteeringPolicy(PreTrainedPolicy):
     A batch is the base policy's (the cursor's dict, plain or under ``observation.`` as the pre-processor leaves it;
     pi0.5's features), ``observation.scene_tokens`` the task module's scene, and ``command``, the operator's command
     per row ((B, n), or (n,) for a single unbatched trial) or per chunk step ((B, H, n)) in the operator's units
-    (deflections in [-1, 1]). The base gets the batch less this policy's own keys (``observation``), the adapter its
-    own view of it (``_adapter_view``). Chunks come out normalized, as the base's: its postprocessor unnormalizes them.
+    (deflections in [-1, 1]). The base gets the batch untouched less this policy's own keys (``observation``), the
+    adapter its own view of it (``_adapter_view``, where the scene tokens become the task module's scene). Chunks
+    come out normalized, as the base's: its postprocessor unnormalizes them.
 
     ``forward`` takes the example trainer's batches (the pre-processor carries their keys through untouched, but
     does not build them): ``batch["kind"]`` ``"task"`` is the task module's flow matching on ``chunk`` (in action
-    units, normalized by the postprocessor's statistics; taken as normalized without a postprocessor), ``"user"`` the
+    units, normalized by the postprocessor's statistics, which it needs), ``"user"`` the
     user module's field regression from ``latent`` to ``bci_target`` (the BCI's chunk, normalized: a regression
     target, not an operator command) through the task module if any; ``noise``, ``time`` and ``weight`` as the trainer
     draws them (drawn here when absent)."""
@@ -1925,6 +1929,16 @@ class SteeringPolicy(PreTrainedPolicy):
         _ = self.base_policy  # a base loaded from its folder brings its postprocessor
         return None if self._postprocessor is None else _ChunkSteering.action_mean_std(self._postprocessor)
 
+    def _no_stats(self, what: str) -> ValueError:
+        """The error for ``what`` needing the base policy's action statistics when there are none."""
+        return ValueError(
+            f"{what} from the base policy's postprocessor's action statistics, and there is none: none was passed "
+            f"with the base, and its folder (config.base_policy_path = {self.config.base_policy_path!r}) has no "
+            f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json / {POLICY_POSTPROCESSOR_DEFAULT_NAME}.json; pass it with "
+            "set_base_policy(policy, postprocessor=...) (a cursor base's: "
+            "make_cursor_flow_pre_post_processors(policy.config)[1])"
+        )
+
     @property
     def core(self) -> "FlowControlSteering | FlowReversalSteering":
         """The mode's steering core over the base policy, built on first use. FRS's reference is the core's own, from
@@ -1956,14 +1970,8 @@ class SteeringPolicy(PreTrainedPolicy):
             else:
                 stats = self._action_stats()
                 if stats is None:
-                    raise ValueError(
-                        "frs builds its reference from the base policy's postprocessor's action statistics, and there "
-                        "is none: none was passed with the base, and its folder (config.base_policy_path = "
-                        f"{cfg.base_policy_path!r}) has no policy_preprocessor.json / policy_postprocessor.json; pass "
-                        "it with set_base_policy(policy, postprocessor=...) (a cursor base's: "
-                        "make_cursor_flow_pre_post_processors(policy.config)[1])"
-                    )
-                step = cfg.max_speed * cfg.dt if stats[0].shape[0] < N_ACTION_DIMS else None
+                    raise self._no_stats("frs builds its reference")
+                step = None if FlowReversalSteering.has_gripper_dim(stats[0]) else cfg.max_speed * cfg.dt
                 self._core = FlowReversalSteering(
                     base,
                     None,
@@ -1977,29 +1985,26 @@ class SteeringPolicy(PreTrainedPolicy):
         return self._core
 
     def observation(self, batch: dict) -> dict:
-        """The base policy's batch: every key of ``batch`` but the steering policy's own (``STEERING_BATCH_KEYS``),
-        the cursor's dict under its prefix or not and pi0.5's features alike, with ``observation.scene_tokens`` (the
-        scene step's output) put at ``scene[config.scene_source]``. Raises ``ValueError`` when the batch has scene
-        tokens and the config no scene source."""
-        obs = {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
-        tokens = obs.pop(f"{OBS_PREFIX}scene_tokens", None)
+        """The base policy's batch: ``batch`` untouched but for the steering policy's own keys
+        (``STEERING_BATCH_KEYS``), the cursor's dict under its prefix or not and pi0.5's features alike."""
+        return {k: v for k, v in batch.items() if k not in STEERING_BATCH_KEYS}
+
+    def _adapter_view(self, obs: dict) -> dict:
+        """The adapter's view of the base's batch ``obs`` (``observation``'s), the task module's input contract (the
+        cursor's dict: it reads ``pos``, ``obstacles``, ``obstacle_mask``, ``scene`` and ``scene_keep``): every key's
+        ``observation.`` prefix stripped, the scene step's inputs (``layouts``, ``scene_images``) dropped, its output
+        (``observation.scene_tokens``) put at ``scene[config.scene_source]``, and a single unbatched trial given a
+        batch of one (``batched_trial``). The adapter's field binds to it, and a command's rows are counted on it.
+        Raises ``ValueError`` when there are scene tokens and the config has no scene source."""
+        view = {k.removeprefix(OBS_PREFIX): v for k, v in obs.items()}
+        for key in ("layouts", "scene_images"):  # the scene step's inputs, not the task module's
+            view.pop(key, None)
+        tokens = view.pop("scene_tokens", None)
         if tokens is not None:
             if self.config.scene_source is None:
                 raise ValueError("observation.scene_tokens needs a scene_source (a task module's)")
-            obs["scene"] = {**(obs.get("scene") or {}), self.config.scene_source: tokens}
-        return obs
-
-    def _adapter_view(self, batch: dict) -> dict:
-        """The adapter's view of the batch, the task module's input contract (the cursor's dict: it reads ``pos``,
-        ``obstacles``, ``obstacle_mask``, ``scene`` and ``scene_keep``): ``observation``'s batch with every key's
-        ``observation.`` prefix stripped, the scene step's inputs (``layouts``, ``scene_images``) dropped, and a single
-        unbatched trial (a 1-D ``pos``) given a batch of one, every tensor unsqueezed. The adapter's field binds to
-        it, and a command's rows are counted on it."""
-        view = {k.removeprefix(OBS_PREFIX): v for k, v in self.observation(batch).items()}
-        for key in ("layouts", "scene_images"):  # the scene step's inputs, not the task module's
-            view.pop(key, None)
-        pos = view.get("pos")
-        return _unsqueezed(view) if torch.is_tensor(pos) and pos.dim() == 1 else view
+            view["scene"] = {**(view.get("scene") or {}), self.config.scene_source: tokens}
+        return batched_trial(view)
 
     def _field(self, view: dict) -> AdaptedField | None:
         return None if self.adapter.kind == "none" else self.adapter.field(view)
@@ -2016,16 +2021,14 @@ class SteeringPolicy(PreTrainedPolicy):
 
     def _normalized_chunk(self, chunk: Tensor) -> Tensor:
         """A chunk in the base policy's action units, normalized by its postprocessor's statistics, ``(chunk - mean) /
-        std`` over the dims they cover (the rest as is); without a postprocessor, the chunk as it is (normalized
-        already)."""
+        std`` over the chunk's n dims (the statistics' first n: a pi0.5 base's translation, the cursor's two). Raises
+        ``ValueError`` without a postprocessor."""
         stats = self._action_stats()
         if stats is None:
-            return chunk
-        n = min(chunk.shape[-1], stats[0].shape[0])
+            raise self._no_stats("a task batch's chunk (in action units) is normalized")
+        n = chunk.shape[-1]
         mean, std = (torch.as_tensor(a[:n], dtype=chunk.dtype, device=chunk.device) for a in stats)
-        if n == chunk.shape[-1]:
-            return (chunk - mean) / std
-        return torch.cat([(chunk[..., :n] - mean) / std, chunk[..., n:]], dim=-1)
+        return (chunk - mean) / std
 
     def get_optim_params(self) -> Iterator[nn.Parameter]:
         return self.adapter.parameters()
@@ -2075,13 +2078,13 @@ class SteeringPolicy(PreTrainedPolicy):
         view of the observation; normalized, as the base's (its postprocessor unnormalizes it)."""
         obs = self.observation(batch)
         view = self._adapter_view(obs)
+        command = self._command(batch.get(COMMAND), view)  # checked in every mode, mode "none" too
         field = self._field(view)
         if self.config.mode == "none":
             hook = FlowControlSteering.velocity_hook(field)
             return self._sampler().predict_action_chunk(
                 obs, **({} if hook is None else {"velocity_hook": hook})
             )
-        command = self._command(batch.get(COMMAND), view)
         # the steered chunk alone: the policy's own plan is not drawn when every row steers
         return self.core.steered_chunk(obs, command, field=field, paired=False)[0]
 

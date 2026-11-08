@@ -26,7 +26,9 @@ displacements.
 It has no dataset features, and `lerobot-train` does not train it. It is trained by the example's own trainer,
 `examples/pi05/mars/cursor/train/train_policy.py`, which writes the cursor project's `policy.pt` format.
 `examples/pi05/mars/cursor/tools/convert_checkpoints.py` converts those files (and the cursor's adapter
-checkpoints) in place to the formats lerobot loads.
+checkpoints) in place to the formats lerobot loads. A converted policy folder also holds the policy's pipelines
+(`policy_preprocessor.json`, `policy_postprocessor.json` and the unnormalizer's statistics), so a steering policy that
+loads it by path has its postprocessor; a folder converted before them gets them on a re-run.
 
 ```python
 from lerobot.policies.cursor_flow import CursorFlowPolicy, make_cursor_flow_pre_post_processors

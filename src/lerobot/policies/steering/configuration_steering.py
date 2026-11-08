@@ -56,7 +56,8 @@ class SteeringConfig(PreTrainedConfig):
 
     The base policy reads its own observation (the cursor's dict, or pi0.5's features), so this config has, like
     ``CursorFlowConfig``, no input/output features of its own and no delta indices; its optimizer preset (AdamW)
-    trains the adapter modules.
+    trains the adapter modules. The flow's settings (Euler steps, chunk length, the steps executed per replan) are
+    the base policy's own, its config's sampler fields: this config does not repeat them.
 
     The adapter is four flat fields, so the CLI sets each directly: ``from_spec`` reads a ``reversal_adapter`` spec
     (a fixed F and/or module checkpoint paths) into them, ``build_adapter`` builds the fixed F of a spec, and
@@ -88,12 +89,6 @@ class SteeringConfig(PreTrainedConfig):
         lambda_id: The task module's pull of A, b toward the identity in ``forward``.
         n_dims: The action dims the adapter acts on, and the most dims an operator's command may have (the command
             step refuses a wider one): 2 on the cursor, 3 for a pi0.5 base's translation.
-        horizon: The base policy's chunk length, as recorded; ``SteeringPolicy`` reads the base's own
-            (``config.chunk_size``, the sampler contract's).
-        num_inference_steps: The base policy's Euler steps per chunk, as recorded; ``SteeringPolicy`` reads the
-            base's own (``config.num_inference_steps``).
-        n_action_steps: The chunk steps executed per replan, as recorded; ``SteeringPolicy.select_action`` serves the
-            base's own (``config.n_action_steps``).
         max_speed: The command's speed at full deflection, in action units per second (FRS's reference in an action
             space without the 7-D operator space's gripper dim, the cursor's; pi0.5's uses the command as is).
         dt: The control period in seconds (that reference: a full push moves ``max_speed * dt`` per step).
@@ -126,9 +121,6 @@ class SteeringConfig(PreTrainedConfig):
     task_module: dict | None = None
     lambda_id: float = 1e-3
     n_dims: int = 2
-    horizon: int = 16
-    num_inference_steps: int = 10
-    n_action_steps: int = 8
     max_speed: float = 1.2
     dt: float = 0.02
     base_policy_type: str = "cursor_flow"

@@ -51,6 +51,7 @@ from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.steering import Flow
+from lerobot.policies.utils import batched_trial
 from lerobot.utils.constants import OBS_PREFIX
 
 from .configuration_cursor_flow import CursorFlowConfig
@@ -245,14 +246,6 @@ class FlowPolicy(nn.Module):
 # ---------------------------------------------------------------- the lerobot policy wrapper
 
 
-def _unsqueezed(obs: dict) -> dict:
-    """The observation with a leading batch dim on every tensor (nested dicts too)."""
-    return {
-        k: v[None] if torch.is_tensor(v) else _unsqueezed(v) if isinstance(v, dict) else v
-        for k, v in obs.items()
-    }
-
-
 class CursorFlowPolicy(PreTrainedPolicy):
     """A `FlowPolicy` as a lerobot policy: saving, loading and the Hub through `PreTrainedPolicy`, and pi0.5's
     sampler interface, which the steering policy (``lerobot.policies.steering``) drives every base through.
@@ -331,9 +324,7 @@ class CursorFlowPolicy(PreTrainedPolicy):
         """`FlowPolicy`'s observation in ``batch``: every key with its ``observation.`` prefix stripped (an
         ``observation.scene_tokens`` is the caller's to place: the model reads no scene), and a single unbatched
         trial (``pos`` of shape (2,)) given a batch of one, every tensor unsqueezed."""
-        obs = {k.removeprefix(OBS_PREFIX): v for k, v in batch.items()}
-        pos = obs.get("pos")
-        return _unsqueezed(obs) if torch.is_tensor(pos) and pos.dim() == 1 else obs
+        return batched_trial({k.removeprefix(OBS_PREFIX): v for k, v in batch.items()})
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **hooks: Any) -> Tensor:

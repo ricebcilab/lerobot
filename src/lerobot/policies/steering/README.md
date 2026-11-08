@@ -111,11 +111,13 @@ the local Hugging Face cache: on a machine without a valid HF token, run with `H
 features, as `CursorFlowConfig`.
 
 - Its weights are the adapter modules'. The base policy is passed in, or loaded from `base_policy_path` (a folder or
-  a Hub repo id) together with that folder's processors.
+  a Hub repo id) together with that folder's processors (a converted cursor folder has them:
+  `convert_checkpoints.py`).
 - Every base is driven one way, through pi0.5's sampler interface: a `config` with `num_inference_steps`,
   `chunk_size`, `max_action_dim`, `n_action_steps` and `noise_time`, `predict_action_chunk(batch, **hooks)` (the
   normalized chunk), `reset()` and `velocity_field(batch)`. `PI05Policy` and `CursorFlowPolicy` offer it
   (`CursorFlowPolicy.wrapping(model)` puts a bare `FlowPolicy` behind it); a base without it is refused by name.
+  The flow's settings are the base's config's: `SteeringConfig` does not repeat them.
 - `frs` needs the base's postprocessor, for its action statistics, on every base (a cursor base's is
   `make_cursor_flow_pre_post_processors(base.config)[1]`); pass it with the base, or with
   `set_base_policy(policy, postprocessor=...)`.
@@ -124,12 +126,13 @@ features, as `CursorFlowConfig`.
   translation is 3). The chunk is normalized, as the base's: the base's postprocessor unnormalizes it.
   `select_action` serves the chunk's first `n_action_steps` steps (the base's) one per call. Mode `"none"` is the
   base's own chunk through the task module, the command ignored.
-- The base gets the batch less the steering policy's own keys (`command` and a training batch's). The adapter binds
-  to its own view of it, the task module's input: the `observation.` prefix stripped, the scene step's inputs dropped,
-  `observation.scene_tokens` at `scene[scene_source]`, a single unbatched trial given a batch of one.
+- The base gets the batch untouched less the steering policy's own keys (`command` and a training batch's). The
+  adapter binds to its own view of it, the task module's input: the `observation.` prefix stripped, the scene step's
+  inputs dropped, `observation.scene_tokens` at `scene[scene_source]`, a single unbatched trial given a batch of one.
 - `forward` returns the adapter's training loss on the example trainer's batches: `kind`, `chunk` (in action units,
-  normalized by the postprocessor's statistics) or `latent` and `bci_target`, `noise`, `time`, `weight`. The
-  pre-processor carries these through untouched, but does not build them.
+  normalized by the postprocessor's statistics, so a task batch needs the postprocessor too) or `latent` and
+  `bci_target`, `noise`, `time`, `weight`. The pre-processor carries these through untouched, but does not build
+  them.
 - A task module's scene settings become the config's (`SteeringConfig.scene_settings`).
 - The processor factory adds the scene step for a `vlm_image` / `vlm_prefix` task module.
 - The cursor example's `tools/convert_checkpoints.py --steering` writes a `SteeringPolicy` folder and its pipelines

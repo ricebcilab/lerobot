@@ -202,9 +202,9 @@ def test_the_base_policy_loads_from_the_configs_reference(tmp_path):
 
 
 def test_observation_has_one_rule(tmp_path):
-    """The base gets the batch less the steering policy's own keys, a cursor batch under its prefix and a pi0.5 batch
-    alike, ``observation.scene_tokens`` put at ``scene[scene_source]``; the adapter's view strips the prefix (the
-    task module reads the cursor's dict), so a prefixed batch steers as the plain one."""
+    """The base gets the batch untouched less the steering policy's own keys, a cursor batch under its prefix and a
+    pi0.5 batch alike; the adapter's view strips the prefix and puts ``observation.scene_tokens`` at
+    ``scene[scene_source]`` (the task module reads the cursor's dict), so a prefixed batch steers as the plain one."""
     steering = _steering(SteeringConfig(scene_source="vlm_image", device="cpu"))
     obs = _obs()
     prefixed = {f"observation.{k}": v for k, v in obs.items()}
@@ -212,13 +212,17 @@ def test_observation_has_one_rule(tmp_path):
     extra = {"observation.layouts": object(), "action": None, "next.reward": 0.0}
     batch = {**prefixed, "observation.scene_tokens": tokens, **extra, "command": COMMAND, "kind": "task"}
     seen = steering.observation(batch)
-    assert list(seen) == [*prefixed, *extra, "scene"] and seen["scene"]["vlm_image"] is tokens
+    assert list(seen) == [*prefixed, "observation.scene_tokens", *extra] and all(
+        seen[k] is batch[k] for k in seen
+    )
     pi05 = _pi05_batch()
     assert list(steering.observation({**pi05, "kind": "user"})) == [k for k in pi05 if k != "command"]
     view = steering._adapter_view(seen)
-    assert list(view) == [*obs, "action", "next.reward", "scene"] and view["pos"] is obs["pos"]
+    assert list(view) == [*obs, "action", "next.reward", "scene"] and view["scene"] == {"vlm_image": tokens}
+    assert view["pos"] is obs["pos"] and view["scene"]["vlm_image"] is tokens
+    nameless = _steering(SteeringConfig(device="cpu"))
     with pytest.raises(ValueError, match="needs a scene_source"):
-        _steering(SteeringConfig(device="cpu")).observation({**prefixed, "observation.scene_tokens": tokens})
+        nameless._adapter_view(nameless.observation({**prefixed, "observation.scene_tokens": tokens}))
     _, task_path = _modules(tmp_path)
     steering = _steering(SteeringConfig(adapter_task=str(task_path), device="cpu"))
     torch.manual_seed(5)
@@ -268,6 +272,8 @@ def test_mode_none_ignores_the_command(tmp_path):
     assert torch.equal(got, want) and not torch.equal(got, base.predict_action_chunk(obs))
     torch.manual_seed(3)
     assert torch.equal(steering.select_action({**obs, "command": COMMAND}), want[:, 0])
+    with pytest.raises(ValueError, match=r"command of shape \(2, 2\) for an observation batch of 3"):
+        steering.predict_action_chunk({**obs, "command": COMMAND[:2]})  # checked though ignored
 
 
 def test_forward_needs_the_module_of_its_kind(tmp_path):
@@ -340,8 +346,9 @@ def _pi05_batch():
     }
 
 
-def _pi05_postprocessor():
-    """A pi0.5-style postprocessor: MEAN_STD statistics over the 8 padded action dims (7 of them the env's)."""
+def _pi05_postprocessor(dims=8):
+    """A pi0.5-style postprocessor: MEAN_STD statistics over ``dims`` action dims (by default the 8 padded ones, 7 of
+    them the env's)."""
     from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
     from lerobot.processor import (
         PolicyProcessorPipeline,
@@ -350,9 +357,11 @@ def _pi05_postprocessor():
         transition_to_policy_action,
     )
 
-    stats = {"action": {"mean": 0.1 * torch.arange(8.0), "std": 0.5 + 0.25 * torch.arange(8.0)}}
+    stats = {
+        "action": {"mean": 0.1 * torch.arange(float(dims)), "std": 0.5 + 0.25 * torch.arange(float(dims))}
+    }
     step = UnnormalizerProcessorStep(
-        features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(8,))},
+        features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(dims,))},
         norm_map={FeatureType.ACTION: NormalizationMode.MEAN_STD},
         stats=stats,
     )
@@ -399,6 +408,64 @@ def test_a_pi05_style_stub_is_driven_unchanged(tmp_path, mode):
     torch.manual_seed(1)
     want = core.steered_chunk(obs, batch["command"], field=steering.adapter.field(obs), paired=False)[0]
     assert torch.equal(chunk, want) and not torch.equal(chunk[0], chunk[1])
+
+
+def test_the_reference_rule_is_the_action_spaces():
+    """FRS's default reference is the action space's rule: in the 7-D operator space (pi0.5's statistics, no
+    reference_step from the policy) the uniform chunk; without the gripper dim the held command at ``reference_step``,
+    zero beyond the commanded dims; there, without a reference_step, a named error."""
+    command = torch.tensor([[0.5, -0.2, 0.1], [0.0, 0.3, 0.0]])
+    config = SteeringConfig(operator_dims=["translation"], n_dims=3, device="cpu")
+    core = SteeringPolicy(config, base_policy=_SamplerBase(), postprocessor=_pi05_postprocessor(7)).core
+    assert core._reference_step is None
+    want = Flow.uniform_reference(command, core._gripper_ref, core._mean, core._std, 6, 8)
+    assert torch.equal(core.reference_chunk(command), want)
+    three, two = _pi05_postprocessor(3), command[:, :2]
+    held = FlowReversalSteering(
+        _SamplerBase(), None, three, operator_dims=None, pinned_steps=None, reference_step=0.5
+    )
+    reference = held.reference_chunk(two)
+    mean, std = 0.1 * torch.arange(2.0), 0.5 + 0.25 * torch.arange(2.0)
+    assert reference.shape == (2, 6, 8) and not reference[..., 2:].any()
+    assert torch.equal(reference[..., :2], (two[:, None].expand(-1, 6, -1) * 0.5 - mean) / std)
+    bare = FlowReversalSteering(_SamplerBase(), None, three, operator_dims=None, pinned_steps=None)
+    with pytest.raises(ValueError, match="needs a reference_step or a reference_fn"):
+        bare.reference_chunk(two)
+
+
+class _FieldBase(_SamplerBase):
+    """The stub with the contract's ``velocity_field``: its fixed field, whatever the batch."""
+
+    def velocity_field(self, batch):
+        return self.velocity
+
+
+def test_a_task_batch_is_normalized_by_the_statistics_it_needs(tmp_path):
+    """``forward``'s task chunk (action units) is normalized by the postprocessor's statistics over its n dims (a
+    pi0.5 base's translation: the first 3 of 7); without a postprocessor it is refused by name, not misscaled."""
+    torch.manual_seed(0)
+    task = LearnedTaskModule(horizon=6, d=16, tdim=8, heads=2, layers=1, n_dims=3)
+    path = AdapterModules.save_module(task, tmp_path / "t.pt", "task")
+    config = SteeringConfig(
+        operator_dims=["translation"], n_dims=3, adapter_task=str(path), lambda_id=0.01, device="cpu"
+    )
+    steering = SteeringPolicy(config, base_policy=_FieldBase(), postprocessor=_pi05_postprocessor(7))
+    batch = {k: v for k, v in _pi05_batch().items() if k != "command"}
+    g = torch.Generator().manual_seed(2)
+    chunk, z, t = (
+        torch.randn(2, 6, 3, generator=g),
+        torch.randn(2, 6, 3, generator=g),
+        torch.rand(2, generator=g),
+    )
+    loss, parts = steering({**batch, "kind": "task", "chunk": chunk, "noise": z, "time": t})
+    normalized = (chunk - 0.1 * torch.arange(3.0)) / (0.5 + 0.25 * torch.arange(3.0))
+    bound = steering.adapter.task.bind(steering._adapter_view(steering.observation(batch)))
+    want, want_parts = LearnedTaskModule.field_loss(bound, _SamplerBase.velocity, normalized, z, t, 0.01, 3)
+    assert torch.equal(loss, want) and parts == {k: v.item() for k, v in want_parts.items()}
+    with pytest.raises(
+        ValueError, match=r"a task batch's chunk .*base_policy_path.*policy_postprocessor\.json"
+    ):
+        SteeringPolicy(config, base_policy=_FieldBase())({**batch, "kind": "task", "chunk": chunk})
 
 
 def test_select_action_serves_the_chunks_executed_steps_one_per_call():

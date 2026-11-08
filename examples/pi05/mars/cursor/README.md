@@ -409,7 +409,9 @@ checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapte
 which `AdapterModules.load` reads; the policy trainer still writes the cursor
 project's `policy.pt`, which `FlowPolicy.load` reads alongside lerobot's format, so a fresh policy works before
 it is converted. After training a policy, rerun `convert_checkpoints.py`: its folder becomes a `cursor_flow`
-policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`). The converter also
+policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`, and the policy's two
+processor pipelines, whose postprocessor holds the action statistics a steering policy loading the folder by path
+reads; a folder converted before them gets them). The converter also
 rewrites any `adapter.pt` still in the cursor's old format. The originals stay beside them as `*.orig`, and
 running it again changes nothing. When a policy folder holds both formats (a retrained `policy.pt` beside an older
 converted `model.safetensors`), `policy.pt` wins, with a warning, until you convert again. `hub.py upload`

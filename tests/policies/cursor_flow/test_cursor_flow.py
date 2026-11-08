@@ -31,6 +31,8 @@ from lerobot.policies.steering import (
     Flow,
     LearnedTaskModule,
     LearnedUserModule,
+    SteeringConfig,
+    SteeringPolicy,
 )
 
 CONVERTER = (
@@ -93,6 +95,7 @@ def test_round_trip_is_exact(tmp_path, obstacle_tokens):
     out = tmp_path / "policies" / "p"
     assert (out / "config.json").is_file() and (out / "model.safetensors").is_file()
     assert not (out / "policy.pt").exists() and (out / "policy.pt.orig").is_file()
+    assert (out / "policy_preprocessor.json").is_file() and (out / "policy_postprocessor.json").is_file()
 
     loaded = CursorFlowPolicy.from_pretrained(out, strict=True)
     assert isinstance(loaded.config, CursorFlowConfig) and loaded.config.obstacle_tokens is obstacle_tokens
@@ -102,6 +105,42 @@ def test_round_trip_is_exact(tmp_path, obstacle_tokens):
     for obs in (_obs(), _obs(n_obstacles=0), {k: v for k, v in _obs().items() if "obstacle" not in k}):
         x, t = torch.randn(3, 16, 2), torch.rand(3)
         assert torch.equal(loaded.model(obs, x, t), model(obs, x, t))
+
+
+PIPELINE_FILES = {
+    "policy_preprocessor.json",
+    "policy_postprocessor.json",
+    "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+}
+
+
+def test_a_converted_folder_without_pipelines_gets_them(tmp_path):
+    """A policy folder converted before the pipelines gets them on a re-run and nothing else changes; a further run
+    changes nothing; a steering policy then loads the base by path with its action statistics."""
+    model = _small_policy(False)
+    _save_old_policy(model, tmp_path, "p")
+    converter = _converter()
+    converter.convert_tree(tmp_path)
+    out = tmp_path / "policies" / "p"
+    assert {f.name for f in out.iterdir()} == {
+        "config.json",
+        "model.safetensors",
+        "policy.pt.orig",
+        *PIPELINE_FILES,
+    }
+    for name in PIPELINE_FILES:
+        (out / name).unlink()  # a folder converted before them
+    before = {f: (f.read_bytes(), f.stat().st_mtime_ns) for f in out.iterdir()}
+    assert converter.convert_tree(tmp_path) == {"policies": 1, "adapters": 0, "tasks": 0, "skipped": 0}
+    assert {f.name for f in out.iterdir()} == {f.name for f in before} | PIPELINE_FILES
+    assert {f: (f.read_bytes(), f.stat().st_mtime_ns) for f in before} == before
+    stamps = {f: f.stat().st_mtime_ns for f in out.iterdir()}
+    assert converter.convert_tree(tmp_path)["policies"] == 0
+    assert {f: f.stat().st_mtime_ns for f in out.iterdir()} == stamps
+    steering = SteeringPolicy(SteeringConfig(base_policy_path=str(out), device="cpu"))
+    _ = steering.core  # FRS: the folder's action statistics
+    chunk = torch.randn(3, 16, 2)
+    assert torch.equal(steering._postprocessor(chunk), chunk * model.action_scale)
 
 
 def test_predict_action_chunk_is_the_plain_policy_chunk():

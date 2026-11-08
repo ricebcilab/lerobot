@@ -5,8 +5,11 @@
 DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
 
 - every policies/**/policy.pt (the cursor trainer's {config, state_dict, args}) becomes a lerobot
-  `CursorFlowPolicy` directory beside it: config.json + model.safetensors (`save_pretrained`). The
-  policy.pt is kept as policy.pt.orig.
+  `CursorFlowPolicy` directory beside it: config.json + model.safetensors (`save_pretrained`) and the policy's
+  two processor pipelines (policy_preprocessor.json, policy_postprocessor.json and the unnormalizer's statistics:
+  `make_cursor_flow_pre_post_processors`, which the factory's `make_pre_post_processors(config, pretrained_path=folder)`
+  reloads, so a steering policy that loads the folder by path has the action statistics). The policy.pt is kept as
+  policy.pt.orig. A policy folder converted before the pipelines (config.json, no pipelines) is given them.
 - every adapters/**/adapter.pt (the cursor's {kind?, config, state_dict, args, obstacle}) is rewritten in
   the `AdapterModules.save_module` format (`AdapterModules.from_cursor_checkpoint`; kind, config, weights, meta). The original is
   kept as adapter.pt.orig.
@@ -29,6 +32,7 @@ again after training a policy (FlowPolicy.load reads both formats meanwhile); th
 
 import argparse
 import filecmp
+import json
 import os
 import shutil
 import sys
@@ -38,7 +42,9 @@ from pathlib import Path
 
 import torch
 
-from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy, make_cursor_flow_pre_post_processors
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import (AdapterModules, LearnedTaskModule, LearnedUserModule, SteeringConfig,
                                        SteeringPolicy, make_steering_pre_post_processors)
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
@@ -66,11 +72,27 @@ def backup(path):
 
 
 POLICY_FILES = ("config.json", "model.safetensors")
+PIPELINE_FILES = (f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
+
+
+def save_pipelines(config, folder):
+    """The cursor policy's pipelines (`make_cursor_flow_pre_post_processors(config)`) saved into folder and verified:
+    reloaded as the factory reloads them, the postprocessor scales a normalized action by the config's action_scale
+    exactly. Returns the names of the files written (the two JSONs and the unnormalizer's statistics)."""
+    folder = Path(folder)
+    before = {f.name for f in folder.iterdir()}
+    for pipeline in make_cursor_flow_pre_post_processors(config):
+        pipeline.save_pretrained(folder)
+    _, post = make_pre_post_processors(config, pretrained_path=str(folder))
+    x = torch.ones(1, 1, 2)
+    if not torch.equal(post(x), x * torch.tensor(config.action_scale)):
+        raise RuntimeError(f"{folder}: the saved postprocessor does not unnormalize by action_scale {config.action_scale}")
+    return sorted(f.name for f in folder.iterdir() if f.name not in before)
 
 
 def convert_policy(path):
-    """policies/<name>/policy.pt -> policies/<name>/{config.json, model.safetensors}; True if converted.
-    The new files are written and verified in a temporary folder and only then moved into place; policy.pt
+    """policies/<name>/policy.pt -> policies/<name>/{config.json, model.safetensors, the pipelines' files}; True if
+    converted. The new files are written and verified in a temporary folder and only then moved into place; policy.pt
     (read first by FlowPolicy.load) is removed last, after its backup, so a crash leaves a loadable folder."""
     path = Path(path)
     ckpt = torch.load(path, map_location="cpu")
@@ -84,14 +106,39 @@ def convert_policy(path):
         loaded = CursorFlowPolicy.from_pretrained(tmp, strict=True)
         if loaded.model.config != ckpt["config"] or not _same_weights(loaded.model.state_dict(), state):
             raise RuntimeError(f"{path}: the converted policy does not reproduce the checkpoint")
+        names = [*POLICY_FILES, *save_pipelines(config, tmp)]
         if not backup(path):
             return False
-        for name in POLICY_FILES:
+        for name in names:
             os.replace(tmp / name, path.parent / name)
         path.unlink()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return True
+
+
+def add_pipelines(folder):
+    """A converted policy folder (config.json of a cursor_flow policy, no policy.pt) given the policy's pipelines
+    (`save_pipelines`) when it lacks them; True if added. Written and verified in a temporary folder, then moved into
+    place; the folder's other files are left as they are."""
+    folder = Path(folder)
+    if all((folder / name).exists() for name in PIPELINE_FILES):
+        return False
+    config = PreTrainedConfig.from_pretrained(folder)  # the registry reads its type: a CursorFlowConfig
+    tmp = Path(tempfile.mkdtemp(prefix=".convert-", dir=folder))
+    try:
+        for name in save_pipelines(config, tmp):
+            os.replace(tmp / name, folder / name)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return True
+
+
+def _policy_folders(root):
+    """The converted cursor policy folders under root/policies: config.json of type cursor_flow, no policy.pt."""
+    for config in sorted((Path(root) / "policies").rglob("config.json")):
+        if not (config.parent / "policy.pt").exists() and json.loads(config.read_text()).get("type") == "cursor_flow":
+            yield config.parent
 
 
 def converted(ckpt):
@@ -166,11 +213,13 @@ def convert_adapter_to_policy(path, base_policy_path=None):
 
 
 def convert_tree(root=CHECKPOINTS, steering=False, base_policy_path=None):
-    """Convert every policy and adapter checkpoint under root. Returns the counts converted (policies,
-    adapters, of which task modules) and of the files skipped for a differing .orig backup; with `steering`, also
-    the count of adapters given a SteeringPolicy folder (`convert_adapter_to_policy`)."""
+    """Convert every policy and adapter checkpoint under root. Returns the counts converted (policies: a policy.pt
+    converted, or a converted folder given the pipelines it lacked; adapters, of which task modules) and of the files
+    skipped for a differing .orig backup; with `steering`, also the count of adapters given a SteeringPolicy folder
+    (`convert_adapter_to_policy`)."""
     root = Path(root)
     done = [convert_policy(p) for p in sorted((root / "policies").rglob("policy.pt"))]
+    done += [add_pipelines(folder) or None for folder in _policy_folders(root)]  # None: nothing to add
     kinds = Counter(convert_adapter(p) for p in sorted((root / "adapters").rglob("adapter.pt")))
     kinds.pop(None, None)
     skipped = done.count(False) + kinds.pop("skipped", 0)
