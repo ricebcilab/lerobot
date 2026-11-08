@@ -1,0 +1,59 @@
+# The grid rederived with the vision task module (Figure 3d's arms, 2026-11-08): the grid's cells, trials and seed
+# (grid.yaml), so every method plays the trials it would there (teleop replays the grid's, a check). The arms here:
+#   ft_flow_control, ft_frs  flow control and FRS on each obstacle task's fine-tuned policy (grid_ft.yaml's models; T1 the
+#                            frozen policy), each tuned on its paper's one knob, replacing the grid's frozen-policy arms
+#   mars_task, mars          the task module is the vision module: the rigid recipe at 300 demonstrations
+#                            (vlm_image tokens, relative geometry, 32 rigid copies per demonstration, rank 256 through the
+#                            disk store; image/task_<task>_n300_s0_with_<user>_vlm_image_rel_rigid_r256), trained with
+#                            the grid's user in the loop (T2 with U1, T3 with U2, T4 with U3, T5 with U4); mars adds the
+#                            grid's user module. On T1 there is no task module: mars_task is FRS and mars is MARS-U.
+# MARS-U (grid.yaml's mars_user) and the fine-tuned arm (grid_ft.yaml's ft_mars_user) are unchanged and read from those runs.
+# Seeds: the modules' training seed, as the grid's (_s0 tuned; seeds 1-4 at seed 0's settings):
+#   python run_sweep.py --sweep grid_vision --cells U1xT1 ... --out grid_vision_s0_parts/<part>; --merge ... --out grid_vision_s0
+#   python run_sweep.py --sweep grid_vision --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_vision_s0/settings.yaml --out grid_vision_s1
+name: grid_vision
+agent: expert
+arm: condition_grid.yaml
+methods:
+  teleop: {mode: teleop}
+  ft_flow_control:
+    mode: flow_control
+    model: &ft {T1: flow_goaldrop, T2: flow_goaldrop_disc_large_ft_n300_s0, T3: flow_goaldrop_wall_gap_ft_n300_s0,
+                T4: flow_goaldrop_ring_goal_ft_n300_s0, T5: flow_goaldrop_ring_start_ft_n300_s0}
+  ft_frs:
+    mode: frs
+    model: *ft
+  mars_task:
+    mode: frs
+    tune: &mars {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}
+    reversal_adapter:
+      task: &vision {T1: null,
+                     T2: image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256,
+                     T3: image/task_wall_gap_n300_s0_with_gain025x_vlm_image_rel_rigid_r256,
+                     T4: image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256,
+                     T5: image/task_ring_start_n300_s0_with_curl20_vlm_image_rel_rigid_r256}
+  mars:
+    mode: frs
+    tune: *mars
+    reversal_adapter: {user: cell, task: *vision}
+tune:  # the baselines as their papers define them, each with its one knob tuned (grid.yaml's)
+  flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}
+  frs: {pinned_steps: [2, 4, 8, 16]}
+grid:
+  users:
+    U1: {corruption: {scale: [1.0, 0.25]}, adapter: user_gain025y_expert_n100_s0}
+    U2: {corruption: {scale: [0.25, 1.0]}, adapter: user_gain025x_expert_n100_s0}
+    U3: {corruption: {rotation_deg: 60}, adapter: user_rot60_expert_n100_s0}
+    U4: {corruption: {curl: 20, tau: 0.1}, adapter: user_curl20_expert_n100_s0}
+  tasks:
+    T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+    T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
+    T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
+    T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
+    T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
+  noises: [1.0]
+  train: [[U1, T1], [U2, T1], [U3, T1], [U4, T1], [U1, T2], [U2, T3], [U3, T4], [U4, T5]]
+trials: {tune: 200, test: 500}
+focus: mars
+against: [teleop, ft_flow_control, ft_frs]
+seed: 800

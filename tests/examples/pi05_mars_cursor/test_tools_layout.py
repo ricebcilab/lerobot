@@ -13,7 +13,15 @@ def py_files(folder):
 
 
 @pytest.mark.parametrize(
-    "name", ["diag_layouts", "report_grid_image", "hub", "convert_checkpoints", "analyze_results"]
+    "name",
+    [
+        "diag_layouts",
+        "report_grid_image",
+        "report_grid_vision",
+        "hub",
+        "convert_checkpoints",
+        "analyze_results",
+    ],
 )
 def test_moved_scripts_import_by_bare_name(name):
     assert importlib.import_module(name).__file__
@@ -22,7 +30,7 @@ def test_moved_scripts_import_by_bare_name(name):
 def test_folders_hold_exactly_their_scripts():
     assert py_files(".") == {"run_experiment.py", "run_sweep.py"}
     assert py_files("tools") == {"analyze_results.py", "convert_checkpoints.py", "hub.py", "diag_layouts.py"}
-    assert py_files("reports") == {"build_study_report.py", "report_grid_image.py"}
+    assert py_files("reports") == {"build_study_report.py", "report_grid_image.py", "report_grid_vision.py"}
 
 
 def test_cursor_sa_has_no_env_shim_and_demos_share_the_package_layouts():
