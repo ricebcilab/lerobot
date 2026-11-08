@@ -24,13 +24,14 @@ interrupted run leaves every checkpoint loadable and can simply be run again. An
 differs from the file is never overwritten: that file is skipped with a warning. Files already in the new
 format are left untouched, so re-running is a no-op. The policy trainer still writes policy.pt, so run this
 again after training a policy (FlowPolicy.load reads both formats meanwhile); the adapter trainer writes the
-`AdapterModules.save_module` format itself, and ReversalAdapter.load reads only that.
+`AdapterModules.save_module` format itself, and AdapterModules.load reads only that.
 """
 
 import argparse
 import filecmp
 import os
 import shutil
+import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -42,7 +43,8 @@ from lerobot.policies.steering import (AdapterModules, LearnedTaskModule, Learne
                                        SteeringPolicy, make_steering_pre_post_processors)
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa sits one folder up
+from cursor_sa.paths import CHECKPOINTS  # noqa: E402
 
 
 def _same_weights(a, b):

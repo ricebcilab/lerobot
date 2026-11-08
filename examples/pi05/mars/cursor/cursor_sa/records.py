@@ -14,6 +14,7 @@ carries the arm's resolved settings, so a file can be analyzed on its own.
 import contextlib
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -88,11 +89,17 @@ def read_manifest(run_dir):
 
 
 def file_sha256(path):
-    h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def atomic_write_json(path, obj, indent=None):
+    """Write `obj` as JSON to `path` whole or not at all: to a temporary name beside it (the writer's pid in it), then
+    renamed into place, so a crash or a full disk leaves the last complete file."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=indent))
+    os.replace(tmp, path)
 
 
 def git_commit(cwd):

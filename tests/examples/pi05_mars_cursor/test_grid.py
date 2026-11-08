@@ -13,7 +13,7 @@ from cursor_sa.agents import ExpertAgent
 from cursor_sa.readout import Readout, corruption_spec
 from lerobot.envs.cursor import TaskConfig, curl_steady_state, obstacle_count, obstacle_spec, place_obstacles, plan_route, route_side, sample_layouts
 from cursor_sa.session import readout_for, load_checkpoints, run_trials
-from cursor_sa.steering import TaskModule, UserModule
+from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule
 from run_sweep import cell_groups, cell_key, load_sweep, main as sweep_main, method_arm
 
 STUDY = dict(min_reach=0.35, max_reach=0.5)
@@ -187,7 +187,7 @@ RUN_GRID = (GRID.replace("  per_task: {mode: frs, model: {T0: flow_goaldrop, T1:
 
 
 def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
-    for name, module, kind in (("user_a", UserModule(), "user"), ("task_a", TaskModule(), "task")):
+    for name, module, kind in (("user_a", LearnedUserModule(16, n_dims=2), "user"), ("task_a", LearnedTaskModule(), "task")):
         (tmp_path / name).mkdir()
         torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args={}, obstacle=None),
                    tmp_path / name / "adapter.pt")

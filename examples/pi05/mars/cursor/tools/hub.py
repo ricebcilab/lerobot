@@ -27,23 +27,22 @@ convert_checkpoints.py first.
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
 import yaml
 from huggingface_hub import HfApi, snapshot_download
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa (imported lazily) sits one folder up
-ROOT = Path(__file__).resolve().parents[1]
-CHECKPOINTS = ROOT.parent / "checkpoints"  # = cursor_sa.paths.CHECKPOINTS
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa (otherwise imported lazily) sits one folder up
+from cursor_sa.paths import CHECKPOINTS, ROOT  # noqa: E402
+
 MANIFEST = ROOT / "hub_manifest.yaml"
 REPO = "ricebcilab/mars-cursor"
 SEEDS = (1, 2, 3, 4)  # the grid's training seeds besides seed 0 (each module's _s0 -> _s<k>, in adapters/)
 GROUPS = ("study", "grid", "grid_seeds")
 POLICY_FILES = ("config.json", "model.safetensors", "train_log.json")
 ADAPTER_FILES = ("adapter.pt", "train_log.json")
-# the files the loaders open (FlowPolicy.load, ReversalAdapter.load / AdapterModules.load_module): a download must bring these
+# the files the loaders open (FlowPolicy.load, AdapterModules.load / AdapterModules.load_module): a download must bring these
 POLICY_REQUIRED = ("config.json", "model.safetensors")
 ADAPTER_REQUIRED = ("adapter.pt",)
 HEADER = """\
@@ -61,9 +60,11 @@ def arm_folders(arms):
 
 
 def seed_name(name, k):
-    """A seed-0 module's name for training seed k, e.g. task_ring_goal_n300_s0_with_rot60 -> task_ring_goal_n300_s2_with_rot60."""
-    new, count = re.subn(r"(_[nt]\d+)_s0(?=_|$)", rf"\1_s{k}", name, count=1)
-    if not count:
+    """A seed-0 module's name for training seed k (k > 0; `run_sweep.with_module_seed`'s rule), e.g.
+    task_ring_goal_n300_s0_with_rot60 -> task_ring_goal_n300_s2_with_rot60."""
+    import run_sweep
+    new = run_sweep.with_module_seed(name, k)
+    if new == name:
         raise ValueError(f"{name}: no seed-0 tag (_n<N>_s0 or _t<seconds>_s0) to put seed {k} in place of")
     return new
 

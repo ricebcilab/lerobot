@@ -15,6 +15,8 @@ import yaml
 
 from .readout import adapter_spec, corruption_spec
 from lerobot.envs.cursor import obstacle_spec
+from lerobot.policies.cursor_flow import CursorFlowConfig
+from lerobot.policies.steering import FlowControlSteering, FlowReversalSteering
 from .paths import CONFIGS as CONFIG_DIR
 from .steering import GAIN_MODES, MODES, method_name
 
@@ -45,7 +47,7 @@ ARM_KEYS = {  # dotted YAML key -> parameter name
 }
 LAYOUT_KEYS = ("targets", "target_radius", "min_target_sep", "reach", "obstacle")  # the task parameters the layouts depend on
 MODE_ALIASES = {"shared_flow_control": "flow_control", "shared_flow_reversal_steering": "frs"}  # LeRobot's names
-CHUNK_STEPS = 16  # the policies' chunk length (FlowPolicy's horizon): flow_control's tau counts chunk steps
+CHUNK_STEPS = CursorFlowConfig.horizon  # the cursor policy's chunk length: flow_control's tau counts chunk steps
 PROTOCOL_DEFAULTS = {
     "blocks": {"trials": 40, "practice": 5, "order": "latin_square"},
     "trial": {"ready_hold_s": 0.3, "feedback_s": 0.6},
@@ -102,16 +104,16 @@ def validate_arm(params, where="arm"):
     steps = params["flow_steps"]
     if params["mode"] not in MODES:
         raise ValueError(f"{where}: control.mode must be one of {MODES}, got {params['mode']!r}")
-    if not 1 <= params["tau"] <= CHUNK_STEPS:  # Kao et al.: chunk steps whose initial condition carries the command
-        raise ValueError(f"{where}: control.tau must be in [1, {CHUNK_STEPS}] chunk steps, got {params['tau']}")
-    if not 0 <= params["lambda"] <= steps:  # the lab's variant: Euler steps the command's chunk is held for
-        raise ValueError(f"{where}: control.lambda must be in [0, {steps}] Euler steps, got {params['lambda']}")
+    # the cores' checks of the step knobs (Kao et al.'s tau: chunk steps whose initial condition carries the command;
+    # lambda: the Euler steps it is written at; FRS's depth and pinned prefix)
+    FlowControlSteering.check_steps(f"{where}: control.tau", params["tau"], 1, CHUNK_STEPS, "chunk steps")
+    FlowControlSteering.check_steps(f"{where}: control.lambda", params["lambda"], 0, steps, "Euler steps")
     if params["ic_gain"] <= 0:
         raise ValueError(f"{where}: control.ic_gain must be positive")
-    if params["n_reverse_steps"] is not None and not 1 <= params["n_reverse_steps"] <= steps:
-        raise ValueError(f"{where}: control.n_reverse_steps must be null or in [1, {steps}]")
-    if params["pinned_steps"] is not None and not 1 <= params["pinned_steps"] <= CHUNK_STEPS:
-        raise ValueError(f"{where}: control.pinned_steps must be null or in [1, {CHUNK_STEPS}] chunk steps")
+    FlowReversalSteering.check_steps(f"{where}: control.n_reverse_steps", params["n_reverse_steps"], 1, steps,
+                                     "Euler steps", optional=True)
+    FlowReversalSteering.check_steps(f"{where}: control.pinned_steps", params["pinned_steps"], 1, CHUNK_STEPS,
+                                     "chunk steps", optional=True)
     if params["speed_gain"] <= 0:
         raise ValueError(f"{where}: control.speed_gain must be positive")
     if params["gain_mode"] not in GAIN_MODES:

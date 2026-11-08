@@ -127,16 +127,19 @@ def setup():
         _perturb(ref.UserModule(policy.horizon), 1),
         _perturb(ref.TaskModule(policy.horizon), 2),
     )
-    new_user, new_task = _twin(old_user, steering.UserModule), _twin(old_task, steering.TaskModule)
+    new_user, new_task = (
+        _twin(old_user, lambda **c: core.LearnedUserModule(n_dims=2, **c)),
+        _twin(old_task, core.LearnedTaskModule),
+    )
     f = torch.eye(2) + 0.3 * torch.randn(B, 2, 2, generator=torch.Generator().manual_seed(3))
     adapters = {
         "none": (None, None),
         "per_trial_F": (f, f),
-        "user": (ref.ReversalAdapter(user=old_user), steering.ReversalAdapter(user=new_user)),
-        "task": (ref.ReversalAdapter(task=old_task), steering.ReversalAdapter(task=new_task)),
+        "user": (ref.ReversalAdapter(user=old_user), core.AdapterModules(user=new_user)),
+        "task": (ref.ReversalAdapter(task=old_task), core.AdapterModules(task=new_task)),
         "user_task": (
             ref.ReversalAdapter(user=old_user, task=old_task),
-            steering.ReversalAdapter(user=new_user, task=new_task),
+            core.AdapterModules(user=new_user, task=new_task),
         ),
     }
     # two of the six commands inside the deadband: their rows get the plain policy chunk
@@ -314,10 +317,10 @@ def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_pat
     obs, x, v, t = setup["obs"], torch.randn(B, 16, 2), torch.randn(B, 16, 2), torch.rand(B)
     expect = new_user(x, t) if kind == "user" else new_task(x, t, v, obs)
     for name, path in paths.items():
-        adapter = steering.ReversalAdapter.load(path)
+        adapter = core.AdapterModules.load(path)
         module = getattr(adapter, kind)
         assert adapter.kind == kind and isinstance(
-            module, core.LearnedUserModule if kind == "user" else steering.TaskModule
+            module, core.LearnedUserModule if kind == "user" else core.LearnedTaskModule
         ), name
         got = module(x, t) if kind == "user" else module(x, t, v, obs)
         for a, b in zip(

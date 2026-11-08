@@ -14,7 +14,7 @@ through the policy's flow), along the straight path from z_L to a_bci:
 
     U(x_t, t) P(x_t, t) = a_bci - z_L,   x_t = (1 - t) z_L + t a_bci
 
-so a full reversal of a_bci lands on z_L, which regenerates L. Two knobs set the module's flexibility (UserModule):
+so a full reversal of a_bci lands on z_L, which regenerates L. Two knobs set the module's flexibility (LearnedUserModule):
 `--step-rank r` builds every step's matrix from r matrices shared by the chunk, and `--cross-step-rank q` adds a
 rank-q coupling between the chunk's steps (`--cross-step-dims 0` or `0,1` picks the dims it couples; default both);
 the defaults (every step's matrix free, no coupling) are the grid's. They are saved in the module's config.
@@ -128,7 +128,7 @@ from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
 from cursor_sa.readout import DEADBAND, Readout, corruption_spec  # noqa: E402
 from cursor_sa.demos import (  # noqa: E402
-    DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, plan_reach,
+    DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, pad_steps, plan_reach,
 )
 from lerobot.envs.cursor import (RENDER_PALETTE, SCENE_SIZE, Layouts, TaskConfig, obstacle_spec, render_views,  # noqa: E402
                            sample_layouts)
@@ -136,8 +136,7 @@ from cursor_sa.paths import adapter_dir, adapter_path, policy_path  # noqa: E402
 from cursor_sa.policy import FlowPolicy  # noqa: E402
 from cursor_sa.dataset import SceneDataset, encoder_digest, store_name  # noqa: E402
 from cursor_sa.session import arm_task, readout_for, run_trials  # noqa: E402
-from cursor_sa.steering import (ReversalAdapter, TaskModule, UserModule, forward_flow, hide_goal,  # noqa: E402
-                                reverse_flow, to_action)
+from cursor_sa.steering import forward_flow, hide_goal, reverse_flow, to_action  # noqa: E402
 
 from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, AdapterModules, Flow,  # noqa: E402
                                        LearnedTaskModule, LearnedUserModule, SceneEncoder, active_rows)
@@ -169,8 +168,8 @@ def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
     teacher in the reversal, the hits kept until n are. Returns the layouts, the task, the actions [n, L, 2] (the
     planned steps, zero after each demonstration's length), the lengths [n] and info: drawn, kept, outcomes (counts
     over everything drawn) and records (the kept trials')."""
-    adapter = ReversalAdapter.load(adapter_path(args.teacher), device)
-    taught = obstacle_spec(AdapterModules.load_module(adapter_path(args.teacher))[2]["obstacle"])
+    adapter = AdapterModules.load(adapter_path(args.teacher), device)
+    taught = obstacle_spec(adapter.meta["obstacle"])
     if taught != obstacle_spec(obstacle):
         raise ValueError(f"--teacher {args.teacher} was trained on the obstacle {taught}, not this run's "
                          f"{obstacle_spec(obstacle)}: a teacher's rollouts are only demonstrations of its own obstacle")
@@ -201,10 +200,7 @@ def teacher_demos(args, obstacle, policy, device, rng, n, p_free=0.0):
     records = records[:n]
     layouts = (Layouts.concat(parts) if len(parts) > 1 else parts[0])[np.arange(n)]
     steps = [planned_steps(r["path"]) for r in records]
-    lengths = np.array([len(s) for s in steps])
-    actions = np.zeros((n, lengths.max(), 2))
-    for i, s in enumerate(steps):
-        actions[i, :len(s)] = s
+    lengths, actions = np.array([len(s) for s in steps]), pad_steps(steps)
     print(f"teacher {args.teacher}: kept {n} of {drawn} rollouts {outcomes} ({time.time() - tic:.0f}s)", flush=True)
     return layouts, task, actions, lengths, dict(drawn=drawn, kept=n, outcomes=outcomes, records=records)
 
@@ -319,7 +315,7 @@ def view_frames(args, layouts, actions, lengths, encoder, device, reduction=None
     variance share when fitted here, else None), reduction (the one used, or None) and seconds."""
     tic = time.time()
     demo, step, start = frame_steps(lengths, args.view_stride)
-    pos = layouts.start[:, None] + np.concatenate([np.zeros((len(actions), 1, 2)), np.cumsum(actions, 1)], 1)
+    pos = demo_positions(layouts, actions)
     spec = LearnedTaskModule.spec("vlm_views", args.render_size, wrist_span=args.wrist_span)
     rng = affine_rng if affine_rng is not None else np.random.default_rng([args.seed, 7])
     workers = args.render_workers
@@ -523,7 +519,7 @@ def closed_loop_splits(args, policy, model, device, rng):
             model=model, mode="frs", reversal_adapter={"user": name, "task": None}, n_reverse_steps=args.closed_loop_depth,
             corruption=args.corruption, input_noise=args.closed_loop_noise, obstacle=None, time_limit_s=args.closed_loop_time_limit,
             targets=list(args.targets), reach=list(args.reach)))
-        adapters, task = {name: ReversalAdapter.load(adapter_path(name), device)}, arm_task(arm)
+        adapters, task = {name: AdapterModules.load(adapter_path(name), device)}, arm_task(arm)
         tic, first = time.time(), len(records)
         for start in range(0, args.closed_loop_trials, 500):
             layouts = sample_layouts(rng, min(500, args.closed_loop_trials - start), tuple(args.targets), task)
@@ -537,9 +533,8 @@ def closed_loop_splits(args, policy, model, device, rng):
         val += list(range(len(records) - max(1, len(mine) // 10), len(records)))   # the last tenth of each module's trials
     layouts = Layouts.concat(parts) if len(parts) > 1 else parts[0]
     lengths = np.array([len(r["raw_commands"]) for r in records])
-    actions, raw = np.zeros((len(records), lengths.max(), 2)), np.zeros((len(records), lengths.max(), 2))
-    for b, r in enumerate(records):
-        actions[b, :lengths[b]], raw[b, :lengths[b]] = np.diff(np.asarray(r["path"]), axis=0), np.asarray(r["raw_commands"])
+    actions = pad_steps([np.diff(np.asarray(r["path"]), axis=0) for r in records])
+    raw = pad_steps([np.asarray(r["raw_commands"]) for r in records])
     train = np.setdiff1d(np.arange(len(records)), val)
     split = lambda idx: ClosedLoopData(layouts[idx], actions[idx], lengths[idx], raw[idx], policy, device, corruption, curl, rng, task)
     return {"train": split(train), "val": split(np.array(val))}
@@ -562,10 +557,6 @@ def bci_command(policy, push, core, sigma, noise=None):
 
 def draw_sigma(args, n, device):
     return args.sigma_min + (args.sigma_max - args.sigma_min) * torch.rand(n, device=device)
-
-
-def active_of(push):
-    return active_rows(push, DEADBAND)
 
 
 # ---------------------------------------------------------------- losses and checks
@@ -623,12 +614,12 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
     label does (cosine of their displacements, over active commands), with no module, the user module, and
     the task module with it (and how often the regenerated chunks collide)."""
     obs, chunk, push, core, _, _ = data.sample(n)
-    free, active = hide_goal(obs), active_of(push)
+    free, active = hide_goal(obs), active_rows(push, DEADBAND)
     bci = bci_command(policy, push, core, draw_sigma(args, n, push.device))
     out = {}
     variants = [("none", None, None), ("user", user, None)] + ([("composed", user, task)] if task is not None else [])
     for name, u, tm in variants:
-        adapter = ReversalAdapter(user=u, task=tm) if u is not None or tm is not None else None
+        adapter = AdapterModules(user=u, task=tm) if u is not None or tm is not None else None
         regen = Flow(lambda x, t_: policy(free, x, t_), None if adapter is None else adapter.field(free), noise_time=0.0,
                      batch_time=True).regenerate(bci, args.flow_steps) * policy.action_scale
         out[f"heading_cos_{name}"] = float(Flow.heading_cosine(regen, chunk, n_dims=2)[active].mean())
@@ -643,11 +634,13 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
 # Moved verbatim from lerobot.policies.steering (train_module, step_if_finite), which keeps no training loop.
 
 
-def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
-    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
-    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
+def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0,
+                    finite: bool = True) -> bool:
+    """One optimizer step, unless the loss (`finite`: whether it is, as the caller read it) or the clipped gradient
+    norm is not finite (a batch where a flow blew up): then the step is skipped and the weights stay whole. Returns
+    whether a step was taken."""
     opt.zero_grad(set_to_none=True)
-    if not torch.isfinite(loss):
+    if not finite:
         return False
     loss.backward()
     norm = nn.utils.clip_grad_norm_(list(params), clip)
@@ -679,9 +672,11 @@ def _train_module(
     running, skipped, tic = 0.0, 0, time.time()
     for step in range(1, steps + 1):
         loss = batch_loss(step)
-        skipped += not _step_if_finite(opt, loss, module.parameters(), clip)
+        value = loss.item()  # the step's one read of the loss
+        finite = math.isfinite(value)
+        skipped += not _step_if_finite(opt, loss, module.parameters(), clip, finite)
         sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
+        running += value if finite else 0.0
         if step % log_every == 0 or step == steps:
             module.eval()
             val = validate() if validate is not None else {}
@@ -727,18 +722,18 @@ def train_task(args, policy, device, rng):
                 torch.manual_seed(args.seed)
             data = expert_splits(args, obstacle_spec(e["obstacle"]), policy, device, rng, *corruption_spec(e["corruption"]),
                                  args.p_free, encoder)
-            pairs.append((data, ReversalAdapter.load(adapter_path(e["user_module"]), device).user.requires_grad_(False)))
+            pairs.append((data, AdapterModules.load(adapter_path(e["user_module"]), device).user.requires_grad_(False)))
     finally:
         if encoder is not None:
             encoder.close()
     views = dict(wrist_span=args.wrist_span, scene_rank=args.scene_rank or None) if args.token_source == "vlm_views" else {}
     if args.token_source in STORED_SCENE_SOURCES and args.scene_rank:
         views = dict(scene_rank=args.scene_rank)
-    task = TaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
-                      **LearnedTaskModule.spec(args.token_source, args.render_size, **views)).to(device)
+    task = LearnedTaskModule(policy.horizon, d=args.d, layers=args.layers, token_geometry=args.token_geometry,
+                             **LearnedTaskModule.spec(args.token_source, args.render_size, **views)).to(device)
     if views.get("scene_rank"):
         task.set_reduction(*(args.view_reduction if args.token_source == "vlm_views" else args.scene_reduction))
-    adapted = ReversalAdapter(task=task)
+    adapted = AdapterModules(task=task)
     parts = dict(step=0, fm=[], field=[])  # the window's loss parts, reported and cleared by validate
 
     def batch_loss(step):
@@ -755,9 +750,9 @@ def train_task(args, policy, device, rng):
             free = hide_goal(obs)
             latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps, adapted)
             bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), data["train"].noise_at(i, k))
-            weight = (active_of(push) & obs["obstacle_mask"].any(1)).float()  # on the obstacle-free layouts T stays I
+            weight = (active_rows(push, DEADBAND) & obs["obstacle_mask"].any(1)).float()  # on the obstacle-free layouts T stays I
             field = field_loss(policy, user, task, free, latent, bci, weight)
-            parts["field"].append(field.item())
+            parts["field"].append(field.detach())  # converted at log time (window_mean)
             loss = loss + args.lambda_field * field
         return loss
 
@@ -777,7 +772,7 @@ def train_task(args, policy, device, rng):
         return val
 
     def window_mean(values):
-        values = [v.item() if torch.is_tensor(v) else v for v in values]   # the parts are converted here, once a window
+        values = torch.stack(values).tolist() if values else []   # the parts' one read, once a window
         finite = [v for v in values if np.isfinite(v)]   # as train_loss, a non-finite batch adds nothing
         return float(np.mean(finite)) if finite else None
 
@@ -805,8 +800,8 @@ def train_user(args, policy, model, device, rng):
     corruption, curl = corruption_spec(args.corruption)
     data = expert_splits(args, None, policy, device, rng, corruption, curl)
     closed = closed_loop_splits(args, policy, model, device, np.random.default_rng(args.seed + 1)) if args.closed_loop else None
-    user = UserModule(policy.horizon, step_rank=args.step_rank, cross_step_rank=args.cross_step_rank,
-                      cross_step_dims=args.cross_step_dims).to(device)
+    user = LearnedUserModule(policy.horizon, n_dims=2, step_rank=args.step_rank, cross_step_rank=args.cross_step_rank,
+                             cross_step_dims=args.cross_step_dims).to(device)
 
     def batch_loss(step):
         noise = None
@@ -818,7 +813,7 @@ def train_user(args, policy, model, device, rng):
         free = hide_goal(obs)
         latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps)
         bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), noise)
-        return field_loss(policy, user, None, free, latent, bci, active_of(push).float())
+        return field_loss(policy, user, None, free, latent, bci, active_rows(push, DEADBAND).float())
 
     def validate():
         val = expert_check(policy, data["val"], args, user)

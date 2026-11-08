@@ -56,7 +56,7 @@ def _reference(seed, scale=0.1, **ranks):
 
 def _twin(old):
     """The example's UserModule with the reference's weights, through the core's checkpoint conversion."""
-    new = steering.UserModule(
+    new = core.LearnedUserModule(
         **core.AdapterModules.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict()}
         )["config"]
@@ -70,7 +70,7 @@ def test_a_fresh_module_draws_the_same_weights_as_the_cursor():
         torch.manual_seed(7)
         old = ref.UserModule(**ranks)
         torch.manual_seed(7)
-        new = steering.UserModule(**ranks)
+        new = core.LearnedUserModule(16, n_dims=2, **ranks)
         assert old.state_dict().keys() == new.state_dict().keys(), ranks
         assert all(torch.equal(old.state_dict()[k], new.state_dict()[k]) for k in old.state_dict()), ranks
 
@@ -90,7 +90,7 @@ def test_velocity_matches_the_cursor(exact, ranks):
         _close(new.velocity(x, t, v), old.velocity(x, t, v), exact)
         _close(core.LearnedUserModule.apply_correction(new, x, t, v), ref.user_velocity(old, x, t, v), exact)
         _close(
-            steering.ReversalAdapter(user=new).adapt({}, x, t, v, backward=True),
+            core.AdapterModules(user=new).adapt({}, x, t, v, backward=True),
             ref.ReversalAdapter(user=old).adapt({}, x, t, v, backward=True),
             exact,
         )
@@ -113,7 +113,7 @@ def test_reversal_through_the_policy_matches_the_cursor(exact, ranks):
     }
     chunk = 0.5 * torch.randn(4, policy.horizon, 2, generator=g)
     old_z = ref.reverse_flow(policy, obs, chunk, 10, 10, ref.ReversalAdapter(user=old))
-    new_z = steering.reverse_flow(policy, obs, chunk, 10, 10, steering.ReversalAdapter(user=new))
+    new_z = steering.reverse_flow(policy, obs, chunk, 10, 10, core.AdapterModules(user=new))
     assert (
         torch.isfinite(old_z).all()
         and (old_z - steering.reverse_flow(policy, obs, chunk, 10, 10)).abs().max() > 1e-3
@@ -129,7 +129,7 @@ def test_a_cursor_checkpoint_loads_into_the_same_module(exact, tmp_path):
         ),
         tmp_path / "adapter.pt",
     )
-    new = steering.ReversalAdapter.load(tmp_path / "adapter.pt").user
+    new = core.AdapterModules.load(tmp_path / "adapter.pt").user
     assert new.config == {
         "horizon": 16,
         "n_dims": 2,

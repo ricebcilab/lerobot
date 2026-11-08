@@ -33,6 +33,7 @@ from lerobot.policies.steering import (
     FlowControlSteering,
     FlowReversalSteering,
     ReversalAdapter,
+    SampleChunkSampler,
 )
 
 STEPS, CHUNK = 10, 6
@@ -81,25 +82,16 @@ class FieldFlowPolicy(FlowPolicy):
         return self.field(x, t)
 
 
-class CursorSampler:
-    """The cursor example's sampler (``cursor_sa.steering.CursorSampler``): ``FlowPolicy.sample_chunk`` behind
+class CursorSampler(SampleChunkSampler):
+    """The cursor example's sampler (the package's ``SampleChunkSampler``): ``FlowPolicy.sample_chunk`` behind
     pi0.5's interface, noise at t = 0, from a fixed noise."""
 
     def __init__(self, policy, noise):
-        self.policy, self.noise = policy, noise
-        self.config = SimpleNamespace(
-            num_inference_steps=STEPS,
-            chunk_size=CHUNK,
-            max_action_dim=noise.shape[-1],
-            n_action_steps=2,
-            noise_time=0.0,
-        )
-
-    def reset(self):
-        pass
+        super().__init__(policy, STEPS, CHUNK, noise.shape[-1], 2)
+        self.noise = noise
 
     def predict_action_chunk(self, obs, **hooks):
-        return self.policy.sample_chunk(obs, STEPS, noise=self.noise.clone(), **hooks)
+        return super().predict_action_chunk(obs, noise=self.noise.clone(), **hooks)
 
 
 def fields(dims, seed=0):

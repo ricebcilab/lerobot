@@ -1,15 +1,16 @@
 """The cursor checkpoints in both formats: the cursor project's .pt files and the converted lerobot ones
 (convert_checkpoints.py). FlowPolicy.load reads both with the same results; adapters are read in lerobot's format
-(ReversalAdapter.load is AdapterModules.load_module), which the trainer writes and the converter produces from old files."""
+(AdapterModules.load reads AdapterModules.load_module's format), which the trainer writes and the converter produces from old files."""
 
 import convert_checkpoints
 import pytest
 import torch
 from cursor_sa import paths
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_checkpoint
-from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule, steered_chunk
+from cursor_sa.steering import steered_chunk
 
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
 
 def _obs(b=3, n=5, k=2):
@@ -91,7 +92,7 @@ def test_policy_chunk_is_the_lerobot_policy_chunk(tmp_path):
 
 
 def test_converted_adapters_load_as_before(tmp_path):
-    user, task = _perturb(UserModule(), 1), _perturb(TaskModule(), 2)
+    user, task = _perturb(LearnedUserModule(16, n_dims=2), 1), _perturb(LearnedTaskModule(), 2)
     old_user = {
         k: user.config[k] for k in ("horizon", "d", "tdim")
     }  # the cursor's user config, saved without kind
@@ -113,14 +114,14 @@ def test_converted_adapters_load_as_before(tmp_path):
         (tmp_path / "adapters" / name).mkdir(parents=True)
         torch.save(ckpt, tmp_path / "adapters" / name / "adapter.pt")
     frozen = lambda m: m.eval().requires_grad_(False)  # as load_module serves them  # noqa: E731
-    before = {"u": ReversalAdapter(user=frozen(user)), "t": ReversalAdapter(task=frozen(task))}
+    before = {"u": AdapterModules(user=frozen(user)), "t": AdapterModules(task=frozen(task))}
     assert convert_checkpoints.convert_tree(tmp_path) == {
         "policies": 0,
         "adapters": 2,
         "tasks": 1,
         "skipped": 0,
     }
-    after = {n: ReversalAdapter.load(tmp_path / "adapters" / n / "adapter.pt") for n in ("u", "t")}
+    after = {n: AdapterModules.load(tmp_path / "adapters" / n / "adapter.pt") for n in ("u", "t")}
     obs, x, t, v = _obs(), torch.randn(3, 16, 2), torch.rand(3), torch.randn(3, 16, 2)
     for n in ("u", "t"):
         assert after[n].kind == before[n].kind
@@ -133,7 +134,7 @@ def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_modu
 
     torch.manual_seed(0)
     policy = FlowPolicy(d_model=32, layers=1, heads=2, d_ff=64, action_scale=0.0077).eval()
-    user, task = _perturb(UserModule(), 1), _perturb(TaskModule(), 2)
+    user, task = _perturb(LearnedUserModule(16, n_dims=2), 1), _perturb(LearnedTaskModule(), 2)
     for name, kind, module in (("u", "user", user), ("group/t", "task", task)):
         AdapterModules.save_module(
             module, tmp_path / "adapters" / name / "adapter.pt", kind, meta={"args": {}}
@@ -150,7 +151,7 @@ def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_modu
         assert folder.joinpath("adapter.pt").read_bytes() == before[n]  # adapter.pt stays as it was
         steering = SteeringPolicy.from_pretrained(folder, base_policy=policy)
         assert (steering.config.mode, steering.config.base_policy_path) == ("frs", str(tmp_path / "base"))
-        adapter = ReversalAdapter.load(folder / "adapter.pt")  # before the seed: building a module draws
+        adapter = AdapterModules.load(folder / "adapter.pt")  # before the seed: building a module draws
         torch.manual_seed(3)
         want = steered_chunk(policy, obs, command, "frs", adapter=adapter)
         torch.manual_seed(3)

@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa, run_s
 
 from cursor_sa import paths as cursor_paths  # noqa: E402
 from cursor_sa.agents import make_agent  # noqa: E402
+from cursor_sa.records import summarize  # noqa: E402
 from lerobot.envs.cursor import TaskConfig, layouts_on_screen, move_layouts, obstacle_spec  # noqa: E402
 from cursor_sa.session import load_checkpoints  # noqa: E402
 from run_sweep import attach_scene, load_sweep, method_arm, run_cell_batch, scene_sources  # noqa: E402
@@ -90,9 +91,8 @@ def context_cell(sweep, context):
 
 
 def rates(records):
-    outcomes = [r["outcome"] for r in records]
-    return dict(hits=outcomes.count("hit") / len(outcomes), collision=outcomes.count("collision") / len(outcomes),
-                n=len(outcomes))
+    s = summarize(records)
+    return dict(hits=s["success"], collision=s["collision"], n=s["n"])
 
 
 def table(results, arms):

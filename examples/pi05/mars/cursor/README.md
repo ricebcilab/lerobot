@@ -281,7 +281,7 @@ Main parameters (`control:` and `task:` sections):
   pass then runs n steps of the policy's own 1/N from where the reversal stopped. The cursor and the robot run one
   implementation of each method: the cursor's chunks come from lerobot's `FlowControlSteering` and
   `FlowReversalSteering`, the cores pi0.5 uses, driving the cursor policy through pi0.5's sampler interface
-  (`CursorSampler` over `FlowPolicy.sample_chunk`), and one operator readout (`lerobot.teleoperators.readout`:
+  (lerobot's `SampleChunkSampler` over `FlowPolicy.sample_chunk`), and one operator readout (`lerobot.teleoperators.readout`:
   corruption, curl, noise, deadband). Until 2026-10-31 the cursor's forward pass took N − n steps instead, coarse at
   large depths, so earlier partial-reversal results are not comparable.
   FRS keeps the full reversal, Tang et al.'s method, and tunes `pinned_steps` (their `action_repeats`, fixed at
@@ -293,10 +293,10 @@ Main parameters (`control:` and `task:` sections):
   tau: s}`: a curl field on the command (the dynamics of the cursor curl below, acting on what the
   controller gets instead of on the cursor: the served command is a velocity driven by the push,
   turned clockwise by atan(τb) and slowed by 1/√(1 + (τb)²) at steady state, from rest each trial).
-- `reversal_adapter`: a `ReversalAdapter` (`cursor_sa/steering.py`) with up to two modules. The
-  **user module** (a fixed F = M, or a trained `UserModule` U(x_t, t)) multiplies the policy's
+- `reversal_adapter`: lerobot's `AdapterModules` (composed in `cursor_sa/session.py`) with up to two modules. The
+  **user module** (a fixed F = M, or a trained `LearnedUserModule` U(x_t, t)) multiplies the policy's
   velocity in the backward pass of the reversal only (frs): it undoes the user's command corruption.
-  The **task module** (`TaskModule`: A(x_t, t, v, obstacles)·v + b, from obstacle tokens seen from
+  The **task module** (`LearnedTaskModule`: A(x_t, t, v, obstacles)·v + b, from obstacle tokens seen from
   the cursor) — the tokens come from the disc parameters or, with `token_source` `vlm_image` (π0.5's frozen vision tokens) or `cnn` (a small encoder trained with the module), from a rendered image of the scene — acts in both directions, so it reshapes every chunk the controller produces — in every
   mode, and the `expert_chunk` agent's intent — toward a task the frozen policy never saw. The
   forward field is task(v), the backward field user(task(v)); the two are trained apart and composed
@@ -406,7 +406,7 @@ checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapte
 `adapters/refit/` and `adapters/data_efficiency/`, and are not distributed.
 
 `train_adapter.py` writes `adapter.pt` in lerobot's `AdapterModules.save_module` format (kind, config, weights, meta),
-which `ReversalAdapter.load` (lerobot's `AdapterModules.load`) reads; the policy trainer still writes the cursor
+which `AdapterModules.load` reads; the policy trainer still writes the cursor
 project's `policy.pt`, which `FlowPolicy.load` reads alongside lerobot's format, so a fresh policy works before
 it is converted. After training a policy, rerun `convert_checkpoints.py`: its folder becomes a `cursor_flow`
 policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`). The converter also

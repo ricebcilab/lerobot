@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import ReversalAdapter, observation, steered_chunk
+from cursor_sa.steering import observation, steered_chunk
 from train import train_adapter
 
 from lerobot.envs.cursor import TaskConfig, obstacle_spec, sample_layouts
@@ -68,7 +68,7 @@ def _adapters(kind, paths):
         "adapter_user": user_path if user is not None else None,
         "adapter_task": task_path if task is not None else None,
     }
-    return ReversalAdapter(user=user, task=task), spec
+    return AdapterModules(user=user, task=task), spec
 
 
 @pytest.mark.parametrize("adapter", ADAPTERS)

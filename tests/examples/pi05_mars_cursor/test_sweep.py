@@ -12,6 +12,7 @@ from _view_stub import ViewStub
 from cursor_sa import config
 from cursor_sa.agents import ExpertChunkAgent
 from cursor_sa.readout import Readout
+import lerobot.envs.cursor
 from lerobot.envs.cursor import TaskConfig, sample_layouts
 from cursor_sa.policy import FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
@@ -284,7 +285,7 @@ def test_scene_cache_is_keyed_by_cell_split_source_size_and_the_digest(tmp_path,
     for changed, size in ((_lay(seed=1), 64), (_lay(), 32), (obstructed, 64)):  # another draw, size, render
         attach_scene(changed, {"cnn": size}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
     assert len(_files(tmp_path)) == 4
-    monkeypatch.setitem(run_sweep.RENDER_PALETTE, "obstacle", (1, 2, 3))  # the dict render_layouts draws with
+    monkeypatch.setitem(lerobot.envs.cursor.RENDER_PALETTE, "obstacle", (1, 2, 3))  # the dict render_layouts draws with
     attach_scene(_lay(), {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
     assert len(_files(tmp_path)) == 5
 

@@ -9,10 +9,9 @@ from cursor_sa.agents import ExpertChunkAgent
 from lerobot.envs.cursor import TaskConfig, sample_layouts
 from cursor_sa.paths import adapter_path
 from cursor_sa.policy import FlowPolicy
-from lerobot.policies.steering import LearnedUserModule
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
-from cursor_sa.steering import (ReversalAdapter, SharedController, TaskModule, UserModule, flow,
-                                forward_flow, reverse_flow, steered_chunk)
+from cursor_sa.steering import SharedController, flow, forward_flow, reverse_flow, steered_chunk
 
 MODES = ("policy", "flow_control", "frs")
 
@@ -30,7 +29,7 @@ def _obs(B=3, N=5, hist=4, obstacles=0):
 
 
 def _perturbed_task(seed=1):
-    task = TaskModule()
+    task = LearnedTaskModule()
     torch.manual_seed(seed)
     torch.nn.init.normal_(task.out.weight, std=0.3)
     torch.nn.init.normal_(task.out.bias, std=0.3)
@@ -45,7 +44,7 @@ def _chunk(model, obs, mode, command, adapter=None, seed=1):
 def test_fresh_task_module_is_the_identity_in_every_mode():
     model, obs = FlowPolicy().eval(), _obs(obstacles=2)
     command = torch.tensor([[0.8, 0.0], [0.0, -0.5], [0.3, 0.3]])
-    fresh = ReversalAdapter(task=TaskModule()).eval()
+    fresh = AdapterModules(task=LearnedTaskModule()).eval()
     assert fresh.kind == "task"
     for mode in MODES:
         torch.testing.assert_close(_chunk(model, obs, mode, command, fresh), _chunk(model, obs, mode, command))
@@ -58,7 +57,7 @@ def test_fresh_task_module_is_the_identity_in_every_mode():
 def test_composed_adapter_applies_task_forward_and_user_task_backward():
     model, obs = FlowPolicy().eval(), _obs(obstacles=2)
     task, F = _perturbed_task(), torch.diag(torch.tensor([1.0, 0.5]))
-    adapter = ReversalAdapter(task=task, matrix=F).eval()
+    adapter = AdapterModules(task=task, matrix=F).eval()
     assert adapter.kind == "composed"
     x, t = torch.randn(3, model.horizon, 2), torch.full((3,), 0.4)
     with torch.no_grad():
@@ -77,18 +76,18 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
         back = torch.einsum("ij,bsj->bsi", F, torch.einsum("bsij,bsj->bsi", A1, v1) + b1)
         torch.testing.assert_close(reverse_flow(model, obs, x, 1, 10, adapter), x - 0.1 * back)
     # a user-only adapter leaves the forward pass alone
-    user_only = ReversalAdapter(matrix=F)
+    user_only = AdapterModules(matrix=F)
     torch.testing.assert_close(forward_flow(model, obs, x, 0.0, 1.0, 10, user_only), forward_flow(model, obs, x, 0.0, 1.0, 10))
     # the flow core is differentiable (the trainers' path), the wrappers are not
     model.requires_grad_(False)
-    user = UserModule()
-    flow(model, obs, x, 1.0, -0.1, 3, ReversalAdapter(user=user)).sum().backward()
+    user = LearnedUserModule(16, n_dims=2)
+    flow(model, obs, x, 1.0, -0.1, 3, AdapterModules(user=user)).sum().backward()
     assert user.net[-1].weight.grad is not None and user.net[-1].weight.grad.abs().sum() > 0
-    assert not reverse_flow(model, obs, x, 3, 10, ReversalAdapter(user=user)).requires_grad
+    assert not reverse_flow(model, obs, x, 3, 10, AdapterModules(user=user)).requires_grad
 
 
 def test_old_adapter_checkpoint_loads_as_a_user_only_adapter():
-    adapter = ReversalAdapter.load(adapter_path("learned_adapter/gain025y_free"))
+    adapter = AdapterModules.load(adapter_path("learned_adapter/gain025y_free"))
     assert adapter.kind == "user" and adapter.task is None and isinstance(adapter.user, LearnedUserModule)
     model, obs = FlowPolicy().eval(), _obs()
     x = torch.randn(3, model.horizon, 2)
@@ -119,14 +118,14 @@ def test_adapter_specs_accept_single_and_composite_forms(tmp_path, monkeypatch):
         config.load_arm("base.yaml", {"reversal_adapter": {"bogus": 1}})
 
     # tiny checkpoints of both kinds, assembled into one composed adapter by the session
-    for name, module, kind in (("tiny_user", UserModule(), "user"), ("tiny_task", TaskModule(), "task")):
+    for name, module, kind in (("tiny_user", LearnedUserModule(16, n_dims=2), "user"), ("tiny_task", LearnedTaskModule(), "task")):
         (tmp_path / name).mkdir()
         torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args={}), tmp_path / name / "adapter.pt")
     monkeypatch.setattr(session, "adapter_path", lambda name: tmp_path / name / "adapter.pt")
     policies, adapters = session.load_checkpoints({"a": both, "b": fixed, "c": task_only}, "cpu")
     assert set(adapters) == {"tiny_user", "tiny_task"}
     composed = session.arm_adapter(both, adapters)
-    assert composed.kind == "composed" and isinstance(composed.user, LearnedUserModule) and isinstance(composed.task, TaskModule)
+    assert composed.kind == "composed" and isinstance(composed.user, LearnedUserModule) and isinstance(composed.task, LearnedTaskModule)
     with_fixed = session.arm_adapter(fixed, adapters)
     assert with_fixed.kind == "user" and with_fixed.user is None and with_fixed.matrix is not None
     assert session.arm_adapter(task_only, adapters).kind == "task"  # served in every mode
@@ -140,8 +139,8 @@ def test_expert_chunk_plans_through_the_adapted_field():
     policy = policies[arm["model"]]
     layouts = sample_layouts(np.random.default_rng(2), 3, 4, TaskConfig())
     plain = SharedController(policy, layouts, "teleop", steps=10, execute=2)
-    adapted = SharedController(policy, layouts, "teleop", steps=10, execute=2, adapter=ReversalAdapter(task=_perturbed_task()))
-    fresh = SharedController(policy, layouts, "teleop", steps=10, execute=2, adapter=ReversalAdapter(task=TaskModule()))
+    adapted = SharedController(policy, layouts, "teleop", steps=10, execute=2, adapter=AdapterModules(task=_perturbed_task()))
+    fresh = SharedController(policy, layouts, "teleop", steps=10, execute=2, adapter=AdapterModules(task=LearnedTaskModule()))
     agent = ExpertChunkAgent()
     agent.reset(3)
     torch.manual_seed(0)

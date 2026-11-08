@@ -35,7 +35,7 @@ from reportlab.platypus import (Image, KeepTogether, ListFlowable, ListItem, Par
                                 Spacer, Table, TableStyle)
 
 from analyze_results import find_runs, load_trials  # noqa: E402
-from cursor_sa.records import ARM_ALIASES
+from cursor_sa.records import summarize  # noqa: E402
 from cursor_sa.analysis import (GRID, INK, INK_2, aligned_path, bootstrap_mean, cumulative_hits, paired_lead,  # noqa: E402
                                 path_efficiency, style)
 from cursor_sa.paths import REPORTS, RESULTS  # noqa: E402
@@ -91,12 +91,10 @@ def arm_stats(trials, arms, focus, rng):
     for arm in arms:
         rs = [r for r in trials if r["arm"] == arm]
         hits = [r["outcome"] == "hit" for r in rs]
-        times = [r["duration_s"] for r in rs if r["outcome"] == "hit"]
         eff = [e for e in (path_efficiency(r) for r in rs) if e is not None]
-        out[arm] = dict(n=len(rs), success=bootstrap_mean(hits, rng), wrong=np.mean([r["outcome"] == "wrong_target" for r in rs]),
-                        collision=np.mean([r["outcome"] == "collision" for r in rs]),
-                        timeout=np.mean([r["outcome"] == "timeout" for r in rs]), time_s=float(np.median(times)) if times else None,
-                        efficiency=float(np.median(eff)) if eff else None,
+        s = summarize(rs)
+        out[arm] = dict(n=s["n"], success=bootstrap_mean(hits, rng), wrong=s["wrong"], collision=s["collision"],
+                        timeout=s["timeout"], time_s=s["time_s"], efficiency=float(np.median(eff)) if eff else None,
                         lead=paired_lead(trials, focus, arm, rng) if arm != focus else None)
     return out
 
@@ -383,11 +381,7 @@ def load(args, participant):
     runs = find_runs(args.results, [participant], args.protocol)
     if not runs:
         sys.exit(f"no {args.protocol} runs for {participant} under {args.results}")
-    trials, arms_seen = load_trials(runs)
-    manifests = [json.loads((r[2] / "manifest.json").read_text()) for r in runs]
-    for m in manifests:  # sessions recorded before the rename name the arm differently; the files keep their names
-        m["block_order"] = [ARM_ALIASES.get(a, a) for a in m["block_order"]]
-    return trials, arms_seen, manifests
+    return load_trials(runs, with_manifests=True)  # the manifests with today's arm names, as load_run reads them
 
 
 def arm_order(arms_seen):

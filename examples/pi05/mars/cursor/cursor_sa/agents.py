@@ -38,11 +38,12 @@ def pursuit_index(pos, pts, valid, discs, dmask):
     """For each row, the index of the farthest valid point of its route pts [n, P, 2] (valid where
     `valid` [n, P]) whose straight line from pos [n, 2] clears every disc of discs [n, K, 3] (valid
     where dmask [n, K]); -1 where none does."""
-    d = pts - pos[:, None]                                          # [n, P, 2]
-    rel = discs[:, None, :, :2] - pos[:, None, None]                # [n, 1, K, 2]
-    dd = np.maximum((d * d).sum(-1), 1e-12)[..., None]              # [n, P, 1]
-    tau = np.clip((rel * d[:, :, None]).sum(-1) / dd, 0.0, 1.0)     # [n, P, K]
-    gap2 = ((rel - tau[..., None] * d[:, :, None]) ** 2).sum(-1)    # [n, P, K]
+    # the 2-vectors as their components (the same sums as reductions over the length-2 axis, without them)
+    dx, dy = (pts[..., 0] - pos[:, None, 0])[..., None], (pts[..., 1] - pos[:, None, 1])[..., None]   # [n, P, 1]
+    rx, ry = discs[:, None, :, 0] - pos[:, None, None, 0], discs[:, None, :, 1] - pos[:, None, None, 1]  # [n, 1, K]
+    dd = np.maximum(dx * dx + dy * dy, 1e-12)                       # [n, P, 1]
+    tau = np.clip((rx * dx + ry * dy) / dd, 0.0, 1.0)               # [n, P, K]
+    gap2 = (rx - tau * dx) ** 2 + (ry - tau * dy) ** 2              # [n, P, K]
     blocked = ((gap2 < discs[:, None, :, 2] ** 2) & dmask[:, None]).any(-1)
     return np.where(valid & ~blocked, np.arange(pts.shape[1]), -1).max(-1)
 

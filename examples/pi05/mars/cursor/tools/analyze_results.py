@@ -51,15 +51,18 @@ def find_runs(results, participants=None, protocol=None):
     return runs
 
 
-def load_trials(runs):
-    trials, arms_in_order = [], []
+def load_trials(runs, with_manifests=False):
+    """The runs' trials (practice and aborted ones left out) and their arms in first-seen order; `with_manifests`
+    adds the runs' manifests, as `load_run` reads them (today's arm names)."""
+    trials, arms_in_order, manifests = [], [], []
     for participant, run, rdir in runs:
         manifest, records = load_run(rdir)
+        manifests.append(manifest)
         for arm in manifest["block_order"]:
             if arm not in arms_in_order:
                 arms_in_order.append(arm)
         trials += [r for r in records if not r["practice"] and r["outcome"] != "aborted"]
-    return trials, arms_in_order
+    return (trials, arms_in_order, manifests) if with_manifests else (trials, arms_in_order)
 
 
 def by_arm(trials):

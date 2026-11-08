@@ -14,29 +14,28 @@ the specs that configure it and re-exports the rest.
 
 import numpy as np
 
+from lerobot.policies.steering import SteeringConfig
 from lerobot.teleoperators.readout import DEADBAND, Readout, add_noise, corrupt, curl_step, is_active  # noqa: F401
 
 
 def matrix_spec(spec, where="matrix"):
-    """2x2 matrix from a spec, or None for a null spec. Forms, as in LeRobot:
-    {scale: [sx, sy]} (per-axis gain), {rotation_deg: d}, {M: rows}, or bare rows."""
+    """2x2 matrix from a spec, or None for a null spec. Forms, as in LeRobot (`SteeringConfig.translation`'s, in
+    the plane): {scale: [sx, sy]} (per-axis gain), {rotation_deg: d} (`SteeringConfig.rotation`'s top-left block),
+    {M: rows}, or bare rows; checked by `SteeringConfig.checked_matrix`."""
     if spec is None:
         return None
     if isinstance(spec, dict):
         if set(spec) == {"scale"}:
             m = np.diag(np.asarray(spec["scale"], dtype=float))
         elif set(spec) == {"rotation_deg"}:
-            c, s = np.cos(np.radians(spec["rotation_deg"])), np.sin(np.radians(spec["rotation_deg"]))
-            m = np.array([[c, -s], [s, c]])
+            m = np.ascontiguousarray(SteeringConfig.rotation(spec["rotation_deg"])[:2, :2])
         elif set(spec) == {"M"}:
-            m = np.asarray(spec["M"], dtype=float)
+            m = spec["M"]
         else:
             raise ValueError(f"{where}: expected exactly one of scale, rotation_deg or M, got {sorted(spec)}")
     else:
-        m = np.asarray(spec, dtype=float)
-    if m.shape != (2, 2) or not np.all(np.isfinite(m)):
-        raise ValueError(f"{where}: expected a finite 2x2 matrix, got {spec!r}")
-    return m
+        m = spec
+    return SteeringConfig.checked_matrix(m, 2, where)
 
 
 def corruption_spec(spec, where="control.corruption"):

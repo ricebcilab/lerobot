@@ -9,25 +9,21 @@ RESULTS = ROOT.parent / "results"
 REPORTS = ROOT / "reports"
 
 
-def policy_dir(name):
-    return CHECKPOINTS / "policies" / name
-
-
 def policy_path(name):
     """The policy checkpoint: its directory, a lerobot policy (config.json + model.safetensors, see
     convert_checkpoints.py); FlowPolicy.load reads it, and a trainer's unconverted policy.pt in it."""
-    return policy_dir(name)
+    return CHECKPOINTS / "policies" / name
 
 
 def policy_weights(name):
     """The file holding the policy's weights (for the session manifest's hash): an unconverted policy.pt
     if there is one (FlowPolicy.load reads it first), else model.safetensors."""
-    pt = policy_dir(name) / "policy.pt"
-    return pt if pt.is_file() else policy_dir(name) / "model.safetensors"
+    pt = policy_path(name) / "policy.pt"
+    return pt if pt.is_file() else policy_path(name) / "model.safetensors"
 
 
 def policy_log(name):
-    return policy_dir(name) / "train_log.json"
+    return policy_path(name) / "train_log.json"
 
 
 def adapter_dir(name):

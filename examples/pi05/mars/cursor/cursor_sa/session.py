@@ -25,7 +25,8 @@ from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import FlowPolicy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
                       outcome_of, read_manifest, read_records, rounded, trial_record, write_manifest)
-from .steering import ReversalAdapter, SharedController, view_scene_fn
+from .steering import SharedController, view_scene_fn
+from lerobot.policies.steering import AdapterModules
 
 
 class Aborted(Exception):
@@ -101,14 +102,15 @@ def arm_task(arm):
 def load_checkpoints(arms, device):
     """One policy per model name and one adapter checkpoint per name the arms reference."""
     policies = {name: FlowPolicy.load(policy_path(name), device) for name in {a["model"] for a in arms.values()}}
-    adapters = {name: ReversalAdapter.load(adapter_path(name), device)
+    adapters = {name: AdapterModules.load(adapter_path(name), device)
                 for name in {n for a in arms.values() for n in config.adapter_names(a)}}
     return policies, adapters
 
 
 def adapter_checkpoints(arms):
     """'adapters/<name>' -> file hash for every adapter checkpoint the arms reference."""
-    return {f"adapters/{n}": file_sha256(adapter_path(n)) for a in arms.values() for n in config.adapter_names(a)}
+    names = dict.fromkeys(n for a in arms.values() for n in config.adapter_names(a))  # each checkpoint hashed once
+    return {f"adapters/{n}": file_sha256(adapter_path(n)) for n in names}
 
 
 def arm_adapter(arm, adapters):
@@ -120,9 +122,9 @@ def arm_adapter(arm, adapters):
     if isinstance(names, str):
         return adapters[names]
     if isinstance(names, dict):
-        return ReversalAdapter(user=adapters[names["user"]].user if names["user"] else None,
-                               task=adapters[names["task"]].task if names["task"] else None)
-    return None if arm["adapter_matrix"] is None else ReversalAdapter(matrix=arm["adapter_matrix"])
+        return AdapterModules(user=adapters[names["user"]].user if names["user"] else None,
+                              task=adapters[names["task"]].task if names["task"] else None)
+    return None if arm["adapter_matrix"] is None else AdapterModules(matrix=arm["adapter_matrix"])
 
 
 def readout_for(arm, rng=None, input_noise=None, off=False):
@@ -237,7 +239,8 @@ class Run:
         self.policies = self.adapters = None
 
     def manifest(self):
-        checkpoints = {f"policies/{a['model']}": file_sha256(policy_weights(a["model"])) for a in self.arms.values()}
+        models = dict.fromkeys(a["model"] for a in self.arms.values())  # each policy hashed once
+        checkpoints = {f"policies/{m}": file_sha256(policy_weights(m)) for m in models}
         checkpoints.update(adapter_checkpoints(self.arms))
         return dict(participant=self.participant, session=self.session, run=self.run_name,
                     protocol=self.protocol, arms={k: arm_fields(v) for k, v in self.arms.items()},

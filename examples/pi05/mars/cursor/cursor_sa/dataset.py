@@ -33,6 +33,8 @@ from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERS
 from lerobot.policies.steering import VLM_SCENE_DIM, VLM_SCENE_TOKENS
 from lerobot.policies.steering.processor_steering import SCENE_PROMPT, STORED_SCENE_SOURCES, SceneEncoder
 
+from .records import atomic_write_json
+
 ENCODE_CHUNK = 256  # layouts rendered and encoded at a time
 
 
@@ -43,14 +45,25 @@ def encoder_digest(vlm_path: str) -> str:
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
+def render_spec(size: int) -> dict:
+    """What `render_layouts` draws a layout with at `size`: the size, the palette, the supersampling and the radii (the
+    render part of the digests here and of the sweep's `scene_digest`)."""
+    return dict(size=size, palette=RENDER_PALETTE, supersample=RENDER_SUPERSAMPLE, target_radius=RENDER_TARGET_RADIUS,
+                min_radius=RENDER_MIN_RADIUS)
+
+
+def array_head(a, rows: bool = False) -> bytes:
+    """The dtype and shape every digest hashes before an array's bytes (`rows`: of one of its rows)."""
+    return f"{a.dtype.str}{a.shape[1:] if rows else a.shape}".encode()
+
+
 def layout_digests(layouts, size: int) -> list[str]:
     """Every layout's digest: the first 16 hex digits of a sha256 over its start, targets, mask, goal, obstacles and
     obstacle mask (each row's dtype, shape and bytes) and the render spec (`render_layouts` at `size`)."""
-    spec = json.dumps(dict(size=int(size), palette=RENDER_PALETTE, supersample=RENDER_SUPERSAMPLE,
-                           target_radius=RENDER_TARGET_RADIUS, min_radius=RENDER_MIN_RADIUS), sort_keys=True).encode()
+    spec = json.dumps(render_spec(int(size)), sort_keys=True).encode()
     arrays = [np.ascontiguousarray(a) for a in (layouts.start, layouts.targets, layouts.mask, layouts.goal,
                                                  layouts.obstacles, layouts.obstacle_mask)]
-    heads = [f"{a.dtype.str}{a.shape[1:]}".encode() for a in arrays]
+    heads = [array_head(a, rows=True) for a in arrays]
     out = []
     for b in range(len(layouts)):
         h = hashlib.sha256()
@@ -114,18 +127,12 @@ class SceneDataset:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
     def _write_index(self, index: dict[str, int]) -> None:
-        file = self._path / "index.json"
-        tmp = file.with_name(f"index.json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(index))
-        os.replace(tmp, file)
+        atomic_write_json(self._path / "index.json", index)
 
     def _write_meta(self) -> None:
-        meta = dict(rows=self.n_rows, tokens=self.tokens, width=self.width, dtype="float16", source=self.source,
-                    size=self.size, encoder=self.encoder_path, encoder_digest=self.encoder_digest)
-        file = self._path / "meta.json"
-        tmp = file.with_name(f"meta.json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(meta, indent=1))
-        os.replace(tmp, file)
+        atomic_write_json(self._path / "meta.json", dict(rows=self.n_rows, tokens=self.tokens, width=self.width,
+                                                         dtype="float16", source=self.source, size=self.size,
+                                                         encoder=self.encoder_path, encoder_digest=self.encoder_digest))
 
     def _append(self, digests: list[str], tokens: np.ndarray) -> None:
         """Rows for `digests` (not stored when another writer stored them meanwhile), then the index, then the meta."""

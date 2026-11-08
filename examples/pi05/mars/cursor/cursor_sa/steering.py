@@ -30,14 +30,16 @@ MAX_SPEED at full deflection. In the shared modes the executed action is always
 the policy's own output, and a command inside DEADBAND means the plain policy.
 The command is read once per chunk, as in LeRobot.
 
-A reversal adapter (`ReversalAdapter`) has up to two modules that change the
+A reversal adapter (lerobot's `AdapterModules`, two dims by default; `as_adapter`
+coerces a matrix, a module or None into one) has up to two modules that change the
 policy's velocity v at every Euler step:
 
     task module   v -> A(x_t, t, v, obstacles) v + b(...), in BOTH directions: it steers
-                  the frozen policy's chunk distribution into a task's (around obstacles)
+                  the frozen policy's chunk distribution into a task's (around obstacles);
+                  a `LearnedTaskModule`, bound to each observation
     user module   v -> U(x_t, t) v, in the BACKWARD pass only: it undoes the user's
-                  command corruption (MARS's fixed F = M, `ReversalAdapter(matrix=F)`,
-                  or a trained `UserModule`)
+                  command corruption (MARS's fixed F = M, `AdapterModules(matrix=F)`,
+                  or a trained `LearnedUserModule(16, n_dims=2)`)
 
 so the forward field is task(v) and the backward field user(task(v)). The two are
 trained apart and composed here. Flow time runs from t=0 (noise) to t=1 (action),
@@ -46,18 +48,16 @@ the reverse of pi0.5.
 The methods themselves are lerobot's: the cursor's chunks come from the same
 `FlowControlSteering` and `FlowReversalSteering` cores the robot (pi0.5)
 uses, driving the cursor policy through pi0.5's sampler interface
-(`CursorSampler`, over `FlowPolicy.sample_chunk`); the Euler flows and the user
+(`SampleChunkSampler`, over `FlowPolicy.sample_chunk`); the Euler flows and the user
 and task modules are lerobot's steering core too. This module binds them to the
 cursor policy's observation, its two action dims and its screen units.
 """
 
-from types import SimpleNamespace
-
 import numpy as np
 import torch
 
-from lerobot.policies.steering import (AdapterModules, Flow, SceneEncoder, FlowControlSteering, FlowReversalSteering,
-                                             LearnedTaskModule, LearnedUserModule, as_adapter)
+from lerobot.policies.steering import (Flow, FlowControlSteering, FlowReversalSteering, SampleChunkSampler, SceneEncoder,
+                                       as_adapter)
 
 from lerobot.envs.cursor import render_views
 from .readout import DEADBAND, Readout, is_active
@@ -145,28 +145,6 @@ def hide_goal(obs):
 # ---------------------------------------------------------------- reversal adapters
 
 
-def UserModule(horizon=16, d=256, tdim=64, n_dims=2, time_embedding="mars", step_rank=None, cross_step_rank=0,
-               cross_step_dims=None):
-    """The core's `LearnedUserModule` with the cursor's dims and defaults: U(x_t, t), one 2x2 matrix per chunk
-    step applied to the policy's velocity in the backward pass; it undoes one user's command corruption.
-    Initialized to the identity. `step_rank` and `cross_step_rank` (`cross_step_dims`) set its flexibility as the
-    core documents; `velocity(x, t, v)` applies the whole correction (the core's `LearnedUserModule.apply_correction`),
-    `forward(x, t)` gives the per-step matrices alone [B, H, 2, 2]."""
-    return LearnedUserModule(horizon, n_dims=n_dims, d=d, tdim=tdim, time_embedding=time_embedding, step_rank=step_rank,
-                             cross_step_rank=cross_step_rank, cross_step_dims=cross_step_dims)
-
-
-# A(x_t, t, v, obstacles) v + b(...): the core's task module (two dims by default), bound to each observation
-TaskModule = LearnedTaskModule
-
-
-# The reversal adapter: a user part (`matrix`, MARS's fixed F, one 2x2 or one per trial [B, 2, 2], and/or `user`, a
-# UserModule or any (x, t) -> [B, H, 2, 2] callable) and/or a task module, composed at test time; forward task(v),
-# backward user(task(v)). The core's `AdapterModules` (two dims by default), under the name the cursor's code and
-# checkpoints use; `as_adapter` (imported above) coerces a matrix, a module or None into one.
-ReversalAdapter = AdapterModules
-
-
 def _field(adapter, obs, device):
     """The core's form of an adapter (see `as_adapter`) for this observation, or None."""
     adapter = as_adapter(adapter, device)
@@ -202,41 +180,19 @@ def action_gain(policy, dt=0.02, max_speed=MAX_SPEED):
     return float(max_speed * dt / float(policy.action_scale))
 
 
-class CursorSampler:
-    """The cursor policy behind pi0.5's sampler interface (`FlowPolicy.sample_chunk`), so lerobot's steering
-    wrappers drive it exactly as they drive pi0.5: its `config` gives the flow's Euler steps, the chunk, the two
-    action dims, the steps executed per replan and the flow time of noise (0, the cursor's convention)."""
-
-    def __init__(self, policy, steps=10, execute=8):
-        self.policy = policy
-        self.config = SimpleNamespace(num_inference_steps=steps, chunk_size=policy.horizon, max_action_dim=2,
-                                      n_action_steps=execute, noise_time=0.0)
-
-    def reset(self):
-        pass
-
-    def predict_action_chunk(self, obs, **hooks):
-        """A normalized chunk [B, H, 2] (pi0.5's hooks: noise_fn, flow_start_time, num_forward_steps, x_t_hook,
-        velocity_hook; and noise)."""
-        return self.policy.sample_chunk(obs, self.config.num_inference_steps, **hooks)
-
-
 def steering_wrapper(sampler, mode, tau=5, n_reverse_steps=None, dt=0.02, max_speed=MAX_SPEED, ic_gain=1.0, lam=1,
                      pinned_steps=None):
     """lerobot's wrapper for a shared mode on the cursor's sampler, every action dim commanded (None in modes
     policy and teleop). frs's reference is the command held at constant velocity over the chunk, or a command per
-    step, in action units (`to_action`)."""
+    step, in action units (`Flow.held_reference`, `to_action`'s units)."""
     if mode == "flow_control":
         return FlowControlSteering(sampler, None, tau=tau, lam=lam, ic_gain=ic_gain, deadband=DEADBAND, dims=slice(None))
     if mode == "frs":
-        policy, horizon = sampler.policy, sampler.config.chunk_size
-
-        def reference(commands):
-            per_step = commands if commands.dim() == 3 else commands[:, None].expand(-1, horizon, -1)
-            return to_action(per_step, policy, dt, max_speed)
-
-        return FlowReversalSteering(sampler, None, n_reversal_steps=n_reverse_steps, operator_dims=None,
-                                          pinned_steps=pinned_steps, deadband=DEADBAND, reference_fn=reference)
+        policy, horizon = sampler.model, sampler.config.chunk_size
+        return FlowReversalSteering(
+            sampler, None, n_reversal_steps=n_reverse_steps, operator_dims=None, pinned_steps=pinned_steps,
+            deadband=DEADBAND,
+            reference_fn=lambda commands: Flow.held_reference(commands, horizon, max_speed * dt, policy.action_scale))
     return None
 
 
@@ -245,7 +201,7 @@ def _chunk(sampler, wrapper, obs, commands, field, noise=None):
     if wrapper is None:
         hook = FlowControlSteering.velocity_hook(field)
         return sampler.predict_action_chunk(obs, noise=noise, **({} if hook is None else {"velocity_hook": hook}))
-    return wrapper.steered_chunk(obs, commands, field=field)[0]
+    return wrapper.steered_chunk(obs, commands, field=field, paired=False)[0]
 
 
 @torch.no_grad()
@@ -256,7 +212,7 @@ def steered_chunk(policy, obs, command, mode, tau=5, n_reverse_steps=None, steps
     toward is the command held constant over the chunk, or `reference` [B, H, 2] (a deflection per step, e.g. the
     chunk an expert_chunk agent means). Rows whose command (or whole reference) is inside the deadband get the
     plain policy chunk, from the same noise."""
-    sampler = CursorSampler(policy, steps)
+    sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, 8)  # lerobot's sampler over sample_chunk
     wrapper = steering_wrapper(sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam, pinned_steps)
     chunk = _chunk(sampler, wrapper, obs, command if reference is None else reference,
                    _field(adapter, obs, command.device))
@@ -297,10 +253,20 @@ class SharedController:
         assert speed_gain > 0, speed_gain
         assert gain_mode in GAIN_MODES, gain_mode
         self.gain, self.gain_mode, self.adapter = speed_gain, gain_mode, as_adapter(adapter, device)
-        self.ic_gain, self.lam, self.pinned_steps = ic_gain, lam, pinned_steps
-        self.policy, self.mode, self.tau, self.n_reverse_steps = policy, mode, tau, n_reverse_steps
-        self.steps, self.execute, self.dt, self.max_speed, self.device = steps, execute, dt, max_speed, device
+        self.policy, self.mode = policy, mode
+        self.execute, self.dt, self.max_speed, self.device = execute, dt, max_speed, device
         self.layouts = layouts
+        # what every observation repeats, on the device once (`observation` adds the positions and histories): the
+        # targets, the goal flags given and hidden, the obstacles and the layouts' scene arrays the task module reads
+        task = None if self.adapter is None else self.adapter.task
+        source = getattr(task, "token_source", None)  # a module without one: every array, as it may read any
+        self._static = dict(targets=_f32(layouts.targets, device), mask=torch.as_tensor(layouts.mask, device=device))
+        self._goal = {False: torch.as_tensor(np.zeros(layouts.mask.shape, dtype=bool), device=device),
+                      True: torch.as_tensor(layouts.goal_mask(), device=device)}
+        self._obstacles = dict(obstacles=_f32(layouts.obstacles, device),
+                               obstacle_mask=torch.as_tensor(layouts.obstacle_mask, device=device))
+        self._layout_scene = {k: torch.as_tensor(v, device=device) for k, v in (layouts.scene or {}).items()
+                              if task is not None and source in (None, k)}
         self.pos = layouts.start.copy()
         self.hist = np.zeros((len(layouts), policy.hist, 2))
         self.chunk = None
@@ -311,7 +277,7 @@ class SharedController:
         self.moved, self.played = {}, {}      # per planned step under way: the displacement so far, the share so far
         self.chunks = 0
         self.steered_chunks = np.zeros(len(layouts), dtype=int)
-        self.sampler = CursorSampler(policy, steps, execute)  # lerobot's wrapper for the mode drives the policy
+        self.sampler = SampleChunkSampler(policy, steps, policy.horizon, 2, execute)  # the mode's wrapper drives it
         self.wrapper = steering_wrapper(self.sampler, mode, tau, n_reverse_steps, dt, max_speed, ic_gain, lam,
                                         pinned_steps)
         self.scene_fn, self.active = scene_fn, None
@@ -329,16 +295,22 @@ class SharedController:
         return [(i, s) for i, s in shares if s > 1e-9]
 
     def observation(self, goal_given=False):
-        """The policy's observation of the current state; the goal is hidden unless asked for. With a `scene_fn` its
-        scene of these positions joins it, reused while the positions and `active` are unchanged."""
-        if self.scene_fn is None:
-            return observation(self.layouts, self.pos, self.hist, self.device, goal_given)
-        cached = self._scene
-        if (cached is None or not np.array_equal(cached[0], self.pos) or (cached[1] is None) != (self.active is None)
-                or (self.active is not None and not np.array_equal(cached[1], self.active))):
-            active = None if self.active is None else np.array(self.active, copy=True)
-            cached = self._scene = (self.pos.copy(), active, self.scene_fn(self.layouts, self.pos, self.active))
-        return observation(self.layouts, self.pos, self.hist, self.device, goal_given, cached[2])
+        """The policy's observation of the current state (`observation`'s, the static arrays uploaded once); the goal
+        is hidden unless asked for. With a `scene_fn` its scene of these positions joins it, reused while the
+        positions and `active` are unchanged."""
+        scene = None
+        if self.scene_fn is not None:
+            cached = self._scene
+            if (cached is None or not np.array_equal(cached[0], self.pos) or (cached[1] is None) != (self.active is None)
+                    or (self.active is not None and not np.array_equal(cached[1], self.active))):
+                active = None if self.active is None else np.array(self.active, copy=True)
+                cached = self._scene = (self.pos.copy(), active, self.scene_fn(self.layouts, self.pos, self.active))
+            scene = cached[2]
+        obs = dict(pos=_f32(self.pos, self.device), hist=_f32(self.hist, self.device), **self._static,
+                   goal=self._goal[bool(goal_given)], **self._obstacles)
+        if self._layout_scene or scene is not None:
+            obs["scene"] = {**self._layout_scene, **{k: torch.as_tensor(v, device=self.device) for k, v in (scene or {}).items()}}
+        return obs
 
     @torch.no_grad()
     def sample_chunk(self, obs, z=None):

@@ -89,10 +89,10 @@ from cursor_sa.analysis import INK, INK_2, bootstrap_mean, draw_scene, style
 from lerobot.envs.cursor import ROUTE_CLEARANCE, TaskConfig, center_out, curl_steady_state, plan_route, route_side, sample_layouts
 from cursor_sa import paths as cursor_paths
 from cursor_sa.paths import RESULTS
-from cursor_sa.records import logged, summarize
+from cursor_sa.dataset import array_head, render_spec
+from cursor_sa.records import atomic_write_json, logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
-from lerobot.envs.cursor import RENDER_MIN_RADIUS, RENDER_PALETTE, RENDER_SUPERSAMPLE, RENDER_TARGET_RADIUS
 from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SCENE_VLM_PATH, SceneEncoder
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
@@ -125,6 +125,12 @@ def with_module_seed(value, seed):
     return value
 
 
+def _valid_tune(mode, knobs):
+    """Whether `knobs` maps some of `mode`'s tuned knobs (TUNE_KNOBS) to non-empty lists of values."""
+    return (mode in TUNE_KNOBS and isinstance(knobs, dict) and bool(knobs) and not set(knobs) - set(TUNE_KNOBS[mode])
+            and all(isinstance(v, list) and v for v in knobs.values()))
+
+
 def load_sweep(path, module_seed=None):
     path = Path(path)
     if not path.exists():
@@ -138,14 +144,11 @@ def load_sweep(path, module_seed=None):
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
     tune = data.get("tune", DEFAULT_TUNE)
     for mode, knobs in tune.items():  # every combination of a mode's knob values is a setting
-        if mode not in TUNE_KNOBS or not isinstance(knobs, dict) or not knobs or set(knobs) - set(TUNE_KNOBS[mode]) \
-                or not all(isinstance(v, list) and v for v in knobs.values()):
+        if not _valid_tune(mode, knobs):
             raise ValueError(f"{path}: tune maps a mode to lists of its knobs' values, of {TUNE_KNOBS}; got {mode}: {knobs}")
     for m, spec in data["methods"].items():  # a method's own knobs replace its mode's
         own = spec.get("tune")
-        if own is not None and (spec.get("mode") not in TUNE_KNOBS or not isinstance(own, dict) or not own
-                                or set(own) - set(TUNE_KNOBS[spec["mode"]])
-                                or not all(isinstance(v, list) and v for v in own.values())):
+        if own is not None and not _valid_tune(spec.get("mode"), own):
             raise ValueError(f"{path}: methods.{m}.tune maps its mode's knobs ({TUNE_KNOBS}) to value lists; got {own}")
     sweep = dict(name=data.get("name", path.stem), agent=data.get("agent", "expert"), arm=data.get("arm", "base.yaml"),
                  methods=data["methods"], tune=tune,
@@ -318,8 +321,8 @@ def run_cell_batch(sweep, arm, method, layouts, noises, agent, policy, adapters,
     off = sweep["methods"][method].get("readout") in ("off", False)  # YAML reads `off` as False
     readout = readout_for(arm, np.random.default_rng(seed), np.repeat(noises, n), off)
     torch.manual_seed(seed)
-    records = run_trials(arm, layouts.tile(len(noises)), agent, readout, policy, adapters, device,
-                         scene_encoder=scene_encoder)
+    played = layouts if len(noises) == 1 else layouts.tile(len(noises))  # no copy of the scene for one level
+    records = run_trials(arm, played, agent, readout, policy, adapters, device, scene_encoder=scene_encoder)
     return {str(s): records[i * n:(i + 1) * n] for i, s in enumerate(noises)}
 
 
@@ -772,9 +775,8 @@ def scene_digest(layouts, source, size, vlm=SCENE_VLM_PATH):
     h = hashlib.sha256()
     for a in (layouts.start, layouts.targets, layouts.mask, layouts.obstacles, layouts.obstacle_mask):
         a = np.ascontiguousarray(a)
-        h.update(f"{a.dtype.str}{a.shape}".encode() + a.tobytes())
-    spec = dict(source=source, size=size, palette=RENDER_PALETTE, supersample=RENDER_SUPERSAMPLE,
-                target_radius=RENDER_TARGET_RADIUS, min_radius=RENDER_MIN_RADIUS)
+        h.update(array_head(a) + a.tobytes())
+    spec = dict(source=source, **render_spec(size))
     if source.startswith("vlm_"):
         spec.update(vlm=vlm, prompt=SCENE_PROMPT)
     h.update(json.dumps(spec, sort_keys=True).encode())
@@ -1006,15 +1008,15 @@ def run(args, sweep, out, encoder_factory=None):
 
     def save():
         settings = {k: tuned_settings(v) for k, v in tuning.items()}
-        write("tuning.json", lambda f: json.dump(dict(args=run_args, tuning=tuning, settings=settings), f, indent=1))
+        atomic_write_json(out / "tuning.json", dict(args=run_args, tuning=tuning, settings=settings), indent=1)
         if fixed is not None:  # the settings tested are the input's
             if Path(args.fixed_settings).resolve() != (out / "settings.yaml").resolve():
                 write("settings.yaml", lambda f: f.write(Path(args.fixed_settings).read_text()))
         else:  # merged fixed-setting parts have no tuning: their cells keep the settings they were tested at
             settings.update({k: v["settings"] for k, v in test.items() if k not in settings})
             write("settings.yaml", lambda f: yaml.safe_dump(settings, f, sort_keys=False))
-        write("test.json", lambda f: json.dump(dict(args=run_args, showcase=showcase(), skipped=skipped, test=test),
-                                               f, indent=1))
+        atomic_write_json(out / "test.json", dict(args=run_args, showcase=showcase(), skipped=skipped, test=test),
+                          indent=1)
 
     tic = time.time()
     if args.merge:

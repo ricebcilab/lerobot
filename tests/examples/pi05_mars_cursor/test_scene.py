@@ -75,9 +75,14 @@ def test_observation_and_sampler_carry_the_scene():
         _layouts(2), np.zeros((2, 2)), np.zeros((2, 4, 2))
     )
     policy = FlowPolicy().eval()
+    cnn = LearnedTaskModule(
+        **LearnedTaskModule.spec("cnn", 64)
+    )  # the controller uploads what its task module reads
     assert torch.equal(
-        SharedController(policy, lay, "policy").observation()["scene"]["cnn"], obs["scene"]["cnn"]
+        SharedController(policy, lay, "policy", adapter=cnn).observation()["scene"]["cnn"],
+        obs["scene"]["cnn"],
     )
+    assert "scene" not in SharedController(policy, lay, "policy").observation()  # no task module, no scene
     cfg = TaskConfig(min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec(DISC))
     sampler = DemoSampler(
         lay, *make_demos(np.random.default_rng(0), lay, cfg), policy.horizon, policy.hist, "cpu"

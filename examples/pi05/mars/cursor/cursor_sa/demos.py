@@ -136,7 +136,7 @@ def make_demos(rng, layouts, task=TaskConfig(), demo=DemoConfig(), max_tries=50,
             plans[b] = (plan_along(rng, paths[b], task, demo) if b in paths
                         else plan_reach(rng, layouts.start[b], layouts.goal_pos[b], task, demo))
         on_screen = np.array([((plans[b] >= 0) & (plans[b] <= 1)).all() for b in todo])
-        env = replay(_pad([np.diff(plans[b], axis=0) for b in todo]), layouts[todo], task)
+        env = replay(pad_steps([np.diff(plans[b], axis=0) for b in todo]), layouts[todo], task)
         todo = todo[~(env.success & on_screen)]
         if not len(todo):
             break
@@ -147,7 +147,7 @@ def make_demos(rng, layouts, task=TaskConfig(), demo=DemoConfig(), max_tries=50,
         for b in todo:
             plans[b] = layouts.start[b][None]
 
-    actions = _pad([np.diff(p, axis=0) for p in plans])
+    actions = pad_steps([np.diff(p, axis=0) for p in plans])
     lengths = replay(actions, layouts, task).steps
     lengths[todo] = 0
     # The dwell can finish after the last planned step; cover the whole trial.
@@ -181,7 +181,7 @@ def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25
         mirror = rng.random(len(rows)) < 0.5
         moved_layouts = move_layouts(layouts[rows], angle, offset, mirror)
         moved = move_actions(actions[rows], angle, mirror)
-        path = moved_layouts.start[:, None] + np.concatenate([np.zeros_like(moved[:, :1]), np.cumsum(moved, 1)], 1)
+        path = demo_positions(moved_layouts, moved)
         fits = np.flatnonzero(layouts_on_screen(moved_layouts, margin=task.margin) & ((path >= 0) & (path <= 1)).all((1, 2)))
         steps = np.zeros(len(rows), dtype=np.int64)  # 0: not kept
         for at in range(0, len(fits), 500):
@@ -215,7 +215,8 @@ def replay(actions, layouts, task=TaskConfig(), rng=None):
     return env
 
 
-def _pad(seqs):
+def pad_steps(seqs):
+    """Sequences of 2-d steps [n_i, 2] as one zero-padded array [len(seqs), max n_i, 2]."""
     out = np.zeros((len(seqs), max(len(s) for s in seqs), 2))
     for i, s in enumerate(seqs):
         out[i, :len(s)] = s
@@ -248,10 +249,11 @@ class DemoSampler:
     The history, like everything else in the sample, stays the demonstration step's.
 
     With `store` = (SceneDataset, rows [B], source) the scene tokens stay on disk: every batch gathers its demos' rows
-    (`SceneDataset.gather`) into a host buffer (pinned, allocated for the largest batch seen, when `device` is CUDA),
-    copies them to the device without blocking and puts them in obs["scene"][source], the same values the layouts'
+    (`SceneDataset.gather`) into a host buffer and puts them in obs["scene"][source], the same values the layouts'
     `scene` would give; `layouts.scene` is not read. With `reduction` = (mean, basis) the gathered batch is reduced on
-    the device (`LearnedTaskModule.reduce`)."""
+    the device (`LearnedTaskModule.reduce`). A frame table held in RAM while `device` is CUDA is gathered the same way.
+    On CUDA the host buffer is pinned (one per source, allocated for the largest batch seen) and copied to the device
+    without blocking (`_staged`)."""
 
     def __init__(self, layouts, actions, lengths, horizon, hist, device, frames=None, jitter=0.0, jitter_steps=4,
                  store=None, reduction=None):
@@ -278,7 +280,7 @@ class DemoSampler:
             self.store = (token_store, rows, source)
         self.device = torch.device(device)
         self.reduction = None if reduction is None else tuple(torch.as_tensor(t, device=device) for t in reduction)
-        self._host, self._copied = None, None   # the pinned gather buffer and the event of its last copy to the device
+        self._staging = {}   # per source: the pinned gather buffer and the event of its last copy to the device
         self.scene = (None if layouts.scene is None or store is not None
                       else {k: torch.as_tensor(v, device=device) for k, v in layouts.scene.items()})
         if frames and len({stride for _, _, stride in frames.values()}) > 1:
@@ -308,7 +310,11 @@ class DemoSampler:
             obs.setdefault("scene", {})[self.store[2]] = self._gathered(i)
         for name, (tokens, start) in self.frames.items():
             row = start[i.to(start.device)] + (k // self.stride).to(start.device)
-            obs.setdefault("scene", {})[name] = tokens[row].to(i.device)
+            if tokens.device.type == "cpu" and self.device.type == "cuda":   # a table too large for the device
+                frame = self._staged(name, len(row), tokens.shape[1:], lambda out: torch.index_select(tokens, 0, row, out=out))
+            else:
+                frame = tokens[row].to(i.device)
+            obs.setdefault("scene", {})[name] = frame
         chunk = seq[:, self.hist:]
         if self.jitter > 0:
             delta = self.jitter * torch.randn(n, 2, device=i.device)
@@ -318,19 +324,28 @@ class DemoSampler:
             chunk[:, :m] -= delta[:, None] / m
         return (obs, chunk, i, k) if indexed else (obs, chunk)
 
+    def _staged(self, key, n, shape, fill):
+        """`fill(out)` writing n float16 rows into `out` (a pinned host buffer [n, *shape], `key`'s, allocated for the
+        largest batch seen), copied to the device without blocking; the buffer is refilled only once its last copy
+        has finished (an event)."""
+        host, copied = self._staging.get(key, (None, None))
+        if copied is not None:
+            copied.synchronize()   # the buffer's last copy to the device has finished: it may be refilled
+        if host is None or len(host) < n:
+            host = torch.empty((n, *shape), dtype=torch.float16, pin_memory=True)
+        out = fill(host[:n]).to(self.device, non_blocking=True)
+        copied = torch.cuda.Event()
+        copied.record()
+        self._staging[key] = (host, copied)
+        return out
+
     def _gathered(self, i):
         """The store's tokens of demos i [n] on the device (reduced when the sampler has a reduction)."""
-        token_store, rows, _ = self.store
+        token_store, rows, source = self.store
         rows = rows[i.cpu().numpy()]
         if self.device.type == "cuda":
-            if self._copied is not None:
-                self._copied.synchronize()   # the buffer's last copy to the device has finished: it may be refilled
-            if self._host is None or len(self._host) < len(rows):
-                self._host = torch.empty((len(rows), token_store.tokens, token_store.width), dtype=torch.float16,
-                                         pin_memory=True)
-            tokens = token_store.gather(rows, self._host).to(self.device, non_blocking=True)
-            self._copied = torch.cuda.Event()
-            self._copied.record()
+            tokens = self._staged(source, len(rows), (token_store.tokens, token_store.width),
+                                  lambda out: token_store.gather(rows, out))
         else:
             tokens = token_store.gather(rows)   # a fresh tensor: on the CPU no copy would separate it from a buffer
         return tokens if self.reduction is None else LearnedTaskModule.reduce(tokens, *self.reduction)

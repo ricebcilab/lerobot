@@ -15,8 +15,8 @@ from cursor_sa.readout import Readout, corruption_spec
 from lerobot.envs.cursor import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy
-from cursor_sa.steering import ReversalAdapter, TaskModule, UserModule
-from lerobot.policies.steering import AdapterModules, LearnedTaskModule
+from cursor_sa.readout import DEADBAND
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule, active_rows
 from train import train_adapter
 from _view_stub import TokenStub, ViewStub
 
@@ -77,7 +77,7 @@ def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
     moving = push.norm(dim=-1) > 0.99  # full deflection: far from the goal, where the push points
     assert moving.any() and (torch.nn.functional.cosine_similarity(push, goal - obs["pos"], dim=-1)[moving] > 0.999).all()
     assert train.noise is not None and data["val"].noise is None  # validation keeps fresh commands
-    sigma, active = torch.ones(len(i)), train_adapter.active_of(push)
+    sigma, active = torch.ones(len(i)), active_rows(push, DEADBAND)
     served = train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k))
     torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))  # one draw per step
     assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
@@ -91,7 +91,7 @@ def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
 
 def test_the_field_loss_trains_the_task_module_through_the_frozen_user_module():
     """field_loss's gradient reaches the task module (bound to the observation) through the frozen user module."""
-    policy, user, task = FlowPolicy().eval().requires_grad_(False), UserModule().requires_grad_(False), TaskModule()
+    policy, user, task = FlowPolicy().eval().requires_grad_(False), LearnedUserModule(16, n_dims=2).requires_grad_(False), LearnedTaskModule()
     torch.nn.init.normal_(user.net[-1].weight, std=0.05)
     torch.nn.init.normal_(task.out.weight, std=0.05)
     B, g = 4, torch.Generator().manual_seed(0)
@@ -163,7 +163,7 @@ def test_a_user_module_trains_and_recalibrates_closed_loop(trained):
     ckpt = torch.load(trained / "u" / "adapter.pt")
     assert ckpt["kind"] == "user" and ckpt["meta"]["obstacle"] is None and ckpt["meta"]["args"]["corruption"] == {"rotation_deg": 60}
     assert [ckpt["meta"][k] for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")] == [None] * 4  # the task module's flags
-    assert ReversalAdapter.load(trained / "u" / "adapter.pt").kind == "user"
+    assert AdapterModules.load(trained / "u" / "adapter.pt").kind == "user"
     log = _log(trained, "u")
     assert len(log) == 2 and {"heading_cos_none", "heading_cos_user"} <= set(log[-1])
     # recalibrated closed loop: the initial module runs the open-field trials, their states join the batches
@@ -178,7 +178,7 @@ def test_a_disc_task_module_trains_with_the_user_module_in_the_loop(trained):
     assert final["kind"] == "task" and meta["obstacle"]["kind"] == "disc" and meta["args"]["user_module"] == "u"
     assert meta["token_geometry"] == "absolute" and "token_geometry" not in final["config"]
     assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"], meta["rigid_kept"]) == (0.0, 4, 0, None)  # off, and said so
-    assert isinstance(ReversalAdapter.load(trained / "t" / "adapter.pt").task, TaskModule)
+    assert isinstance(AdapterModules.load(trained / "t" / "adapter.pt").task, LearnedTaskModule)
     log = _log(trained, "t")
     assert {"val_fm", "chunk_collision_hidden", "chunk_collision_policy_given", "collide_user", "collide_composed"} <= set(log[-1])
     assert all(np.isfinite(row[k]) and row[k] >= 0 for row in log for k in ("train_fm", "train_field")), log  # the loss parts
@@ -186,7 +186,7 @@ def test_a_disc_task_module_trains_with_the_user_module_in_the_loop(trained):
         step = torch.load(trained / f"t_step{n}" / "adapter.pt")
         assert step["meta"]["step"] == n and step["config"] == final["config"] and "step" not in meta
         assert {k: v for k, v in step["meta"].items() if k != "step"} == meta
-        assert ReversalAdapter.load(trained / f"t_step{n}" / "adapter.pt").task is not None
+        assert AdapterModules.load(trained / f"t_step{n}" / "adapter.pt").task is not None
         same = all(torch.equal(step["state_dict"][k], v) for k, v in final["state_dict"].items())
         assert same == (n == 4)  # the module as it was at that step
 
@@ -205,7 +205,7 @@ def test_an_image_module_trains_on_jittered_and_moved_copies(trained, monkeypatc
     assert (cfg["token_source"], cfg["image_size"], cfg["token_geometry"]) == ("cnn", 64, "relative") and "scene_pos" not in ckpt["state_dict"]
     assert (meta["token_source"], meta["token_geometry"], meta["teacher"], meta["teacher_demos"], meta["scene_center"]) == ("cnn", "relative", None, None, None)
     assert (meta["scene_store"], meta["scene_rank"], meta["args"]["scene_rank"]) == (None, None, None) and "scene_rank" not in cfg
-    assert ReversalAdapter.load(trained / "t_aug" / "adapter.pt").task.token_geometry == "relative"
+    assert AdapterModules.load(trained / "t_aug" / "adapter.pt").task.token_geometry == "relative"
     assert {"val_fm", "chunk_collision_hidden", "collide_composed"} <= set(_log(trained, "t_aug")[-1])
     assert (meta["jitter"], meta["jitter_steps"], meta["rigid_motions"]) == (0.02, 3, 2) and type(meta["rigid_kept"]) is int
     (layouts, actions, lengths, kept, _), = made  # the val split never augments
@@ -229,7 +229,7 @@ def test_a_pooled_module_alternates_the_contexts_on_their_own_demonstrations(tra
     entries = (("u", "{rotation_deg: 60}", IMAGE), ("u_cl", "{scale: [1.0, 0.25]}", "{kind: ring, around: start, gap_angle: [15, 30]}"))
     (tmp_path / "pooled.yaml").write_text("entries:\n" + "".join(f"  - {{obstacle: {o}, user_module: {u}, corruption: {c}}}\n" for u, c, o in entries))
     splits, real_splits = _recording(monkeypatch, "expert_splits")
-    users, load = {}, train_adapter.ReversalAdapter.load  # id of a loaded user module -> its name
+    users, load = {}, train_adapter.AdapterModules.load  # id of a loaded user module -> its name
 
     def recording_load(path, *a, **k):
         adapter = load(path, *a, **k)
@@ -243,7 +243,7 @@ def test_a_pooled_module_alternates_the_contexts_on_their_own_demonstrations(tra
         drawn.extend(j for j, s in enumerate(splits) if s["train"] is self)  # not the validation draws
         return real_sample(self, *a, **k)
 
-    monkeypatch.setattr(train_adapter.ReversalAdapter, "load", staticmethod(recording_load))
+    monkeypatch.setattr(train_adapter.AdapterModules, "load", staticmethod(recording_load))
     monkeypatch.setattr(train_adapter.ExpertData, "sample", sample)
     monkeypatch.setattr(train_adapter, "field_loss", lambda policy, user, *a, **k: used.append(users[id(user)]) or real_field(policy, user, *a, **k))
     flags = [*CNN, "--frozen-noise", "--lambda-field", "0.1", "--rigid-motions", "1", *COMMON]
@@ -343,7 +343,7 @@ def test_a_two_view_module_trains_on_the_scripted_draws(trained, monkeypatch):
     assert info["val"]["moved"] == 0 and 0 < info["train"]["kept"] <= 1 and info["val"]["kept"] is None
     assert views["train"].sampler.sample(4)[0]["scene"]["vlm_views"].shape == (4, 512, 2)
     assert {"val_fm", "chunk_collision_hidden", "collide_composed", "train_fm", "train_field"} <= set(_log(trained, "t_views")[-1])
-    assert ReversalAdapter.load(trained / "t_views" / "adapter.pt").task.wrist_span == 0.5
+    assert AdapterModules.load(trained / "t_views" / "adapter.pt").task.wrist_span == 0.5
     keeps = [k for k in seen["fm"] if k is not None]  # --token-drop hides tokens from the flow matching loss only
     assert len(keeps) == 4 and all(k.shape == (32, 512) and k.dtype == torch.bool for k in keeps)  # COMMON: 4 steps of batch 32
     assert 0.6 < torch.stack(keeps).float().mean() < 0.8 and any(k is None for k in seen["fm"])  # validation sees every token
@@ -398,7 +398,7 @@ def test_a_reduced_image_module_trains_from_the_store_and_carries_its_basis(trai
     cfg, meta, state = ckpt["config"], ckpt["meta"], ckpt["state_dict"]
     assert (cfg["scene_rank"], cfg["token_geometry"], meta["scene_rank"], meta["scene_center"]) == (8, "relative", 8, "yes")
     assert state["scene_basis"].shape == (2048, 8) and state["scene_basis"].abs().sum() > 0 and state["scene_mean"].any()
-    task = ReversalAdapter.load(trained / "t_reduced" / "adapter.pt").task
+    task = AdapterModules.load(trained / "t_reduced" / "adapter.pt").task
     assert task.scene_in.in_features == 8 and task.scene_rank == 8
     (data,) = splits
     for split in ("train", "val"):
@@ -414,8 +414,7 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
     budget and seed gets the same ones); --eval_steps scores the EMA weights alone with the goal given and saves the
     best, without changing the training itself; a user module calibrates on the result with --model."""
     from train import train_policy
-    monkeypatch.setattr(train_policy, "policy_dir", lambda name: trained / name)
-    monkeypatch.setattr(train_policy, "policy_path", lambda name: trained / name / "policy.pt")
+    monkeypatch.setattr(train_policy, "policy_path", lambda name: trained / name)
     tiny = ["--val_demos", "10", "--steps", "4", "--batch", "16", "--log_every", "2", "--warmup", "2",
             "--goal_dropout", "0.25", "--targets", "4", "4", "--reach", "0.35", "0.5"]
     train_policy.main(["--name", "base", "--n_demos", "30", "--d_model", "32", "--layers", "1", "--heads", "2", *tiny])
