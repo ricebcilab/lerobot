@@ -1649,6 +1649,7 @@ class FlowReversalSteering(_ChunkSteering):
 
 # ---------------------------------------------------------------- the lerobot policy wrapper
 
+# The steering policy's own batch keys, not the observation's: the operator's command, and the training batch's
 STEERING_BATCH_KEYS = (
     "command",
     "kind",
@@ -1657,8 +1658,28 @@ STEERING_BATCH_KEYS = (
     "noise",
     "time",
     "weight",
-)  # not the observation's
+    "bci_target",
+)
 OBS_PREFIX = "observation."
+
+
+def _unsqueezed(obs: dict) -> dict:
+    """The observation with a leading batch dim on every tensor (nested dicts too)."""
+    return {
+        k: v[None] if torch.is_tensor(v) else _unsqueezed(v) if isinstance(v, dict) else v
+        for k, v in obs.items()
+    }
+
+
+def _obs_rows(obs: dict) -> int | None:
+    """The batch size of an observation: its ``pos``'s leading dim (the cursor's), else its first tensor's."""
+    pos = obs.get("pos")
+    if torch.is_tensor(pos):
+        return int(pos.shape[0])
+    for value in obs.values():
+        if torch.is_tensor(value) and value.dim() > 0:
+            return int(value.shape[0])
+    return None
 
 
 class _SampleChunkSampler:
@@ -1697,11 +1718,14 @@ class SteeringPolicy(PreTrainedPolicy):
 
     A batch is the base policy's observation (the cursor's dict, or its keys under ``observation.`` as the
     pre-processor leaves them, ``observation.scene_tokens`` the task module's scene) and ``command``, the
-    operator's command per row ((B, n)) or per chunk step ((B, H, n)) in the operator's units (deflections in
-    [-1, 1]). ``forward`` is the adapter's training loss for ``batch["kind"]``: ``"task"`` the task module's flow
-    matching on ``chunk`` (in action units), ``"user"`` the user module's field regression from ``latent`` to
-    ``command`` (the BCI's chunk, normalized) through the task module if any; ``noise``, ``time`` and ``weight``
-    as the example's trainer draws them (drawn here when absent)."""
+    operator's command per row ((B, n), or (n,) for a single unbatched trial) or per chunk step ((B, H, n)) in the
+    operator's units (deflections in [-1, 1]).
+
+    ``forward`` takes the example trainer's batches (the pre-processor carries their keys through untouched, but
+    does not build them): ``batch["kind"]`` ``"task"`` is the task module's flow matching on ``chunk`` (in action
+    units), ``"user"`` the user module's field regression from ``latent`` to ``bci_target`` (the BCI's chunk,
+    normalized: a regression target, not an operator command) through the task module if any; ``noise``, ``time``
+    and ``weight`` as the trainer draws them (drawn here when absent)."""
 
     config_class = SteeringConfig
     name = "steering"
@@ -1715,6 +1739,7 @@ class SteeringPolicy(PreTrainedPolicy):
             self, "_base_policy", base_policy
         )  # not a submodule: its weights are not this policy's
         self._postprocessor = postprocessor
+        self._base_preprocessor = None  # the base's own pre-processor, when it is loaded from its folder
         self._core: FlowControlSteering | FlowReversalSteering | None = None
         self._action_queue: deque = deque()
 
@@ -1759,19 +1784,44 @@ class SteeringPolicy(PreTrainedPolicy):
 
     @property
     def base_policy(self):
-        """The policy whose chunks are steered."""
+        """The policy whose chunks are steered. Loaded from ``config.base_policy_path`` (a local folder or a Hub
+        repo id) on first use, with its pre/post processors when the folder has them (``make_pre_post_processors``
+        with the folder as ``pretrained_path``): a pi0.5-style base needs its postprocessor's action statistics."""
         if self._base_policy is None:
-            if self.config.base_policy_path is None:
+            path = self.config.base_policy_path
+            if path is None:
                 raise ValueError(
                     "SteeringPolicy needs a base policy: pass one, or set config.base_policy_path"
                 )
-            from lerobot.policies.factory import get_policy_class
+            from huggingface_hub.errors import HFValidationError
+            from huggingface_hub.utils import validate_repo_id
 
-            policy = get_policy_class(self.config.base_policy_type).from_pretrained(
-                self.config.base_policy_path
-            )
+            from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+
+            if not Path(path).is_dir():
+                try:
+                    validate_repo_id(path)
+                except HFValidationError:
+                    raise FileNotFoundError(
+                        f"base_policy_path {path!r} is neither a local folder nor a Hub repo id"
+                    ) from None
+            policy = get_policy_class(self.config.base_policy_type).from_pretrained(path)
             object.__setattr__(self, "_base_policy", policy.to(self.config.device).eval())
+            pipelines = [
+                Path(path) / f"{name}.json" for name in ("policy_preprocessor", "policy_postprocessor")
+            ]
+            if self._postprocessor is None and all(p.is_file() for p in pipelines):
+                self._base_preprocessor, self._postprocessor = make_pre_post_processors(
+                    policy.config, pretrained_path=str(path)
+                )
         return self._base_policy
+
+    @property
+    def base_preprocessor(self):
+        """The base policy's own pre-processor (a pi0.5 base's normalizer and tokenizer), loaded with it from
+        ``config.base_policy_path``, or None. A pi0.5-style batch goes through it before this policy."""
+        _ = self.base_policy
+        return self._base_preprocessor
 
     def _flow_model(self):
         """The base policy's flow model: a ``CursorFlowPolicy``'s ``FlowPolicy``, else the base policy itself."""
@@ -1820,6 +1870,14 @@ class SteeringPolicy(PreTrainedPolicy):
                     dims=written,
                 )
             else:
+                if self._action_scale() is None and self._postprocessor is None:
+                    raise ValueError(
+                        "frs on a base without sample_chunk (pi0.5's sampler interface) builds its reference from the "
+                        "base's postprocessor's action statistics, and there is none: none was passed with the base, "
+                        f"and its folder (config.base_policy_path = {cfg.base_policy_path!r}) has no "
+                        "policy_preprocessor.json / policy_postprocessor.json; pass it with "
+                        "set_base_policy(policy, postprocessor=...)"
+                    )
                 self._core = FlowReversalSteering(
                     sampler,
                     None,
@@ -1872,7 +1930,8 @@ class SteeringPolicy(PreTrainedPolicy):
             self._core.reset()
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
-        """The adapter's training loss for ``batch["kind"]`` (``"task"`` or ``"user"``) and its parts."""
+        """The adapter's training loss for ``batch["kind"]`` (``"task"`` or ``"user"``) and its parts, on the
+        example trainer's batches (see the class docstring; the pre-processor carries their keys through)."""
         obs, kind = self.observation(batch), batch.get("kind")
         velocity = self._velocity(obs, batch)
         if kind == "task":
@@ -1897,7 +1956,7 @@ class SteeringPolicy(PreTrainedPolicy):
             t = torch.rand(len(latent), device=latent.device) if t is None else t
             task = None if self.adapter.task is None else self.adapter.task.bind(obs)
             loss = LearnedUserModule.field_loss(
-                self.adapter.user, velocity, latent, batch["command"], t, task, batch.get("weight")
+                self.adapter.user, velocity, latent, batch["bci_target"], t, task, batch.get("weight")
             )
             return loss, {"field": loss.item()}
         raise ValueError(f"batch['kind'] must be 'task' or 'user', got {kind!r}")
@@ -1911,9 +1970,34 @@ class SteeringPolicy(PreTrainedPolicy):
         command = batch.get("command")
         if command is not None and not torch.is_tensor(command):
             command = torch.as_tensor(np.asarray(command), dtype=torch.float32)
+        obs, command = self._batched(obs, command)
         chunk = self.core.steered_chunk(obs, command, field=self._field(obs))[0]
         scale = self._action_scale()
         return chunk if scale is None else chunk * scale
+
+    def _batched(self, obs: dict, command: Tensor | None) -> tuple[dict, Tensor | None]:
+        """The observation and the command with their leading batch dim. A single unbatched trial gets one, as
+        ``AddBatchDimensionProcessorStep`` gives lerobot's state one (which knows neither the cursor's keys nor the
+        command): a cursor observation whose ``pos`` is (2,) has every tensor unsqueezed, a 1-D command becomes
+        (1, n). Raises ``ValueError`` naming the shapes when the command is not (B, n) or (B, H, n) for the
+        observation's batch B."""
+        if (
+            hasattr(self._flow_model(), "sample_chunk")
+            and torch.is_tensor(obs.get("pos"))
+            and obs["pos"].dim() == 1
+        ):
+            obs = _unsqueezed(obs)
+        if command is None:
+            return obs, command
+        if command.dim() == 1:
+            command = command[None]
+        rows = _obs_rows(obs)
+        if command.dim() not in (2, 3) or (rows is not None and command.shape[0] != rows):
+            raise ValueError(
+                f"command of shape {tuple(command.shape)} for an observation batch of {rows}: the command must be "
+                "(n,) for one unbatched trial, (B, n) per row or (B, H, n) per chunk step"
+            )
+        return obs, command
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:

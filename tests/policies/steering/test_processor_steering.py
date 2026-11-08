@@ -180,8 +180,8 @@ def test_scene_tokens_step_declares_its_feature():
 # ---------------------------------------------------------------- the command step
 
 
-def test_command_step_keeps_the_commanded_dims_and_zeroes_the_idle_rows():
-    raw = np.array([[0.5, -0.2, 9.0], [DEADBAND / 2, 0.0, 9.0], [0.0, -DEADBAND, 9.0]])
+def test_command_step_zeroes_the_idle_rows_and_refuses_a_wider_command():
+    raw = np.array([[0.5, -0.2], [DEADBAND / 2, 0.0], [0.0, -DEADBAND]])
     out = SteeringCommandProcessorStep()(_transition(complementary={COMMAND: raw, "task": "x"}))
     data = out[TransitionKey.COMPLEMENTARY_DATA]
     assert data["task"] == "x" and data[COMMAND].dtype == torch.float32
@@ -191,6 +191,9 @@ def test_command_step_keeps_the_commanded_dims_and_zeroes_the_idle_rows():
     per_step[1] = DEADBAND / 4
     chunk = SteeringCommandProcessorStep().command(per_step)
     assert torch.equal(chunk[0], per_step[0]) and not chunk[1].any()
+    with pytest.raises(ValueError, match="n_dims is 2"):  # a pi0.5 translation command on a 2-dim config
+        SteeringCommandProcessorStep().command(np.zeros((2, 3)))
+    assert SteeringCommandProcessorStep(n_dims=3).command(np.full((2, 3), 0.5)).shape == (2, 3)
 
 
 def test_command_step_needs_a_command_and_declares_no_feature():
@@ -260,9 +263,7 @@ def test_a_round_trip_through_the_pre_pipeline_into_the_policy(mode):
         "mask": torch.ones(3, 4, dtype=torch.bool),
         "goal": torch.zeros(3, 4, dtype=torch.bool),
     }
-    raw = np.array(
-        [[0.6, -0.2, 0.9], [DEADBAND / 2, 0.0, 0.9], [-0.4, 0.8, 0.9]]
-    )  # a third dim the policy ignores
+    raw = np.array([[0.6, -0.2], [DEADBAND / 2, 0.0], [-0.4, 0.8]])
     batch = pre({**{f"observation.{k}": v for k, v in obs.items()}, COMMAND: raw})
     torch.manual_seed(2)
     chunk = post(policy.predict_action_chunk(batch))

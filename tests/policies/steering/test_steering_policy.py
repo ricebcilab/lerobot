@@ -18,6 +18,8 @@ feature-less config, the factory entries, lerobot's save/load format with the ba
 and the policy's batch forms. Its chunks against the cursor example's are in
 tests/examples/pi05_mars_cursor/test_steering_policy_cursor.py."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -214,7 +216,7 @@ def test_forward_needs_the_module_of_its_kind(tmp_path):
     )
     trainable = SteeringPolicy(fresh, base_policy=_policy())
     loss, parts = trainable(
-        {**_obs(), "kind": "user", "latent": torch.randn(3, 16, 2), "command": torch.randn(3, 16, 2)}
+        {**_obs(), "kind": "user", "latent": torch.randn(3, 16, 2), "bci_target": torch.randn(3, 16, 2)}
     )
     loss.backward()
     assert parts["field"] == loss.item() and all(p.grad is not None for p in trainable.get_optim_params())
@@ -275,3 +277,150 @@ def test_select_action_serves_the_chunks_executed_steps_one_per_call():
     steering.reset()
     torch.manual_seed(6)
     assert torch.equal(steering.select_action(batch), chunk[:, 0]) and len(steering._action_queue) == 2
+
+
+# ---------------------------------------------------------------- off the cursor path
+
+
+class _FolderBase(torch.nn.Module):
+    """A pi0.5-style base saved in a folder: pi0.5's sampler interface (a small PI05Config), no ``sample_chunk``."""
+
+    def __init__(self):
+        from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+        super().__init__()
+        self.config = PI05Config(
+            device="cpu", chunk_size=6, n_action_steps=3, max_action_dim=8, num_inference_steps=4
+        )
+
+    @classmethod
+    def from_pretrained(cls, path):
+        assert (Path(path) / "stub.txt").is_file(), path
+        return cls()
+
+    def reset(self):
+        pass
+
+    def predict_action_chunk(self, batch, **hooks):
+        noise = torch.zeros(len(batch["observation.state"]), 6, 8)
+        if "noise_fn" in hooks:  # FRS: the reversed reference
+            noise = hooks["noise_fn"](lambda x, t: torch.ones_like(x), noise)
+        return noise
+
+
+def _base_folder(root, with_processors):
+    from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.processor import (
+        DeviceProcessorStep,
+        PolicyProcessorPipeline,
+        UnnormalizerProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+    from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+    root.mkdir(parents=True)
+    (root / "stub.txt").write_text("a base")
+    if with_processors:
+        stats = {"action": {"mean": torch.zeros(8), "std": torch.full((8,), 2.0)}}
+        features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(8,))}
+        PolicyProcessorPipeline(
+            steps=[DeviceProcessorStep(device="cpu")], name=POLICY_PREPROCESSOR_DEFAULT_NAME
+        ).save_pretrained(root)
+        PolicyProcessorPipeline(
+            steps=[
+                UnnormalizerProcessorStep(
+                    features=features, norm_map={FeatureType.ACTION: NormalizationMode.MEAN_STD}, stats=stats
+                )
+            ],
+            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        ).save_pretrained(root)
+    return str(root)
+
+
+def test_a_base_loaded_from_its_folder_brings_its_processors_for_frs(tmp_path, monkeypatch):
+    monkeypatch.setattr("lerobot.policies.factory.get_policy_class", lambda name: _FolderBase)
+    config = SteeringConfig(
+        base_policy_type="stub",
+        base_policy_path=_base_folder(tmp_path / "base", True),
+        operator_dims=["translation"],
+        n_dims=3,
+        device="cpu",
+    )
+    steering = SteeringPolicy(config)
+    batch = {
+        "observation.state": torch.zeros(2, 8),
+        "task": ["a", "b"],
+        "command": torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    }
+    chunk = steering.predict_action_chunk(batch)
+    assert chunk.shape == (2, 6, 8) and steering.base_preprocessor is not None
+    np.testing.assert_allclose(steering.core._std, np.full(7, 2.0))  # the folder's action statistics
+    bare = SteeringPolicy(
+        SteeringConfig(
+            base_policy_type="stub", base_policy_path=_base_folder(tmp_path / "bare", False), device="cpu"
+        )
+    )
+    with pytest.raises(ValueError, match=r"set_base_policy\(policy, postprocessor=\.\.\.\)"):
+        _ = bare.core
+    with pytest.raises(FileNotFoundError, match="missing"):
+        _ = SteeringPolicy(
+            SteeringConfig(base_policy_path=str(tmp_path / "missing" / "base"), device="cpu")
+        ).base_policy
+
+
+def test_a_trainer_batch_through_the_pre_pipeline_reaches_forward_unchanged(tmp_path):
+    from lerobot.policies.steering import make_steering_pre_post_processors
+
+    user_path, task_path = _modules(tmp_path)
+    config = SteeringConfig(adapter_user=str(user_path), adapter_task=str(task_path), device="cpu")
+    steering = SteeringPolicy(config, base_policy=_policy())
+    pre, _ = make_steering_pre_post_processors(config)
+    g = torch.Generator().manual_seed(8)
+    obs, prefixed = _obs(), {f"observation.{k}": v for k, v in _obs().items()}
+    target = 0.01 * torch.randn(
+        3, 16, 2, generator=g
+    )  # every entry inside the deadband: a target, not a command
+    user = {
+        "kind": "user",
+        "latent": torch.randn(3, 16, 2, generator=g),
+        "bci_target": target,
+        "weight": torch.ones(3),
+        "time": torch.rand(3, generator=g),
+    }
+    task = {
+        "kind": "task",
+        "chunk": 0.01 * torch.randn(3, 16, 2, generator=g),
+        "noise": torch.randn(3, 16, 2, generator=g),
+        "time": torch.rand(3, generator=g),
+    }
+    for training in (user, task):
+        batch = pre({**prefixed, **training})
+        assert all(
+            batch[k] is training[k] or torch.equal(batch[k], training[k]) for k in training if k != "kind"
+        )
+        got, want = steering(batch), steering({**obs, **training})
+        assert torch.equal(got[0], want[0]) and got[1] == want[1]
+    assert torch.equal(pre({**prefixed, **user})["bci_target"], target)  # not deadband-zeroed
+
+
+def test_a_single_unbatched_trial_gets_its_batch_dimension():
+    steering = SteeringPolicy(SteeringConfig(device="cpu"), base_policy=_policy())
+    one = {k: v[0] for k, v in _obs().items()}
+    torch.manual_seed(9)
+    want = steering.predict_action_chunk({**{k: v[:1] for k, v in _obs().items()}, "command": COMMAND[:1]})
+    torch.manual_seed(9)
+    got = steering.predict_action_chunk({**one, "command": COMMAND[0]})
+    assert got.shape == (1, 16, 2) and torch.equal(got, want)
+    torch.manual_seed(9)
+    assert torch.equal(steering.select_action({**one, "command": COMMAND[0]}), want[:, 0])
+    with pytest.raises(ValueError, match=r"command of shape \(3, 2\) for an observation batch of 1"):
+        steering.predict_action_chunk({**one, "command": COMMAND})
+
+
+def test_a_ragged_adapter_matrix_is_refused_by_name():
+    for bad in ([[1.0, 0.0], [0.0]], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]):
+        with pytest.raises(ValueError, match="adapter_matrix"):
+            SteeringConfig(adapter_matrix=bad, device="cpu")

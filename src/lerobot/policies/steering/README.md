@@ -26,7 +26,7 @@ always the model's own output:
   maps to it. The forward flow then starts from that noise.
 
 Both read an operator `TeleopSource` and take the checkpoint's action statistics from the postprocessor
-(`action_mean_std`). `_ChunkSteering.check_steps` is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
+(`action_mean_std`). `FlowControlSteering.check_steps` (both cores have it) is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
 (Modular Adapters for Reversal Steering, the method formerly called FRS-RA). It has two optional parts:
 
 - a _user module_ that adapts the velocity field of the reversal only: a fixed 7x7 matrix F, typically the known
@@ -107,10 +107,47 @@ the local Hugging Face cache: on a machine without a valid HF token, run with `H
 `SteeringPolicy` puts a mode's core and the adapter behind lerobot's policy contract. `SteeringConfig` has no dataset
 features, as `CursorFlowConfig`.
 
-- Its weights are the adapter modules'. The base policy is passed in or loaded from `base_policy_path`.
-- `predict_action_chunk` returns the steered chunk for `batch["command"]`. `select_action` serves the chunk's
-  executed steps one per call. `forward` returns the adapter's training loss.
+- Its weights are the adapter modules'. The base policy is passed in, or loaded from `base_policy_path` (a folder or
+  a Hub repo id) together with that folder's processors. A pi0.5-style base needs its postprocessor's action
+  statistics for `frs`; without them, pass it with `set_base_policy(policy, postprocessor=...)`.
+- `predict_action_chunk` returns the steered chunk for `batch["command"]`, the operator's deflection: `(B, n)`,
+  `(B, H, n)` per chunk step, or `(n,)` for a single unbatched trial. `n` is at most `n_dims` (a pi0.5 base's
+  translation is 3). `select_action` serves the chunk's executed steps one per call.
+- `forward` returns the adapter's training loss on the example trainer's batches: `kind`, `chunk` or `latent` and
+  `bci_target`, `noise`, `time`, `weight`. The pre-processor carries these through untouched, but does not build
+  them.
 - A task module's scene settings become the config's (`SteeringConfig.scene_settings`).
 - The processor factory adds the scene step for a `vlm_image` / `vlm_prefix` task module.
 - The cursor example's `tools/convert_checkpoints.py --steering` writes a `SteeringPolicy` folder and its pipelines
   beside each `adapter.pt`.
+
+`make_policy` cannot build a steering policy: it needs dataset or env features, and the base must be passed in
+(the `cursor_flow` precedent). Build it with `SteeringPolicy(config, base_policy=...)`, or
+`get_policy_class("steering")`, or `from_pretrained`, and its processors with `make_steering_pre_post_processors`,
+or with `make_pre_post_processors(config, pretrained_path=...)` for a saved folder.
+
+On the cursor's base:
+
+```python
+from lerobot.policies.cursor_flow import CursorFlowPolicy
+from lerobot.policies.steering import SteeringConfig, SteeringPolicy, make_steering_pre_post_processors
+
+base = CursorFlowPolicy.from_pretrained("path/to/cursor_policy")  # the policy whose chunks are steered
+config = SteeringConfig(mode="frs", adapter_user="path/to/adapter.pt", device="cpu")  # MARS-U
+policy = SteeringPolicy(config, base_policy=base)
+preprocessor, postprocessor = make_steering_pre_post_processors(policy.config)
+
+# obs: the cursor's observation dict (pos, hist, targets, mask, goal, ...); deflection: (B, 2) in [-1, 1]
+batch = preprocessor({**{f"observation.{k}": v for k, v in obs.items()}, "command": deflection})
+action = postprocessor(policy.select_action(batch))  # (B, 2), screen units per step
+```
+
+From a converted folder (`convert_checkpoints.py --steering`), or any folder `save_pretrained` and the pipelines'
+`save_pretrained` wrote:
+
+```python
+from lerobot.policies.factory import make_pre_post_processors
+
+policy = SteeringPolicy.from_pretrained("path/to/adapters/<name>", base_policy=base)
+preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path="path/to/adapters/<name>")
+```

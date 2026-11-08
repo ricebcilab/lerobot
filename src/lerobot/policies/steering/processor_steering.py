@@ -59,6 +59,8 @@ OBS_LAYOUTS = "observation.layouts"  # the scene step's input: the trials' layou
 OBS_SCENE_IMAGES = "observation.scene_images"  # ... or their pictures, uint8 [B, 3, S, S]
 OBS_SCENE_TOKENS = "observation.scene_tokens"  # the scene step's output, float16 [B, 256, width]
 COMMAND = "command"  # the operator's command, in the complementary data
+# A training batch's keys (``SteeringPolicy.forward``'s), carried through the pre-processor untouched
+TRAINING_KEYS = ("kind", "chunk", "latent", "noise", "time", "weight", "bci_target")
 
 
 class SceneEncoder:
@@ -381,20 +383,27 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
 class SteeringCommandProcessorStep(ProcessorStep):
     """The operator's command as the steering policy reads it.
 
-    Reads ``command`` from the complementary data (one command per row, ``[B, >= n_dims]``, or one per chunk
-    step, ``[B, H, >= n_dims]``, in the operator's units: a deflection in [-1, 1] per dim), keeps its first
-    ``n_dims`` dims as float32 and zeroes the rows inside ``deadband`` (every entry below it in magnitude: the
-    operator is idle and the row gets the policy's own chunk), and writes it back. The steering policy converts
-    the deflection to the policy's action units itself, as each mode needs it (flow control writes it at
-    ``ic_gain``; FRS's reference moves at ``max_speed``)."""
+    Reads ``command`` from the complementary data (one command per row, ``[B, n]``, one per chunk step,
+    ``[B, H, n]``, or a single unbatched trial's ``[n]``, in the operator's units: a deflection in [-1, 1] per dim,
+    ``n`` at most ``n_dims``: a wider command raises rather than losing dims), converts it to float32, zeroes the
+    rows inside ``deadband`` (every entry below it in magnitude: the operator is idle and the row gets the policy's
+    own chunk), and writes it back. The steering policy converts the deflection to the policy's action units
+    itself, as each mode needs it (flow control writes it at ``ic_gain``; FRS's reference moves at ``max_speed``).
+    A training batch (one with ``kind``, ``SteeringPolicy.forward``'s) has no operator command: the step leaves it
+    as it is."""
 
     deadband: float = DEADBAND
     n_dims: int = 2
 
     def command(self, command: Any) -> torch.Tensor:
-        """The processed command: float32, the first ``n_dims`` dims, the idle rows zeroed."""
+        """The processed command: float32, the idle rows zeroed."""
         command = torch.as_tensor(np.asarray(command) if not torch.is_tensor(command) else command)
-        command = command[..., : self.n_dims].to(torch.float32)
+        if command.shape[-1] > self.n_dims:
+            raise ValueError(
+                f"a command of shape {tuple(command.shape)} has {command.shape[-1]} dims, the steering policy's "
+                f"n_dims is {self.n_dims}: set n_dims to the commanded dims (a pi0.5 base's translation is 3)"
+            )
+        command = command.to(torch.float32)
         magnitude = command.abs().amax(-1)
         active = (magnitude.amax(-1) if magnitude.dim() == 2 else magnitude) >= self.deadband
         shape = (-1,) + (1,) * (command.dim() - 1)
@@ -403,6 +412,8 @@ class SteeringCommandProcessorStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
         data = transition.get(TransitionKey.COMPLEMENTARY_DATA)
+        if data and "kind" in data:  # a training batch: its keys go to forward as they are
+            return transition
         if not data or data.get(COMMAND) is None:
             raise ValueError(f"SteeringCommandProcessorStep needs {COMMAND!r} in the complementary data")
         transition[TransitionKey.COMPLEMENTARY_DATA] = {**data, COMMAND: self.command(data[COMMAND])}
@@ -419,12 +430,15 @@ class SteeringCommandProcessorStep(ProcessorStep):
 
 
 def steering_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
-    """``batch_to_transition`` that also carries the operator's ``command`` in the complementary data."""
+    """``batch_to_transition`` that also carries the operator's ``command`` and a training batch's keys
+    (``TRAINING_KEYS``) in the complementary data, which ``transition_to_batch`` hands back as they were."""
     transition = batch_to_transition(batch)
-    if COMMAND in batch:
-        data = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
-        data[COMMAND] = batch[COMMAND]
-        transition[TransitionKey.COMPLEMENTARY_DATA] = data
+    carried = {k: batch[k] for k in (COMMAND, *TRAINING_KEYS) if k in batch}
+    if carried:
+        transition[TransitionKey.COMPLEMENTARY_DATA] = {
+            **(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}),
+            **carried,
+        }
     return transition
 
 

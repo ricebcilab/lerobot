@@ -85,7 +85,8 @@ class SteeringConfig(PreTrainedConfig):
             rebuilds it without its checkpoint); None: read from ``adapter_user``.
         task_module: The task module's, likewise.
         lambda_id: The task module's pull of A, b toward the identity in ``forward``.
-        n_dims: The action dims the adapter acts on.
+        n_dims: The action dims the adapter acts on, and the most dims an operator's command may have (the command
+            step refuses a wider one): 2 on the cursor, 3 for a pi0.5 base's translation.
         horizon: The base policy's chunk length (when it does not say).
         num_inference_steps: The base policy's Euler steps per chunk (a ``sample_chunk`` policy's, as the cursor's).
         n_action_steps: The chunk steps executed per replan.
@@ -149,8 +150,9 @@ class SteeringConfig(PreTrainedConfig):
             )
         if (
             self.adapter_matrix is not None
-        ):  # rows of numbers; kept as lists, so the config compares and serializes
-            self.adapter_matrix = np.asarray(self.adapter_matrix, dtype=np.float64).tolist()
+        ):  # a square of numbers, kept as lists so the config compares and serializes
+            rows = len(self.adapter_matrix)
+            self.adapter_matrix = self.checked_matrix(self.adapter_matrix, rows, "adapter_matrix").tolist()
 
     @property
     def fixed_matrix(self) -> np.ndarray | None:

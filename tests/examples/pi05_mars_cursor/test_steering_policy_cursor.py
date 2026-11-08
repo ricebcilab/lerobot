@@ -129,7 +129,7 @@ def test_forward_is_the_trainers_losses(setup):
     torch.manual_seed(5)
     want = train_adapter.field_loss(policy, user, task, obs, latent, bci, weight)  # draws t
     torch.manual_seed(5)
-    loss, _ = steering({**obs, "kind": "user", "latent": latent, "command": bci, "weight": weight})
+    loss, _ = steering({**obs, "kind": "user", "latent": latent, "bci_target": bci, "weight": weight})
     assert torch.equal(loss, want)
 
 
