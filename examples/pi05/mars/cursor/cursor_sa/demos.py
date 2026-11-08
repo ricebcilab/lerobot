@@ -155,14 +155,16 @@ def make_demos(rng, layouts, task=TaskConfig(), demo=DemoConfig(), max_tries=50,
     return np.concatenate([actions, np.zeros((B, extra, 2))], 1), lengths
 
 
-def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25, tries=20):
+def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25, tries=20, mirror=True):
     """Up to `k` rigidly moved copies of every demonstration (`env.move_layouts`, `env.move_actions`).
 
     Returns (layouts, actions, lengths, kept, push): rows 0..B-1 are the originals unchanged, then the
     copies grouped by original in original order; kept [B] counts each original's copies and push is
     `push` [B, L, 2] with the copies' rows moved by their motions (None stays None). Every round draws
     one motion for each original still short of `k`: an angle in [0, 2 pi), a shift in [-shift, shift]^2
-    and a mirror with chance 1/2, in that order. A copy is kept when its layout is on screen, its whole
+    and a mirror with chance 1/2, in that order; with `mirror` False (a curl corruption, whose handedness does not
+    mirror) the mirror draw is still made but every copy stays unmirrored, so the other motions do not change. A
+    copy is kept when its layout is on screen, its whole
     path lies in [0, 1]^2 and its actions replay to success; its length is what the replay took. Rounds
     stop after `tries * k`, so a reach too wide to move gets fewer copies, and a demonstration of length
     0 gets none. Layouts carrying a `scene` are refused (by `Layouts.concat`) once a copy is kept.
@@ -178,9 +180,11 @@ def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25
             break
         angle = rng.uniform(0, 2 * np.pi, len(rows))
         offset = rng.uniform(-shift, shift, (len(rows), 2))
-        mirror = rng.random(len(rows)) < 0.5
-        moved_layouts = move_layouts(layouts[rows], angle, offset, mirror)
-        moved = move_actions(actions[rows], angle, mirror)
+        flip = rng.random(len(rows)) < 0.5
+        if not mirror:
+            flip[:] = False
+        moved_layouts = move_layouts(layouts[rows], angle, offset, flip)
+        moved = move_actions(actions[rows], angle, flip)
         path = demo_positions(moved_layouts, moved)
         fits = np.flatnonzero(layouts_on_screen(moved_layouts, margin=task.margin) & ((path >= 0) & (path <= 1)).all((1, 2)))
         steps = np.zeros(len(rows), dtype=np.int64)  # 0: not kept
@@ -193,7 +197,7 @@ def augment_demos(rng, layouts, actions, lengths, k, task, push=None, shift=0.25
             origin = rows[good]
             kept[origin] += 1
             found.append((origin, moved_layouts[good], moved[good], steps[good],
-                          None if push is None else move_actions(push[origin], angle[good], mirror[good])))
+                          None if push is None else move_actions(push[origin], angle[good], flip[good])))
     if not found:
         return layouts, actions, lengths, kept, push
     origin, moved_layouts, moved, steps, pushes = zip(*found)

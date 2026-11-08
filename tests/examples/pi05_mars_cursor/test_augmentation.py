@@ -159,6 +159,24 @@ def test_motions_are_drawn_angle_then_shift_then_mirror_whatever_the_cursor_nois
         assert np.array_equal(out.targets[8:], want.targets) and np.array_equal(acts[:8], actions)
 
 
+def test_mirror_off_keeps_the_other_draws_and_mirrors_nothing():
+    lay, actions, lengths = _demos(FREE, n=8)
+    draw = np.random.default_rng(3)
+    angle, shift = draw.uniform(0, 2 * np.pi, 8), draw.uniform(-0.1, 0.1, (8, 2))
+    out, acts, lens, kept, _ = augment_demos(
+        np.random.default_rng(3), lay, actions, lengths, 1, FREE, shift=0.1, tries=1, mirror=False
+    )
+    want = move_layouts(lay, angle, shift, np.zeros(8, bool))[kept == 1]
+    assert (
+        kept.sum() > 0
+        and np.array_equal(out.start[8:], want.start)
+        and np.array_equal(out.targets[8:], want.targets)
+    )
+    assert np.array_equal(
+        acts[8:], move_actions(actions, angle, np.zeros(8, bool))[kept == 1][:, : acts.shape[1]]
+    )
+
+
 def test_replays_run_500_rows_at_a_time(monkeypatch):
     lay, actions, lengths = _demos(FREE)
     rows = []

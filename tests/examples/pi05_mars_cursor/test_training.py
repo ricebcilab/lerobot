@@ -463,9 +463,9 @@ DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
     ([*POOLED, "--teacher", "t"], True),                                           # no pooled teacher run
     ([*VIEWS_TASK, "--jitter", "0.02"], True),                                     # the picture would show the cursor elsewhere
     ([*VIEWS_TASK, "--rigid-motions", "2"], True),
-    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--rigid-motions", "2"], True),  # a curl does not mirror
+    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--rigid-motions", "2"], {"rigid_motions": 2}),  # unmirrored copies
     ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--jitter", "0.02"], {"jitter": 0.02}),
-    (["--kind", "task", "--pooled", "CURLED_POOL", "--name", "x", "--rigid-motions", "2"], True),
+    (["--kind", "task", "--pooled", "CURLED_POOL", "--name", "x", "--rigid-motions", "2"], {"rigid_motions": 2}),
     ([*POOLED, "--jitter", "0.02"], {"jitter": 0.02}),
     ([*DISCS_TASK, "--teacher", "t", "--rigid-motions", "2"], True),               # a teacher's demonstrations are rollouts
     ([*DISCS_TASK, "--teacher", "t", "--jitter", "0.02"], {"jitter": 0.02}),

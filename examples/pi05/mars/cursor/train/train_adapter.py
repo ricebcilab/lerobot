@@ -54,7 +54,8 @@ ones, which the module reduces. The val split reuses the train split's reduction
 entry's train split. The meta records `scene_store` (the store's folder name), `scene_rank` and `scene_center`.
 `--jitter s` moves every training sample's position off the path by N(0, s^2 I) and has the first `--jitter-steps` steps of
 its chunk take the move back out (a recovery label). `--rigid-motions k` adds up to k copies of every training demonstration
-under random rigid motions of the screen (`augment_demos`), the expert's pushes moved with them; neither touches the val split.
+under random rigid motions of the screen (`augment_demos`), the expert's pushes moved with them; under a curl corruption the
+copies are not mirrored (a curl's handedness does not mirror; the meta's `rigid_mirror`); neither touches the val split.
 The user's frozen module is in the loop through lambda_field x the field regression above through both
 modules, on that user's commands around the obstacles (the layouts with the obstacle only):
 
@@ -431,12 +432,15 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
         frames, push, stored, reduction = None, None, None, None
         if split == "train" and args.rigid_motions:  # before any scene: `Layouts.concat` refuses layouts that carry one
             push = expert_pushes(layouts, demo_positions(layouts, actions))
+            mirror = curl is None  # a curl's handedness does not mirror: rotations and shifts only
+            args.rigid_mirror = getattr(args, "rigid_mirror", True) is not False and mirror
             layouts, actions, lengths, kept, push = augment_demos(np.random.default_rng([args.seed, 11]), layouts, actions, lengths,
-                                                                  args.rigid_motions, task, push=push)
+                                                                  args.rigid_motions, task, push=push, mirror=mirror)
             if getattr(args, "rigid_kept", None) is None:  # `train_task` sets it; a direct call starts the count here
                 args.rigid_kept = 0
             args.rigid_kept += int(kept.sum())
-            print(f"train: {len(kept)} demonstrations and {kept.sum()} moved copies ({kept.min()}-{kept.max()} per demonstration)",
+            print(f"train: {len(kept)} demonstrations and {kept.sum()} moved copies ({kept.min()}-{kept.max()} per demonstration"
+                  f"{'' if mirror else ', no mirror: curl'})",
                   flush=True)
         if args.token_source == "vlm_views":
             train = split == "train"
@@ -713,6 +717,7 @@ def train_task(args, policy, device, rng):
     encoder = SceneEncoder(args.vlm, device) if args.token_source.startswith("vlm_") else None
     entries = entries_of(args)
     args.rigid_kept = 0 if args.rigid_motions else None
+    args.rigid_mirror = True if args.rigid_motions else None
     args.scene_reduction, args.scene_kept = None, None   # --scene-rank (vlm_image, vlm_prefix): fitted on the first train split
     try:
         pairs = []
@@ -844,7 +849,7 @@ def save_module(args, kind, module, name, **extra):
     reduced = args.token_source in STORED_SCENE_SOURCES and bool(args.scene_rank)
     center = args.scene_center if args.token_source == "vlm_views" or reduced else None
     store = None if args.scene_store is None else store_name(args.token_source, args.render_size, encoder_digest(args.vlm))
-    augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept")}
+    augmented = {k: getattr(args, k) if kind == "task" else None for k in ("jitter", "jitter_steps", "rigid_motions", "rigid_kept", "rigid_mirror")}
     path = AdapterModules.save_module(module, adapter_dir(name) / "adapter.pt", kind, meta=dict(args=saved, obstacle=args.obstacle, pooled=args.pooled,
                                                               token_source=args.token_source, render_size=args.render_size,
                                                               token_geometry=args.token_geometry,
@@ -875,7 +880,6 @@ def dim_indices(text):
         raise argparse.ArgumentTypeError(f"expected a comma list of dim indices, got {text!r}") from None
 
 
-NO_CURL_COPIES = "--rigid-motions mirrors demonstrations and a curl's handedness does not mirror: no curl corruption"
 
 
 def parse_args(argv=None):
@@ -1021,14 +1025,10 @@ def parse_args(argv=None):
         for e in args.pooled:
             if not {"obstacle", "user_module", "corruption"} <= set(e):
                 p.error("--pooled: every entry needs obstacle, user_module and corruption")
-            if args.rigid_motions and corruption_spec(e["corruption"])[1] is not None:
-                p.error(NO_CURL_COPIES)
         args.obstacle = None
         return args
     if args.corruption is None:
         p.error("--corruption is required")
-    if args.rigid_motions and corruption_spec(args.corruption)[1] is not None:
-        p.error(NO_CURL_COPIES)
     if args.kind == "task" and (args.obstacle is None or args.user_module is None):
         p.error("--kind task needs the task's --obstacle and the user's --user-module")
     if args.frozen_noise and args.closed_loop:
