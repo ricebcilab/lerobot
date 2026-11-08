@@ -57,9 +57,9 @@ def _reference(seed, scale=0.1, **ranks):
 def _twin(old):
     """The example's UserModule with the reference's weights, through the core's checkpoint conversion."""
     new = steering.UserModule(
-        **core.convert_cursor_module({"kind": "user", "config": old.config, "state_dict": old.state_dict()})[
-            "config"
-        ]
+        **core.AdapterModules.from_cursor_checkpoint(
+            {"kind": "user", "config": old.config, "state_dict": old.state_dict()}
+        )["config"]
     )
     new.load_state_dict(old.state_dict())
     return new.eval()
@@ -88,7 +88,7 @@ def test_velocity_matches_the_cursor(exact, ranks):
     with torch.no_grad():
         _close(new(x, t), old(x, t), exact)
         _close(new.velocity(x, t, v), old.velocity(x, t, v), exact)
-        _close(core.apply_user_module(new, x, t, v), ref.user_velocity(old, x, t, v), exact)
+        _close(core.LearnedUserModule.apply_correction(new, x, t, v), ref.user_velocity(old, x, t, v), exact)
         _close(
             steering.ReversalAdapter(user=new).adapt({}, x, t, v, backward=True),
             ref.ReversalAdapter(user=old).adapt({}, x, t, v, backward=True),
@@ -124,7 +124,7 @@ def test_reversal_through_the_policy_matches_the_cursor(exact, ranks):
 def test_a_cursor_checkpoint_loads_into_the_same_module(exact, tmp_path):
     old = _reference(5, step_rank=None, cross_step_rank=2)
     torch.save(  # the reference's checkpoint, as convert_checkpoints.py rewrites it (ReversalAdapter.load reads that)
-        core.convert_cursor_module(
+        core.AdapterModules.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict(), "args": {}}
         ),
         tmp_path / "adapter.pt",

@@ -22,7 +22,6 @@ pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTa
 ``configuration_steering``'s, the pre-processing ``processor_steering``'s; this folder's README describes the
 methods. The module-level functions at the end are deprecated aliases of the methods that replaced them."""
 
-import functools
 import math
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -935,8 +934,8 @@ class Flow:
     matrix). ``noise_time`` is the flow time of noise: 1.0 is pi0.5's convention (t = 1 noise, t = 0 the action),
     0.0 the cursor's. With ``batch_time`` the flow times reach ``velocity`` and the adapter as (B,) float32
     tensors (the cursor policy's form), else as floats. ``reverse`` and ``forward`` are the reversal toward noise
-    and the unsteered forward pass at the policy's own step of 1/N; the statics ``schedule``,
-    ``uniform_reference``, ``heading_cosine`` and ``paired_chunks`` need no field."""
+    and the unsteered forward pass at the policy's own step of 1/N; the statics ``Flow.schedule``,
+    ``Flow.uniform_reference``, ``Flow.heading_cosine`` and ``Flow.paired_chunks`` need no field."""
 
     def __init__(
         self,
@@ -1926,145 +1925,3 @@ class SteeringPolicy(PreTrainedPolicy):
             n = self.core._policy.config.n_action_steps
             self._action_queue.extend(chunk[:, :n].transpose(0, 1))
         return self._action_queue.popleft()
-
-
-# ---------------------------------------------------------------- deprecated aliases (one round)
-#
-# The module-level functions these methods replaced, each calling its method; a later round removes them.
-
-
-def deprecated_alias(target: Callable[..., Any], name: str, new: str) -> Callable[..., Any]:
-    """A function named ``name`` that calls ``target`` with its arguments: the deprecated alias of ``new`` (a
-    method that replaced a module-level function of this package), kept for one round."""
-
-    @functools.wraps(target)
-    def alias(*args: Any, **kwargs: Any) -> Any:
-        return target(*args, **kwargs)
-
-    alias.__name__ = alias.__qualname__ = name
-    alias.__doc__ = (
-        f"Deprecated alias of ``{new}``, kept for one round: call ``{new}``.\n\n{target.__doc__ or ''}"
-    )
-    return alias
-
-
-def integrate(
-    x: torch.Tensor,
-    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
-    t0: float,
-    h: float,
-    n: int,
-    adapter=None,
-    backward: bool = False,
-    grad: bool = False,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """Deprecated alias of ``Flow(velocity, adapter, batch_time=batch_time).integrate(x, t0, h, n, backward,
-    grad)``, kept for one round."""
-    return Flow(velocity, adapter, batch_time=batch_time).integrate(x, t0, h, n, backward=backward, grad=grad)
-
-
-def reverse_flow(
-    x: torch.Tensor, velocity, num_steps: int, adapter=None, n_reversal_steps: int | None = None
-) -> torch.Tensor:
-    """Deprecated alias of ``Flow(velocity, adapter).reverse(x, num_steps, n_reversal_steps)``, kept for one
-    round."""
-    return Flow(velocity, adapter).reverse(x, num_steps, n_reversal_steps)
-
-
-def forward_flow(
-    x: torch.Tensor, velocity, num_steps: int, stop_at: int | None = None, adapter=None
-) -> torch.Tensor:
-    """Deprecated alias of ``Flow(velocity, adapter).forward(x, num_steps, stop_at)``, kept for one round."""
-    return Flow(velocity, adapter).forward(x, num_steps, stop_at)
-
-
-def frs_latent(
-    velocity: Callable[[torch.Tensor, float | torch.Tensor], torch.Tensor],
-    reference: torch.Tensor,
-    noise: torch.Tensor,
-    steps: int,
-    n_reverse_steps: int | None = None,
-    adapter=None,
-    delegated: torch.Tensor | None = None,
-    noise_time: float = 1.0,
-    grad: bool = False,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """Deprecated alias of ``Flow(velocity, adapter, noise_time, batch_time).latent(reference, noise, steps,
-    n_reverse_steps, delegated, grad)``, kept for one round."""
-    return Flow(velocity, adapter, noise_time, batch_time).latent(
-        reference, noise, steps, n_reverse_steps, delegated=delegated, grad=grad
-    )
-
-
-def regenerate(
-    velocity,
-    chunk: torch.Tensor,
-    num_steps: int,
-    adapter=None,
-    noise_time: float = 1.0,
-    batch_time: bool = False,
-) -> torch.Tensor:
-    """Deprecated alias of ``Flow(velocity, adapter, noise_time, batch_time).regenerate(chunk, num_steps)``, kept
-    for one round."""
-    return Flow(velocity, adapter, noise_time, batch_time).regenerate(chunk, num_steps)
-
-
-_adapt_velocity = deprecated_alias(Flow.adapt_velocity, "_adapt_velocity", "Flow.adapt_velocity")
-frs_schedule = deprecated_alias(Flow.schedule, "frs_schedule", "Flow.schedule")
-uniform_reference = deprecated_alias(Flow.uniform_reference, "uniform_reference", "Flow.uniform_reference")
-heading_cosine = deprecated_alias(Flow.heading_cosine, "heading_cosine", "Flow.heading_cosine")
-paired_chunks = deprecated_alias(Flow.paired_chunks, "paired_chunks", "Flow.paired_chunks")
-
-apply_user_module = deprecated_alias(
-    LearnedUserModule.apply_correction, "apply_user_module", "LearnedUserModule.apply_correction"
-)
-user_field_loss = deprecated_alias(
-    LearnedUserModule.field_loss, "user_field_loss", "LearnedUserModule.field_loss"
-)
-reduce_tokens = deprecated_alias(LearnedTaskModule.reduce, "reduce_tokens", "LearnedTaskModule.reduce")
-task_field_loss = deprecated_alias(
-    LearnedTaskModule.field_loss, "task_field_loss", "LearnedTaskModule.field_loss"
-)
-save_adapter_module = deprecated_alias(
-    AdapterModules.save_module, "save_adapter_module", "AdapterModules.save_module"
-)
-load_adapter_module = deprecated_alias(
-    AdapterModules.load_module, "load_adapter_module", "AdapterModules.load_module"
-)
-convert_cursor_module = deprecated_alias(
-    AdapterModules.from_cursor_checkpoint, "convert_cursor_module", "AdapterModules.from_cursor_checkpoint"
-)
-_MODULE_KINDS = AdapterModules.KINDS  # deprecated: AdapterModules.KINDS
-
-FlowControlPolicy = FlowControlSteering  # deprecated alias, kept for one round: FlowControlSteering
-FlowReversalSteeringPolicy = (
-    FlowReversalSteering  # deprecated alias, kept for one round: FlowReversalSteering
-)
-flow_control_write = deprecated_alias(
-    FlowControlSteering.write, "flow_control_write", "FlowControlSteering.write"
-)
-delegation_mask = deprecated_alias(
-    FlowReversalSteering.delegation_mask, "delegation_mask", "FlowReversalSteering.delegation_mask"
-)
-task_velocity_hook = deprecated_alias(
-    FlowControlSteering.velocity_hook, "task_velocity_hook", "FlowControlSteering.velocity_hook"
-)
-get_action_mean_std = deprecated_alias(
-    FlowControlSteering.action_mean_std, "get_action_mean_std", "FlowControlSteering.action_mean_std"
-)
-validate_matrix = deprecated_alias(
-    SteeringConfig.checked_matrix, "validate_matrix", "SteeringConfig.checked_matrix"
-)
-rotation_about_z = deprecated_alias(SteeringConfig.rotation, "rotation_about_z", "SteeringConfig.rotation")
-translation_matrix = deprecated_alias(
-    SteeringConfig.translation, "translation_matrix", "SteeringConfig.translation"
-)
-build_reversal_adapter = deprecated_alias(
-    SteeringConfig.build_adapter, "build_reversal_adapter", "SteeringConfig.build_adapter"
-)
-parse_adapter_spec = deprecated_alias(
-    SteeringConfig.from_spec, "parse_adapter_spec", "SteeringConfig.from_spec"
-)
-format_matrix = deprecated_alias(MatrixHolder.format_rows, "format_matrix", "MatrixHolder.format_rows")

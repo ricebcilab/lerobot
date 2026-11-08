@@ -4,13 +4,7 @@ import _reference_steering as ref
 import torch
 from cursor_sa.policy import FlowPolicy
 
-from lerobot.policies.steering import (
-    LearnedTaskModule,
-    LearnedUserModule,
-    convert_cursor_module,
-    integrate,
-    load_adapter_module,
-)
+from lerobot.policies.steering import AdapterModules, Flow, LearnedTaskModule, LearnedUserModule
 
 
 def _obs(b=3, n=5, hist=4, k=2):
@@ -51,12 +45,12 @@ def test_integrate_reproduces_cursor_flows_exactly():
     for n in (4, steps):
         expect = ref.reverse_flow(policy, obs, x, n, steps)
         assert torch.equal(
-            integrate(x, velocity, 1.0, -1.0 / steps, n, backward=True, batch_time=True), expect
+            Flow(velocity, batch_time=True).integrate(x, 1.0, -1.0 / steps, n, backward=True), expect
         )
         t0 = 1.0 - n / steps
         m = steps if n == steps else steps - n
         expect = ref.forward_flow(policy, obs, x, t0, 1.0, m)
-        assert torch.equal(integrate(x, velocity, t0, (1.0 - t0) / m, m, batch_time=True), expect)
+        assert torch.equal(Flow(velocity, batch_time=True).integrate(x, t0, (1.0 - t0) / m, m), expect)
 
 
 def test_cursor_user_module_converts_and_matches(tmp_path):
@@ -69,13 +63,13 @@ def test_cursor_user_module_converts_and_matches(tmp_path):
         "obstacle": None,
     }
     assert "kind" not in ckpt  # the first adapters were saved without one
-    converted = convert_cursor_module(ckpt)
+    converted = AdapterModules.from_cursor_checkpoint(ckpt)
     assert converted["kind"] == "user" and converted["meta"] == {
         "args": {"name": "u", "seed": 0},
         "obstacle": None,
     }
     torch.save(converted, tmp_path / "user.pt")
-    new, kind, _ = load_adapter_module(tmp_path / "user.pt")
+    new, kind, _ = AdapterModules.load_module(tmp_path / "user.pt")
     assert isinstance(new, LearnedUserModule) and kind == "user" and new.n_dims == 2
     x, t = torch.randn(3, 16, 2), torch.rand(3)
     with torch.no_grad():
@@ -93,10 +87,10 @@ def test_cursor_task_module_converts_and_matches(tmp_path):
         "args": {},
         "obstacle": obstacle,
     }
-    converted = convert_cursor_module(ckpt)
+    converted = AdapterModules.from_cursor_checkpoint(ckpt)
     assert converted["kind"] == "task" and "arch" not in converted
     torch.save(converted, tmp_path / "task.pt")
-    new, kind, meta = load_adapter_module(tmp_path / "task.pt")
+    new, kind, meta = AdapterModules.load_module(tmp_path / "task.pt")
     assert isinstance(new, LearnedTaskModule) and kind == "task" and meta["obstacle"] == obstacle
     obs = _obs()
     x, v, t = torch.randn(3, 16, 2), torch.randn(3, 16, 2), torch.rand(3)

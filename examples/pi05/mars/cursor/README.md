@@ -279,8 +279,8 @@ Main parameters (`control:` and `task:` sections):
   steps the reference is reversed (null: all, to noise), and how many leading chunk steps it steers
   (null: the whole chunk); the rest of the latent is handed back to the policy (Tang et al., App. D). The forward
   pass then runs n steps of the policy's own 1/N from where the reversal stopped. The cursor and the robot run one
-  implementation of each method: the cursor's chunks come from lerobot's `FlowControlPolicy` and
-  `FlowReversalSteeringPolicy`, the wrappers pi0.5 uses, driving the cursor policy through pi0.5's sampler interface
+  implementation of each method: the cursor's chunks come from lerobot's `FlowControlSteering` and
+  `FlowReversalSteering`, the cores pi0.5 uses, driving the cursor policy through pi0.5's sampler interface
   (`CursorSampler` over `FlowPolicy.sample_chunk`), and one operator readout (`lerobot.teleoperators.readout`:
   corruption, curl, noise, deadband). Until 2026-10-31 the cursor's forward pass took N − n steps instead, coarse at
   large depths, so earlier partial-reversal results are not comparable.
@@ -405,8 +405,8 @@ modules of all five training seeds, each named with `_s<k>` after its demonstrat
 checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapters/grid_20000demos/`,
 `adapters/refit/` and `adapters/data_efficiency/`, and are not distributed.
 
-`train_adapter.py` writes `adapter.pt` in lerobot's `save_adapter_module` format (kind, config, weights, meta),
-which `ReversalAdapter.load` (lerobot's `load_adapter_module`) reads; the policy trainer still writes the cursor
+`train_adapter.py` writes `adapter.pt` in lerobot's `AdapterModules.save_module` format (kind, config, weights, meta),
+which `ReversalAdapter.load` (lerobot's `AdapterModules.load`) reads; the policy trainer still writes the cursor
 project's `policy.pt`, which `FlowPolicy.load` reads alongside lerobot's format, so a fresh policy works before
 it is converted. After training a policy, rerun `convert_checkpoints.py`: its folder becomes a `cursor_flow`
 policy (`config.json` + `model.safetensors`, loaded by `CursorFlowPolicy.from_pretrained`). The converter also

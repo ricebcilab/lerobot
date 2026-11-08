@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The robot and the cursor run one implementation of each steering method: the same wrapper classes
-(`FlowControlPolicy`, `FlowReversalSteeringPolicy`) drive pi0.5's sampler loop (``PI05Pytorch.sample_actions``,
+(`FlowControlSteering`, `FlowReversalSteering`) drive pi0.5's sampler loop (``PI05Pytorch.sample_actions``,
 t = 1 noise) and the cursor policy's (``FlowPolicy.sample_chunk``, t = 0 noise). On time-mirrored fields and the
 same noise the two give the same chunk, for flow control at every tau and lambda and for FRS and MARS at every
 reversal depth and pinned prefix: the samplers, the only per-side code, agree."""
@@ -29,10 +29,10 @@ from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
 from lerobot.policies.steering import (
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
-    FlowControlPolicy,
-    FlowReversalSteeringPolicy,
+    Flow,
+    FlowControlSteering,
+    FlowReversalSteering,
     ReversalAdapter,
-    frs_schedule,
 )
 
 STEPS, CHUNK = 10, 6
@@ -131,12 +131,12 @@ OBS = {"pos": torch.zeros(1, 2)}
 
 
 def test_frs_schedule_mirrors_the_reversal_in_either_convention():
-    assert frs_schedule(10, None, 1.0) == (1.0, 10) and frs_schedule(10, None, 0.0) == (0.0, 10)
-    assert frs_schedule(10, 4, 1.0) == pytest.approx((0.4, 4)) and frs_schedule(10, 4, 0.0) == pytest.approx(
-        (0.6, 4)
-    )
+    assert Flow.schedule(10, None, 1.0) == (1.0, 10) and Flow.schedule(10, None, 0.0) == (0.0, 10)
+    assert Flow.schedule(10, 4, 1.0) == pytest.approx((0.4, 4)) and Flow.schedule(
+        10, 4, 0.0
+    ) == pytest.approx((0.6, 4))
     with pytest.raises(ValueError, match="noise_time"):
-        frs_schedule(10, 4, 0.5)
+        Flow.schedule(10, 4, 0.5)
 
 
 @pytest.mark.parametrize("depth", [1, 3, 5, 8, 9, None])
@@ -147,7 +147,7 @@ def test_frs_and_mars_run_one_implementation_on_both_samplers(depth, pinned, mar
     noise = torch.randn(1, CHUNK, N_ACTION_DIMS, generator=torch.Generator().manual_seed(1))
     command = np.array([0.6, -0.3, 0.2])
     adapter = ReversalAdapter(matrix=np.diag([1.0, 0.5, 2.0, 1.0, 1.0, 1.0, 1.0])) if mars else None
-    robot = FlowReversalSteeringPolicy(
+    robot = FlowReversalSteering(
         MiniPi05(pi05_field, noise),
         Source(command),
         postprocessor(N_ACTION_DIMS),
@@ -158,7 +158,7 @@ def test_frs_and_mars_run_one_implementation_on_both_samplers(depth, pinned, mar
     )
     reference, field = robot.reference_chunk(command), robot._adapter_field(noise)
     robot_chunk, _ = robot._sample_chunk(batch=None)
-    cursor = FlowReversalSteeringPolicy(
+    cursor = FlowReversalSteering(
         CursorSampler(FieldFlowPolicy(cursor_field), noise),
         None,
         n_reversal_steps=depth,
@@ -176,11 +176,11 @@ def test_flow_control_runs_one_implementation_on_both_samplers(tau, lam):
     pi05_field, cursor_field = fields(3, seed=2)
     noise = torch.randn(1, CHUNK, 3, generator=torch.Generator().manual_seed(3))
     command = np.array([0.4, -0.7, 0.1])
-    robot = FlowControlPolicy(
+    robot = FlowControlSteering(
         MiniPi05(pi05_field, noise), Source(command), postprocessor(3), tau=tau, lam=lam, ic_gain=1.5
     )
     robot_chunk, _ = robot._sample_chunk(batch=None)
-    cursor = FlowControlPolicy(
+    cursor = FlowControlSteering(
         CursorSampler(FieldFlowPolicy(cursor_field), noise),
         None,
         tau=tau,
@@ -200,8 +200,8 @@ def test_idle_rows_get_the_plain_chunk():
     commands = torch.tensor([[0.8, 0.1], [0.01, 0.0], [-0.5, 0.6]])
     plain = sampler.predict_action_chunk(OBS)
     for wrapper in (
-        FlowControlPolicy(sampler, None, tau=4, ic_gain=1.5, dims=slice(None)),
-        FlowReversalSteeringPolicy(
+        FlowControlSteering(sampler, None, tau=4, ic_gain=1.5, dims=slice(None)),
+        FlowReversalSteering(
             sampler,
             None,
             n_reversal_steps=5,

@@ -10,24 +10,15 @@ from lerobot.policies.steering import (
     DEADBAND,
     GRIPPER_DIM,
     N_ACTION_DIMS,
-    FlowControlPolicy,
-    FlowReversalSteeringPolicy,
+    AdapterModules,
+    Flow,
+    FlowControlSteering,
+    FlowReversalSteering,
     LearnedTaskModule,
     LearnedUserModule,
     ReversalAdapter,
     SteeringConfig,
-    build_reversal_adapter,
-    delegation_mask,
-    forward_flow,
-    get_action_mean_std,
-    load_adapter_module,
-    parse_adapter_spec,
-    reverse_flow,
-    rotation_about_z,
-    save_adapter_module,
     sinusoidal_time_embedding,
-    translation_matrix,
-    validate_matrix,
 )
 
 NUM_STEPS = 10
@@ -93,11 +84,11 @@ def _ones(x_t, t):
 
 def _frs(policy=None, translation=(1.0, 0.0, 0.0), post=None, **kw):
     policy, post = policy or FakePolicy(), post or postprocessor()
-    return FlowReversalSteeringPolicy(policy, Source(translation), post, **kw)
+    return FlowReversalSteering(policy, Source(translation), post, **kw)
 
 
 def _fc(policy=None, translation=(1.0, 0.0, 0.0), post=None, **kw):
-    return FlowControlPolicy(policy or FakePolicy(), Source(translation), post or postprocessor(), **kw)
+    return FlowControlSteering(policy or FakePolicy(), Source(translation), post or postprocessor(), **kw)
 
 
 # ---------------------------------------------------------------- matrices and adapters
@@ -105,40 +96,46 @@ def _fc(policy=None, translation=(1.0, 0.0, 0.0), post=None, **kw):
 
 def test_matrix_helpers_validate_rotate_and_build_translations():
     with pytest.raises(ValueError, match="3x3"):
-        validate_matrix([[1, 0], [0, 1]], 3, "m")
+        SteeringConfig.checked_matrix([[1, 0], [0, 1]], 3, "m")
     with pytest.raises(ValueError, match="finite"):
-        validate_matrix([[np.nan, 0, 0], [0, 1, 0], [0, 0, 1]], 3, "m")
-    np.testing.assert_allclose(rotation_about_z(90) @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], atol=1e-12)
-    np.testing.assert_allclose(rotation_about_z(0), np.eye(3))
-    np.testing.assert_allclose(translation_matrix({"rotation_z_deg": 20}), rotation_about_z(20))
-    np.testing.assert_allclose(translation_matrix({"scale": [1, 2, 3]}), np.diag([1.0, 2.0, 3.0]))
-    np.testing.assert_allclose(translation_matrix({"M": np.eye(3).tolist()}), np.eye(3))
-    np.testing.assert_allclose(translation_matrix(np.eye(3).tolist()), np.eye(3))
+        SteeringConfig.checked_matrix([[np.nan, 0, 0], [0, 1, 0], [0, 0, 1]], 3, "m")
+    np.testing.assert_allclose(
+        SteeringConfig.rotation(90) @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], atol=1e-12
+    )
+    np.testing.assert_allclose(SteeringConfig.rotation(0), np.eye(3))
+    np.testing.assert_allclose(
+        SteeringConfig.translation({"rotation_z_deg": 20}), SteeringConfig.rotation(20)
+    )
+    np.testing.assert_allclose(SteeringConfig.translation({"scale": [1, 2, 3]}), np.diag([1.0, 2.0, 3.0]))
+    np.testing.assert_allclose(SteeringConfig.translation({"M": np.eye(3).tolist()}), np.eye(3))
+    np.testing.assert_allclose(SteeringConfig.translation(np.eye(3).tolist()), np.eye(3))
     for bad, match in (({"rotate": 20}, "rotation_z_deg"), ({"scale": [1, 2]}, "scale")):
         with pytest.raises(ValueError, match=match):
-            translation_matrix(bad)
+            SteeringConfig.translation(bad)
 
 
 def test_build_reversal_adapter_blocks_and_errors():
-    m = rotation_about_z(20)
-    f = build_reversal_adapter({"translation": "corruption", "orientation": "zero", "gripper": "zero"}, m)
+    m = SteeringConfig.rotation(20)
+    f = SteeringConfig.build_adapter(
+        {"translation": "corruption", "orientation": "zero", "gripper": "zero"}, m
+    )
     assert f.shape == (7, 7) and np.allclose(f[:3, :3], m) and not f[3:, :].any() and not f[:3, 3:].any()
-    inv = build_reversal_adapter({"translation": "corruption_inverse"}, m)
+    inv = SteeringConfig.build_adapter({"translation": "corruption_inverse"}, m)
     np.testing.assert_allclose(inv[:3, :3], np.linalg.inv(m))
-    scaled = build_reversal_adapter({"translation": {"scale": [2, 2, 2]}})
+    scaled = SteeringConfig.build_adapter({"translation": {"scale": [2, 2, 2]}})
     np.testing.assert_allclose(scaled[:3, :3], 2 * np.eye(3))
     np.testing.assert_allclose(scaled[3:, 3:], np.eye(4))
-    assert build_reversal_adapter(None) is None
-    np.testing.assert_allclose(build_reversal_adapter({"F": np.eye(7).tolist()}), np.eye(7))
+    assert SteeringConfig.build_adapter(None) is None
+    np.testing.assert_allclose(SteeringConfig.build_adapter({"F": np.eye(7).tolist()}), np.eye(7))
     for spec, match in (
         ({"orientation": "half"}, "orientation"),
         ({"rotation": "zero"}, "unknown"),
         ({"F": np.eye(7).tolist(), "gripper": "zero"}, "F"),
     ):
         with pytest.raises(ValueError, match=match):
-            build_reversal_adapter(spec)
+            SteeringConfig.build_adapter(spec)
     with pytest.raises(ValueError, match="corruption"):
-        build_reversal_adapter({"translation": "corruption"}, None)
+        SteeringConfig.build_adapter({"translation": "corruption"}, None)
 
 
 def test_reversal_adapter_kind_description_and_modules(tmp_path):
@@ -153,12 +150,17 @@ def test_reversal_adapter_kind_description_and_modules(tmp_path):
     adapter.matrix = None
     assert adapter.kind == "task" and "MARS-T" in adapter.describe()
     user = LearnedUserModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=32, tdim=8)
-    save_adapter_module(user, tmp_path / "u.pt", kind="user", meta={"corruption": {"rotation_z_deg": 20}})
+    AdapterModules.save_module(
+        user, tmp_path / "u.pt", kind="user", meta={"corruption": {"rotation_z_deg": 20}}
+    )
     task = LearnedTaskModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=16, tdim=8)
-    save_adapter_module(task, tmp_path / "t.pt", "task")
-    assert load_adapter_module(tmp_path / "u.pt")[1:] == ("user", {"corruption": {"rotation_z_deg": 20}})
+    AdapterModules.save_module(task, tmp_path / "t.pt", "task")
+    assert AdapterModules.load_module(tmp_path / "u.pt")[1:] == (
+        "user",
+        {"corruption": {"rotation_z_deg": 20}},
+    )
     with pytest.raises(ValueError, match="kind"):
-        save_adapter_module(user, tmp_path / "bad.pt", kind="policy")
+        AdapterModules.save_module(user, tmp_path / "bad.pt", kind="policy")
     loaded = ReversalAdapter()
     loaded.load_modules(user_path=tmp_path / "u.pt", task_path=tmp_path / "t.pt")
     assert loaded.kind == "composed" and "MARS" in loaded.describe()
@@ -168,7 +170,7 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
     # Unequal scales and cross-group mixing expose copying F directly into model space.
     std = np.array([0.3, 0.4, 0.5, 0.04, 0.06, 0.08, 1.0])
     matrix = np.eye(7)
-    matrix[:3, :3] = rotation_about_z(20)
+    matrix[:3, :3] = SteeringConfig.rotation(20)
     matrix[0, 3] = 0.2
     normalized_velocity = np.arange(1.0, 8.0)
     actual = std * (ReversalAdapter(matrix).normalized_matrix(std) @ normalized_velocity)
@@ -178,20 +180,20 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
 
 
 def test_parse_adapter_spec_forms():
-    m = rotation_about_z(20)
-    assert parse_adapter_spec(None, m) == SteeringConfig()
-    fixed = parse_adapter_spec({"translation": "corruption", "gripper": "zero"}, m)
+    m = SteeringConfig.rotation(20)
+    assert SteeringConfig.from_spec(None, m) == SteeringConfig()
+    fixed = SteeringConfig.from_spec({"translation": "corruption", "gripper": "zero"}, m)
     np.testing.assert_allclose(fixed.fixed_matrix[:3, :3], m)
     assert fixed.adapter_user is None and fixed.adapter_task is None
-    assert parse_adapter_spec({"learned": "u.pt"}, m) == SteeringConfig(adapter_user="u.pt")
-    composed = parse_adapter_spec({"user": {"translation": "corruption"}, "task": "t.pt"}, m)
+    assert SteeringConfig.from_spec({"learned": "u.pt"}, m) == SteeringConfig(adapter_user="u.pt")
+    composed = SteeringConfig.from_spec({"user": {"translation": "corruption"}, "task": "t.pt"}, m)
     np.testing.assert_allclose(composed.fixed_matrix[:3, :3], m)
     assert composed.adapter_task == "t.pt" and composed.adapter_user is None
-    assert parse_adapter_spec({"user": {"learned": "u.pt"}, "task": None}, m) == SteeringConfig(
+    assert SteeringConfig.from_spec({"user": {"learned": "u.pt"}, "task": None}, m) == SteeringConfig(
         adapter_user="u.pt"
     )
-    assert parse_adapter_spec({"user": None, "task": "t.pt"}, m) == SteeringConfig(adapter_task="t.pt")
-    np.testing.assert_allclose(parse_adapter_spec({"F": np.eye(7).tolist()}, m).fixed_matrix, np.eye(7))
+    assert SteeringConfig.from_spec({"user": None, "task": "t.pt"}, m) == SteeringConfig(adapter_task="t.pt")
+    np.testing.assert_allclose(SteeringConfig.from_spec({"F": np.eye(7).tolist()}, m).fixed_matrix, np.eye(7))
     for bad in (
         {"user": {"learned": "u"}, "F": np.eye(7).tolist()},
         {"learned": 1},
@@ -200,7 +202,7 @@ def test_parse_adapter_spec_forms():
         {"user": {"learned": "u", "translation": "corruption"}},
     ):
         with pytest.raises(ValueError):
-            parse_adapter_spec(bad, m)
+            SteeringConfig.from_spec(bad, m)
 
 
 @pytest.mark.parametrize("name", ["mars", "pi05"])
@@ -217,12 +219,12 @@ def test_learned_user_module_time_embedding(tmp_path, name):
     else:
         expected = create_sinusoidal_pos_embedding(t, 8, 0.004, 4.0, t.device).float()
     torch.testing.assert_close(seen[0], expected)
-    path = save_adapter_module(module, tmp_path / "user.pt", kind="user")
-    assert load_adapter_module(path)[0].config["time_embedding"] == name
+    path = AdapterModules.save_module(module, tmp_path / "user.pt", kind="user")
+    assert AdapterModules.load_module(path)[0].config["time_embedding"] == name
     ckpt = torch.load(path, weights_only=True)  # checkpoints saved before the option keep the MARS embedding
     del ckpt["config"]["time_embedding"]
     torch.save(ckpt, tmp_path / "old.pt")
-    assert load_adapter_module(tmp_path / "old.pt")[0].time_embedding == "mars"
+    assert AdapterModules.load_module(tmp_path / "old.pt")[0].time_embedding == "mars"
     with pytest.raises(ValueError, match="time_embedding"):
         LearnedUserModule(horizon=CHUNK, time_embedding="rope")
 
@@ -237,21 +239,21 @@ def test_flows_have_constant_field_closed_forms_and_touch_only_action_dims():
         seen.append(round(t, 6))
         return torch.ones_like(x_t)
 
-    torch.testing.assert_close(reverse_flow(x, velocity, NUM_STEPS), torch.ones_like(x))  # 10 of h=0.1, v=1
+    torch.testing.assert_close(Flow(velocity).reverse(x, NUM_STEPS), torch.ones_like(x))  # 10 of h=0.1, v=1
     assert seen == [round(k / NUM_STEPS, 6) for k in range(NUM_STEPS)]  # times 0 to 1
-    torch.testing.assert_close(reverse_flow(x, _ones, NUM_STEPS, n_reversal_steps=3), torch.full_like(x, 0.3))
+    torch.testing.assert_close(Flow(_ones).reverse(x, NUM_STEPS, 3), torch.full_like(x, 0.3))
     seen.clear()
-    stopped = forward_flow(x, velocity, NUM_STEPS, stop_at=4)  # t = 1 down to 0.4
+    stopped = Flow(velocity).forward(x, NUM_STEPS, 4)  # t = 1 down to 0.4
     assert stopped[0, 0, 0].item() == pytest.approx(-0.6)
     assert seen == pytest.approx([1.0, 0.9, 0.8, 0.7, 0.6, 0.5])
-    assert forward_flow(x, _ones, NUM_STEPS)[0, 0, 0].item() == pytest.approx(-1.0)
+    assert Flow(_ones).forward(x, NUM_STEPS)[0, 0, 0].item() == pytest.approx(-1.0)
     adapter = torch.zeros(7, 7)
     adapter[0, 0] = 2.0  # double dx, kill the other six action dims
-    out = reverse_flow(x, _ones, NUM_STEPS, adapter=adapter)
+    out = Flow(_ones, adapter).reverse(x, NUM_STEPS)
     torch.testing.assert_close(out[..., 0], torch.full((1, CHUNK), 2.0))
     torch.testing.assert_close(out[..., 1:7], torch.zeros(1, CHUNK, 6))
     torch.testing.assert_close(out[..., 7:], torch.ones(1, CHUNK, MAX_DIM - 7))  # padding untouched
-    torch.testing.assert_close(reverse_flow(x, _ones, NUM_STEPS, adapter=torch.eye(7)), torch.ones_like(x))
+    torch.testing.assert_close(Flow(_ones, torch.eye(7)).reverse(x, NUM_STEPS), torch.ones_like(x))
 
 
 def test_task_slot_acts_in_both_directions_and_composes_before_the_user_module():
@@ -261,10 +263,10 @@ def test_task_slot_acts_in_both_directions_and_composes_before_the_user_module()
     adapter = ReversalAdapter(user_module=user, task_module=task)
     assert adapter.kind == "composed"
     x0 = torch.zeros(1, CHUNK, MAX_DIM)
-    back = reverse_flow(x0, _ones, NUM_STEPS, adapter=adapter)  # backward: user(task(v)) = 6 v
+    back = Flow(_ones, adapter).reverse(x0, NUM_STEPS)  # backward: user(task(v)) = 6 v
     torch.testing.assert_close(back[..., :n], torch.full((1, CHUNK, n), 6.0))
     torch.testing.assert_close(back[..., n:], torch.full((1, CHUNK, MAX_DIM - n), 1.0))
-    fwd = forward_flow(x0, _ones, NUM_STEPS, adapter=adapter)  # forward: task(v) = 2 v
+    fwd = Flow(_ones, adapter).forward(x0, NUM_STEPS)  # forward: task(v) = 2 v
     torch.testing.assert_close(fwd[..., :n], torch.full((1, CHUNK, n), -2.0))
     torch.testing.assert_close(fwd[..., n:], torch.full((1, CHUNK, MAX_DIM - n), -1.0))
 
@@ -273,18 +275,18 @@ def test_task_slot_acts_in_both_directions_and_composes_before_the_user_module()
 
 
 def test_get_action_mean_std_follows_the_normalization_mode():
-    mean, std = get_action_mean_std(postprocessor(mean=np.arange(7), std=np.zeros(7)))
+    mean, std = FlowControlSteering.action_mean_std(postprocessor(mean=np.arange(7), std=np.zeros(7)))
     np.testing.assert_allclose(mean, np.arange(7))
     assert np.all(std >= 1e-6)
     with pytest.raises(RuntimeError):
-        get_action_mean_std(SimpleNamespace(steps=[]))
+        FlowControlSteering.action_mean_std(SimpleNamespace(steps=[]))
     q01, q99 = np.full(7, -0.02), np.full(7, 0.06)
     step = SimpleNamespace(stats={"action": {"mean": np.ones(7), "std": np.ones(7), "q01": q01, "q99": q99}})
     step.stats["action"].update(min=np.zeros(7), max=np.full(7, 4.0))
     # quantiles: 2 (x - q01) / (q99 - q01) - 1 == (x - mean) / std
     for mode, expect in (("QUANTILES", (0.02, 0.04)), ("MEAN_STD", (1.0, 1.0)), ("MIN_MAX", (2.0, 2.0))):
         step.norm_map = {"ACTION": mode}
-        got = get_action_mean_std(SimpleNamespace(steps=[step]))
+        got = FlowControlSteering.action_mean_std(SimpleNamespace(steps=[step]))
         np.testing.assert_allclose(got, np.outer(expect, np.ones(7)))
 
 
@@ -318,14 +320,16 @@ def test_the_wrappers_validate_their_knobs():
 
 
 def test_the_delegation_mask_follows_the_operator_dims():
-    mask = delegation_mask(CHUNK, MAX_DIM, ("translation",), pinned_steps=2)
+    mask = FlowReversalSteering.delegation_mask(CHUNK, MAX_DIM, ("translation",), pinned_steps=2)
     assert mask.shape == (CHUNK, MAX_DIM)
     assert not mask[:2, :3].any()  # translation, first two steps: the operator's
     assert mask[:2, 3:].all() and mask[2:, :].all()  # the rest and the chunk's tail: the policy's
-    full = delegation_mask(CHUNK, MAX_DIM, ("translation", "rotation", "gripper"), pinned_steps=None)
+    full = FlowReversalSteering.delegation_mask(
+        CHUNK, MAX_DIM, ("translation", "rotation", "gripper"), pinned_steps=None
+    )
     assert not full[:, :N_ACTION_DIMS].any() and full[:, N_ACTION_DIMS:].all()
     with pytest.raises(ValueError, match="operator_dims"):
-        delegation_mask(CHUNK, MAX_DIM, ("translation", "wrist"), pinned_steps=2)
+        FlowReversalSteering.delegation_mask(CHUNK, MAX_DIM, ("translation", "wrist"), pinned_steps=2)
     wrapper = _frs()
     assert wrapper.operator_dims == ("translation",) and wrapper._delegated[0, 3].item() is True
     wrapper.operator_dims = ["translation", "rotation"]  # the setter rebuilds the mask
@@ -392,7 +396,7 @@ def test_flow_control_runs_the_policy_alone_when_idle_or_at_lambda_zero():
             return np.array([self.reads / 10, 0.0, 0.0])
 
     source = ChangingSource()
-    wrapper = FlowControlPolicy(FakePolicy(), source, postprocessor(), lam=NUM_STEPS)
+    wrapper = FlowControlSteering(FakePolicy(), source, postprocessor(), lam=NUM_STEPS)
     first, second = wrapper.select_action({}), wrapper.select_action({})
     assert source.reads == 1 and first[0, 0].item() == pytest.approx(0.1)
     torch.testing.assert_close(first, second)
@@ -427,7 +431,7 @@ def test_flow_control_records_the_policy_plan_from_the_same_noise_without_distur
 
 def test_reverse_flow_steering_passes_a_schedule_only_for_a_partial_reversal():
     policy, source = FakePolicy(), Source()
-    wrapper = FlowReversalSteeringPolicy(policy, source, postprocessor(), n_reversal_steps=4)
+    wrapper = FlowReversalSteering(policy, source, postprocessor(), n_reversal_steps=4)
     wrapper.select_action({})
     assert "flow_start_time" not in policy.calls[-1] and wrapper.steered_chunks == 0  # idle
     source.translation = np.array([1.0, 0.0, 0.0])
@@ -498,7 +502,7 @@ def test_reverse_flow_steering_delegates_uncommanded_elements():
 def test_wrapper_converts_adapter_before_reversal():
     policy, std = FakePolicy(), np.array([2.0, 4.0, 6.0, 1.0, 1.0, 1.0, 1.0])
     matrix = np.eye(7)
-    matrix[:3, :3] = rotation_about_z(90)
+    matrix[:3, :3] = SteeringConfig.rotation(90)
     _frs(
         policy, post=postprocessor(std=std), adapter=ReversalAdapter(matrix), n_reversal_steps=2
     ).select_action({})

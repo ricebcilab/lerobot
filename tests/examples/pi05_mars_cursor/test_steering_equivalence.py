@@ -228,7 +228,7 @@ def test_field_loss_matches_the_reference(setup, exact, with_task, weighted):
 
 @pytest.mark.parametrize("with_task", (False, True))
 def test_core_user_field_loss_matches_the_reference(setup, exact, with_task):
-    from lerobot.policies.steering import user_field_loss
+    from lerobot.policies.steering import LearnedUserModule
 
     s = setup
     old_user, old_task, new_user, new_task = s["modules"]
@@ -239,7 +239,7 @@ def test_core_user_field_loss_matches_the_reference(setup, exact, with_task):
     )
     torch.manual_seed(0)
     t = torch.rand(B)
-    got = user_field_loss(
+    got = LearnedUserModule.field_loss(
         new_user,
         lambda x, t: s["policy"](s["obs"], x, t),
         latent,
@@ -265,14 +265,14 @@ def test_task_loss_matches_the_reference(setup, exact):
 
 
 def test_core_task_field_loss_matches_the_reference(setup, exact):
-    from lerobot.policies.steering import task_field_loss
+    from lerobot.policies.steering import LearnedTaskModule
 
     s = setup
     _, old_task, _, new_task = s["modules"]
     _, _, chunk, z, _ = _loss_inputs(s)
     t = torch.rand(B, generator=torch.Generator().manual_seed(6))
     expect, expect_parts = _ref_task_loss(s["policy"], old_task, s["obs"], chunk, z, t, 0.01)
-    got, parts = task_field_loss(
+    got, parts = LearnedTaskModule.field_loss(
         new_task.bind(s["obs"]),
         lambda x, t: s["policy"](s["obs"], x, t),
         chunk / s["policy"].action_scale,
@@ -296,7 +296,7 @@ def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_pat
     cursor = {"config": old.config, "state_dict": old.state_dict(), "args": {"name": "m"}, "obstacle": None}
     if kind == "task":
         cursor["kind"] = "task"  # user modules from the first adapters carry no kind
-    # what train_adapter.save wrote before save_adapter_module: the module config (with n_dims), no meta
+    # what train_adapter.save wrote before AdapterModules.save_module: the module config (with n_dims), no meta
     trainer = {
         "kind": kind,
         "config": new.config,
@@ -305,7 +305,10 @@ def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_pat
         "obstacle": None,
     }
     paths = {}
-    for name, ckpt in (("converted", core.convert_cursor_module(cursor)), ("trainer", trainer)):
+    for name, ckpt in (
+        ("converted", core.AdapterModules.from_cursor_checkpoint(cursor)),
+        ("trainer", trainer),
+    ):
         paths[name] = tmp_path / f"{name}.pt"
         torch.save(ckpt, paths[name])
     obs, x, v, t = setup["obs"], torch.randn(B, 16, 2), torch.randn(B, 16, 2), torch.rand(B)

@@ -26,7 +26,7 @@ always the model's own output:
   maps to it. The forward flow then starts from that noise.
 
 Both read an operator `TeleopSource` and take the checkpoint's action statistics from the postprocessor
-(`action_mean_std`). `check_steps` is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
+(`action_mean_std`). `_ChunkSteering.check_steps` is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
 (Modular Adapters for Reversal Steering, the method formerly called FRS-RA). It has two optional parts:
 
 - a _user module_ that adapts the velocity field of the reversal only: a fixed 7x7 matrix F, typically the known
@@ -37,7 +37,7 @@ Both read an operator `TeleopSource` and take the checkpoint's action statistics
 The forward field is task(v) and the backward field user(task(v)). The modules are trained apart and composed here.
 FRS with a user module alone is MARS-U, with a task module alone MARS-T.
 
-Elements of the reference the operator does not command are _delegated_ to the policy (`delegation_mask`):
+Elements of the reference the operator does not command are _delegated_ to the policy (`FlowReversalSteering.delegation_mask`):
 
 - the dims outside `operator_dims` (which of translation / rotation / gripper the operator commands);
 - the padding dims;
@@ -64,9 +64,9 @@ The sign of `h` sets the direction of flow time, and `backward` decides whether 
 
 - `reverse` and `forward` at the policy's own step;
 - FRS's `latent` and `schedule`;
-- the trainers' validation `regenerate` and `heading_cosine`;
-- `uniform_reference`;
-- `paired_chunks` (the steered chunk and the policy's own plan from the same noise).
+- the trainers' validation `Flow.regenerate` and `Flow.heading_cosine`;
+- `Flow.uniform_reference`;
+- `Flow.paired_chunks` (the steered chunk and the policy's own plan from the same noise).
 
 The modules and their losses:
 

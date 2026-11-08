@@ -641,7 +641,7 @@ are the module as it was, and a fresh module is the identity under every setting
 
 The options are saved in `user.pt`'s config (only when they differ from the
 defaults), and every place that loads a user module for steering
-(`reversal_adapter: {learned: ...}` or `{user: ...}`, `load_adapter_module`)
+(`reversal_adapter: {learned: ...}` or `{user: ...}`, `AdapterModules.load_module`)
 rebuilds it from that config: there is nothing to set at run time.
 
 The checkpoint carries its kind (`user`), config and meta (corruption, policy,

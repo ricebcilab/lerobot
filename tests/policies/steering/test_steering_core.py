@@ -25,16 +25,10 @@ import torch
 from lerobot.policies.steering import modeling_steering as steering
 from lerobot.policies.steering.modeling_steering import (
     AdaptedField,
+    AdapterModules,
+    Flow,
     LearnedTaskModule,
     LearnedUserModule,
-    _adapt_velocity,
-    apply_user_module,
-    forward_flow,
-    integrate,
-    load_adapter_module,
-    reverse_flow,
-    save_adapter_module,
-    user_field_loss,
 )
 
 # ---------------------------------------------------------------- the pi0.5 flows before the core
@@ -46,7 +40,7 @@ def old_reverse_flow(x, velocity, num_steps, adapter=None, n_reversal_steps=None
     x_t = x
     for step in range(steps):
         t = step * h
-        v = _adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=True)
+        v = Flow.adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=True)
         x_t = x_t + h * v
     return x_t
 
@@ -57,7 +51,7 @@ def old_forward_flow(x, velocity, num_steps, stop_at=None, adapter=None):
     x_t = x
     for step in range(steps):
         t = 1.0 - step * h
-        x_t = x_t - h * _adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=False)
+        x_t = x_t - h * Flow.adapt_velocity(adapter, x_t, t, velocity(x_t, t), backward=False)
     return x_t
 
 
@@ -71,23 +65,19 @@ def _linear_field(dim=7, seed=0):
 def test_integrate_reproduces_pi05_flows_exactly():
     f = _linear_field()
     x = torch.randn(4, 10, 7, generator=torch.Generator().manual_seed(1))
-    assert torch.equal(integrate(x, f, 0.0, 1 / 10, 10, backward=True), old_reverse_flow(x, f, 10))
-    assert torch.equal(integrate(x, f, 1.0, -1 / 10, 6), old_forward_flow(x, f, 10, stop_at=4))
+    assert torch.equal(Flow(f).integrate(x, 0.0, 1 / 10, 10, backward=True), old_reverse_flow(x, f, 10))
+    assert torch.equal(Flow(f).integrate(x, 1.0, -1 / 10, 6), old_forward_flow(x, f, 10, stop_at=4))
     # the wrappers themselves, with and without an adapter and a partial reversal
     matrix = torch.randn(7, 7, generator=torch.Generator().manual_seed(2))
     for adapter in (None, matrix, AdaptedField(matrix[:3, :3])):
+        assert torch.equal(Flow(f, adapter).reverse(x, 10), old_reverse_flow(x, f, 10, adapter=adapter))
         assert torch.equal(
-            reverse_flow(x, f, 10, adapter=adapter), old_reverse_flow(x, f, 10, adapter=adapter)
-        )
-        assert torch.equal(
-            reverse_flow(x, f, 10, adapter=adapter, n_reversal_steps=4),
+            Flow(f, adapter).reverse(x, 10, 4),
             old_reverse_flow(x, f, 10, adapter=adapter, n_reversal_steps=4),
         )
+        assert torch.equal(Flow(f, adapter).forward(x, 10), old_forward_flow(x, f, 10, adapter=adapter))
         assert torch.equal(
-            forward_flow(x, f, 10, adapter=adapter), old_forward_flow(x, f, 10, adapter=adapter)
-        )
-        assert torch.equal(
-            forward_flow(x, f, 10, stop_at=4, adapter=adapter),
+            Flow(f, adapter).forward(x, 10, 4),
             old_forward_flow(x, f, 10, stop_at=4, adapter=adapter),
         )
     # the grad flag (off by default) and the times the field is asked at, a float or one per row
@@ -98,10 +88,10 @@ def test_integrate_reproduces_pi05_flows_exactly():
         return x * w
 
     x = torch.ones(2, 3, 1)
-    assert not integrate(x, velocity, 0.5, 0.25, 2).requires_grad and seen == [0.5, 0.75]
-    assert integrate(x, velocity, 0.5, 0.25, 2, grad=True).requires_grad
+    assert not Flow(velocity).integrate(x, 0.5, 0.25, 2).requires_grad and seen == [0.5, 0.75]
+    assert Flow(velocity).integrate(x, 0.5, 0.25, 2, grad=True).requires_grad
     seen.clear()
-    integrate(x, velocity, 1.0, -0.5, 2, batch_time=True)
+    Flow(velocity, batch_time=True).integrate(x, 1.0, -0.5, 2)
     assert [s.tolist() for s in seen] == [[1.0, 1.0], [0.5, 0.5]]
 
 
@@ -112,7 +102,7 @@ def test_adapted_field_takes_per_trial_matrices_and_an_n_dims_override():
     x = torch.randn(3, 5, 2, generator=g)
     expect = torch.einsum("bij,bhj->bhi", f, v)
     torch.testing.assert_close(AdaptedField(f).adapt(x, 0.3, v, backward=True), expect)
-    torch.testing.assert_close(_adapt_velocity(f, x, 0.3, v, backward=True), expect)
+    torch.testing.assert_close(Flow.adapt_velocity(f, x, 0.3, v, backward=True), expect)
     assert torch.equal(AdaptedField(f).adapt(x, 0.3, v, backward=False), v)
     # a (2, 2) F on a 7-dim velocity changes only the first two dims
     f2 = torch.randn(2, 2, generator=g)
@@ -163,9 +153,9 @@ def test_task_module_starts_at_identity_and_round_trips(tmp_path):
     with torch.no_grad():
         for p in module.parameters():
             p.add_(0.1 * torch.randn_like(p))
-    path = save_adapter_module(module, tmp_path / "task.pt", kind="task", meta={"note": "x"})
+    path = AdapterModules.save_module(module, tmp_path / "task.pt", kind="task", meta={"note": "x"})
     assert "arch" not in torch.load(path, weights_only=True)
-    loaded, kind, meta = load_adapter_module(path)
+    loaded, kind, meta = AdapterModules.load_module(path)
     assert isinstance(loaded, LearnedTaskModule) and kind == "task" and meta == {"note": "x"}
     module.requires_grad_(False)  # both on nn.MultiheadAttention's same (fast, inference) path
     for obs in (with_obs, without, None):
@@ -185,14 +175,14 @@ def test_task_checkpoints_of_the_obstacle_arch_load_and_mlp_ones_are_refused(tmp
     """Files from when there were two task modules: arch "obstacle" is LearnedTaskModule; "mlp", or an MLP's
     weights with no arch (the first LIBERO files), is the removed MLP module, refused with a clear error."""
     module = LearnedTaskModule(horizon=4, d=16, layers=1)
-    path = save_adapter_module(module, tmp_path / "task.pt", kind="task")
+    path = AdapterModules.save_module(module, tmp_path / "task.pt", kind="task")
     ckpt = torch.load(path, weights_only=True)
     torch.save({**ckpt, "arch": "obstacle"}, path)
-    assert isinstance(load_adapter_module(path)[0], LearnedTaskModule)
+    assert isinstance(AdapterModules.load_module(path)[0], LearnedTaskModule)
     for old in ({**ckpt, "arch": "mlp"}, {**ckpt, "state_dict": {"net.0.weight": torch.zeros(1)}}):
         torch.save(old, path)
         with pytest.raises(ValueError, match="MLP task module"):
-            load_adapter_module(path)
+            AdapterModules.load_module(path)
 
 
 # ---------------------------------------------------------------- the user module's rank knobs
@@ -240,7 +230,9 @@ def test_every_rank_setting_starts_at_the_identity_and_round_trips(tmp_path):
             **ranks,
         }
         user = _perturbed_user(**ranks)
-        loaded, kind, _ = load_adapter_module(save_adapter_module(user, tmp_path / f"u{i}.pt", kind="user"))
+        loaded, kind, _ = AdapterModules.load_module(
+            AdapterModules.save_module(user, tmp_path / f"u{i}.pt", kind="user")
+        )
         assert kind == "user" and loaded.config == user.config
         assert torch.equal(loaded.velocity(x, t, v), user.velocity(x, t, v))
     # at the identity the coefficients and U get a gradient (the basis and V do not, each multiplied by a zero);
@@ -334,16 +326,16 @@ def test_the_core_applies_a_ranked_module_through_its_velocity():
         def velocity(x_, t_):
             return 0.5 * x_
 
-        stepped = integrate(full, velocity, 0.0, 0.1, 1, AdaptedField(None, user), backward=True)
+        stepped = Flow(velocity, AdaptedField(None, user)).integrate(full, 0.0, 0.1, 1, backward=True)
         torch.testing.assert_close(
             stepped, full + 0.1 * torch.cat([user.velocity(full, 0.0, 0.5 * v), 0.5 * full[..., 3:]], -1)
         )
         latent, target = torch.randn(3, 6, 3), torch.randn(3, 6, 3)
         xs = (1 - t[:, None, None]) * latent + t[:, None, None] * target
         loss = ((user.velocity(xs, t, velocity(xs, t)) - (target - latent)) ** 2).mean((1, 2)).mean()
-        assert torch.equal(user_field_loss(user, velocity, latent, target, t), loss)
+        assert torch.equal(LearnedUserModule.field_loss(user, velocity, latent, target, t), loss)
     matrices = user(x, t).detach()
-    plain = apply_user_module(lambda x_, t_: matrices, x, t, v)
+    plain = LearnedUserModule.apply_correction(lambda x_, t_: matrices, x, t, v)
     assert torch.equal(plain, torch.einsum("bhij,bhj->bhi", matrices, v))
 
 
@@ -385,7 +377,7 @@ class FieldSampler:
 
 
 def _frs(sampler, reference, **kw):
-    return steering.FlowReversalSteeringPolicy(
+    return steering.FlowReversalSteering(
         sampler, None, operator_dims=None, reference_fn=lambda c: reference, **kw
     )
 
@@ -413,15 +405,19 @@ def test_frs_reversal_uses_the_coupling():
 
 def test_convert_cursor_module_maps_the_ranks():
     sd = {}
-    plain = steering.convert_cursor_module(
+    plain = steering.AdapterModules.from_cursor_checkpoint(
         {"config": {"horizon": 16, "d": 256, "tdim": 64}, "state_dict": sd}
     )
     assert plain["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64}
     cursor = {"horizon": 16, "d": 256, "tdim": 64, "step_rank": None, "cross_step_rank": 8}
-    ranked = steering.convert_cursor_module({"kind": "user", "config": cursor, "state_dict": sd})
+    ranked = steering.AdapterModules.from_cursor_checkpoint(
+        {"kind": "user", "config": cursor, "state_dict": sd}
+    )
     assert ranked["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "cross_step_rank": 8}
     cursor = {"horizon": 16, "d": 256, "tdim": 64, "step_rank": 2, "cross_step_rank": 0}
-    ranked = steering.convert_cursor_module({"kind": "user", "config": cursor, "state_dict": sd})
+    ranked = steering.AdapterModules.from_cursor_checkpoint(
+        {"kind": "user", "config": cursor, "state_dict": sd}
+    )
     assert ranked["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "step_rank": 2}
     assert "cross_step_dims" not in ranked["config"]
 
@@ -435,7 +431,7 @@ def test_frs_pinned_steps_in_paint_the_later_steps():
     field = lambda x, t: x @ w.T * (1.0 + t) + c  # noqa: E731
     z, ref = torch.randn(4, 16, 2, generator=g), torch.randn(4, 16, 2, generator=g)
     sampler, command = FieldSampler(field, z), torch.ones(4, 2)
-    plain = integrate(z, field, 0.0, 1 / 10, 10)
+    plain = Flow(field).integrate(z, 0.0, 1 / 10, 10)
     for n in (None, 6):
         whole = _frs(sampler, ref, n_reversal_steps=n, pinned_steps=None).steered_chunk(None, command)[0]
         assert torch.equal(
@@ -446,8 +442,8 @@ def test_frs_pinned_steps_in_paint_the_later_steps():
         if n is None:  # the later steps start from z itself, so they are the plain chunk
             torch.testing.assert_close(pinned[:, 5:], plain[:, 5:])
         else:  # from the plain flow at t = 0.4, run on to the action in 6 steps of the policy's 1/10
-            mid = integrate(z, field, 0.0, 1 / 10, 4)
-            torch.testing.assert_close(pinned[:, 5:], integrate(mid, field, 0.4, 1 / 10, 6)[:, 5:])
+            mid = Flow(field).integrate(z, 0.0, 1 / 10, 4)
+            torch.testing.assert_close(pinned[:, 5:], Flow(field).integrate(mid, 0.4, 1 / 10, 6)[:, 5:])
     for bad in (0, 17):
         with pytest.raises(ValueError, match="pinned_steps"):
             _frs(sampler, ref, pinned_steps=bad)

@@ -19,7 +19,7 @@ engine of the scene step), the two steering steps (``SteeringSceneTokensProcesso
 MARS task module; ``SteeringCommandProcessorStep``, the operator's command), and
 ``make_steering_pre_post_processors``, the pipelines around them."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_steering import SteeringConfig
-from .modeling_steering import DEADBAND, VLM_SCENE_DIM, VLM_SCENE_TOKENS, LearnedTaskModule, deprecated_alias
+from .modeling_steering import DEADBAND, VLM_SCENE_DIM, VLM_SCENE_TOKENS, LearnedTaskModule
 
 SCENE_VLM_PATH = "lerobot/pi05_base"  # the pi0.5 checkpoint SceneEncoder reads by default
 SCENE_PROMPT = "Move the cursor to the target."  # the prompt prefix_tokens runs behind the image by default
@@ -69,10 +69,11 @@ class SceneEncoder:
     on the layout alone). Both take uint8 ``[B, 3, S, S]``, resized with padding to pi0.5's resolution when S
     differs, and return float16 ``[B, 256, 2048]`` on the CPU.
 
-    ``scene_for(layouts, source, size)`` is a layout batch's scene array through this encoder and
-    ``encode_views(images, batch)`` the tokens of several views per scene; their static forms, ``scene_array`` and
-    ``view_tokens``, take any object with the encoder's methods (``scene_array`` none for the ``cnn`` render).
-    ``fit_reduction`` is the PCA of token batches a reduced task module carries.
+    ``SceneEncoder.scene_for(layouts, source, size)`` is a layout batch's scene array through this encoder and
+    ``SceneEncoder.encode_views(images, batch)`` the tokens of several views per scene; their static forms,
+    ``SceneEncoder.scene_array`` and ``SceneEncoder.view_tokens``, take any object with the encoder's methods
+    (``scene_array`` none for the ``cnn`` render). ``SceneEncoder.fit_reduction`` is the PCA of token batches a
+    reduced task module carries.
 
     Lazy: constructing it loads nothing; the first call loads ``path`` (``PI05Policy.from_pretrained``) and
     imports pi0.5 and ``transformers``, after checking that its ``model.safetensors`` is on disk. ``close``
@@ -260,7 +261,7 @@ class SceneEncoder:
             second += x.T @ x
             count += len(x)
         if total is None or second is None or count < 2:
-            raise ValueError("fit_token_reduction needs at least two tokens")
+            raise ValueError("fit_reduction needs at least two tokens")
         if not center:
             values, vectors = torch.linalg.eigh(second / count)  # ascending
             values = values.clamp_min(0)
@@ -509,16 +510,3 @@ def make_steering_pre_post_processors(
             **(postprocessor_kwargs or {}),
         ),
     )
-
-
-# ---------------------------------------------------------------- deprecated aliases (one round)
-
-scene_for: Callable[..., np.ndarray] = deprecated_alias(
-    SceneEncoder.scene_array, "scene_for", "SceneEncoder.scene_array"
-)
-encode_views: Callable[..., torch.Tensor] = deprecated_alias(
-    SceneEncoder.view_tokens, "encode_views", "SceneEncoder.view_tokens"
-)
-fit_token_reduction: Callable[..., tuple[torch.Tensor, torch.Tensor, float]] = deprecated_alias(
-    SceneEncoder.fit_reduction, "fit_token_reduction", "SceneEncoder.fit_reduction"
-)
