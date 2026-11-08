@@ -18,7 +18,14 @@ by test_steering_core.py and test_steering_wrappers.py)."""
 
 import torch
 
-from lerobot.policies.steering import Flow
+from lerobot.policies.cursor_flow.modeling_cursor_flow import FlowPolicy
+from lerobot.policies.steering import (
+    Flow,
+    FlowControlSteering,
+    FlowReversalSteering,
+    SampleChunkSampler,
+    active_rows,
+)
 
 
 def _field():
@@ -50,3 +57,41 @@ def test_paired_chunks_reuses_the_noise_and_restores_the_generator():
     torch.manual_seed(0)
     assert torch.equal(steered - 1.0, plain) and torch.equal(torch.randn(2, 3), plain)
     assert torch.equal(torch.randn(1), after)  # the stream is what it would be without the second pass
+
+
+class _FieldPolicy(FlowPolicy):
+    """The cursor's FlowPolicy (``sample_chunk`` draws its noise from torch's generator) over a fixed field."""
+
+    def __init__(self):
+        super().__init__(horizon=6, d_model=8, layers=1, heads=1, d_ff=8)
+
+    def forward(self, obs, x=None, t=None):
+        return torch.tanh(x + 0.3) * (1.5 - t.reshape(-1, 1, 1))
+
+
+def test_a_steered_chunk_without_the_plan_is_the_paired_one_and_leaves_the_same_stream():
+    """``paired=False`` skips the plain pass when every row steers: the chunk and the generator state afterwards are
+    the paired call's (with an idle row the plan is still drawn, for that row)."""
+    policy = _FieldPolicy().eval()
+    sampler = SampleChunkSampler(policy, 5, 6, 2, 2)
+    obs = {"pos": torch.zeros(2, 2)}
+    cores = (
+        FlowControlSteering(sampler, None, tau=4, lam=2, ic_gain=1.5, dims=slice(None)),
+        FlowReversalSteering(
+            sampler,
+            None,
+            n_reversal_steps=3,
+            operator_dims=None,
+            pinned_steps=None,
+            reference_fn=lambda c: Flow.held_reference(c, 6, 0.024, policy.action_scale),
+        ),
+    )
+    for core in cores:
+        for commands in (torch.tensor([[0.8, 0.1], [-0.5, 0.6]]), torch.tensor([[0.8, 0.1], [0.0, 0.0]])):
+            torch.manual_seed(1)
+            paired, plan = core.steered_chunk(obs, commands)
+            after = torch.get_rng_state()
+            torch.manual_seed(1)
+            alone, none = core.steered_chunk(obs, commands, paired=False)
+            assert torch.equal(alone, paired) and torch.equal(torch.get_rng_state(), after)
+            assert (none is None) == bool(active_rows(commands, core.deadband).all()) and plan is not None

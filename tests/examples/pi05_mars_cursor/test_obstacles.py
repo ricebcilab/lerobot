@@ -259,3 +259,27 @@ def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
     for b in range(20):  # the ring is round a non-goal target
         d = np.linalg.norm(ring.targets[b][ring.mask[b]] - ring.real_obstacles(b)[:, :2].mean(0), axis=1)
         assert np.argmin(d) != ring.goal[b] and d.min() < 0.14
+
+
+def test_the_pursuit_geometry_is_the_reductions_it_replaced():
+    """agents.pursuit_index in components: the squared lengths, the projections and the gaps are the reductions over
+    the length-2 axis it computed before, and so are the indices (random routes, discs and masks)."""
+    from cursor_sa.agents import pursuit_index
+
+    rng = np.random.default_rng(0)
+    n, p, k = 64, 30, 4
+    pos, pts = rng.random((n, 2)), rng.random((n, p, 2))
+    discs = np.concatenate([rng.random((n, k, 2)), rng.uniform(0.01, 0.15, (n, k, 1))], -1)
+    valid, dmask = rng.random((n, p)) < 0.9, rng.random((n, k)) < 0.8
+    d, rel = pts - pos[:, None], discs[:, None, :, :2] - pos[:, None, None]
+    dd = np.maximum((d * d).sum(-1), 1e-12)[..., None]
+    tau = np.clip((rel * d[:, :, None]).sum(-1) / dd, 0.0, 1.0)
+    gap2 = ((rel - tau[..., None] * d[:, :, None]) ** 2).sum(-1)
+    dx, dy = d[..., :1], d[..., 1:]
+    rx, ry = rel[..., 0], rel[..., 1]
+    assert np.array_equal(np.maximum(dx * dx + dy * dy, 1e-12), dd)
+    assert np.array_equal(np.clip((rx * dx + ry * dy) / dd, 0.0, 1.0), tau)
+    assert np.array_equal((rx - tau * dx) ** 2 + (ry - tau * dy) ** 2, gap2)
+    blocked = ((gap2 < discs[:, None, :, 2] ** 2) & dmask[:, None]).any(-1)
+    want = np.where(valid & ~blocked, np.arange(p), -1).max(-1)
+    assert blocked.any() and not blocked.all() and np.array_equal(pursuit_index(pos, pts, valid, discs, dmask), want)

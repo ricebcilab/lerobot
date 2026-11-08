@@ -223,3 +223,35 @@ def test_token_reduction_keeps_the_top_directions_centred_or_not():
         and centred[2] == default[2]
     )
     torch.testing.assert_close(centred[0], x.mean(0), atol=1e-4, rtol=0)
+
+
+def _fit_reduction_before(batches, rank, center=True):
+    """``SceneEncoder.fit_reduction`` before its centred and uncentred forms shared their tail."""
+    total = second = None
+    count = 0
+    for batch in batches:
+        x = batch.reshape(-1, batch.shape[-1]).to(torch.float64)
+        if total is None:
+            total = torch.zeros(x.shape[1], dtype=torch.float64)
+            second = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float64)
+        total += x.sum(0)
+        second += x.T @ x
+        count += len(x)
+    if not center:
+        values, vectors = torch.linalg.eigh(second / count)
+        values = values.clamp_min(0)
+        kept = float(values[-rank:].sum() / values.sum())
+        return torch.zeros(second.shape[0]), vectors[:, -rank:].flip(1).float().contiguous(), kept
+    mean = total / count
+    values, vectors = torch.linalg.eigh((second - count * torch.outer(mean, mean)) / (count - 1))
+    values = values.clamp_min(0)
+    kept = float(values[-rank:].sum() / values.sum())
+    return mean.float(), vectors[:, -rank:].flip(1).float().contiguous(), kept
+
+
+def test_the_token_reduction_is_the_one_it_was():
+    x = (torch.randn(4000, 16, generator=torch.Generator().manual_seed(4)) + 0.5).to(torch.float16)
+    for center in (True, False):
+        new = SceneEncoder.fit_reduction(iter(x.split(500)), 3, center=center)
+        old = _fit_reduction_before(iter(x.split(500)), 3, center=center)
+        assert torch.equal(new[0], old[0]) and torch.equal(new[1], old[1]) and new[2] == old[2]

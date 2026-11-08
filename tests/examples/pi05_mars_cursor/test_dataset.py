@@ -152,3 +152,35 @@ def test_budgets_are_nested_at_one_seed(tmp_path):
     store.rows_for(small, TokenStub())
     store.rows_for(large, TokenStub())
     assert store.encoded == len(large) - len(small)
+
+
+def test_the_digests_are_the_recorded_ones():
+    """The sweep's scene digests and the store's layout and encoder digests of a fixed layout set, as they were before
+    their render spec and array hashing were shared: a changed digest would orphan every cached scene and stored row."""
+    import run_sweep
+
+    task = TaskConfig(
+        min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
+    )
+    lay = sample_layouts(np.random.default_rng(0), 4, 4, task)
+    scenes = [
+        run_sweep.scene_digest(lay, s, n) for s, n in (("vlm_image", 224), ("vlm_prefix", 112), ("cnn", 64))
+    ]
+    assert scenes == ["bf728395f471", "1e1dd92064da", "358510a11b81"]
+    assert run_sweep.scene_digest(lay, "vlm_image", 224, "elsewhere/pi05") == "b72f9b1bc293"
+    assert layout_digests(lay, 224) == [
+        "dfe9dd111708424e",
+        "3257139bb0a78796",
+        "455cbf929bd7574e",
+        "c61ce13d202a9639",
+    ]
+    assert layout_digests(lay, 112) == [
+        "03dcf5e0de438fce",
+        "591e72f1ebe4b27b",
+        "4a3a408d3d891fdb",
+        "20604ccd63c87822",
+    ]
+    assert (encoder_digest("lerobot/pi05_base"), encoder_digest("elsewhere/pi05")) == (
+        "bd8e8f283ae8",
+        "bcc792092d7f",
+    )

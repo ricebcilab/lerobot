@@ -33,6 +33,7 @@ from lerobot.policies.steering import (
     SteeringConfig,
     SteeringPolicy,
     SteeringSceneTokensProcessorStep,
+    active_rows,
     make_steering_pre_post_processors,
 )
 from lerobot.policies.steering.processor_steering import (
@@ -318,3 +319,24 @@ def test_a_factory_reload_of_the_pipelines_carries_the_command(tmp_path):
     )
     action = torch.rand(3, 16, 2)
     assert torch.equal(post(action), action)
+
+
+def test_active_rows_is_the_three_rules_it_replaced():
+    """The cores' ``_active``, the command step's and the cursor trainer's ``active_of`` before they shared it."""
+    g = torch.Generator().manual_seed(0)
+    rows = 0.02 * torch.randn(6, 2, generator=g)
+    rows[::2] *= 50  # some outside the deadband
+    chunks = 0.02 * torch.randn(6, 4, 2, generator=g)
+    chunks[1::2, 2] = 0.9  # active when any step is
+    for commands in (rows, chunks, rows.numpy(), rows.double(), rows[0]):  # the cores'
+        m = (
+            torch.as_tensor(np.asarray(commands) if not torch.is_tensor(commands) else commands)
+            .abs()
+            .amax(-1)
+        )
+        assert torch.equal(active_rows(commands, DEADBAND), (m.amax(-1) if m.dim() == 2 else m) >= DEADBAND)
+    for commands in (rows.double(), chunks, rows[0]):  # the command step's, after its float32 cast
+        c = commands.to(torch.float32)
+        m = c.abs().amax(-1)
+        assert torch.equal(active_rows(c, DEADBAND), (m.amax(-1) if m.dim() == 2 else m) >= DEADBAND)
+    assert torch.equal(active_rows(rows, DEADBAND), rows.abs().amax(-1) >= DEADBAND)  # the trainer's
