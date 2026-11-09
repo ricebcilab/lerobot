@@ -14,9 +14,11 @@ module alone, MARS-T the task module alone.
 Reads (results/ is git-ignored, so these are local):
     fig1  nothing (its reaches come from the readout's rule, its densities are made up)
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
-    fig3  the grid's five training seeds: results/sim/sweeps/grid_s<k>/test.json (seed 0 tuned, seeds 1-4 tested at
-          seed 0's settings) with their fine-tuned arm, grid_ft_s<k>/test.json (on the same trials), and each seed's
-          checkpoints for one cell's rollouts; for panel e's curve the demonstration-time sweeps,
+    fig3  the vision grid's five training seeds: results/sim/sweeps/grid_vision_s<k>/test.json (seed 0 tuned, seeds 1-4
+          tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
+          module alone and with the user module) joined trial for trial by MARS-U from grid_s<k>/test.json and the
+          fine-tuned arm from grid_ft_s<k>/test.json, and seed 0's checkpoints for one cell's rollouts (the vision
+          module's scene tokens through checkpoints/scene/fig3); for panel e's curve the demonstration-time sweeps,
           results/sim/sweeps/demo_time_{mars,ft}_s<k>/test.json (on the grid's trials), and the fine-tuned policies'
           training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
 
@@ -53,7 +55,8 @@ from lerobot.envs.cursor import Layouts, TaskConfig, sample_layouts
 from cursor_sa.paths import CHECKPOINTS, RESULTS
 from cursor_sa.records import load_run
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
-from run_sweep import method_arm, with_setting
+from lerobot.policies.steering.processor_steering import SCENE_VLM_PATH, SceneEncoder
+from run_sweep import attach_scene, method_arm, scene_sources, with_setting
 
 FIG_DIR = Path(__file__).resolve().parent
 MARS = "MARS"
@@ -65,14 +68,16 @@ SERVED = "#8a3a5b"  # the served (corrupted) command
 OUTCOMES = ("hit", "wrong_target", "timeout")
 OUTCOME_LABEL = {"hit": "Success", "wrong_target": "Wrong target", "collision": "Collision", "timeout": "Timeout"}
 OUTCOME_GRAY = {"hit": "#1f1f1e", "collision": "#1f1f1e", "wrong_target": "#767571", "timeout": "#aeaca4"}  # ordinal ramp
-GRID_METHODS = ["teleop", "flow_control", "frs", "mars_task", "mars_user", "ft_mars_user", "mars"]
-GRID_LABEL = {"teleop": "Teleop", "flow_control": "Flow control", "frs": "FRS", "mars_user": f"{MARS}-U", "mars_task": f"{MARS}-T",
-              "mars": f"{MARS}-UT", "ft_mars_user": f"Fine-tuned + {MARS}-U"}  # MARS-UT: both modules
-GRID_COLOR = {"teleop": "#008300", "flow_control": "#e87ba4", "frs": "#e69f00", "mars_task": "#8a63d2", "mars_user": "#6da7ec",
+GRID_METHODS = ["teleop", "ft_flow_control", "ft_frs", "mars_task", "mars_user", "ft_mars_user", "mars"]
+GRID_LABEL = {"teleop": "Teleop", "ft_flow_control": "Fine-tuned + flow control", "ft_frs": "Fine-tuned + FRS",
+              "mars_user": f"{MARS}-U", "mars_task": f"{MARS}-T", "mars": f"{MARS}-UT",
+              "ft_mars_user": f"Fine-tuned + {MARS}-U"}  # MARS-UT: both modules; the fine-tuned arms play each paper's
+# baseline on the policy fine-tuned on the task's demonstrations (on T1, with nothing to fine-tune on, the frozen policy)
+GRID_COLOR = {"teleop": "#008300", "ft_flow_control": "#e87ba4", "ft_frs": "#e69f00", "mars_task": "#8a63d2", "mars_user": "#6da7ec",
               "ft_mars_user": "#2e7da0", "mars": ARM_COLOR[MARS_KEY]}  # one palette with Figures 1 and 2: MARS a
 # royal blue, MARS-U a sky blue, the fine-tuned arm a cerulean, MARS-T a lighter purple; every pair of the family is 15 or more
 # colour units apart (OKLab x 100), the limit the colour checks ask for
-T1_METHODS = ("teleop", "flow_control", "frs", "mars")  # on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS
+T1_METHODS = ("teleop", "ft_flow_control", "ft_frs", "mars")  # on T1 MARS-U is MARS, MARS-T is FRS, the fine-tuned arm MARS
 FULL_W = 7.0  # in, a two-column figure
 SURFACE = "white"
 FILL = "#ebeae4"
@@ -695,21 +700,38 @@ def build_fig2(out, results):
 
 
 TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustration
-SEED_RUNS = tuple(f"grid_s{k}" for k in range(5))  # the grid's runs under results/sim/sweeps,
-# one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the demonstrations and
-# are tested at seed 0's settings on the grid's trials (the baselines train nothing, so every seed has the grid's)
+SEED_RUNS = tuple(f"grid_vision_s{k}" for k in range(5))  # the grid's runs on the vision task module, under
+# results/sim/sweeps, one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the
+# demonstrations and are tested at seed 0's settings on the grid's trials (teleop trains nothing, so every seed has the grid's)
+USER_RUNS = tuple(f"grid_s{k}" for k in range(5))  # MARS-U (the user module alone) from the parametric grid's run of the
+# same seed: the user modules are the same, and the vision grid does not replay that arm
 FT_ARM = "ft_mars_user"   # the policy fine-tuned on each obstacle task's 300 demonstrations (as many as its task module's),
 FT_RUNS = tuple(f"grid_ft_s{k}" for k in range(5))  # with the user modules refitted on it: a sweep of its own per seed
-GRID_BASELINES = ("teleop", "flow_control", "frs")
+JOINED = {"mars_user": USER_RUNS, FT_ARM: FT_RUNS}  # arm -> the runs it joins the grid's from, per seed
+GRID_BASELINES = ("teleop", "ft_flow_control", "ft_frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
 ROLLOUT_SEED = 7  # panel b's trials
 FIG3_H = 6.15  # in: a (the schematic) and b (the tasks) side by side on top, then c, then d and e (positions in inches from the bottom)
 
 
+def join_arm(test, other, arm, what):
+    """`other`'s arm joins `test` cell by cell (its settings, metrics and trial records), once the two sweeps are shown to
+    be on the same trials: the cells, each trial's side and teleop's outcome, trial for trial."""
+    if other.keys() != test.keys() or any(c["trials"]["side"] != test[key]["trials"]["side"] or
+                                          c["trials"]["outcome"]["teleop"] != test[key]["trials"]["outcome"]["teleop"]
+                                          for key, c in other.items()):
+        raise ValueError(f"{what} is not on its run's trials")
+    for key, c in other.items():
+        for f in ("settings", "metrics"):
+            test[key][f][arm] = c[f][arm]
+        for f in ("outcome", "duration_s"):
+            test[key]["trials"][f][arm] = c["trials"][f][arm]
+
+
 def grid_data(results):
-    """The grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the seed
-    D["seeds"][k]), each joined by its seed's fine-tuned arm. Every run is on the grid's trials, so methods compare
-    trial for trial within a seed and a cell's numbers average over the seeds."""
+    """The vision grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the
+    seed D["seeds"][k]), each joined trial for trial by its seed's MARS-U and fine-tuned arm (`JOINED`). Every run is on
+    the grid's trials, so methods compare trial for trial within a seed and a cell's numbers average over the seeds."""
     sweeps = Path(results) / "sim" / "sweeps"
     seeds = [k for k, run in enumerate(SEED_RUNS) if k == 0 or (sweeps / run / "test.json").exists()]
     runs = [json.loads((sweeps / SEED_RUNS[k] / "test.json").read_text()) for k in seeds]
@@ -718,22 +740,15 @@ def grid_data(results):
         if run["test"].keys() != grid["test"].keys() or any(c["trials"]["side"] != grid["test"][key]["trials"]["side"]
                                                              for key, c in run["test"].items()):
             raise ValueError(f"seed {k}'s run ({SEED_RUNS[k]}) is not on the grid's trials")
-    for k, run in zip(seeds, runs):   # the fine-tuned arm joins its seed's run, its teleop the run's trial for trial
-        ft, test = json.loads((sweeps / FT_RUNS[k] / "test.json").read_text())["test"], run["test"]
-        if ft.keys() != test.keys() or any(c["trials"]["side"] != test[key]["trials"]["side"] or
-                                           c["trials"]["outcome"]["teleop"] != test[key]["trials"]["outcome"]["teleop"]
-                                           for key, c in ft.items()):
-            raise ValueError(f"seed {k}'s fine-tuned arm ({FT_RUNS[k]}) is not on its run's trials")
-        for key, c in ft.items():
-            for f in ("settings", "metrics"):
-                test[key][f][FT_ARM] = c[f][FT_ARM]
-            for f in ("outcome", "duration_s"):
-                test[key]["trials"][f][FT_ARM] = c["trials"][f][FT_ARM]
+    for k, run in zip(seeds, runs):   # the joined arms come from their seed's own sweeps, trial for trial
+        for arm, names in JOINED.items():
+            join_arm(run["test"], json.loads((sweeps / names[k] / "test.json").read_text())["test"], arm,
+                     f"seed {k}'s {GRID_LABEL[arm]} ({names[k]})")
     G = grid["args"]["sweep"]["grid"]
     users, tasks, noise = G["users"], G["tasks"], G["noises"][0]
     train = yaml.safe_load((config.CONFIG_DIR / "sweeps" / "grid.yaml").read_text())["grid"]["train"]
     return dict(G=G, runs=runs, seeds=seeds, users=users, tasks=tasks, noise=noise, leads={},
-                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"] or m == FT_ARM],
+                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"] or m in JOINED],
                 obstacle_tasks=[t for t in tasks if G["cells"][f"{users[0]}x{t}"]["obstacle"]],
                 cell=lambda u, t, k=0: runs[k]["test"][f"{u}x{t}|{noise}"], train={tuple(p) for p in train},
                 test_n=grid["args"]["test_trials"])
@@ -830,7 +845,8 @@ def draw_training(fig, D, rect):
 
 def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
     """One sampled layout per task and a successful MARS trial on it: the task's trained cell (T1 with the first user),
-    seed 0's modules at their tuned depth, the first success of n trials with the grid's readout noise."""
+    seed 0's modules at their tuned depth, the first success of n trials with the grid's readout noise. A vision task
+    module's scene tokens are attached as the sweep attaches them (cached under checkpoints/scene/fig3)."""
     out = {}
     for t, layout_seed in zip(D["tasks"], TASK_SEEDS):
         u = next((u for u in D["users"] if (u, t) in D["train"] and t != D["tasks"][0]), D["users"][0])
@@ -839,6 +855,8 @@ def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
         arm = arms["mars"]
         task = arm_task(arm)
         layouts = sample_layouts(np.random.default_rng(layout_seed), 1, (4, 4), task)
+        attach_scene(layouts, scene_sources(adapters), CHECKPOINTS / "scene" / "fig3", f"{u}x{t}",
+                     lambda: SceneEncoder(SCENE_VLM_PATH, device=device))
         torch.manual_seed(seed)
         recs = run_trials(arm, layouts.tile(n), ExpertAgent(), readout_for(arm, np.random.default_rng(seed + 1), D["noise"]),
                           policies[arm["model"]], adapters, device)
@@ -959,11 +977,14 @@ def build_fig3(out, results, device):
     write_stats(out, "fig3", dict(
         names={"MARS-UT": "user + task modules (mars)", "MARS-U": "user module alone (mars_user)", "MARS-T": "task module alone (mars_task)"},
         seeds=seeds, seed_runs=[f"results/sim/sweeps/{SEED_RUNS[k]}" for k in seeds],
+        user_module_runs=[f"results/sim/sweeps/{USER_RUNS[k]}" for k in seeds],
         fine_tuned_runs=[f"results/sim/sweeps/{FT_RUNS[k]}" for k in seeds],
+        task_module_note="the task module is the vision module: pi0.5's vision tokens of a picture of the scene (vlm_image, "
+                         "relative geometry), trained on 300 demonstrations with 32 rigid copies of each, rank 256",
         seed_note="every number is over the seeds: seed 0 is the grid of record; seeds 1-4 retrain every module (user modules "
-                  "from 100 demonstrations, task modules from 300) and the fine-tuned arm (each obstacle task's policy "
-                  "fine-tuned on 300 demonstrations, its user modules refitted on it) on their own draws and rerun them on the "
-                  "grid's trials; the baselines train nothing, so theirs are the grid's in every seed",
+                  "from 100 demonstrations, task modules from 300) and the fine-tuned policies (each obstacle task's policy "
+                  "fine-tuned on 300 demonstrations, its user modules refitted on it; flow control and FRS play on them) on "
+                  "their own draws and rerun them on the grid's trials; teleop trains nothing, so its is the grid's in every seed",
         ci_note=f"panel d: 95% t CIs over the four users (each user's success averaged over the seeds), the user the unit as "
                 f"the participant in Figure 2b (the drawn lines stop at the axis); panel e: 95% t CIs over the training "
                 f"seeds (demo_time); the leads: 95% CIs resampling the seeds, then the trials within each ({N_BOOT} draws)",
@@ -987,8 +1008,10 @@ def build_fig3(out, results, device):
         tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},
         schematic="panel a's densities are made up",
         task_rollouts={t: {k: v[k] for k in ("cell", "trial", "hits", "of")} for t, v in shown.items()},
-        t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS (no obstacle, nothing to fine-tune on), so only four arms are drawn",
-        flow_control_note="Kao et al.'s flow control, ic_gain 2.0, tau tuned per cell"))
+        t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS, and flow control and FRS play the frozen "
+                "policy (no obstacle, nothing to fine-tune on), so only four arms are drawn",
+        flow_control_note="Kao et al.'s flow control on each task's fine-tuned policy, ic_gain 2.0, tau tuned per cell; FRS on "
+                          "the same policy, pinned_steps tuned per cell"))
     return png
 
 
