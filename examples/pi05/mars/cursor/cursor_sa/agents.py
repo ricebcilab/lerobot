@@ -17,7 +17,7 @@ from collections import deque
 import numpy as np
 import torch
 
-from .readout import Readout, is_active
+from lerobot.teleoperators.readout import Readout, is_active
 from lerobot.envs.cursor import AVOID_CLEARANCE, densify, plan_route
 from .devices import Keyboard, SpaceMouse, find_spacemouse, spacemouse_full_scale, spacemouse_hid_id
 

@@ -19,6 +19,7 @@ from lerobot.policies.steering import (
     SteeringConfig,
     sinusoidal_time_embedding,
 )
+from lerobot.teleoperators import readout
 
 NUM_STEPS = 10
 CHUNK = 4
@@ -95,26 +96,22 @@ def _fc(policy=None, translation=(1.0, 0.0, 0.0), post=None, **kw):
 
 def test_matrix_helpers_validate_rotate_and_build_translations():
     with pytest.raises(ValueError, match="3x3"):
-        SteeringConfig.checked_matrix([[1, 0], [0, 1]], 3, "m")
+        readout.checked_matrix([[1, 0], [0, 1]], 3, "m")
     with pytest.raises(ValueError, match="finite"):
-        SteeringConfig.checked_matrix([[np.nan, 0, 0], [0, 1, 0], [0, 0, 1]], 3, "m")
-    np.testing.assert_allclose(
-        SteeringConfig.rotation(90) @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], atol=1e-12
-    )
-    np.testing.assert_allclose(SteeringConfig.rotation(0), np.eye(3))
-    np.testing.assert_allclose(
-        SteeringConfig.translation({"rotation_z_deg": 20}), SteeringConfig.rotation(20)
-    )
-    np.testing.assert_allclose(SteeringConfig.translation({"scale": [1, 2, 3]}), np.diag([1.0, 2.0, 3.0]))
-    np.testing.assert_allclose(SteeringConfig.translation({"M": np.eye(3).tolist()}), np.eye(3))
-    np.testing.assert_allclose(SteeringConfig.translation(np.eye(3).tolist()), np.eye(3))
+        readout.checked_matrix([[np.nan, 0, 0], [0, 1, 0], [0, 0, 1]], 3, "m")
+    np.testing.assert_allclose(readout.rotation(90) @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(readout.rotation(0), np.eye(3))
+    np.testing.assert_allclose(readout.matrix_spec({"rotation_z_deg": 20}, 3), readout.rotation(20))
+    np.testing.assert_allclose(readout.matrix_spec({"scale": [1, 2, 3]}, 3), np.diag([1.0, 2.0, 3.0]))
+    np.testing.assert_allclose(readout.matrix_spec({"M": np.eye(3).tolist()}, 3), np.eye(3))
+    np.testing.assert_allclose(readout.matrix_spec(np.eye(3).tolist(), 3), np.eye(3))
     for bad, match in (({"rotate": 20}, "rotation_z_deg"), ({"scale": [1, 2]}, "scale")):
         with pytest.raises(ValueError, match=match):
-            SteeringConfig.translation(bad)
+            readout.matrix_spec(bad, 3)
 
 
 def test_build_reversal_adapter_blocks_and_errors():
-    m = SteeringConfig.rotation(20)
+    m = readout.rotation(20)
     f = SteeringConfig.build_adapter(
         {"translation": "corruption", "orientation": "zero", "gripper": "zero"}, m
     )
@@ -169,7 +166,7 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
     # Unequal scales and cross-group mixing expose copying F directly into model space.
     std = np.array([0.3, 0.4, 0.5, 0.04, 0.06, 0.08, 1.0])
     matrix = np.eye(7)
-    matrix[:3, :3] = SteeringConfig.rotation(20)
+    matrix[:3, :3] = readout.rotation(20)
     matrix[0, 3] = 0.2
     normalized_velocity = np.arange(1.0, 8.0)
     actual = std * (AdapterModules(n_dims=None, matrix=matrix).normalized_matrix(std) @ normalized_velocity)
@@ -181,7 +178,7 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
 
 
 def test_parse_adapter_spec_forms():
-    m = SteeringConfig.rotation(20)
+    m = readout.rotation(20)
     assert SteeringConfig.from_spec(None, m) == SteeringConfig()
     fixed = SteeringConfig.from_spec({"translation": "corruption", "gripper": "zero"}, m)
     np.testing.assert_allclose(fixed.fixed_matrix[:3, :3], m)
@@ -503,7 +500,7 @@ def test_reverse_flow_steering_delegates_uncommanded_elements():
 def test_wrapper_converts_adapter_before_reversal():
     policy, std = FakePolicy(), np.array([2.0, 4.0, 6.0, 1.0, 1.0, 1.0, 1.0])
     matrix = np.eye(7)
-    matrix[:3, :3] = SteeringConfig.rotation(90)
+    matrix[:3, :3] = readout.rotation(90)
     _frs(
         policy,
         post=postprocessor(std=std),

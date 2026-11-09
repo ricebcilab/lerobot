@@ -18,8 +18,9 @@
 
 The package keeps lerobot's layout for a policy:
 
-- ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``; its adapter fields, ``from_spec`` and
-  the matrix helpers of a ``reversal_adapter`` spec), and the constants its validation reads.
+- ``configuration_steering``: ``SteeringConfig`` (registered ``"steering"``; its adapter fields and the grammar of a
+  ``reversal_adapter`` spec, ``from_spec`` and ``build_adapter``, whose matrices are ``lerobot.teleoperators.readout``'s
+  ``matrix_spec``), and the constants its validation reads.
 - ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy, driving every base through pi0.5's sampler
   interface, which ``PI05Policy`` and ``CursorFlowPolicy`` offer; the cursor example runs it) and the cores it
   wraps: the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's

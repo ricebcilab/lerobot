@@ -40,7 +40,6 @@ from lerobot.policies.steering import (
     GRIPPER_DIM,
     GRIPPER_OPEN,
     AdapterModules,
-    SteeringConfig,
 )
 from lerobot.teleoperators import readout
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
@@ -387,7 +386,7 @@ class CommandCorruption:
 
     @matrix.setter
     def matrix(self, value) -> None:
-        self._matrix = None if value is None else SteeringConfig.checked_matrix(value, 3, "corruption matrix")
+        self._matrix = None if value is None else readout.checked_matrix(value, 3, "corruption matrix")
 
     def format(self) -> str:
         """The matrix on one line, for the terminal (``AdapterModules.format_rows``); "off" when there is none."""
@@ -445,8 +444,9 @@ class CommandCorruption:
 
 
 def build_corruption(spec, where: str = "corruption") -> np.ndarray | None:
-    """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows) or None."""
-    return None if spec is None else SteeringConfig.translation(spec, where)
+    """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows; ``readout.matrix_spec``) or
+    None."""
+    return readout.matrix_spec(spec, 3, where)
 
 
 def read_matrix_spec(path: str | Path):

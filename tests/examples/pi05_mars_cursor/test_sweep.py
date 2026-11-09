@@ -11,7 +11,7 @@ import torch
 from _view_stub import ViewStub
 from cursor_sa import config
 from cursor_sa.agents import ExpertChunkAgent
-from cursor_sa.readout import Readout
+from lerobot.teleoperators.readout import Readout
 import lerobot.envs.cursor
 from lerobot.envs.cursor import TaskConfig, sample_layouts
 import cursor_sa.steering
@@ -299,7 +299,7 @@ def test_scene_cache_is_keyed_by_cell_split_source_size_and_the_digest(tmp_path,
 
 
 def test_a_vlm_source_makes_the_encoder_once_and_matches_the_trainer(tmp_path, monkeypatch):
-    from cursor_sa.readout import corruption_spec
+    from lerobot.teleoperators.readout import corruption_spec
     from train import train_adapter
 
     made, calls = [], []

@@ -701,7 +701,7 @@ class AdapterModules(nn.Module):
     the holder on every use, so a replaced matrix or module takes effect at once.
 
     ``matrix`` is in the operator's (environment) units: one (n, n) or one per trial (B, n, n), a float64 array,
-    checked on assignment (``SteeringConfig.checked_matrix`` at ``n_dims``, or ``N_ACTION_DIMS`` when ``n_dims`` is
+    checked on assignment (``readout.checked_matrix`` at ``n_dims``, or ``N_ACTION_DIMS`` when ``n_dims`` is
     None). ``normalized_matrix(std)`` is it in the policy's normalized coordinates, S^-1 F S, by the postprocessor's
     action statistics; ``field`` is the ``AdaptedField`` the flows apply, that matrix (normalized when given ``std``)
     as a tensor. The modules act on ``n_dims`` dims (2 on the cursor); ``n_dims=None`` lets each act on its own
@@ -741,9 +741,9 @@ class AdapterModules(nn.Module):
         except (TypeError, ValueError):  # ragged rows: the check below names them
             per_trial = False
         if per_trial:  # one per trial, each checked
-            self._matrix = np.stack([SteeringConfig.checked_matrix(one, size, where) for one in value])
+            self._matrix = np.stack([readout.checked_matrix(one, size, where) for one in value])
         else:
-            self._matrix = SteeringConfig.checked_matrix(value, size, where)
+            self._matrix = readout.checked_matrix(value, size, where)
 
     @property
     def kind(self) -> str:

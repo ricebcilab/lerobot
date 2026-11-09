@@ -60,9 +60,9 @@ class SteeringConfig(PreTrainedConfig):
     the base policy's own, its config's sampler fields: this config does not repeat them.
 
     The adapter is four flat fields, so the CLI sets each directly: ``from_spec`` reads a ``reversal_adapter`` spec
-    (a fixed F and/or module checkpoint paths) into them, ``build_adapter`` builds the fixed F of a spec, and
-    ``checked_matrix``, ``rotation`` and ``translation`` are the matrix helpers of the specs (a command corruption's
-    too).
+    (a fixed F and/or module checkpoint paths) into them, and ``build_adapter`` builds the fixed F of a spec, for any
+    ``n_dims``. The matrices in a spec are the operator readout's grammar (``lerobot.teleoperators.readout``'s
+    ``matrix_spec``, which parses a command corruption's too).
 
     Args:
         mode: ``"flow_control"`` (Kao et al. 2026), ``"frs"`` (Flow Reversal Steering, Tang et al. 2026; MARS
@@ -146,7 +146,7 @@ class SteeringConfig(PreTrainedConfig):
             self.adapter_matrix is not None
         ):  # a square of numbers, kept as lists so the config compares and serializes
             rows = len(self.adapter_matrix)
-            self.adapter_matrix = self.checked_matrix(self.adapter_matrix, rows, "adapter_matrix").tolist()
+            self.adapter_matrix = readout.checked_matrix(self.adapter_matrix, rows, "adapter_matrix").tolist()
 
     @property
     def fixed_matrix(self) -> np.ndarray | None:
@@ -194,54 +194,30 @@ class SteeringConfig(PreTrainedConfig):
     # ---------------------------------------------------------------- the adapter spec
 
     @staticmethod
-    def checked_matrix(matrix, size: int, where: str) -> np.ndarray:
-        """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
-        try:
-            m = np.asarray(matrix, dtype=np.float64)
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"{where}: entries must be numbers ({e})") from e
-        if m.shape != (size, size):
-            raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
-        if not np.all(np.isfinite(m)):
-            raise ValueError(f"{where}: entries must be finite")
-        return m
-
-    @staticmethod
-    def rotation(degrees: float) -> np.ndarray:
-        """3x3 rotation of a translation command about the z axis."""
-        c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
-        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-    @staticmethod
-    def translation(spec, where: str = "matrix", literal_key: str = "M") -> np.ndarray:
-        """Build a 3x3 from a spec: {rotation_z_deg: d}, {scale: [sx, sy, sz]}, {M: rows} or bare rows."""
-        if isinstance(spec, dict):
-            keys = set(spec)
-            if keys == {"rotation_z_deg"}:
-                return SteeringConfig.rotation(float(spec["rotation_z_deg"]))
-            if keys == {"scale"}:
-                scale = np.asarray(spec["scale"], dtype=np.float64)
-                if scale.shape != (3,) or not np.all(np.isfinite(scale)):
-                    raise ValueError(f"{where}: scale must be three finite numbers, got {spec['scale']!r}")
-                return np.diag(scale)
-            if keys == {literal_key}:
-                return SteeringConfig.checked_matrix(spec[literal_key], 3, f"{where}.{literal_key}")
-            raise ValueError(
-                f"{where}: expected exactly one of rotation_z_deg, scale or {literal_key}, got {sorted(keys)}"
-            )
-        return SteeringConfig.checked_matrix(spec, 3, where)
+    def _spec_matrix(spec, n_dims: int, where: str) -> np.ndarray:
+        """``readout.matrix_spec``'s matrix of a spec that must give one (a null spec raises)."""
+        matrix = readout.matrix_spec(spec, n_dims, where)
+        if matrix is None:
+            raise ValueError(f"{where}: expected a matrix spec, got null")
+        return matrix
 
     @classmethod
     def build_adapter(
-        cls, spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter"
+        cls,
+        spec,
+        corruption: np.ndarray | None = None,
+        where: str = "reversal_adapter",
+        n_dims: int = N_ACTION_DIMS,
     ) -> np.ndarray | None:
-        """Build the 7x7 reversal adapter F from a spec, or None when the spec is None.
+        """Build the (n_dims, n_dims) reversal adapter F from a spec, or None when the spec is None.
 
-        Forms: ``{F: rows}`` (literal), or blocks ``translation`` (``corruption`` to
-        copy the 3x3 command corruption, ``corruption_inverse`` for its inverse, the
-        adapter that recovers a curl field's steady state on the cursor task,
-        ``identity``, ``zero``, or any ``translation`` spec), ``orientation``
-        and ``gripper`` (``identity`` or ``zero``). Missing blocks are identity.
+        Forms: ``{F: <matrix spec>}`` (rows, or any ``readout.matrix_spec`` form for ``n_dims``), or blocks
+        ``translation`` (``corruption`` to copy the command corruption, ``corruption_inverse`` for its inverse, the
+        adapter that recovers a curl field's steady state on the cursor task, ``identity``, ``zero``, or a matrix
+        spec), ``orientation`` and ``gripper`` (``identity`` or ``zero``). Missing blocks are identity. The blocks
+        are ``OPERATOR_DIM_GROUPS``' dims of the 7-D operator space (``N_ACTION_DIMS``, the default) that fit in
+        ``n_dims``: ``translation`` the first min(3, n_dims) dims, so with 2 dims (the cursor's) the only block, and
+        a block with no dims there raises.
         """
         if spec is None:
             return None
@@ -249,35 +225,46 @@ class SteeringConfig(PreTrainedConfig):
             raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
         if "F" in spec:
             if set(spec) != {"F"}:
-                raise ValueError(f"{where}: a literal F cannot be combined with block keys")
-            return cls.checked_matrix(spec["F"], N_ACTION_DIMS, f"{where}.F")
-        unknown = set(spec) - {"translation", "orientation", "gripper"}
+                raise ValueError(f"{where}: an F cannot be combined with block keys")
+            return cls._spec_matrix(spec["F"], n_dims, f"{where}.F")
+        translation_dims = OPERATOR_DIM_GROUPS["translation"]
+        blocks = {
+            "translation": slice(translation_dims.start, min(translation_dims.stop, n_dims)),
+            "orientation": OPERATOR_DIM_GROUPS["rotation"],
+            "gripper": OPERATOR_DIM_GROUPS["gripper"],
+        }
+        unknown = set(spec) - set(blocks)
         if unknown:
             raise ValueError(
                 f"{where}: unknown keys {sorted(unknown)} (expected translation, orientation, gripper)"
             )
+        for key in spec:
+            if blocks[key].stop > n_dims:
+                raise ValueError(
+                    f"{where}.{key}: a {n_dims}-D action has no {key} block "
+                    f"(dims {blocks[key].start}-{blocks[key].stop - 1} of the {N_ACTION_DIMS}-D operator space)"
+                )
 
-        f = np.eye(N_ACTION_DIMS)
+        f = np.eye(n_dims)
+        dims = blocks["translation"]
         translation = spec.get("translation", "identity")
         if translation in ("corruption", "corruption_inverse"):
             if corruption is None:
                 raise ValueError(
-                    f"{where}.translation: '{translation}' requested but control.corruption is null"
+                    f"{where}.translation: '{translation}' needs a corruption to copy or invert, but "
+                    "control.corruption is null (or a curl field)"
                 )
-            f[:3, :3] = corruption if translation == "corruption" else np.linalg.inv(corruption)
+            f[dims, dims] = corruption if translation == "corruption" else np.linalg.inv(corruption)
         elif translation == "zero":
-            f[:3, :3] = 0.0
+            f[dims, dims] = 0.0
         elif translation != "identity":
-            f[:3, :3] = cls.translation(translation, f"{where}.translation")
-        for key, dims in (
-            ("orientation", OPERATOR_DIM_GROUPS["rotation"]),
-            ("gripper", OPERATOR_DIM_GROUPS["gripper"]),
-        ):
+            f[dims, dims] = cls._spec_matrix(translation, dims.stop - dims.start, f"{where}.translation")
+        for key in ("orientation", "gripper"):
             choice = spec.get(key, "identity")
             if choice not in _BLOCK_CHOICES:
                 raise ValueError(f"{where}.{key}: expected identity or zero, got {choice!r}")
             if choice == "zero":
-                f[dims, dims] = 0.0
+                f[blocks[key], blocks[key]] = 0.0
         return f
 
     @staticmethod
@@ -288,21 +275,33 @@ class SteeringConfig(PreTrainedConfig):
 
     @classmethod
     def from_spec(
-        cls, spec, corruption: np.ndarray | None = None, where: str = "reversal_adapter", **fields: Any
+        cls,
+        spec,
+        corruption: np.ndarray | None = None,
+        where: str = "reversal_adapter",
+        n_dims: int | None = None,
+        **fields: Any,
     ) -> "SteeringConfig":
         """A config whose adapter fields are a reversal-adapter spec's (``fields`` set the others).
 
-        Forms: ``null``; a fixed user matrix as ``build_adapter`` takes it (blocks or ``{F: rows}``);
-        ``{learned: <path>}`` (a learned user module); or the composite ``{user: <fixed spec | {learned: path}
-        | null>, task: <path | null>}`` (MARS = user + task; one slot alone is MARS-U or MARS-T).
+        Forms: ``null``; a fixed user matrix as ``build_adapter`` takes it (blocks or ``{F: ...}``);
+        ``{learned: <path>}`` (a learned user module); or the composite ``{user: <fixed spec | {learned: path} |
+        path | null>, task: <path | null>}`` (MARS = user + task; one slot alone is MARS-U or MARS-T; a path as the
+        user is ``{learned: path}``, the cursor's checkpoint names).
+
+        ``n_dims``: None builds a fixed F at ``N_ACTION_DIMS`` (the 7-D operator space) and leaves the config's own
+        ``n_dims``; a number builds F at that size and sets the config's ``n_dims`` to it (the cursor passes 2).
         """
+        if n_dims is not None:
+            fields["n_dims"] = n_dims
+        size = N_ACTION_DIMS if n_dims is None else n_dims
         if spec is None:
             return cls(**fields)
         if not isinstance(spec, dict):
             raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
 
         def fixed(blocks, at):
-            matrix = cls.build_adapter(blocks, corruption, at)
+            matrix = cls.build_adapter(blocks, corruption, at, size)
             return {"adapter_matrix": matrix.tolist(), "adapter_blocks": blocks}
 
         keys = set(spec)
@@ -313,6 +312,10 @@ class SteeringConfig(PreTrainedConfig):
             task_path = None if task is None else cls._module_path(task, f"{where}.task")
             if user is None:
                 return cls(adapter_task=task_path, **fields)
+            if isinstance(user, str | Path):  # {learned: path}'s shorthand
+                return cls(
+                    adapter_user=cls._module_path(user, f"{where}.user"), adapter_task=task_path, **fields
+                )
             if isinstance(user, dict) and "learned" in user:
                 if set(user) != {"learned"}:
                     raise ValueError(f"{where}.user: a learned module cannot be combined with a fixed matrix")

@@ -10,7 +10,7 @@ import torch
 
 from cursor_sa import config, session
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.readout import Readout, corruption_spec
+from lerobot.teleoperators.readout import Readout, corruption_spec
 from lerobot.envs.cursor import TaskConfig, curl_steady_state, obstacle_count, obstacle_spec, place_obstacles, plan_route, route_side, sample_layouts
 from cursor_sa.session import readout_for, load_checkpoints, run_trials
 from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule

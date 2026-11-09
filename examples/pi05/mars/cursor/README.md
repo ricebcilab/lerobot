@@ -66,7 +66,7 @@ with 401 errors.
 
 ```
 cursor_sa/            the library: env, policy, demos (+ the training sampler), steering (modes, reversal
-                      adapters), devices, readout, agents, config, session (the experiment mechanism),
+                      adapters), devices, agents, config, session (the experiment mechanism),
                       renderer, records (trial records and their summary), analysis (figure style,
                       kinematics, goal-choice statistics), paths
 run_experiment.py     the portal: a protocol for a participant (human or expert), or free play
@@ -290,8 +290,9 @@ Main parameters (`control:` and `task:` sections):
   method (the 100-demonstration module fails at the full reversal).
 - `input_noise` and `corruption` act on the command on its way to the controller, as in LeRobot:
   raw → M·raw (clipped to [-1, 1]) → + Gaussian noise. Both apply only while pushing, so idle input
-  stays idle. Corruption specs: `{scale: [sx, sy]}`, `{rotation_deg: d}`, `{M: rows}`, or `{curl: b,
-  tau: s}`: a curl field on the command (the dynamics of the cursor curl below, acting on what the
+  stays idle. Corruption specs (`lerobot.teleoperators.readout.corruption_spec`): `{scale: [sx, sy]}`,
+  `{rotation_deg: d}`, `{M: rows}`, or `{curl: b, tau: s}`: a curl field on the command (the dynamics of the
+  cursor curl below, acting on what the
   controller gets instead of on the cursor: the served command is a velocity driven by the push,
   turned clockwise by atan(τb) and slowed by 1/√(1 + (τb)²) at steady state, from rest each trial).
 - `reversal_adapter`: lerobot's `AdapterModules` (composed in `cursor_sa/session.py`) with up to two modules. The
@@ -301,7 +302,9 @@ Main parameters (`control:` and `task:` sections):
   the cursor) — the tokens come from the disc parameters or, with `token_source` `vlm_image` (π0.5's frozen vision tokens) or `cnn` (a small encoder trained with the module), from a rendered image of the scene — acts in both directions, so it reshapes every chunk the controller produces — in every
   mode, and the `expert_chunk` agent's intent — toward a task the frozen policy never saw. The
   forward field is task(v), the backward field user(task(v)); the two are trained apart and composed
-  here (`{user: U, task: T}`).
+  here (`{user: U, task: T}`). The spec forms are lerobot's adapter grammar in the cursor's two dims
+  (`SteeringConfig.from_spec(spec, corruption, n_dims=2)`): `{translation: corruption}` (F = M), `{translation:
+  <matrix spec>}`, `{F: <matrix spec>}`, `{learned: name}`, or `{user: name, task: name}` (checkpoint names).
 - `execute` (default 2): the input is re-read each time the policy replans. LeRobot replans every
   chunk, but here that made steering much worse than direct control: with the expert agent at input
   noise 0.6, replanning every 8 steps gave 34% success (66% timeouts, from failing to hold still on

@@ -4,8 +4,9 @@ Both entry points read the same nested YAML shape (policy / scene / control /
 server) into dataclasses. A file may say `extends: other.yaml` (relative to
 itself) to overlay on another; a key set to null keeps the built-in default,
 and unknown keys are rejected. Matrix specs under `control` are resolved here
-into arrays (see `lerobot.policies.steering` for the accepted forms); a
-`{random: ...}` corruption becomes a family that each trial draws from instead.
+into arrays (the forms: `lerobot.teleoperators.readout.matrix_spec` for a
+matrix, `SteeringConfig.from_spec` for a reversal adapter); a `{random: ...}`
+corruption becomes a family that each trial draws from instead.
 """
 
 import copy

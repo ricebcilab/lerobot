@@ -127,7 +127,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cursor_sa import config  # noqa: E402
 from cursor_sa.agents import ExpertAgent, ExpertChunkAgent  # noqa: E402
-from cursor_sa.readout import DEADBAND, Readout, corruption_spec  # noqa: E402
+from lerobot.teleoperators.readout import DEADBAND, Readout, corruption_spec  # noqa: E402
 from cursor_sa.demos import (  # noqa: E402
     DemoConfig, DemoSampler, augment_demos, demo_positions, frame_steps, make_demos, pad_steps, plan_reach,
 )

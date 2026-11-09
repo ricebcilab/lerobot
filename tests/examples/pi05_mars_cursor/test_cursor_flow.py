@@ -8,7 +8,6 @@ import torch
 
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.readout import Readout, adapter_spec, matrix_spec
 from cursor_sa.demos import DemoSampler, make_demos, replay
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
@@ -17,7 +16,9 @@ from cursor_sa.session import load_checkpoints
 from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, bci_chunk, hide_goal, observation, to_action,
                                 to_deflection)
 
+from lerobot.policies.steering import SteeringConfig
 from lerobot.teleoperators import readout as shared_readout
+from lerobot.teleoperators.readout import Readout, matrix_spec
 
 CFG = TaskConfig()
 
@@ -189,7 +190,7 @@ def test_observation_units_and_adapter_helpers():
 def test_the_torch_readout_twins_follow_the_shared_readout():
     """The cursor's torch versions of the readout (training) give the shared numpy rule's numbers for the same draws."""
     policy = FlowPolicy().eval()
-    m = matrix_spec({"scale": [1.0, 0.25]})
+    m = matrix_spec({"scale": [1.0, 0.25]}, 2)
     deflection = torch.tensor([[[0.8, 0.8], [0.02, 0.01], [-0.5, 1.0]]])  # the middle step is idle
     served = Readout(torch.as_tensor(m, dtype=torch.float32)).chunk(deflection, torch.zeros(1))
     torch.testing.assert_close(served, torch.as_tensor(Readout(m)(deflection.numpy()), dtype=torch.float32))
@@ -296,25 +297,26 @@ def test_gain_scales_the_cursor_by_step_or_by_time():
 
 
 def test_the_readout_corrupts_and_adds_noise_only_while_commanding():
-    np.testing.assert_allclose(matrix_spec({"scale": [1.0, 0.5]}), [[1, 0], [0, 0.5]])
-    np.testing.assert_allclose(matrix_spec({"rotation_deg": 90}) @ [1, 0], [0, 1], atol=1e-12)
-    np.testing.assert_allclose(matrix_spec([[0, 1], [1, 0]]), [[0, 1], [1, 0]])
-    assert matrix_spec(None) is None
-    m = matrix_spec({"scale": [2.0, 0.5]})
-    np.testing.assert_allclose(adapter_spec({"translation": "corruption"}, m), m)
-    np.testing.assert_allclose(adapter_spec({"F": {"scale": [3, 3]}}, None), 3 * np.eye(2))
-    for bad in (lambda: matrix_spec({"scale": [1, 1, 1]}), lambda: adapter_spec({"translation": "corruption"}, None)):
+    np.testing.assert_allclose(matrix_spec({"scale": [1.0, 0.5]}, 2), [[1, 0], [0, 0.5]])
+    np.testing.assert_allclose(matrix_spec({"rotation_deg": 90}, 2) @ [1, 0], [0, 1], atol=1e-12)
+    np.testing.assert_allclose(matrix_spec([[0, 1], [1, 0]], 2), [[0, 1], [1, 0]])
+    assert matrix_spec(None, 2) is None
+    m = matrix_spec({"scale": [2.0, 0.5]}, 2)
+    adapter_matrix = lambda spec, corruption: SteeringConfig.from_spec(spec, corruption, n_dims=2, device="cpu").fixed_matrix
+    np.testing.assert_allclose(adapter_matrix({"translation": "corruption"}, m), m)
+    np.testing.assert_allclose(adapter_matrix({"F": {"scale": [3, 3]}}, None), 3 * np.eye(2))
+    for bad in (lambda: matrix_spec({"scale": [1, 1, 1]}, 2), lambda: adapter_matrix({"translation": "corruption"}, None)):
         with pytest.raises(ValueError):
             bad()
-    readout = Readout(matrix_spec({"scale": [1.0, 0.5]}), input_noise=0.3, rng=np.random.default_rng(0))
+    readout = Readout(matrix_spec({"scale": [1.0, 0.5]}, 2), input_noise=0.3, rng=np.random.default_rng(0))
     idle = np.array([[0.01, -0.02]] * 1000)
     np.testing.assert_array_equal(readout(idle), idle)
     pushed = readout(np.array([[0.4, 0.8]] * 20000))
     np.testing.assert_allclose(pushed.mean(0), [0.4, 0.4], atol=0.02)
     assert abs(pushed[:, 0].std() - 0.3) < 0.02
-    np.testing.assert_allclose(Readout(matrix_spec({"scale": [2.0, 2.0]}))(np.array([0.8, -0.1])), [1.0, -0.2])
+    np.testing.assert_allclose(Readout(matrix_spec({"scale": [2.0, 2.0]}, 2))(np.array([0.8, -0.1])), [1.0, -0.2])
     # per-trial matrices and noise levels, on single commands and on chunks
-    ms = np.stack([matrix_spec({"scale": [1.0, 0.5]}), matrix_spec({"rotation_deg": 90})])
+    ms = np.stack([matrix_spec({"scale": [1.0, 0.5]}, 2), matrix_spec({"rotation_deg": 90}, 2)])
     raw = np.array([[0.4, 0.8], [0.6, -0.3]])
     batched = Readout(ms)(raw)
     for i in range(2):

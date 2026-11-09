@@ -11,7 +11,7 @@ import torch
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.analysis import trial_metrics
-from cursor_sa.readout import Readout
+from lerobot.teleoperators.readout import Readout
 from cursor_sa.demos import DemoSampler, make_demos, plan_reach, replay
 from lerobot.envs.cursor import (CursorEnv, Layouts, TaskConfig, center_out, obstacle_spec, plan_route, route_side,
                            sample_layouts, segment_distance)

@@ -13,10 +13,10 @@ from pathlib import Path
 
 import yaml
 
-from .readout import adapter_spec, corruption_spec
+from lerobot.teleoperators.readout import corruption_spec
 from lerobot.envs.cursor import obstacle_spec
 from lerobot.policies.cursor_flow import CursorFlowConfig
-from lerobot.policies.steering import FlowControlSteering, FlowReversalSteering
+from lerobot.policies.steering import FlowControlSteering, FlowReversalSteering, SteeringConfig
 from .paths import CONFIGS as CONFIG_DIR
 from .steering import GAIN_MODES, MODES, method_name
 
@@ -134,9 +134,15 @@ def validate_arm(params, where="arm"):
 
 
 def derive(params):
-    spec = params["reversal_adapter"]
+    spec, where = params["reversal_adapter"], "control.reversal_adapter"
     params["corruption_matrix"], params["corruption_curl"] = corruption_spec(params["corruption"], "control.corruption")
-    params["adapter_matrix"] = adapter_spec(spec, params["corruption_matrix"], "control.reversal_adapter")
+    if isinstance(spec, dict) and spec and set(spec) <= {"user", "task"}:  # the session composes checkpoints by name
+        for key, value in spec.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{where}: {key} must be a checkpoint name or null, got {value!r}")
+    # the fixed 2x2 user matrix F of the spec (lerobot's adapter grammar in the cursor's two dims), or None
+    params["adapter_matrix"] = SteeringConfig.from_spec(spec, params["corruption_matrix"], where, n_dims=2,
+                                                        device="cpu").fixed_matrix
     # the checkpoints the spec names: {learned: name} -> the name; {user: ..., task: ...} -> a dict of names
     if isinstance(spec, dict) and "learned" in spec:
         params["learned_adapter"] = spec["learned"]

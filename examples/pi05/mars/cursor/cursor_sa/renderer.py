@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pygame
 
-from .readout import is_active
+from lerobot.teleoperators.readout import is_active
 from .session import Aborted
 
 FIELD, HUD = 760, 124  # px: square task field, text band above it

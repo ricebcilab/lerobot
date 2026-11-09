@@ -6,7 +6,8 @@
   adapter specs read (the modes, the scene sources and token geometries, and the action layout a fixed adapter F is
   built in). Its adapter fields (`adapter_matrix`, `adapter_user`, `adapter_task`, `adapter_blocks`) are what a
   `reversal_adapter` spec parses into (`SteeringConfig.from_spec`). `SteeringConfig.build_adapter` builds a spec's
-  fixed F, and `checked_matrix`, `rotation` and `translation` are the matrix helpers of the specs.
+  fixed F, for any `n_dims` (7, the operator space, by default; 2 on the cursor). The matrices inside a spec are the
+  operator readout's grammar (`lerobot.teleoperators.readout`: `matrix_spec`, `corruption_spec`, `checked_matrix`).
 - `modeling_steering.py`: `SteeringPolicy`, the lerobot policy, and the cores it wraps (below).
 - `processor_steering.py`: `make_steering_pre_post_processors`, its two steps (`SteeringSceneTokensProcessorStep`,
   `SteeringCommandProcessorStep`) and `SceneEncoder`, the engine of the scene step.

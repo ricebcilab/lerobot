@@ -64,7 +64,7 @@ from lerobot.policies.steering import AdapterModules, Flow, SceneEncoder, Steeri
 
 from lerobot.envs.cursor import render_views
 from .policy import as_policy
-from .readout import DEADBAND, Readout, is_active
+from lerobot.teleoperators.readout import DEADBAND, Readout, is_active
 
 MODES = ("policy", "teleop", "flow_control", "frs")
 GAIN_MODES = ("step", "time")  # how speed_gain slows the cursor: smaller steps, or each planned step over more control steps

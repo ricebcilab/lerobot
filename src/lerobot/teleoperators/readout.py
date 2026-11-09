@@ -29,12 +29,21 @@ The functions are numpy and batched over leading axes: a command is (..., n), a 
 (..., n, n), sigma a scalar or one per row. ``Readout`` is the stateful 2D readout of the cursor example built on
 them (numpy, closed loop, a curl velocity per trial), with the same rule over a whole sequence from rest
 (``Readout.core``) and its torch forms for training (``Readout.chunk``, ``Readout.serve``).
+
+The specs that configure a readout are parsed here too, for any number of dims: ``matrix_spec`` builds every matrix
+of a config (a corruption M, and the fixed adapter F's blocks that ``SteeringConfig.build_adapter`` reads),
+``corruption_spec`` a corruption (a matrix or a curl), ``checked_matrix`` checks a literal, ``rotation`` is the
+rotation about z.
 """
+
+from typing import Any
 
 import numpy as np
 import torch
 
 DEADBAND = 0.05  # max |component| below which the operator is idle
+# A matrix spec's rotation key per dimension: in the plane (2 dims), about z (3 dims); no rotation key otherwise.
+ROTATION_KEYS = {2: "rotation_deg", 3: "rotation_z_deg"}
 
 _ROT = np.array([[0.0, 1.0], [-1.0, 0.0]])  # a clockwise quarter turn in the first two axes
 
@@ -108,6 +117,72 @@ def add_noise(core, raw, sigma, noise, deadband: float = DEADBAND) -> np.ndarray
         core + np.asarray(noise, dtype=np.float64) * (sigma[..., None] if sigma.ndim else sigma), -1.0, 1.0
     )
     return np.where(is_active(raw, deadband)[..., None], noisy, raw)
+
+
+# ---------------------------------------------------------------- the specs: matrices and corruptions
+
+
+def checked_matrix(matrix: Any, size: int, where: str) -> np.ndarray:
+    """Coerce `matrix` to a finite (size, size) float array or raise ValueError."""
+    try:
+        m = np.asarray(matrix, dtype=np.float64)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{where}: entries must be numbers ({e})") from e
+    if m.shape != (size, size):
+        raise ValueError(f"{where}: expected a {size}x{size} matrix, got shape {m.shape}")
+    if not np.all(np.isfinite(m)):
+        raise ValueError(f"{where}: entries must be finite")
+    return m
+
+
+def rotation(degrees: float) -> np.ndarray:
+    """3x3 rotation of a translation command about the z axis."""
+    c, s = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def matrix_spec(spec: Any, n_dims: int, where: str = "matrix") -> np.ndarray | None:
+    """The (n_dims, n_dims) matrix of a spec, or None for a null spec. Forms: ``{scale: [s_1, ..., s_n]}`` (exactly
+    ``n_dims`` gains, the diagonal); the rotation by ``d`` degrees, ``{rotation_deg: d}`` in the plane (2 dims) or
+    ``{rotation_z_deg: d}`` about z (3 dims; ``rotation``, whose top-left block is the plane's); ``{M: rows}`` or bare
+    rows (the literal). Checked by ``checked_matrix``; any other key, the other dimension's rotation key included,
+    raises naming the forms of this dimension."""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        return checked_matrix(spec, n_dims, where)
+    keys, rotation_key = set(spec), ROTATION_KEYS.get(n_dims)
+    if keys == {"scale"}:
+        scale = np.asarray(spec["scale"], dtype=np.float64)
+        if scale.shape != (n_dims,) or not np.all(np.isfinite(scale)):
+            raise ValueError(f"{where}: scale must be {n_dims} finite numbers, got {spec['scale']!r}")
+        matrix = np.diag(scale)
+    elif rotation_key is not None and keys == {rotation_key}:
+        matrix = rotation(float(spec[rotation_key]))
+        if n_dims == 2:
+            matrix = np.ascontiguousarray(matrix[:2, :2])
+    elif keys == {"M"}:
+        matrix = spec["M"]
+    else:
+        forms = ", ".join([rotation_key, "scale"] if rotation_key else ["scale"])
+        raise ValueError(f"{where}: expected exactly one of {forms} or M, got {sorted(keys)}")
+    return checked_matrix(matrix, n_dims, where)
+
+
+def corruption_spec(
+    spec: Any, where: str = "control.corruption"
+) -> tuple[np.ndarray | None, dict[str, float] | None]:
+    """(matrix M or None, curl {curl, tau} or None) from a 2D corruption spec (the cursor's): a matrix form
+    (``matrix_spec`` in 2 dims), or ``{curl: b, tau: s}`` for a curl field on the command (b in 1/s, + = clockwise;
+    tau the command's time constant in s)."""
+    if isinstance(spec, dict) and "curl" in spec:
+        if set(spec) != {"curl", "tau"}:
+            raise ValueError(f"{where}: a curl corruption takes exactly curl and tau, got {sorted(spec)}")
+        curl, tau = float(spec["curl"]), float(spec["tau"])
+        if not (np.isfinite(curl) and tau > 0):
+            raise ValueError(f"{where}: curl must be finite and tau positive, got {spec!r}")
+        return None, {"curl": curl, "tau": tau}
+    return matrix_spec(spec, 2, where), None
 
 
 class Readout:

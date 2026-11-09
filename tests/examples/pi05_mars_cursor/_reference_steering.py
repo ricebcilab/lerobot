@@ -49,7 +49,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from cursor_sa.readout import Readout, is_active
+from lerobot.teleoperators.readout import Readout, is_active
 from cursor_sa.policy import mlp, time_embedding
 
 MODES = ("policy", "teleop", "flow_control", "frs")

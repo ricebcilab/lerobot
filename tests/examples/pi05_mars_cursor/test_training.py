@@ -11,11 +11,11 @@ import pytest
 import torch
 
 from cursor_sa import config
-from cursor_sa.readout import Readout, corruption_spec
+from lerobot.teleoperators.readout import Readout, corruption_spec
 from lerobot.envs.cursor import TaskConfig, obstacle_spec
 from cursor_sa.demos import demo_positions, make_demos, replay
 from cursor_sa.policy import FlowPolicy, load_policy
-from cursor_sa.readout import DEADBAND
+from lerobot.teleoperators.readout import DEADBAND
 from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule, active_rows
 from train import train_adapter
 from _view_stub import TokenStub, ViewStub

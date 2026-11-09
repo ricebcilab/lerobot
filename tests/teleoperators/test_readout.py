@@ -20,7 +20,9 @@ import numpy as np
 import pytest
 import torch
 
+from lerobot.policies.steering import SteeringConfig
 from lerobot.teleoperators import readout
+from lerobot.teleoperators.readout import corruption_spec, matrix_spec
 
 DEADBAND = 0.05
 ROT = np.array([[0.0, 1.0], [-1.0, 0.0]])
@@ -46,7 +48,7 @@ def old_robot_curl(tau, curl, dt):
 
 
 def old_cursor_readout(raw, matrix, sigma, rng):
-    """cursor_sa.readout.Readout (a matrix corruption) before the shared core."""
+    """The cursor example's Readout (a matrix corruption) before the shared core."""
     out = np.clip(np.einsum("...ij,...j->...i", matrix, raw), -1.0, 1.0)
     out = np.clip(out + rng.normal(size=out.shape) * sigma, -1.0, 1.0)
     return np.where((np.abs(raw).max(-1) >= DEADBAND)[..., None], out, raw)
@@ -224,3 +226,54 @@ def test_chunk_is_the_readout_on_a_chunk_for_the_same_draws(matrix):
     np.testing.assert_array_equal(out.numpy()[2, 3], chunk[2, 3])
     with pytest.raises(ValueError, match="curl"):
         readout.Readout(curl={"curl": 20.0, "tau": 0.1}).chunk(torch.tensor(chunk), torch.tensor(sigma))
+
+
+# ---------------------------------------------------------------- the matrix and corruption specs
+
+
+def test_matrix_spec_forms_per_dimension():
+    assert np.array_equal(matrix_spec({"scale": [1.0, 0.25]}, 2), np.diag([1.0, 0.25]))
+    assert np.allclose(matrix_spec({"rotation_deg": 90}, 2), [[0, -1], [1, 0]])
+    c, s = np.cos(np.radians(20)), np.sin(np.radians(20))
+    assert np.array_equal(
+        matrix_spec({"rotation_z_deg": 20}, 3), np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    )
+    with pytest.raises(ValueError, match="rotation_z_deg"):
+        matrix_spec({"rotation_deg": 20}, 3)
+    with pytest.raises(ValueError, match="rotation_deg"):
+        matrix_spec({"rotation_z_deg": 20}, 2)
+    assert matrix_spec(None, 2) is None
+    assert np.array_equal(matrix_spec({"M": [[0, 1], [1, 0]]}, 2), matrix_spec([[0, 1], [1, 0]], 2))
+    with pytest.raises(ValueError, match="scale"):
+        matrix_spec({"scale": [1.0, 1.0, 1.0]}, 2)
+    with pytest.raises(ValueError, match="2x2"):
+        matrix_spec([[1, 0, 0]], 2)
+
+
+def test_corruption_spec_is_the_examples():
+    assert corruption_spec({"curl": 20, "tau": 0.1}) == (None, {"curl": 20.0, "tau": 0.1})
+    matrix, curl = corruption_spec({"scale": [1.0, 0.25]})
+    assert np.array_equal(matrix, np.diag([1.0, 0.25])) and curl is None
+    assert corruption_spec(None) == (None, None)
+    for bad in (
+        {"curl": 20},
+        {"curl": 20, "tau": 0},
+        {"curl": float("nan"), "tau": 0.1},
+        {"rotation_z_deg": 20},
+    ):
+        with pytest.raises(ValueError, match="control.corruption"):
+            corruption_spec(bad)
+
+
+def test_build_adapter_two_dims_refuses_blocks_it_has_no_dims_for():
+    m = matrix_spec({"scale": [2.0, 0.5]}, 2)
+    assert np.array_equal(SteeringConfig.build_adapter({"translation": "corruption"}, m, n_dims=2), m)
+    for key in ("orientation", "gripper"):
+        with pytest.raises(ValueError, match=key):
+            SteeringConfig.build_adapter({"translation": "corruption", key: "identity"}, m, n_dims=2)
+    assert np.array_equal(SteeringConfig.build_adapter({"F": {"scale": [3, 3]}}, n_dims=2), 3 * np.eye(2))
+    fixed = SteeringConfig.from_spec({"translation": "corruption"}, m, n_dims=2, device="cpu")
+    assert fixed.n_dims == 2 and np.array_equal(fixed.fixed_matrix, m)
+    # a string user is a checkpoint, {learned: <path>}'s shorthand (the cursor's composite of names)
+    named = SteeringConfig.from_spec({"user": "u", "task": "t"}, n_dims=2, device="cpu")
+    assert (named.adapter_user, named.adapter_task, named.fixed_matrix) == ("u", "t", None)
