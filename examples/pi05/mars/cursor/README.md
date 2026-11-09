@@ -77,7 +77,8 @@ tools/                hub.py (the checkpoints on the Hugging Face Hub: download,
                       analyze_results.py (per-participant and pooled analysis of any runs),
                       diag_layouts.py (an image task module on train, fresh and moved layouts)
                       Obstacle specs take `decoy: true` (the obstacle on the reach to a random non-goal target; the goal-leak sweep
-                      `grid_task_check_rel_leak`), see the design addendum of 2026-11-05 in docs/superpowers/specs
+                      `grid_task_check_rel_leak`), see the design addendum of 2026-11-05 in docs/superpowers/specs, and `decoy: any`
+                      (about a target drawn uniformly, the goal among them: training data without a goal cue; the pilot plan of 2026-11-09)
 train/                train_policy.py, train_adapter.py
 reports/              report_grid_image.py (the image task modules' gate verdicts, scan, recipe choice and width check), report_grid_vision.py (the vision grid and its decoy control);
                       build_study_report.py --participants p<N> ... writes study_p<N>.pdf for one participant or

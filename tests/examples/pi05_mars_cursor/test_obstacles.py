@@ -239,6 +239,22 @@ def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records():
     assert args.overrides["obstacle"]["kind"] == "wall"
 
 
+def test_decoy_any_places_the_obstacle_about_a_target_drawn_uniformly_the_goal_among_them():
+    spec = obstacle_spec({"kind": "disc", "radius": 0.05, "along": 0.5, "decoy": "any"})
+    assert spec["decoy"] == "any"
+    with pytest.raises(ValueError, match="decoy must be true, false or any"):
+        obstacle_spec(dict(DISC, decoy="all"))
+    lay = sample_layouts(np.random.default_rng(0), 400, 4, TaskConfig(**STUDY, obstacle=spec))
+    about_goal = 0
+    for b in range(400):
+        start, disc = lay.start[b], lay.real_obstacles(b)[0, :2]
+        on = [np.allclose(disc, start + 0.5 * (t - start), atol=1e-6) for t in lay.targets[b][lay.mask[b]]]
+        assert sum(on) == 1  # at `along` of the reach to exactly one target
+        about_goal += on[lay.goal[b]]
+        assert np.linalg.norm(lay.goal_pos[b] - start) >= 0.35 - 1e-9  # the reach rule is still about the goal
+    assert 70 <= about_goal <= 130  # one target in four: 100 of 400, within three standard deviations (8.7)
+
+
 def test_a_decoy_obstacle_sits_on_the_reach_to_a_non_goal_target():
     spec = obstacle_spec({"kind": "disc", "radius": 0.05, "along": 0.5, "decoy": True})
     assert spec["decoy"] is True and obstacle_spec(DISC)["decoy"] is False and obstacle_spec(WALL)["decoy"] is False

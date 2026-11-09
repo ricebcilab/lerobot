@@ -248,8 +248,10 @@ def obstacle_spec(spec, where="task.obstacle"):
     way round shorter, so the side to pass is part of the scene.
 
     `decoy: true` (any kind, default false) places the obstacle on a decoy reach instead: from the start to a
-    non-goal target drawn per trial (`_layout`), so the obstacle no longer points at the goal; whether the layout
-    is passable, and everything else, is still about the goal."""
+    non-goal target drawn per trial (`_layout`), so the obstacle no longer points at the goal; `decoy: any` places
+    it on the reach to a target drawn uniformly over all of them, the goal among them, so its position carries no
+    cue about the goal at all (training data for a module that must learn avoidance, not the goal's direction).
+    Whether the layout is passable, and everything else, is still about the goal."""
     if spec is None:
         return None
     if not isinstance(spec, dict) or spec.get("kind") not in OBSTACLE_KINDS:
@@ -282,8 +284,8 @@ def obstacle_spec(spec, where="task.obstacle"):
     for key, value in out.items():
         if value is None:
             raise ValueError(f"{where}: {key} is required for kind {spec['kind']}")
-    if not isinstance(out["decoy"], bool):
-        raise ValueError(f"{where}: decoy must be true or false, got {out['decoy']!r}")
+    if out["decoy"] != "any" and not isinstance(out["decoy"], bool):
+        raise ValueError(f"{where}: decoy must be true, false or any, got {out['decoy']!r}")
     if out["side"] not in ("random", "fixed"):
         raise ValueError(f"{where}: side must be random or fixed, got {out['side']!r}")
     if "around" in out and out["around"] not in ("goal", "start"):
@@ -557,8 +559,11 @@ def _layout(rng, n, goal, cfg, max_tries=20_000, rounds=20):
                 continue
             reach_ok += 1
             if cfg.obstacle is not None:
-                toward = goal  # the target the obstacle is placed for: the goal, or a decoy drawn here
-                if cfg.obstacle.get("decoy"):
+                toward = goal  # the target the obstacle is placed for; `decoy` draws another below
+                decoy = cfg.obstacle.get("decoy")
+                if decoy == "any":  # uniform over the targets, the goal among them
+                    toward = int(rng.integers(n))
+                elif decoy:
                     if n < 2:
                         raise ValueError("decoy needs at least two targets")
                     d = int(rng.integers(n - 1))
