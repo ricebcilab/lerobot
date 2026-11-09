@@ -30,11 +30,14 @@ displacements.
   `vlm_prefix`).
 
 It has no dataset features, and `lerobot-train` does not train it. It is trained by the example's own trainer,
-`examples/pi05/mars/cursor/train/train_policy.py`, which writes the cursor project's `policy.pt` format.
-`examples/pi05/mars/cursor/tools/convert_checkpoints.py` converts those files (and the cursor's adapter
-checkpoints) in place to the formats lerobot loads. A converted policy folder also holds the policy's pipelines
-(`policy_preprocessor.json`, `policy_postprocessor.json` and the unnormalizer's statistics), so a steering policy that
-loads it by path has its postprocessor; a folder converted before them gets them on a re-run.
+`examples/pi05/mars/cursor/train/train_policy.py`, which writes `CursorFlowPolicy.save_pretrained` and the policy's
+pipelines (`policy_preprocessor.json`, `policy_postprocessor.json` and the unnormalizer's statistics), so a steering
+policy that loads the folder by path has its postprocessor. `examples/pi05/mars/cursor/tools/convert_checkpoints.py`
+is the only reader of the cursor project's old `policy.pt` files: it converts those (and the cursor's adapter
+checkpoints) in place to the formats lerobot loads; a folder converted before the pipelines gets them on a re-run.
+A `config.json` written here carries the sampler fields `num_inference_steps`, `n_action_steps`, `noise_time` and
+`max_action_dim` (serialized on purpose, as pi0.5 serializes its own), which draccus rejects as unknown keys in
+lerobot before 21b5ee8c: folders written at this head are not readable by that code.
 
 ```python
 from lerobot.policies.cursor_flow import CursorFlowPolicy, make_cursor_flow_pre_post_processors

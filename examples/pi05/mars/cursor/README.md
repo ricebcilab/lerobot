@@ -292,8 +292,7 @@ Main parameters (`control:` and `task:` sections):
   raw → M·raw (clipped to [-1, 1]) → + Gaussian noise. Both apply only while pushing, so idle input
   stays idle. Corruption specs (`lerobot.teleoperators.readout.corruption_spec`): `{scale: [sx, sy]}`,
   `{rotation_deg: d}`, `{M: rows}`, or `{curl: b, tau: s}`: a curl field on the command (the dynamics of the
-  cursor curl below, acting on what the
-  controller gets instead of on the cursor: the served command is a velocity driven by the push,
+  cursor curl below, acting on what the controller gets instead of on the cursor: the served command is a velocity driven by the push,
   turned clockwise by atan(τb) and slowed by 1/√(1 + (τb)²) at steady state, from rest each trial).
 - `reversal_adapter`: lerobot's `AdapterModules` (composed in `cursor_sa/session.py`) with up to two modules. The
   **user module** (a fixed F = M, or a trained `LearnedUserModule` U(x_t, t)) multiplies the policy's
@@ -332,6 +331,9 @@ Main parameters (`control:` and `task:` sections):
   trained with `--obstacle` reads them as tokens (`flow_goaldrop_<task>`, the grid's ceiling).
 
 ## Training
+
+Policy folders written at this head (trained or converted) are not readable by lerobot before 21b5ee8c: their
+`config.json` carries the sampler fields `num_inference_steps`, `n_action_steps`, `noise_time` and `max_action_dim`.
 
 From the repo root, as the quick start:
 

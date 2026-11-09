@@ -299,3 +299,26 @@ def test_the_old_holders_are_gone():
     for name in ("ReversalAdapter", "MatrixHolder"):
         assert not hasattr(steering, name) and name not in steering.__all__
         assert not hasattr(modeling_steering, name)
+
+
+def test_an_empty_adapter_mapping_is_refused_and_null_means_none():
+    """`{}` is no adapter (it was F = I under the name mars); `None` is the only way to say none."""
+    with pytest.raises(ValueError, match="empty mapping"):
+        SteeringConfig.build_adapter({})
+    with pytest.raises(ValueError, match="empty mapping"):
+        SteeringConfig.from_spec({}, None, "control.reversal_adapter", n_dims=2, device="cpu")
+    assert SteeringConfig.build_adapter(None) is None
+
+
+def test_the_matrix_setter_stores_a_copy_not_the_callers_array():
+    mine = np.array([[1.0, 0.0], [0.0, 2.0]])
+    modules = AdapterModules(n_dims=2)
+    modules.matrix = mine
+    assert modules.matrix is not mine and not np.shares_memory(modules.matrix, mine)
+    assert modules.matrix.dtype == np.float64
+    mine[0, 0] = 9.0
+    assert modules.matrix[0, 0] == 1.0
+    per_trial = np.stack([mine, mine])
+    modules.matrix = per_trial
+    per_trial[:] = 0.0
+    assert modules.matrix[0, 0, 0] == 9.0

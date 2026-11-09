@@ -223,6 +223,8 @@ class SteeringConfig(PreTrainedConfig):
             return None
         if not isinstance(spec, dict):
             raise ValueError(f"{where}: expected a mapping, got {type(spec).__name__}")
+        if not spec:
+            raise ValueError(f"{where}: an empty mapping is no adapter spec (null means none)")
         if "F" in spec:
             if set(spec) != {"F"}:
                 raise ValueError(f"{where}: an F cannot be combined with block keys")

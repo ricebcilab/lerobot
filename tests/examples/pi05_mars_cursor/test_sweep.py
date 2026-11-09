@@ -441,3 +441,16 @@ def test_tiny_sweep_runs_two_view_modules_at_their_own_spans(tmp_path, monkeypat
     policies, adapters = load_checkpoints({"policy_b": arm}, "cpu")
     with pytest.raises(ValueError, match="scene_encoder"):  # run_trials needs an encoder for a view module
         run_trials(arm, _lay(), ExpertChunkAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
+
+
+def test_as_policy_returns_a_matching_policy_as_is_and_rewraps_a_differing_one_without_mutating_it():
+    from cursor_sa.policy import as_policy
+
+    policy = CursorFlowPolicy.wrapping(FlowPolicy().eval())
+    steps, executed = policy.config.num_inference_steps, policy.config.n_action_steps
+    assert as_policy(policy) is policy
+    assert as_policy(policy, num_inference_steps=steps, n_action_steps=executed) is policy
+    other = as_policy(policy, num_inference_steps=steps + 1, n_action_steps=executed + 1)
+    assert other is not policy and other.model is policy.model
+    assert (other.config.num_inference_steps, other.config.n_action_steps) == (steps + 1, executed + 1)
+    assert (policy.config.num_inference_steps, policy.config.n_action_steps) == (steps, executed)

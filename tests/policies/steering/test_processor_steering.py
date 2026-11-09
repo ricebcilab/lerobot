@@ -412,3 +412,15 @@ def test_active_rows_is_the_three_rules_it_replaced():
         m = c.abs().amax(-1)
         assert torch.equal(active_rows(c, DEADBAND), (m.amax(-1) if m.dim() == 2 else m) >= DEADBAND)
     assert torch.equal(active_rows(rows, DEADBAND), rows.abs().amax(-1) >= DEADBAND)  # the trainer's
+
+
+@pytest.mark.parametrize(
+    "make", [lambda a: a.astype(np.float32) / 255, lambda a: torch.from_numpy(a).float()]
+)
+def test_tokens_step_refuses_pictures_that_are_not_uint8(make):
+    stub = TokenStub()
+    step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=stub)
+    pictures = make(np.zeros((2, 3, SIZE, SIZE), np.uint8))
+    with pytest.raises(ValueError, match="uint8"):
+        step(_transition({OBS_SCENE_IMAGES: pictures, OBS_SCENE_DIGEST: "a"}))
+    assert stub.images == 0

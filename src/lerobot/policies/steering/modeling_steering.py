@@ -741,9 +741,11 @@ class AdapterModules(nn.Module):
         except (TypeError, ValueError):  # ragged rows: the check below names them
             per_trial = False
         if per_trial:  # one per trial, each checked
-            self._matrix = np.stack([readout.checked_matrix(one, size, where) for one in value])
+            self._matrix = np.array(
+                [readout.checked_matrix(one, size, where) for one in value], dtype=np.float64
+            )
         else:
-            self._matrix = readout.checked_matrix(value, size, where)
+            self._matrix = np.array(readout.checked_matrix(value, size, where), dtype=np.float64, copy=True)
 
     @property
     def kind(self) -> str:

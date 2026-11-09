@@ -310,6 +310,9 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
             raise ValueError(
                 f"SteeringSceneTokensProcessorStep needs {OBS_SCENE_IMAGES!r} in the observation"
             )
+        dtype = images.dtype if torch.is_tensor(images) else np.asarray(images).dtype
+        if dtype not in (torch.uint8, np.uint8):
+            raise ValueError(f"{OBS_SCENE_IMAGES!r} must be uint8 pictures, got {dtype}")
         pictures = np.asarray(images.cpu() if torch.is_tensor(images) else images, dtype=np.uint8)
         size = self.render_size
         if pictures.ndim != 4 or pictures.shape[1:] != (3, size, size):

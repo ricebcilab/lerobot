@@ -1,5 +1,5 @@
 # Study arm: shared flow control as Kao et al. define it (the command written into the initial condition only, lambda
-# 1), the command in the policy's action units (ic_gain = action_gain(flow_goaldrop), 2.0843, stored to full
+# 1), the command in the policy's action units (ic_gain = steering.to_action(1, policy), 2.0843, stored to full
 # precision), at the tau sweeps/study_tuning.yaml tuned (73.8% of 500 test trials). The recorded sessions ran tau 16,
 # lambda 1 (their records say `tau: 1`, the lab variant's own depth, and carry no lambda or ic_gain).
 extends: condition_study.yaml

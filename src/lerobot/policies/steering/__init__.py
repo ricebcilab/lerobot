@@ -45,6 +45,7 @@ from .modeling_steering import (
     DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_OPEN,
+    SCENE_IMAGE_SIZE,
     VLM_SCENE_DIM,
     VLM_SCENE_TOKENS,
     VLM_VIEWS_TOKENS,
@@ -101,4 +102,5 @@ __all__ = [
     "VLM_SCENE_TOKENS",
     "VLM_VIEWS_TOKENS",
     "VLM_SCENE_DIM",
+    "SCENE_IMAGE_SIZE",
 ]
