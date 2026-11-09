@@ -19,6 +19,7 @@ it reads, and pi0.5's vision tokens (loaded lazily)."""
 import os
 import subprocess  # nosec B404
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -145,6 +146,40 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)
     enc.close()
+
+
+def test_prefix_tokens_are_the_image_positions_of_pi05s_encoded_prefix():
+    from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch
+
+    class Model:  # PI05Pytorch's encode_prefix: records its arguments, returns a hidden state varying by position
+        def __init__(self):
+            self.calls, self.hidden = [], []
+
+        def encode_prefix(self, images, img_masks, tokens, masks):
+            self.calls.append((images, img_masks, tokens, masks))
+            b, length = len(images[0]), 256 + tokens.shape[1]
+            position = torch.arange(length * 2048, dtype=torch.float32).reshape(1, length, 2048) / 4096
+            hidden = position + images[0].mean((1, 2, 3))[:, None, None]
+            self.hidden.append(hidden)
+            return hidden, torch.ones(b, length, dtype=torch.bool), object()
+
+    enc, model = SceneEncoder(device="cpu"), Model()
+    enc._policy = SimpleNamespace(model=model, config=SimpleNamespace(image_resolution=(224, 224)))
+    tokens, masks = torch.arange(7)[None], torch.tensor([[True] * 5 + [False] * 2])
+    enc._prompt_ids = (tokens, masks)
+    images = np.arange(5, dtype=np.uint8)[:, None, None, None] * np.ones((1, 3, 224, 224), np.uint8)
+    out = enc.prefix_tokens(images, batch=2)
+    assert isinstance(out, np.ndarray) and out.dtype == np.float16 and out.shape == (5, 256, 2048)
+    expected = torch.cat([hidden[:, :256].to(torch.float16) for hidden in model.hidden]).numpy()
+    assert np.array_equal(out, expected)
+    assert [len(pictures[0]) for pictures, *_ in model.calls] == [2, 2, 1]  # once per batch
+    for (pictures, img_masks, call_tokens, call_masks), i in zip(model.calls, (0, 2, 4), strict=True):
+        assert len(pictures) == 1 and torch.equal(pictures[0], enc._pixels(images[i : i + 2], (224, 224)))
+        b = len(pictures[0])
+        assert len(img_masks) == 1 and torch.equal(img_masks[0], torch.ones(b, dtype=torch.bool))
+        assert torch.equal(call_tokens, tokens.expand(b, -1)) and torch.equal(call_masks, masks.expand(b, -1))
+    # public, and no private alias left behind
+    assert [name for name in dir(PI05Pytorch) if name.endswith("encode_prefix")] == ["encode_prefix"]
 
 
 class _PatchEncoder:

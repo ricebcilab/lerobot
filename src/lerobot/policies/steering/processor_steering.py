@@ -181,9 +181,7 @@ class SceneEncoder:
     @torch.no_grad()
     def prefix_tokens(self, images: np.ndarray, batch: int = 64) -> np.ndarray:
         """The image positions of the language model's last hidden state on the prefix (the image, then the
-        fixed prompt), as ``PI05Pytorch`` encodes it: float16 ``[B, 256, 2048]``."""
-        from lerobot.policies.pi05.modeling_pi05 import make_att_2d_masks
-
+        fixed prompt), as ``PI05Pytorch.encode_prefix`` encodes it: float16 ``[B, 256, 2048]``."""
         policy = self._load()
         model = policy.model
         tokens, masks = self._prompt_ids
@@ -191,23 +189,13 @@ class SceneEncoder:
         for i in range(0, len(images), batch):
             pixels = self._pixels(images[i : i + batch], policy.config.image_resolution)
             b = len(pixels)
-            embs, pad_masks, att_masks = model.embed_prefix(
+            hidden, _, _ = model.encode_prefix(
                 [pixels],
                 [torch.ones(b, dtype=torch.bool, device=self.device)],
                 tokens.expand(b, -1),
                 masks.expand(b, -1),
             )
-            att_2d = model._prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks))
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
-            model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-            (hidden, _), _ = model.paligemma_with_expert.forward(
-                attention_mask=att_2d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[embs, None],
-                use_cache=False,
-            )
-            n_image = embs.shape[1] - tokens.shape[1]
+            n_image = hidden.shape[1] - tokens.shape[1]
             out.append(hidden[:, :n_image].to(torch.float16).cpu())
         return torch.cat(out).numpy() if out else np.zeros((0, VLM_SCENE_TOKENS, VLM_SCENE_DIM), np.float16)
 

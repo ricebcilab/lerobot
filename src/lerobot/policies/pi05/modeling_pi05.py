@@ -20,7 +20,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -812,8 +812,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def _encode_prefix(self, images, img_masks, tokens, masks):
-        """Encode the observation prefix once: (prefix_pad_masks, past_key_values) for the action expert."""
+    def encode_prefix(self, images, img_masks, tokens, masks) -> tuple[Tensor, Tensor, Any]:
+        """Encode the observation prefix once: ``(hidden, prefix_pad_masks, past_key_values)``, ``hidden`` the
+        language model's last hidden state on the prefix ``(B, L, width)`` (the images' tokens, then the
+        language tokens), the pad masks and the KV cache the action expert attends to."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -821,21 +823,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (hidden, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-        return prefix_pad_masks, past_key_values
+        return hidden, prefix_pad_masks, past_key_values
 
     def velocity_field(self, images, img_masks, tokens, masks):
         """Encode the observation prefix once and return ``velocity(x_t, time)``, the learned flow field
         for this batch on padded normalized chunks; ``time`` is a float or a (batch,) tensor. This is
         what ``sample_actions`` integrates, exposed for callers that invert chunks or train adapters on
         the field (e.g. MARS user modules) without sampling."""
-        prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
+        _, prefix_pad_masks, past_key_values = self.encode_prefix(images, img_masks, tokens, masks)
         return self._velocity_fn(prefix_pad_masks, past_key_values, tokens.shape[0], tokens.device)
 
     def _velocity_fn(self, prefix_pad_masks, past_key_values, bsize, device):
@@ -881,7 +883,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_pad_masks, past_key_values = self._encode_prefix(images, img_masks, tokens, masks)
+        _, prefix_pad_masks, past_key_values = self.encode_prefix(images, img_masks, tokens, masks)
         velocity = self._velocity_fn(prefix_pad_masks, past_key_values, bsize, device)
 
         x_t_hook = kwargs.get("x_t_hook")
