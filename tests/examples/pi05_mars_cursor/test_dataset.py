@@ -11,7 +11,7 @@ from cursor_sa.dataset import SceneDataset, encoder_digest, layout_digests
 from train import train_adapter
 
 from lerobot.envs.cursor import Layouts, TaskConfig, move_layouts, obstacle_spec, sample_layouts
-from lerobot.policies.steering import SceneEncoder
+from lerobot.policies.cursor_flow.processor_cursor_flow import render_scene_array
 
 SIZE = 32
 IMAGE = "{kind: disc, radius: 0.08, along: 0.5}"
@@ -79,7 +79,7 @@ def test_gather_returns_the_stored_tokens_bit_for_bit_and_fills_a_pinned_buffer(
     a, stub = _layouts(0), TokenStub()
     store = _store(tmp_path)
     rows = store.rows_for(a, stub)
-    tokens = torch.from_numpy(SceneEncoder.scene_array(a, "vlm_image", SIZE, TokenStub()))
+    tokens = torch.from_numpy(render_scene_array(a, "vlm_image", SIZE, TokenStub()))
     pick = rows[[4, 0, 0, 2]]
     got = store.gather(pick)
     assert (
@@ -121,7 +121,7 @@ def test_a_crashed_append_leaves_the_index_consistent(tmp_path, monkeypatch):
     assert (
         store.path / "tokens.f16"
     ).stat().st_size == 8 * 256 * 2048 * 2  # the orphan rows were overwritten
-    want = torch.from_numpy(SceneEncoder.scene_array(Layouts.concat([a, b]), "vlm_image", SIZE, TokenStub()))
+    want = torch.from_numpy(render_scene_array(Layouts.concat([a, b]), "vlm_image", SIZE, TokenStub()))
     assert torch.equal(reopened.gather(np.arange(8)), want)
 
 

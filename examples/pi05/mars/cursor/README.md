@@ -384,7 +384,10 @@ module over several contexts, a YAML `entries: [{obstacle, user_module, corrupti
 `--user-module` and `--corruption`. Image modules are checkpointed under `image/` (`image/task_<ctx>_n300_s0_with_<user>_<source>`;
 the pooled `image/task_all_n1200_s0_<source>`). Sweeps attach the scene to each cell's layouts and cache the arrays
 in `checkpoints/scene/<sweep>/` (`--scene-cache` moves it); `run_sweep.py --precompute-scene` fills the cache for every cell in one
-process and exits. The `vlm_*` steps need `uv run --extra pi` and `HF_HUB_OFFLINE=1` with the π0.5 weights cached.
+process and exits. A layout batch's scene array is `render_scene_array` (lerobot's `cursor_flow` processors: the render,
+encoded for `vlm_*`); a steering policy's pre-processor gets the cursor's render step before its scene-tokens step
+(`cursor_sa.steering.cursor_steering_pre_post_processors`, the pipelines `convert_checkpoints.py --steering` saves).
+The `vlm_*` steps need `uv run --extra pi` and `HF_HUB_OFFLINE=1` with the π0.5 weights cached.
 
 `--n-demos` sets how many demonstrations a module trains on (default 20 000, as many as the policy's own;
 one demonstration is one reach, about a second). With few, the two modules want opposite budgets (the

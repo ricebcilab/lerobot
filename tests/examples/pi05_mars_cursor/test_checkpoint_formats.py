@@ -173,6 +173,7 @@ def test_an_adapter_folder_converts_to_a_steering_policy_that_steers_as_the_modu
 
 
 def test_a_converted_image_task_module_keeps_its_scene_settings(tmp_path):
+    from lerobot.policies.cursor_flow.processor_cursor_flow import CursorSceneRenderProcessorStep
     from lerobot.policies.steering import (
         AdapterModules,
         LearnedTaskModule,
@@ -197,3 +198,7 @@ def test_a_converted_image_task_module_keeps_its_scene_settings(tmp_path):
     pre, _ = make_pre_post_processors(config, pretrained_path=str(folder))
     (step,) = (s for s in pre.steps if isinstance(s, SteeringSceneTokensProcessorStep))
     assert (step.source, step.render_size) == ("vlm_image", 48)
+    # the folder's pre-processor reads the trials' layouts: the cursor renders them for the tokens step
+    types = [type(s) for s in pre.steps]
+    at = types.index(SteeringSceneTokensProcessorStep)
+    assert types[at - 1] is CursorSceneRenderProcessorStep and pre.steps[at - 1].render_size == 48

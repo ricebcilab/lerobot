@@ -93,6 +93,7 @@ from cursor_sa.dataset import array_head, render_spec
 from cursor_sa.records import atomic_write_json, atomic_write_text, logged, summarize
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 
+from lerobot.policies.cursor_flow.processor_cursor_flow import render_scene_array
 from lerobot.policies.steering.processor_steering import SCENE_PROMPT, SCENE_VLM_PATH, SceneEncoder
 
 CURL_TAU = 0.1  # s, cursor inertia for the curl family
@@ -802,7 +803,7 @@ def attach_scene(layouts, sources, cache_dir, key, encoder_factory, vlm=SCENE_VL
             scene[source] = np.load(file)
         else:
             encoder = encoder_factory() if source.startswith("vlm_") else None
-            scene[source] = SceneEncoder.scene_array(layouts, source, size, encoder)
+            scene[source] = render_scene_array(layouts, source, size, encoder)
             tmp = file.with_name(f"{file.name}.{os.getpid()}.tmp")
             with open(tmp, "wb") as f:
                 np.save(f, scene[source])

@@ -22,6 +22,12 @@ displacements.
   `make_pre_post_processors` for a `CursorFlowConfig`) makes its pipelines: the postprocessor's unnormalizer scales a
   chunk to screen units, `chunk * action_scale` (mean 0, std `action_scale`), and carries the action statistics the
   steering cores read.
+- The cursor's scenes as pictures, for a steering policy's scene step (`processor_cursor_flow.py`):
+  `CursorSceneRenderProcessorStep` reads the trials' layouts (`observation.layouts`) and writes their render
+  (`observation.scene_images`, `render_layouts` at `render_size`) and a digest of what it is drawn from
+  (`observation.scene_digest`), the key the scene step keeps its tokens under; `render_scene_array` is a layout
+  batch's scene array for a task module's source (the render for `cnn`, its tokens for `vlm_image` /
+  `vlm_prefix`).
 
 It has no dataset features, and `lerobot-train` does not train it. It is trained by the example's own trainer,
 `examples/pi05/mars/cursor/train/train_policy.py`, which writes the cursor project's `policy.pt` format.

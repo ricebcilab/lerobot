@@ -141,6 +141,7 @@ from cursor_sa.steering import forward_flow, hide_goal, reverse_flow, to_action 
 
 from lerobot.policies.steering import (SCENE_SOURCES, TOKEN_GEOMETRIES, AdapterModules, Flow,  # noqa: E402
                                        LearnedTaskModule, LearnedUserModule, SceneEncoder, active_rows)
+from lerobot.policies.cursor_flow.processor_cursor_flow import render_scene_array  # noqa: E402
 from lerobot.policies.steering.processor_steering import SCENE_VLM_PATH, STORED_SCENE_SOURCES  # noqa: E402
 
 # ---------------------------------------------------------------- data
@@ -461,7 +462,7 @@ def expert_splits(args, obstacle, policy, device, rng, corruption, curl, p_free=
                   f"store {store.path}", flush=True)
             stored = (store, rows, args.token_source)
         elif args.token_source != "discs":
-            layouts.scene = {args.token_source: SceneEncoder.scene_array(layouts, args.token_source, args.render_size, encoder)}
+            layouts.scene = {args.token_source: render_scene_array(layouts, args.token_source, args.render_size, encoder)}
         if args.token_source in STORED_SCENE_SOURCES and args.scene_rank:
             if split == "train" and getattr(args, "scene_reduction", None) is None:
                 tokens_of = ((lambda idx: stored[0].gather(stored[1][idx])) if stored is not None

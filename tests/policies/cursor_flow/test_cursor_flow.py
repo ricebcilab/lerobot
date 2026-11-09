@@ -19,12 +19,18 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
 from lerobot.policies.cursor_flow.configuration_cursor_flow import CursorFlowConfig
 from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, FlowPolicy
-from lerobot.policies.cursor_flow.processor_cursor_flow import make_cursor_flow_pre_post_processors
+from lerobot.policies.cursor_flow.processor_cursor_flow import (
+    OBS_LAYOUTS,
+    CursorSceneRenderProcessorStep,
+    make_cursor_flow_pre_post_processors,
+)
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 from lerobot.policies.steering import (
     AdapterModules,
@@ -34,6 +40,8 @@ from lerobot.policies.steering import (
     SteeringConfig,
     SteeringPolicy,
 )
+from lerobot.policies.steering.processor_steering import OBS_SCENE_DIGEST, OBS_SCENE_IMAGES
+from lerobot.types import TransitionKey
 
 CONVERTER = (
     Path(__file__).resolve().parents[3]
@@ -257,6 +265,34 @@ def test_regress_mode_returns_the_prediction():
     assert torch.equal(policy.predict_action_chunk(obs), policy.model(obs))
     with pytest.raises(ValueError, match="regress"):
         policy.predict_action_chunk(obs, noise=torch.zeros(3, 16, 2))
+
+
+def test_render_step_writes_pictures_and_digest():
+    """The cursor's render step writes its layouts' render and the digest the steering step computed before the
+    render moved here (a sha256 over start, targets, mask, obstacles and their mask: the values pinned at the move),
+    and keeps the last render."""
+    task = TaskConfig(
+        min_reach=0.3, max_reach=0.5, obstacle=obstacle_spec({"kind": "disc", "radius": 0.08, "along": 0.5})
+    )
+    lay, other = (sample_layouts(np.random.default_rng(seed), 3, 4, task) for seed in (0, 1))
+    step = CursorSceneRenderProcessorStep(render_size=32)
+
+    def rendered(layouts):
+        return step({TransitionKey.OBSERVATION: {OBS_LAYOUTS: layouts}})[TransitionKey.OBSERVATION]
+
+    obs = rendered(lay)
+    assert np.array_equal(obs[OBS_SCENE_IMAGES], render_layouts(lay, 32)) and obs[OBS_LAYOUTS] is lay
+    assert obs[OBS_SCENE_DIGEST] == "35302b39f2e6b6512f5435209a9aab3301849889520ca3fa8c29092c470579a3"
+    again = rendered(lay[np.arange(3)])  # equal layouts: the kept render
+    assert (
+        again[OBS_SCENE_IMAGES] is obs[OBS_SCENE_IMAGES] and again[OBS_SCENE_DIGEST] == obs[OBS_SCENE_DIGEST]
+    )
+    moved = rendered(other)
+    assert np.array_equal(moved[OBS_SCENE_IMAGES], render_layouts(other, 32))
+    assert moved[OBS_SCENE_DIGEST] == "3f6e3b1ec6d8ca8e34fbac3b6c87dbead8cde9267a4f5d4ad0f9afa71ecff9d6"
+    with pytest.raises(ValueError, match="observation.layouts"):
+        step({TransitionKey.OBSERVATION: {"observation.pos": torch.zeros(1, 2)}})
+    assert CursorSceneRenderProcessorStep(**step.get_config()).render_size == 32
 
 
 def test_factory_knows_cursor_flow():

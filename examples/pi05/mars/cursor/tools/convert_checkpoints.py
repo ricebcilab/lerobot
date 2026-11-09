@@ -16,9 +16,11 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
 - with --steering, every adapters/**/adapter.pt (once in that format) also becomes a lerobot `SteeringPolicy`
   directory beside it: config.json + model.safetensors (`save_pretrained`; MARS, mode frs, the module in its slot,
   its config and scene settings recorded so the folder loads without adapter.pt) and the policy's two processor
-  pipelines (policy_preprocessor.json, policy_postprocessor.json: `make_steering_pre_post_processors`' for that config,
-  which the factory's `make_pre_post_processors(config, pretrained_path=folder)` reloads), `--base-policy` the policy folder it steers (the
-  config's base_policy_path; unset by default). adapter.pt stays, and stays loadable by AdapterModules.load.
+  pipelines (policy_preprocessor.json, policy_postprocessor.json: `cursor_sa.steering.cursor_steering_pre_post_processors`'
+  for that config, lerobot's with the cursor's render step before an image task module's scene-tokens step, so the
+  pre-processor reads the trials' layouts; the factory's `make_pre_post_processors(config, pretrained_path=folder)`
+  reloads them), `--base-policy` the policy folder it steers (the config's base_policy_path; unset by default).
+  adapter.pt stays, and stays loadable by AdapterModules.load.
 
 Each converted file is written to a temporary name, loaded back and its weights compared with the
 original; only then is the original copied to *.orig and the new file moved into place (one atomic
@@ -46,12 +48,12 @@ import torch
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.cursor_flow import CursorFlowConfig, CursorFlowPolicy, make_cursor_flow_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.steering import (AdapterModules, LearnedTaskModule, LearnedUserModule, SteeringConfig,
-                                       SteeringPolicy, make_steering_pre_post_processors)
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule, SteeringConfig, SteeringPolicy
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa sits one folder up
 from cursor_sa.paths import CHECKPOINTS  # noqa: E402
+from cursor_sa.steering import cursor_steering_pre_post_processors  # noqa: E402
 
 
 def _same_weights(a, b):
@@ -224,8 +226,8 @@ STEERING_FILES = ("config.json", "model.safetensors", f"{POLICY_PREPROCESSOR_DEF
 def convert_adapter_to_policy(path, base_policy_path=None):
     """adapters/<name>/adapter.pt (in the `AdapterModules.save_module` format) -> adapters/<name>/{config.json,
     model.safetensors, the two processor JSONs}, a lerobot `SteeringPolicy` (MARS: mode frs, the module in its slot,
-    its config and scene settings recorded) and its pipelines; True if converted, False when the folder already has
-    them all. Written and verified (the module's weights reproduced by
+    its config and scene settings recorded) and its pipelines (`cursor_steering_pre_post_processors`); True if
+    converted, False when the folder already has them all. Written and verified (the module's weights reproduced by
     `SteeringPolicy.from_pretrained`) in a temporary folder, then moved into place; adapter.pt is left as it is."""
     path = Path(path)
     if all((path.parent / name).exists() for name in STEERING_FILES):
@@ -239,7 +241,7 @@ def convert_adapter_to_policy(path, base_policy_path=None):
     tmp = Path(tempfile.mkdtemp(prefix=".convert-", dir=path.parent))
     try:
         policy.save_pretrained(tmp)
-        for pipeline in make_steering_pre_post_processors(policy.config):
+        for pipeline in cursor_steering_pre_post_processors(policy.config):
             pipeline.save_pretrained(tmp)
         loaded = SteeringPolicy.from_pretrained(tmp, strict=True)
         module = getattr(loaded.adapter, kind)

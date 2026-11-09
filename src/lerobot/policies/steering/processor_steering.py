@@ -14,10 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The steering policy's pre-processing: ``SceneEncoder``, pi0.5's frozen vision tokens of rendered scenes (the
+"""The steering policy's pre-processing: ``SceneEncoder``, pi0.5's frozen vision tokens of scene pictures (the
 engine of the scene step), the two steering steps (``SteeringSceneTokensProcessorStep``, the scene's tokens for a
 MARS task module; ``SteeringCommandProcessorStep``, the operator's command), and
-``make_steering_pre_post_processors``, the pipelines around them."""
+``make_steering_pre_post_processors``, the pipelines around them. The scene reaches the package as pictures
+(``observation.scene_images``): drawing them is the environment's (the cursor's render step is ``cursor_flow``'s)."""
 
 import hashlib
 from collections.abc import Iterable
@@ -29,7 +30,6 @@ import numpy as np
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.envs.cursor import SCENE_SIZE, Layouts, render_layouts
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -55,6 +55,7 @@ from .configuration_steering import SteeringConfig
 from .modeling_steering import (
     COMMAND,
     DEADBAND,
+    SCENE_IMAGE_SIZE,
     TRAINING_KEYS,
     VLM_SCENE_DIM,
     VLM_SCENE_TOKENS,
@@ -69,25 +70,26 @@ PI05_TOKENIZER = "google/paligemma-3b-pt-224"  # the tokenizer pi0.5's processor
 
 STORED_SCENE_SOURCES = ("vlm_image", "vlm_prefix")  # the sources with one token array per layout
 
-OBS_LAYOUTS = f"{OBS_PREFIX}layouts"  # the scene step's input: the trials' layouts (a ``Layouts``) ...
-OBS_SCENE_IMAGES = f"{OBS_PREFIX}scene_images"  # ... or their pictures, uint8 [B, 3, S, S]
+# the scene step's input: the scenes' pictures, uint8 [B, 3, S, S], and optionally a str naming what they show
+OBS_SCENE_IMAGES = f"{OBS_PREFIX}scene_images"
+OBS_SCENE_DIGEST = f"{OBS_PREFIX}scene_digest"  # the step keeps its last tokens under it
 OBS_SCENE_TOKENS = f"{OBS_PREFIX}scene_tokens"  # the scene step's output, float16 [B, 256, width]
+# ``SCENE_IMAGE_SIZE`` (the pictures' default side, 224) is ``modeling_steering``'s, the task module's default size
 # ``COMMAND`` (the operator's command) and ``TRAINING_KEYS`` (a training batch's, carried through the pre-processor
 # untouched) are the policy's batch keys, ``modeling_steering``'s
 
 
 class SceneEncoder:
-    """pi0.5's frozen vision tokens of rendered scenes. ``image_tokens`` are SigLIP's patch tokens after the
+    """pi0.5's frozen vision tokens of scene pictures. ``image_tokens`` are SigLIP's patch tokens after the
     multimodal projector (``embed_image``), the tokens pi0.5's prefix starts with; ``prefix_tokens`` are the
     same positions in the last hidden state of pi0.5's language model run on the prefix, the image followed
     by the fixed ``prompt`` (tokenized as pi0.5's processor does, without state tokens, so the tokens depend
     on the layout alone). Both take uint8 ``[B, 3, S, S]``, resized with padding to pi0.5's resolution when S
     differs, and return float16 ``[B, 256, 2048]`` on the CPU.
 
-    ``SceneEncoder.scene_array(layouts, source, size, encoder)`` is a layout batch's scene array and
+    ``SceneEncoder._encode(encoder, source, images)`` is a stored source's tokens of a picture batch and
     ``SceneEncoder.view_tokens(images, encoder)`` the tokens of several views per scene, through any object with the
-    encoder's methods (``scene_array`` none for the ``cnn`` render). ``SceneEncoder.fit_reduction`` is the PCA of token
-    batches a reduced task module carries.
+    encoder's methods. ``SceneEncoder.fit_reduction`` is the PCA of token batches a reduced task module carries.
 
     Lazy: constructing it loads nothing; the first call loads ``path`` (``PI05Policy.from_pretrained``) and
     imports pi0.5 and ``transformers``, after checking that its ``model.safetensors`` is on disk. ``close``
@@ -216,29 +218,6 @@ class SceneEncoder:
             torch.cuda.empty_cache()
 
     @staticmethod
-    def scene_array(
-        layouts: Layouts,
-        source: str,
-        size: int = SCENE_SIZE,
-        encoder: "SceneEncoder | None" = None,
-        batch: int | None = None,
-    ) -> np.ndarray:
-        """The per-layout scene array for ``source``, ``[B, ...]``: ``cnn`` the render (uint8 ``[B, 3, size,
-        size]``), ``vlm_image`` / ``vlm_prefix`` the encoder's ``image_tokens`` / ``prefix_tokens`` of it
-        (``_encode``). ``encoder`` is anything with those two methods, typically one ``SceneEncoder`` built once by
-        the caller; ``batch`` (None: the encoder's default) goes to them. ``discs`` reads the layouts' obstacles
-        directly and has no scene array."""
-        if source == "discs":  # nosec B105
-            raise ValueError("source 'discs' reads the layouts' obstacles; it has no scene array")
-        LearnedTaskModule.spec(source, size)  # the source and size checks
-        images = render_layouts(layouts, size)
-        if source == "cnn":  # nosec B105
-            return images
-        if encoder is None:
-            raise ValueError(f"source {source!r} needs an encoder (e.g. a SceneEncoder)")
-        return SceneEncoder._encode(encoder, source, images, batch)
-
-    @staticmethod
     def _encode(encoder, source: str, images: np.ndarray, batch: int | None = None) -> np.ndarray:
         """The tokens of uint8 ``[B, 3, S, S]`` pictures for a stored source: the encoder's ``image_tokens``
         (``vlm_image``) or ``prefix_tokens`` (``vlm_prefix``), ``batch`` pictures at a time (None: its default),
@@ -299,16 +278,19 @@ class SceneEncoder:
 class SteeringSceneTokensProcessorStep(ProcessorStep):
     """The scene's tokens for a MARS task module with an image source (``vlm_image`` / ``vlm_prefix``).
 
-    Reads the trials' layouts (``observation.layouts``, a ``Layouts``, rendered at ``render_size``) or their
-    pictures (``observation.scene_images``, uint8 ``[B, 3, S, S]``) from the observation and writes
-    ``observation.scene_tokens``: float16 ``[B, 256, 2048]``, the ``SceneEncoder``'s tokens of ``source``, or
-    ``[B, 256, rank]`` when the step holds a task module's ``reduction`` (``(mean, basis)``, applied as the module
-    applies it). The encoder (``vlm_path`` on ``device``, ``batch`` pictures at a time) is built on first use, or
-    given as ``encoder`` (any object with ``image_tokens`` / ``prefix_tokens`` taking the pictures and ``batch``).
-    The last layouts' tokens are kept, so a replan on the same trials encodes nothing (``reset`` clears them)."""
+    Reads the scenes' pictures (``observation.scene_images``, uint8 ``[B, 3, S, S]`` with ``S == render_size``, the
+    task module's image size; a cursor's are its layouts' render, which the cursor's own step draws) from the
+    observation and writes ``observation.scene_tokens``: float16 ``[B, 256, 2048]``, the ``SceneEncoder``'s tokens
+    of ``source``, or ``[B, 256, rank]`` when the step holds a task module's ``reduction`` (``(mean, basis)``,
+    applied as the module applies it). Pictures of another shape raise ``ValueError`` before anything is encoded.
+    The encoder (``vlm_path`` on ``device``, ``batch`` pictures at a time) is built on first use, or given as
+    ``encoder`` (any object with ``image_tokens`` / ``prefix_tokens`` taking the pictures and ``batch``). The last
+    pictures' tokens are kept under ``observation.scene_digest`` (a ``str`` naming what the pictures show, the
+    drawing step's) or, without one, the sha256 of the pictures' bytes, so a replan on the same scenes encodes
+    nothing (``reset`` clears them)."""
 
     source: str = "vlm_image"
-    render_size: int = SCENE_SIZE
+    render_size: int = SCENE_IMAGE_SIZE
     vlm_path: str = SCENE_VLM_PATH
     batch: int = 64
     device: str = "cpu"
@@ -317,7 +299,7 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
 
     _last: tuple[str, np.ndarray] | None = field(
         default=None, init=False, repr=False
-    )  # (layouts' digest, array)
+    )  # (the pictures' digest, array)
 
     def __post_init__(self) -> None:
         if self.source not in STORED_SCENE_SOURCES:
@@ -330,38 +312,32 @@ class SteeringSceneTokensProcessorStep(ProcessorStep):
             self.encoder = SceneEncoder(self.vlm_path, self.device)
         return self.encoder
 
-    @staticmethod
-    def _digest(layouts: Layouts) -> str:
-        """A sha256 over what a render of ``layouts`` is drawn from (start, targets, mask, obstacles, their mask)."""
-        h = hashlib.sha256()
-        for a in (layouts.start, layouts.targets, layouts.mask, layouts.obstacles, layouts.obstacle_mask):
-            a = np.ascontiguousarray(a)
-            h.update(f"{a.dtype.str}{a.shape}".encode() + a.tobytes())
-        return h.hexdigest()
-
     def reset(self) -> None:
         self._last = None
 
     def tokens(self, observation: dict[str, Any]) -> torch.Tensor:
-        """The scene tokens of an observation's layouts or pictures, float16, reduced when the step holds a
-        reduction."""
-        layouts, images = observation.get(OBS_LAYOUTS), observation.get(OBS_SCENE_IMAGES)
-        if layouts is None and images is None:
+        """The scene tokens of an observation's pictures, float16, reduced when the step holds a reduction."""
+        images = observation.get(OBS_SCENE_IMAGES)
+        if images is None:
             raise ValueError(
-                f"SteeringSceneTokensProcessorStep needs {OBS_LAYOUTS!r} or {OBS_SCENE_IMAGES!r} in the observation"
+                f"SteeringSceneTokensProcessorStep needs {OBS_SCENE_IMAGES!r} in the observation"
             )
-        if layouts is not None:
-            digest = self._digest(layouts)
-            if self._last is None or self._last[0] != digest:
-                array = SceneEncoder.scene_array(
-                    layouts, self.source, self.render_size, self.scene_encoder(), self.batch
-                )
-                self._last = (digest, array)
-            array = self._last[1]
-        else:
-            pictures = np.asarray(images.cpu() if torch.is_tensor(images) else images, dtype=np.uint8)
+        pictures = np.asarray(images.cpu() if torch.is_tensor(images) else images, dtype=np.uint8)
+        size = self.render_size
+        if pictures.ndim != 4 or pictures.shape[1:] != (3, size, size):
+            raise ValueError(
+                f"{OBS_SCENE_IMAGES!r} must be [B, 3, {size}, {size}] pictures (render_size, the task module's image "
+                f"size), got shape {tuple(pictures.shape)}"
+            )
+        digest = observation.get(OBS_SCENE_DIGEST)
+        if digest is None:
+            digest = hashlib.sha256(pictures.tobytes()).hexdigest()
+        elif not isinstance(digest, str):
+            raise ValueError(f"{OBS_SCENE_DIGEST!r} must be a str, got {type(digest).__name__}")
+        if self._last is None or self._last[0] != digest:
             array = SceneEncoder._encode(self.scene_encoder(), self.source, pictures, self.batch)
-        tokens = torch.as_tensor(array)
+            self._last = (digest, array)
+        tokens = torch.as_tensor(self._last[1])
         if self.reduction is not None:
             mean, basis = self.reduction
             tokens = LearnedTaskModule.reduce(tokens, mean.to(tokens.device), basis.to(tokens.device))
@@ -489,8 +465,9 @@ def make_steering_pre_post_processors(
     2. Adding a batch dimension.
     3. Normalizing input and output features based on dataset statistics (none for a base policy that reads
        its own observation dict, as the cursor's).
-    4. Encoding the scene into tokens for a task module with an image source (``vlm_image`` / ``vlm_prefix``; the
-       source and render size are the task module's, read from its checkpoint when the config has not recorded it).
+    4. Encoding the scene's pictures (``observation.scene_images``) into tokens for a task module with an image
+       source (``vlm_image`` / ``vlm_prefix``; the source and render size are the task module's, read from its
+       checkpoint when the config has not recorded it).
     5. Reading the operator's command (the first ``n_dims`` dims, the idle rows zeroed).
     6. Moving all data to the specified device.
 
@@ -522,7 +499,7 @@ def make_steering_pre_post_processors(
         input_steps.append(
             SteeringSceneTokensProcessorStep(
                 source=scene["scene_source"],
-                render_size=scene["render_size"] or SCENE_SIZE,
+                render_size=scene["render_size"] or SCENE_IMAGE_SIZE,
                 vlm_path=config.vlm_path or SCENE_VLM_PATH,
                 device=config.device,
             )

@@ -99,9 +99,12 @@ method: the cursor example's controller, sweeps and agents take their chunks fro
 `LearnedTaskModule`'s `token_source` picks where its scene tokens come from:
 
 - `discs` (the default) encodes the obstacle discs, `obs["obstacles"]`, relative to the cursor `obs["pos"]`.
-- The image sources read `obs["scene"][source]`, a per-layout array. `SceneEncoder.scene_array(layouts, source, size,
-encoder)` builds it from the rendered layout (`render_layouts`). `LearnedTaskModule.spec(source, size)` gives the
-  module's kwargs for it.
+- The image sources read `obs["scene"][source]`, a per-scene array. The pre-processor's scene step
+  (`SteeringSceneTokensProcessorStep`) encodes it from the scene's pictures, `observation.scene_images` (uint8
+  `[B, 3, S, S]`, `S` the task module's image size, `SCENE_IMAGE_SIZE` = 224 by default). The package draws no
+  scene: the cursor's pictures are its layouts' render, drawn by the cursor's own step
+  (`CursorSceneRenderProcessorStep`, in `lerobot.policies.cursor_flow`, where `render_scene_array` is a layout
+  batch's array). `LearnedTaskModule.spec(source, size)` gives the module's kwargs for it.
   - `cnn` reads the render itself (uint8 `[B, 3, S, S]`) through a small CNN stem trained with the module.
   - `vlm_image` reads pi0.5's frozen SigLIP tokens of the render (`embed_image`): the patch tokens after the
     multimodal projector, float16 `[B, 256, 2048]`. Every render is resized to 224 px first, so the count does not
@@ -144,7 +147,8 @@ features, as `CursorFlowConfig`.
   `bci_target`, `noise`, `time`, `weight`. The pre-processor carries these through untouched, but does not build
   them.
 - A task module's scene settings become the config's (`SteeringConfig.scene_settings`).
-- The processor factory adds the scene step for a `vlm_image` / `vlm_prefix` task module.
+- The processor factory adds the scene step for a `vlm_image` / `vlm_prefix` task module. The step reads pictures;
+  the cursor example puts the cursor's render step before it (`cursor_steering_pre_post_processors`).
 - The cursor example's `tools/convert_checkpoints.py --steering` writes a `SteeringPolicy` folder and its pipelines
   beside each `adapter.pt`.
 

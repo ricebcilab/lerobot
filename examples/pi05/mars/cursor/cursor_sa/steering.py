@@ -53,14 +53,18 @@ cores the robot (pi0.5) uses that steer it; the policy's postprocessor
 (`make_cursor_flow_pre_post_processors`) turns the normalized chunks into screen
 units. The Euler flows and the user and task modules are lerobot's steering core
 too. This module binds them to the cursor policy's observation, its two action dims
-and its screen units.
+and its screen units. A steering policy's pipelines on the cursor are
+`cursor_steering_pre_post_processors`: lerobot's, its scene-tokens step reading the
+pictures the cursor's render step draws from the trials' layouts.
 """
 
 import numpy as np
 import torch
 
 from lerobot.policies.cursor_flow import make_cursor_flow_pre_post_processors
-from lerobot.policies.steering import AdapterModules, Flow, SceneEncoder, SteeringConfig, SteeringPolicy, as_adapter
+from lerobot.policies.cursor_flow.processor_cursor_flow import CursorSceneRenderProcessorStep
+from lerobot.policies.steering import (AdapterModules, Flow, SceneEncoder, SteeringConfig, SteeringPolicy,
+                                       SteeringSceneTokensProcessorStep, as_adapter, make_steering_pre_post_processors)
 
 from lerobot.envs.cursor import render_views
 from .policy import as_policy
@@ -185,6 +189,20 @@ def reverse_flow(policy, obs, x, n, steps, adapter=None):
 def forward_flow(policy, obs, x, t0, t1, steps, adapter=None):
     """Euler-integrate the (task-adapted) flow from t0 to t1 in `steps` steps."""
     return flow(policy, obs, x, t0, (t1 - t0) / steps, steps, adapter)
+
+
+def cursor_steering_pre_post_processors(config):
+    """The steering policy's pipelines on the cursor: lerobot's (`make_steering_pre_post_processors(config)`), the
+    scene-tokens step of a vlm_image / vlm_prefix task module preceded by the cursor's render step
+    (`CursorSceneRenderProcessorStep` at the tokens step's render_size), which draws the trials' layouts
+    (`observation.layouts`) as the pictures the tokens step encodes. Without a tokens step they are lerobot's as
+    they are."""
+    pre, post = make_steering_pre_post_processors(config)
+    steps = list(pre.steps)
+    at = next((i for i, step in enumerate(steps) if isinstance(step, SteeringSceneTokensProcessorStep)), None)
+    if at is not None:
+        pre.steps = [*steps[:at], CursorSceneRenderProcessorStep(render_size=steps[at].render_size), *steps[at:]]
+    return pre, post
 
 
 def _steering(policy, config, adapter, device):

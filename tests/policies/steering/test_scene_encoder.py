@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, render_layouts, sample_layouts
+from lerobot.policies.cursor_flow.processor_cursor_flow import render_scene_array
 from lerobot.policies.steering import (
     LearnedTaskModule,
     SceneEncoder,
@@ -62,7 +63,7 @@ def test_scene_spec_builds_a_module_that_accepts_scene_array():
     for src in ("vlm_image", "vlm_prefix", "cnn"):
         spec = LearnedTaskModule.spec(src, 112)
         m = LearnedTaskModule(horizon=16, **spec)
-        arr = SceneEncoder.scene_array(lay, src, 112, encoder=stub)
+        arr = render_scene_array(lay, src, 112, encoder=stub)
         assert arr.shape[0] == 4 and (arr.dtype == np.uint8 if src == "cnn" else arr.dtype == np.float16)
         obs = {"pos": torch.rand(4, 2), "scene": {src: torch.as_tensor(arr)}}
         a, _ = m(torch.randn(4, 16, 2), torch.rand(4), torch.randn(4, 16, 2), obs)
@@ -77,7 +78,7 @@ def test_scene_spec_builds_a_module_that_accepts_scene_array():
         and LearnedTaskModule.spec("cnn", 112)["scene_tokens"] == 49
     )
     with pytest.raises(ValueError):
-        SceneEncoder.scene_array(lay, "discs")
+        render_scene_array(lay, "discs")
     with pytest.raises(ValueError):
         LearnedTaskModule.spec("cnn", 50)
 
@@ -116,8 +117,8 @@ def test_encoder_without_weights_raises_before_building_a_policy(where, tmp_path
 )
 def test_real_pi05_image_tokens_have_the_documented_shape():
     enc = SceneEncoder(device="cuda" if torch.cuda.is_available() else "cpu")
-    tok = SceneEncoder.scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
-    pre = SceneEncoder.scene_array(_layouts(2), "vlm_prefix", SCENE_SIZE, enc)
+    tok = render_scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
+    pre = render_scene_array(_layouts(2), "vlm_prefix", SCENE_SIZE, enc)
     assert (
         tok.shape == (2, 256, 2048) and tok.dtype == np.float16 and np.isfinite(tok.astype(np.float32)).all()
     )
@@ -126,7 +127,7 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     assert np.array_equal(enc.encode(images).cpu().numpy(), enc.image_tokens(images))
     assert np.isfinite(pre.astype(np.float32)).all()
     # the tokens carry the scene: other layouts, another obstacle task, give other tokens; the same layouts the same
-    other = SceneEncoder.scene_array(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, enc)
+    other = render_scene_array(_layouts(2, seed=1), "vlm_image", SCENE_SIZE, enc)
     # T3 wall against T2 disc at one seed: the same targets and an unrendered start, so only the obstacles differ
     wall_spec = {
         "kind": "wall",
@@ -138,8 +139,8 @@ def test_real_pi05_image_tokens_have_the_documented_shape():
     }
     wall_layouts = _layouts(2, obstacle=wall_spec)
     assert np.array_equal(wall_layouts.targets, _layouts(2).targets)
-    wall = SceneEncoder.scene_array(wall_layouts, "vlm_image", SCENE_SIZE, enc)
-    again = SceneEncoder.scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
+    wall = render_scene_array(wall_layouts, "vlm_image", SCENE_SIZE, enc)
+    again = render_scene_array(_layouts(2), "vlm_image", SCENE_SIZE, enc)
     assert not np.array_equal(tok, other) and not np.array_equal(tok, wall)
     assert not np.array_equal(tok[0], tok[1])  # the two layouts of one batch differ
     assert np.array_equal(tok, again)

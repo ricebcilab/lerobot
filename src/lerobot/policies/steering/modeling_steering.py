@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from lerobot.envs.cursor import SCENE_SIZE
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import batched_trial
 from lerobot.teleoperators import readout
@@ -56,6 +55,7 @@ GRIPPER_CLOSE = 1.0
 # the default `deadband` of the cores: below this (env units) the operator counts as idle
 DEADBAND = readout.DEADBAND
 # The task module's image token specs (``LearnedTaskModule.spec``); the scene encoder's are ``processor_steering``'s.
+SCENE_IMAGE_SIZE = 224  # the scene pictures' default side (the cursor's render size too)
 VLM_SCENE_TOKENS = 256  # SigLIP's patches of the 224 px input every render is resized to
 VLM_VIEWS_TOKENS = 2 * VLM_SCENE_TOKENS  # vlm_views: the overhead view's tokens, then the wrist view's
 VLM_SCENE_DIM = 2048  # the width of pi0.5's prefix (SigLIP after the multimodal projector, and Gemma's)
@@ -458,7 +458,7 @@ class LearnedTaskModule(nn.Module):
     def spec(
         cls,
         source: str,
-        size: int = SCENE_SIZE,
+        size: int = SCENE_IMAGE_SIZE,
         *,
         wrist_span: float | None = None,
         scene_rank: int | None = None,
@@ -1943,12 +1943,13 @@ class SteeringPolicy(PreTrainedPolicy):
     def _adapter_view(self, obs: dict) -> dict:
         """The adapter's view of the base's batch ``obs`` (``observation``'s), the task module's input contract (the
         cursor's dict: it reads ``pos``, ``obstacles``, ``obstacle_mask``, ``scene`` and ``scene_keep``): every key's
-        ``observation.`` prefix stripped, the scene step's inputs (``layouts``, ``scene_images``) dropped, its output
-        (``observation.scene_tokens``) put at ``scene[config.scene_source]``, and a single unbatched trial given a
-        batch of one (``batched_trial``). The adapter's field binds to it, and a command's rows are counted on it.
+        ``observation.`` prefix stripped, the scene steps' keys (``layouts``, ``scene_images``, ``scene_digest``)
+        dropped, the scene step's output (``observation.scene_tokens``) put at ``scene[config.scene_source]``, and a
+        single unbatched trial given a batch of one (``batched_trial``). The adapter's field binds to it, and a
+        command's rows are counted on it.
         Raises ``ValueError`` when there are scene tokens and the config has no scene source."""
         view = {k.removeprefix(OBS_PREFIX): v for k, v in obs.items()}
-        for key in ("layouts", "scene_images"):  # the scene step's inputs, not the task module's
+        for key in ("layouts", "scene_images", "scene_digest"):  # the scene steps' keys, not the module's
             view.pop(key, None)
         tokens = view.pop("scene_tokens", None)
         if tokens is not None:

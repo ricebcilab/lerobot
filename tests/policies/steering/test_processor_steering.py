@@ -16,13 +16,21 @@
 """The steering policy's processor: each step on a hand-built transition, its features, and the factory's
 pipelines (modelled on tests/processor/test_act_processor.py)."""
 
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.envs.cursor import TaskConfig, obstacle_spec, render_layouts, sample_layouts
+from lerobot.envs.cursor import SCENE_SIZE, TaskConfig, obstacle_spec, render_layouts, sample_layouts
 from lerobot.policies.cursor_flow import CursorFlowPolicy, FlowPolicy, make_cursor_flow_pre_post_processors
+from lerobot.policies.cursor_flow.processor_cursor_flow import (
+    OBS_LAYOUTS,
+    CursorSceneRenderProcessorStep,
+    render_scene_array,
+)
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.steering import (
     DEADBAND,
@@ -38,9 +46,10 @@ from lerobot.policies.steering import (
 )
 from lerobot.policies.steering.processor_steering import (
     COMMAND,
-    OBS_LAYOUTS,
+    OBS_SCENE_DIGEST,
     OBS_SCENE_IMAGES,
     OBS_SCENE_TOKENS,
+    SCENE_IMAGE_SIZE,
 )
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -110,11 +119,14 @@ def _task_module(root, source, **kw):
 
 @pytest.mark.parametrize("source", ["vlm_image", "vlm_prefix"])
 def test_scene_tokens_from_layouts_and_from_pictures_are_the_encoders(source):
+    """The cursor's render step, then the tokens step, give the encoder's tokens of the layouts' render
+    (``render_scene_array``), as the pictures alone do."""
     lay = _layouts()
+    render = CursorSceneRenderProcessorStep(render_size=SIZE)
     step = SteeringSceneTokensProcessorStep(source=source, render_size=SIZE, encoder=TokenStub())
-    out = step(_transition({OBS_LAYOUTS: lay, "observation.pos": torch.zeros(3, 2)}))
+    out = step(render(_transition({OBS_LAYOUTS: lay, "observation.pos": torch.zeros(3, 2)})))
     tokens = out[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS]
-    want = torch.as_tensor(SceneEncoder.scene_array(lay, source, SIZE, TokenStub()))
+    want = torch.as_tensor(render_scene_array(lay, source, SIZE, TokenStub()))
     assert tokens.dtype == torch.float16 and tokens.shape == (3, 256, 2048)
     assert torch.equal(tokens, want)
     assert torch.equal(
@@ -131,27 +143,83 @@ def test_scene_tokens_carry_a_task_modules_reduction():
     g = torch.Generator().manual_seed(1)
     mean, basis = torch.randn(2048, generator=g), torch.linalg.qr(torch.randn(2048, 8, generator=g))[0]
     lay = _layouts()
+    pictures = render_layouts(lay, SIZE)
     step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=TokenStub(), reduction=(mean, basis))
-    tokens = step(_transition({OBS_LAYOUTS: lay}))[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS]
-    full = torch.as_tensor(SceneEncoder.scene_array(lay, "vlm_image", SIZE, TokenStub()))
+    tokens = step(_transition({OBS_SCENE_IMAGES: pictures}))[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS]
+    full = torch.as_tensor(render_scene_array(lay, "vlm_image", SIZE, TokenStub()))
     assert tokens.shape == (3, 256, 8) and torch.equal(tokens, LearnedTaskModule.reduce(full, mean, basis))
     state = step.state_dict()
     again = SteeringSceneTokensProcessorStep(**step.get_config(), encoder=TokenStub())
     again.load_state_dict(state)
     assert torch.equal(
-        again(_transition({OBS_LAYOUTS: lay}))[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS], tokens
+        again(_transition({OBS_SCENE_IMAGES: pictures}))[TransitionKey.OBSERVATION][OBS_SCENE_TOKENS], tokens
     )
 
 
 def test_scene_tokens_step_refuses_what_it_cannot_encode():
     step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=TokenStub())
-    with pytest.raises(ValueError, match="observation.layouts"):
-        step(_transition({"observation.pos": torch.zeros(1, 2)}))
+    with pytest.raises(ValueError, match="observation.scene_images"):
+        step(
+            _transition({OBS_LAYOUTS: _layouts(), "observation.pos": torch.zeros(1, 2)})
+        )  # layouts: the cursor's
     with pytest.raises(ValueError, match="needs an observation"):
         step(_transition(None))
     for source in ("discs", "cnn", "vlm_views", "nope"):
         with pytest.raises(ValueError, match="source must be one of"):
             SteeringSceneTokensProcessorStep(source=source)
+
+
+def test_tokens_step_reads_pictures_and_memoizes_on_the_digest():
+    """The last tokens are kept under ``observation.scene_digest``: the same pictures and digest encode once, a new
+    digest encodes again; without a digest the key is the pictures' sha256."""
+    stub = TokenStub()
+    step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=stub)
+    pictures = render_layouts(_layouts(), SIZE)
+    first, again = (
+        step(_transition({OBS_SCENE_IMAGES: pictures, OBS_SCENE_DIGEST: "a"}))[TransitionKey.OBSERVATION][
+            OBS_SCENE_TOKENS
+        ]
+        for _ in range(2)
+    )
+    assert stub.images == 3 and torch.equal(again, first)
+    step(_transition({OBS_SCENE_IMAGES: pictures, OBS_SCENE_DIGEST: "b"}))
+    assert stub.images == 6
+    other = render_layouts(_layouts(seed=1), SIZE)
+    for shown in (pictures, pictures.copy(), other):  # no digest: equal bytes are one key
+        step(_transition({OBS_SCENE_IMAGES: shown}))
+    assert stub.images == 12
+    step.reset()
+    step(_transition({OBS_SCENE_IMAGES: other}))
+    assert stub.images == 15
+
+
+def test_tokens_step_refuses_the_wrong_picture_size():
+    """Pictures of another size than the step's render_size (the task module's image size) raise before anything is
+    encoded (Review Focus 5)."""
+    stub = TokenStub()
+    step = SteeringSceneTokensProcessorStep(render_size=SIZE, encoder=stub)
+    for wrong in (
+        render_layouts(_layouts(), 2 * SIZE),
+        np.zeros((3, 3, SIZE, SIZE + 1), np.uint8),
+        np.zeros((3, SIZE, SIZE), np.uint8),
+    ):
+        with pytest.raises(ValueError, match=rf"\[B, 3, {SIZE}, {SIZE}\]"):
+            step(_transition({OBS_SCENE_IMAGES: wrong, OBS_SCENE_DIGEST: "a"}))
+    assert stub.images == 0
+
+
+def test_the_package_imports_no_cursor_env():
+    """The steering package's modules name nothing of the cursor environment: a cursor's scenes reach the tokens
+    step as pictures, drawn by the cursor's own render step."""
+    for name in ("configuration_steering", "modeling_steering", "processor_steering"):
+        source = Path(importlib.util.find_spec(f"lerobot.policies.steering.{name}").origin).read_text()
+        assert "lerobot.envs" not in source, name  # nor ``from lerobot.envs import cursor``
+
+
+def test_scene_sizes_agree():
+    assert SCENE_IMAGE_SIZE == SCENE_SIZE
+    assert SteeringSceneTokensProcessorStep().render_size == SCENE_IMAGE_SIZE
+    assert CursorSceneRenderProcessorStep().render_size == SCENE_SIZE
 
 
 def test_scene_tokens_step_builds_its_encoder_on_first_use_only():

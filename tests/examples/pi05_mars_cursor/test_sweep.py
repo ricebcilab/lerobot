@@ -278,15 +278,15 @@ def test_scene_cache_is_keyed_by_cell_split_source_size_and_the_digest(tmp_path,
     assert lay.scene["cnn"].shape == (3, 3, 64, 64) and calls == []
     (name,) = _files(tmp_path)
     assert re.fullmatch(r"U1xT2\|1\.0_test_cnn_64_[0-9a-f]{12}\.npy", name)  # no temporary file is left behind
-    real = run_sweep.SceneEncoder.scene_array
-    monkeypatch.setattr(run_sweep.SceneEncoder, "scene_array", staticmethod(lambda *a, **k: pytest.fail("recomputed")))
+    real = run_sweep.render_scene_array
+    monkeypatch.setattr(run_sweep, "render_scene_array", lambda *a, **k: pytest.fail("recomputed"))
     again = _lay()
     attach_scene(again, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)  # a hit recomputes nothing
     assert np.array_equal(again.scene["cnn"], lay.scene["cnn"]) and _files(tmp_path) == [name]
     goal = _lay()
     goal.goal = (goal.goal + 1) % 3  # the goal is not in the digest (nor is the module seed: it is not an input)
     attach_scene(goal, {"cnn": 64}, tmp_path, "U1xT2|1.0_test", encoder_factory=None)
-    monkeypatch.setattr(run_sweep.SceneEncoder, "scene_array", staticmethod(real))
+    monkeypatch.setattr(run_sweep, "render_scene_array", real)
     obstructed = _lay()
     obstructed.obstacles = np.tile([0.5, 0.5, 0.08], (3, 1, 1))  # the same targets, an obstacle
     obstructed.obstacle_mask = np.ones((3, 1), dtype=bool)
@@ -332,11 +332,11 @@ def test_a_vlm_source_makes_the_encoder_once_and_matches_the_trainer(tmp_path, m
         attach_scene(_lay(), {"cnn": 64}, tmp_path / "paths", "k", None, vlm=vlm)
     assert len(_files(tmp_path / "paths")) == 3
 
-    # the trainer's attach (expert_splits -> SceneEncoder.scene_array) and attach_scene give one array for the same layouts and stub
+    # the trainer's attach (expert_splits -> render_scene_array) and attach_scene give one array for the same layouts and stub
     seen = []
-    real = train_adapter.SceneEncoder.scene_array
-    monkeypatch.setattr(train_adapter.SceneEncoder, "scene_array",
-                        staticmethod(lambda lay, *a: (seen.append((lay, real(lay, *a))), seen[-1][1])[1]))
+    real = train_adapter.render_scene_array
+    monkeypatch.setattr(train_adapter, "render_scene_array",
+                        lambda lay, *a: (seen.append((lay, real(lay, *a))), seen[-1][1])[1])
     args = train_adapter.parse_args(["--name", "x", "--corruption", "{rotation_deg: 60}", "--n-demos", "6", "--val-demos", "4",
                                      "--token-source", "vlm_image", "--render-size", "56"])
     train_adapter.expert_splits(args, None, FlowPolicy().eval(), "cpu", np.random.default_rng(0), *corruption_spec(args.corruption),
