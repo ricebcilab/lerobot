@@ -736,11 +736,14 @@ class AdapterModules(nn.Module):
         if torch.is_tensor(value):
             value = value.detach().cpu()
         size, where = self.n_dims or N_ACTION_DIMS, "adapter matrix"
-        m = np.asarray(value, dtype=np.float64)
-        if m.ndim == 3:  # one per trial
-            self._matrix = np.stack([SteeringConfig.checked_matrix(one, size, where) for one in m])
+        try:
+            per_trial = np.ndim(value) == 3
+        except (TypeError, ValueError):  # ragged rows: the check below names them
+            per_trial = False
+        if per_trial:  # one per trial, each checked
+            self._matrix = np.stack([SteeringConfig.checked_matrix(one, size, where) for one in value])
         else:
-            self._matrix = SteeringConfig.checked_matrix(m, size, where)
+            self._matrix = SteeringConfig.checked_matrix(value, size, where)
 
     @property
     def kind(self) -> str:
@@ -1623,10 +1626,16 @@ class FlowReversalSteering(_ChunkSteering):
 
     def _adapter_field(self, like: torch.Tensor) -> AdaptedField | None:
         """The wrapper's adapter as applied to normalized velocities on `like`'s device (``field(std=..., like=...)``);
-        the fixed matrix is converted once and rebuilt only when the holder's matrix or modules change."""
+        the fixed matrix is converted once and rebuilt only when the holder's matrix or modules change. Raises
+        ``ValueError`` for a fixed matrix when the core has no postprocessor (no std to normalize it by)."""
         if self._adapter is None or self._adapter.kind == "none":
             self._adapter_cache = None
             return None
+        if self._adapter.matrix is not None and self._std is None:
+            raise ValueError(
+                "a fixed adapter matrix is in the operator's units and is normalized by the postprocessor's action "
+                "std; pass the postprocessor, or a field(std=..., like=...) per call"
+            )
         key = (
             self._adapter.matrix,
             self._adapter.user,
@@ -1981,11 +1990,12 @@ class SteeringPolicy(PreTrainedPolicy):
         return batched_trial(view)
 
     def _field(self, view: dict) -> AdaptedField | None:
-        """The adapter's field bound to the adapter view ``view`` (None when the adapter is off), a fixed matrix (the
-        operator's units) normalized by the base's postprocessor's action std over its dims (``normalized_matrix``;
-        the cursor's uniform std leaves it as it is). Raises ``ValueError`` for a fixed matrix without a
-        postprocessor."""
-        if self.adapter.matrix is None:
+        """The adapter's field bound to the adapter view ``view`` (None when the adapter is off). In mode ``"frs"`` a
+        fixed matrix (the operator's units) is normalized by the base's postprocessor's action std over its dims
+        (``normalized_matrix``; the cursor's uniform std leaves it as it is), and ``ValueError`` is raised without a
+        postprocessor. The other modes never run the reversal, the only pass F acts in, so they take F as held and
+        need no statistics."""
+        if self.adapter.matrix is None or self.config.mode != "frs":
             return self.adapter.field(view)
         stats = self._action_stats()
         if stats is None:

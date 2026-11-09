@@ -30,6 +30,7 @@ from lerobot.policies.steering import (
     AdaptedField,
     AdapterModules,
     Flow,
+    FlowReversalSteering,
     LearnedTaskModule,
     LearnedUserModule,
     SteeringConfig,
@@ -221,6 +222,9 @@ def test_describe_load_modules_and_labels(tmp_path):
     )
     with pytest.raises(ValueError, match="finite"):
         AdapterModules(matrix=np.stack([np.eye(2), np.full((2, 2), np.nan)]))
+    for bad in ([["a", 0.0], [0.0, 1.0]], [[1.0, 2.0], [3.0]], {"M": [[1.0, 0.0], [0.0, 1.0]]}):
+        with pytest.raises(ValueError, match="adapter matrix: entries must be numbers"):
+            AdapterModules(matrix=bad)  # non-numeric, ragged, a dict: the check's own error
     assert AdapterModules.format_rows(np.array([[0.94, -0.34], [0.0, 1.0]])) == "[+0.94 -0.34; +0.00 +1.00]"
     user = LearnedUserModule(horizon=H, n_dims=N_ACTION_DIMS, d=8, tdim=8)
     task = LearnedTaskModule(horizon=H, n_dims=N_ACTION_DIMS, d=16, tdim=8, heads=2, layers=1)
@@ -254,6 +258,41 @@ def test_the_policy_normalizes_its_fixed_matrix_by_the_postprocessors_std():
     policy.set_base_policy(SimpleNamespace())
     with pytest.raises(ValueError, match="postprocessor"):
         policy._field({})
+
+
+class _SamplerBase:
+    """A base offering the sampler contract's surface; its chunk is zeros."""
+
+    config = SimpleNamespace(num_inference_steps=10, chunk_size=8, max_action_dim=2, n_action_steps=2)
+
+    def predict_action_chunk(self, batch, **hooks):
+        return torch.zeros(1, 8, 2)
+
+    def reset(self):
+        pass
+
+
+@pytest.mark.parametrize("mode", ["none", "flow_control"])
+def test_a_fixed_matrix_needs_no_statistics_outside_frs(mode):
+    """F acts only in FRS's reversal: the other modes serve chunks without a postprocessor, F as held."""
+    m = [[1.0, 0.3], [0.1, 0.9]]
+    policy = SteeringPolicy(SteeringConfig(mode=mode, adapter_matrix=m, device="cpu"), _SamplerBase())
+    assert policy.predict_action_chunk({"command": torch.tensor([[0.5, 0.0]])}).shape == (1, 8, 2)
+    assert torch.equal(policy._field({}).matrix, torch.as_tensor(m, dtype=torch.float32))
+
+
+def test_frs_without_statistics_refuses_a_fixed_matrix():
+    """A core without the postprocessor's std cannot normalize F (the operator's units): it raises, as Flow and the
+    policy do; a holder without F needs no std."""
+    core = FlowReversalSteering(
+        _SamplerBase(), None, adapter=AdapterModules(matrix=np.eye(2)), reference_fn=lambda c: c
+    )
+    with pytest.raises(ValueError, match="operator's units"):
+        core._adapter_field(torch.zeros(1, 8, 2))
+    core = FlowReversalSteering(
+        _SamplerBase(), None, adapter=AdapterModules(user=_user()), reference_fn=lambda c: c
+    )
+    assert core._adapter_field(torch.zeros(1, 8, 2)).matrix is None
 
 
 def test_the_old_holders_are_gone():
