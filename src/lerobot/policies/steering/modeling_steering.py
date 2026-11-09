@@ -16,9 +16,9 @@
 
 """Shared-autonomy steering of a flow-matching sampler: ``SteeringPolicy``, the lerobot policy, and the cores it
 wraps: ``FlowControlSteering`` (Kao et al. 2026) and ``FlowReversalSteering`` (Tang et al. 2026) over any policy with
-pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTaskModule``, the holder
-``ReversalAdapter`` and the composed ``AdapterModules`` with ``as_adapter``) with their checkpoints and losses, and
-``Flow``, the one Euler integrator of either flow-time convention. The settings and specs are
+pi0.5's sampler interface, the MARS adapters (``LearnedUserModule``, ``LearnedTaskModule`` and their one holder,
+``AdapterModules``, with ``as_adapter``) with their checkpoints and losses, and ``Flow``, the one Euler integrator of
+either flow-time convention. The settings and specs are
 ``configuration_steering``'s, the pre-processing ``processor_steering``'s; this folder's README describes the
 methods."""
 
@@ -645,106 +645,6 @@ def _adapter_kind(has_user: bool, has_task: bool) -> str:
     }[(has_user, has_task)]
 
 
-class MatrixHolder:
-    """Mutable holder for an optional square matrix (None = off) with a display label.
-
-    Consumers read the holder on every use, so replacing ``matrix`` takes effect
-    immediately; the setter validates the shape.
-    """
-
-    size: int
-    where: str
-
-    def __init__(self, matrix=None, label: str | None = None):
-        self.matrix = matrix
-        self.label = label
-
-    @property
-    def matrix(self) -> np.ndarray | None:
-        return self._matrix
-
-    @matrix.setter
-    def matrix(self, value) -> None:
-        self._matrix = None if value is None else SteeringConfig.checked_matrix(value, self.size, self.where)
-
-    def format(self) -> str:
-        """The holder's matrix on one line, for the terminal (``format_rows``); "off" when it holds none."""
-        return "off" if self._matrix is None else self.format_rows(self._matrix)
-
-    @staticmethod
-    def format_rows(matrix: np.ndarray) -> str:
-        """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
-        return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
-
-
-class ReversalAdapter(MatrixHolder):
-    """The MARS adapter of ``FlowReversalSteering``: a user module (``matrix``, a fixed
-    environment-space F, or ``user_module``, a learned U(x_t, t) or any (x_t, t) -> (B, H, n, n)
-    callable) applied in the reversal only, and a ``task_module`` ((x_t, t, v) -> (A, b)) applied in
-    both directions. All None = off (plain FRS). Consumers read the holder on every use."""
-
-    size = N_ACTION_DIMS
-    where = "reversal adapter"
-
-    def __init__(self, matrix=None, label: str | None = None, user_module=None, task_module=None):
-        super().__init__(matrix, label)
-        self.user_module = user_module
-        self.task_module = task_module
-        self.user_label: str | None = None
-        self.task_label: str | None = None
-
-    @property
-    def kind(self) -> str:
-        return _adapter_kind(
-            self._matrix is not None or self.user_module is not None, self.task_module is not None
-        )
-
-    def load_modules(self, user_path=None, task_path=None, device="cpu") -> None:
-        """Load learned modules from checkpoints into the user and/or task slot (None leaves a slot alone)."""
-        if user_path is not None:
-            module, kind, _ = AdapterModules.load_module(user_path, device)
-            if kind != "user":
-                raise ValueError(f"{user_path} holds a {kind} module, not a user module")
-            self.user_module, self.user_label = module, str(user_path)
-        if task_path is not None:
-            module, kind, _ = AdapterModules.load_module(task_path, device)
-            if kind != "task":
-                raise ValueError(f"{task_path} holds a {kind} module, not a task module")
-            self.task_module, self.task_label = module, str(task_path)
-
-    def describe(self) -> str:
-        if self.kind == "none":
-            return "Reversal adapter: off (plain FRS)."
-        parts = []
-        if self._matrix is not None:
-            identity = " (identity, a no-op)" if np.allclose(self._matrix, np.eye(N_ACTION_DIMS)) else ""
-            parts.append(f"fixed user matrix F = {self.label}{identity} = {self.format()}")
-        if self.user_module is not None:
-            parts.append(f"learned user module {self.user_label or type(self.user_module).__name__}")
-        if self.task_module is not None:
-            parts.append(f"task module {self.task_label or type(self.task_module).__name__}")
-        name = {"user": "MARS-U", "task": "MARS-T", "composed": "MARS"}[self.kind]
-        return f"Reversal adapter: {name} ({'; '.join(parts)})."
-
-    def normalized_matrix(self, std: np.ndarray) -> np.ndarray | None:
-        """Convert an environment-space velocity transform to normalized coordinates: S^-1 F S.
-
-        Velocities have no mean offset. Apply this to all seven dimensions so literal
-        matrices that mix translation, orientation and gripper use the same convention.
-        """
-        if self.matrix is None:
-            return None
-        return self.matrix * std[np.newaxis, :] / std[:, np.newaxis]
-
-    def field(self, std: np.ndarray, like: torch.Tensor) -> "AdaptedField | None":
-        """The adapter as applied to normalized velocities on `like`'s device, or None when off."""
-        if self.kind == "none":
-            return None
-        matrix = self.normalized_matrix(std)
-        tensor = None if matrix is None else torch.as_tensor(matrix, dtype=like.dtype, device=like.device)
-        return AdaptedField(tensor, self.user_module, self.task_module)
-
-
 class AdaptedField:
     """Applies MARS modules to a velocity: task (both directions), then user (backward only, through
     ``LearnedUserModule.apply_correction``: a learned module's ``velocity``, any other callable's per-step matrices).
@@ -794,41 +694,137 @@ def _obs_device(obs: dict) -> torch.device | None:
 
 
 class AdapterModules(nn.Module):
-    """The composed MARS adapter of a policy that takes an observation (the cursor example's
-    ``ReversalAdapter``): a user part (``matrix``, a fixed F, one (n, n) or one per trial (B, n, n), and/or
-    ``user``, a ``LearnedUserModule`` or any (x_t, t) -> (B, H, n, n) callable) and/or a ``task`` module
-    (a ``LearnedTaskModule``, bound to each observation, or any (x_t, t, v) -> (A, b) callable), composed
-    at test time. ``adapt`` applies the task module in both directions and the user part in the backward
-    pass: forward task(v), backward user(task(v)). ``field(obs)`` is the ``AdaptedField`` that ``adapt``
-    and the flows use, acting on ``n_dims`` dims (None: each module's own ``n_dims``); ``load`` reads one
-    module from a module checkpoint (``save_module``) into its slot. ``FlowReversalSteering``'s
-    holder is ``ReversalAdapter``, a different class."""
+    """The MARS adapter holder of the cores, the policy and the LIBERO session: a user part (``matrix``, a fixed F,
+    and/or ``user``, a ``LearnedUserModule`` or any (x_t, t) -> (B, H, n, n) callable) applied in the reversal only,
+    and a ``task`` module (a ``LearnedTaskModule``, bound to each observation, or any (x_t, t, v) -> (A, b) callable)
+    applied in both directions: forward task(v), backward user(task(v)). All None = off (plain FRS). Consumers read
+    the holder on every use, so a replaced matrix or module takes effect at once.
+
+    ``matrix`` is in the operator's (environment) units: one (n, n) or one per trial (B, n, n), a float64 array,
+    checked on assignment (``SteeringConfig.checked_matrix`` at ``n_dims``, or ``N_ACTION_DIMS`` when ``n_dims`` is
+    None). ``normalized_matrix(std)`` is it in the policy's normalized coordinates, S^-1 F S, by the postprocessor's
+    action statistics; ``field`` is the ``AdaptedField`` the flows apply, that matrix (normalized when given ``std``)
+    as a tensor. The modules act on ``n_dims`` dims (2 on the cursor); ``n_dims=None`` lets each act on its own
+    ``n_dims`` (``N_ACTION_DIMS`` for a callable without one) and checks the matrix at ``N_ACTION_DIMS``: the
+    7-D holder of the pi0.5 cores and the LIBERO session (``AdapterModules(n_dims=None)``). ``label``, ``user_label``
+    and ``task_label`` name the parts for display (``describe``); ``load_modules`` reads checkpoints into the slots,
+    ``load`` one module into a new holder, ``save_module`` writes one."""
 
     KINDS: dict[str, type[nn.Module]] = {
         "user": LearnedUserModule,
         "task": LearnedTaskModule,
     }  # checkpoint kinds
 
-    def __init__(self, user=None, task=None, matrix=None, n_dims: int | None = 2):
+    def __init__(self, user=None, task=None, matrix=None, n_dims: int | None = 2, label: str | None = None):
         super().__init__()
         self.user, self.task, self.n_dims = user, task, n_dims
         self.meta: dict = {}  # a loaded checkpoint's free-form meta
-        self.matrix = None if matrix is None else torch.as_tensor(matrix, dtype=torch.float32)
+        self.matrix = matrix
+        self.label = label
+        self.user_label: str | None = None
+        self.task_label: str | None = None
+
+    @property
+    def matrix(self) -> np.ndarray | None:
+        return self._matrix
+
+    @matrix.setter
+    def matrix(self, value) -> None:
+        if value is None:
+            self._matrix = None
+            return
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
+        size, where = self.n_dims or N_ACTION_DIMS, "adapter matrix"
+        m = np.asarray(value, dtype=np.float64)
+        if m.ndim == 3:  # one per trial
+            self._matrix = np.stack([SteeringConfig.checked_matrix(one, size, where) for one in m])
+        else:
+            self._matrix = SteeringConfig.checked_matrix(m, size, where)
 
     @property
     def kind(self) -> str:
-        return _adapter_kind(self.user is not None or self.matrix is not None, self.task is not None)
+        return _adapter_kind(self.user is not None or self._matrix is not None, self.task is not None)
 
-    def field(self, obs: dict) -> AdaptedField:
-        """The ``AdaptedField`` for this observation: the fixed matrix on the observation's device (its first
-        tensor's), the user module, the task module bound to ``obs``."""
-        device = None if self.matrix is None else _obs_device(obs)
-        matrix = self.matrix if device is None else self.matrix.to(device)
-        task = self.task.bind(obs) if self.task is not None and hasattr(self.task, "bind") else self.task
-        return AdaptedField(matrix, self.user, task, n_dims=self.n_dims)
+    def format(self) -> str:
+        """The holder's matrix on one line, for the terminal (``format_rows``; one per trial, side by side); "off"
+        when it holds none."""
+        if self._matrix is None:
+            return "off"
+        return " ".join(
+            self.format_rows(m) for m in (self._matrix if self._matrix.ndim == 3 else [self._matrix])
+        )
+
+    @staticmethod
+    def format_rows(matrix: np.ndarray) -> str:
+        """Rows of a small matrix on one line, for the terminal: `[+0.94 -0.34 +0.00; ...]`."""
+        return "[" + "; ".join(" ".join(f"{v:+.2f}" for v in row) for row in matrix) + "]"
+
+    def describe(self) -> str:
+        """The adapter in force, for the terminal: its kind (MARS-U, MARS-T, MARS) and its parts' labels."""
+        if self.kind == "none":
+            return "MARS adapter: off"
+        parts = []
+        if self._matrix is not None:
+            identity = (
+                " (identity, a no-op)" if np.allclose(self._matrix, np.eye(self._matrix.shape[-1])) else ""
+            )
+            parts.append(f"fixed user matrix F = {self.label}{identity} = {self.format()}")
+        if self.user is not None:
+            parts.append(f"learned user module {self.user_label or type(self.user).__name__}")
+        if self.task is not None:
+            parts.append(f"task module {self.task_label or type(self.task).__name__}")
+        name = {"user": "MARS-U", "task": "MARS-T", "composed": "MARS"}[self.kind]
+        return f"MARS adapter: {name} ({'; '.join(parts)})."
+
+    def load_modules(self, user_path=None, task_path=None, device="cpu") -> None:
+        """Load learned modules from checkpoints into the user and/or task slot (None leaves a slot alone), each
+        labelled with its path; raises when a checkpoint holds the other kind."""
+        if user_path is not None:
+            module, kind, _ = AdapterModules.load_module(user_path, device)
+            if kind != "user":
+                raise ValueError(f"{user_path} holds a {kind} module, not a user module")
+            self.user, self.user_label = module, str(user_path)
+        if task_path is not None:
+            module, kind, _ = AdapterModules.load_module(task_path, device)
+            if kind != "task":
+                raise ValueError(f"{task_path} holds a {kind} module, not a task module")
+            self.task, self.task_label = module, str(task_path)
+
+    def normalized_matrix(self, std: np.ndarray) -> np.ndarray | None:
+        """The fixed matrix, an environment-space velocity transform, in normalized coordinates: S^-1 F S (None
+        when there is none). Velocities have no mean offset. Apply this to all of the matrix's dims, so literal
+        matrices that mix translation, orientation and gripper use the same convention. A uniform ``std`` (the
+        cursor's scalar action scale) returns the matrix itself, so its values are the held ones bit for bit."""
+        if self._matrix is None or np.all(std == std.flat[0]):
+            return self._matrix
+        return self._matrix * std[np.newaxis, :] / std[:, np.newaxis]
+
+    def field(
+        self, obs: dict | None = None, *, std: np.ndarray | None = None, like=None
+    ) -> AdaptedField | None:
+        """The ``AdaptedField`` the flows apply, or None when the holder is off: the fixed matrix (normalized by
+        ``std``, the postprocessor's action std over its dims, when given: ``normalized_matrix``) as a tensor of
+        ``like``'s dtype on ``like``'s device, or without ``like`` float32 on the observation's device (its first
+        tensor's); the user module; the task module bound to ``obs`` when given."""
+        if self.kind == "none":
+            return None
+        matrix = self._matrix if std is None else self.normalized_matrix(std)
+        tensor = None
+        if matrix is not None:
+            if like is not None:
+                tensor = torch.as_tensor(matrix, dtype=like.dtype, device=like.device)
+            else:
+                device = None if obs is None else _obs_device(obs)
+                tensor = torch.as_tensor(matrix, dtype=torch.float32, device=device)
+        task = self.task
+        if obs is not None and task is not None and hasattr(task, "bind"):
+            task = task.bind(obs)
+        return AdaptedField(tensor, self.user, task, n_dims=self.n_dims)
 
     def adapt(self, obs: dict, x: torch.Tensor, t, v: torch.Tensor, backward: bool) -> torch.Tensor:
-        return self.field(obs).adapt(x, t, v, backward)
+        field = self.field(obs)
+        return v if field is None else field.adapt(x, t, v, backward)
 
     @classmethod
     def load(cls, path, device="cpu") -> "AdapterModules":
@@ -921,15 +917,16 @@ class AdapterModules(nn.Module):
 
 def as_adapter(adapter, device="cpu", n_dims: int | None = 2) -> AdapterModules | None:
     """None or an ``AdapterModules`` as is; a ``LearnedTaskModule`` in the task slot; a user module or any
-    (x_t, t) callable in the user slot; anything else a fixed matrix F ((n, n) or (B, n, n), float32 on
-    ``device``)."""
+    (x_t, t) callable in the user slot; anything else a fixed matrix F ((n, n) or (B, n, n)), held as the operator's
+    units are (``AdapterModules.matrix``). ``device`` does not apply to a matrix, which takes the device of each use
+    (``AdapterModules.field``)."""
     if adapter is None or isinstance(adapter, AdapterModules):
         return adapter
     if isinstance(adapter, LearnedTaskModule):
         return AdapterModules(task=adapter, n_dims=n_dims)
     if callable(adapter):
         return AdapterModules(user=adapter, n_dims=n_dims)
-    return AdapterModules(matrix=torch.as_tensor(adapter, dtype=torch.float32, device=device), n_dims=n_dims)
+    return AdapterModules(matrix=adapter, n_dims=n_dims)
 
 
 class Flow:
@@ -937,7 +934,7 @@ class Flow:
     methods and the trainers, and what is built on it (FRS's latent and schedule, the validation's regeneration).
 
     ``velocity(x, t)`` is the policy's field; ``adapter`` is anything ``adapt_velocity`` takes (None, a normalized
-    (n, n) or per-trial (B, n, n) matrix F, an ``AdaptedField``, or a ``ReversalAdapter`` holder without a fixed
+    (n, n) or per-trial (B, n, n) matrix F, an ``AdaptedField``, or an ``AdapterModules`` holder without a fixed
     matrix). ``noise_time`` is the flow time of noise: 1.0 is pi0.5's convention (t = 1 noise, t = 0 the action),
     0.0 the cursor's. With ``batch_time`` the flow times reach ``velocity`` and the adapter as (B,) float32
     tensors (the cursor policy's form), else as floats. ``reverse`` and ``forward`` are the reversal toward noise
@@ -970,20 +967,21 @@ class Flow:
     @staticmethod
     def adapt_velocity(adapter, x_t, t, v, backward: bool):
         """`adapter` is None, a normalized (n, n) or per-trial (B, n, n) matrix (the legacy fixed-F form), an
-        AdaptedField, or a ReversalAdapter holder without a fixed matrix used directly (a holder's matrix is in
-        environment units: convert the holder with ``field(std, like)`` first)."""
+        AdaptedField, or an AdapterModules holder without a fixed matrix used directly (its ``field(like=x_t)``; a
+        holder's matrix is in the operator's units: convert the holder with ``field(std=..., like=...)`` first)."""
         if adapter is None:
             return v
         if isinstance(adapter, torch.Tensor):
             adapter = AdaptedField(adapter)
-        elif isinstance(adapter, ReversalAdapter):
+        elif isinstance(adapter, AdapterModules):
             if adapter.matrix is not None:
                 raise ValueError(
-                    "a ReversalAdapter's fixed matrix is in environment units; pass its field(std, like) instead"
+                    "an AdapterModules' fixed matrix is in the operator's units; pass its field(std=..., like=...) "
+                    "instead"
                 )
-            if adapter.kind == "none":
+            adapter = adapter.field(like=x_t)
+            if adapter is None:
                 return v
-            adapter = AdaptedField(None, adapter.user_module, adapter.task_module)
         return adapter.adapt(x_t, t, v, backward)
 
     def toward_noise(self, steps: int) -> float:
@@ -1449,10 +1447,11 @@ class FlowReversalSteering(_ChunkSteering):
     ``Flow.schedule``'s schedule. The executed action is entirely the model's output -- the reference only picks the
     starting noise, so what comes out is the generalist action mode nearest your intent. Idle input = pure policy.
 
-    An optional adapter (MARS) adapts the velocity field: a `ReversalAdapter` here (its user module, a fixed 7x7
-    matrix F or a learned U(x_t, t), in the reversal only, its task module in both directions, including the forward
-    flow that produces the executed chunk and the policy's own plan), or an ``AdaptedField`` passed per call to
-    ``steered_chunk`` (the cursor binds one to each observation).
+    An optional adapter (MARS) adapts the velocity field: an `AdapterModules` holder here (its user part, a fixed
+    7x7 matrix F in the operator's units, normalized by the postprocessor's action std, or a learned U(x_t, t), in the
+    reversal only, its task module in both directions, including the forward flow that produces the executed chunk and
+    the policy's own plan; `AdapterModules(n_dims=None)`, the 7-D holder), or an ``AdaptedField`` passed per call to
+    ``steered_chunk`` (the steering policy binds one to each observation).
 
     `n_reversal_steps` stops the reversal early instead of going all the way to noise: with n of the policy's
     N = num_inference_steps steps the reference is integrated n steps of 1/N, and the forward flow then runs from
@@ -1475,7 +1474,7 @@ class FlowReversalSteering(_ChunkSteering):
         policy,
         source: TeleopSource | None,
         postprocessor=None,
-        adapter: ReversalAdapter | None = None,
+        adapter: AdapterModules | None = None,
         n_reversal_steps: int | None = None,
         operator_dims: tuple[str, ...] | None = ("translation",),
         pinned_steps: int | None = -1,
@@ -1623,15 +1622,15 @@ class FlowReversalSteering(_ChunkSteering):
         )
 
     def _adapter_field(self, like: torch.Tensor) -> AdaptedField | None:
-        """The wrapper's adapter as applied to normalized velocities on `like`'s device; the fixed matrix is
-        converted once and rebuilt only when the holder's matrix or modules change."""
+        """The wrapper's adapter as applied to normalized velocities on `like`'s device (``field(std=..., like=...)``);
+        the fixed matrix is converted once and rebuilt only when the holder's matrix or modules change."""
         if self._adapter is None or self._adapter.kind == "none":
             self._adapter_cache = None
             return None
         key = (
             self._adapter.matrix,
-            self._adapter.user_module,
-            self._adapter.task_module,
+            self._adapter.user,
+            self._adapter.task,
             like.device,
             like.dtype,
         )
@@ -1643,7 +1642,7 @@ class FlowReversalSteering(_ChunkSteering):
             or any(a is not b for a, b in zip(cached[0][:3], key[:3], strict=True))
             or cached[0][3:] != key[3:]
         ):
-            self._adapter_cache = (key, self._adapter.field(self._std, like))
+            self._adapter_cache = (key, self._adapter.field(std=self._std, like=like))
         return self._adapter_cache[1]
 
     def steered_chunk(
@@ -1678,8 +1677,8 @@ class FlowReversalSteering(_ChunkSteering):
                 grad=True,
             )
 
-        holder = field if field is not None else self._adapter
-        common = {"velocity_hook": velocity_hook} if getattr(holder, "task_module", None) is not None else {}
+        task = field.task_module if field is not None else getattr(self._adapter, "task", None)
+        common = {"velocity_hook": velocity_hook} if task is not None else {}
         steer = None if commands is None else self._active(commands)
         if steer is None or not bool(steer.any()):
             self._pending_reference = None
@@ -1982,7 +1981,16 @@ class SteeringPolicy(PreTrainedPolicy):
         return batched_trial(view)
 
     def _field(self, view: dict) -> AdaptedField | None:
-        return None if self.adapter.kind == "none" else self.adapter.field(view)
+        """The adapter's field bound to the adapter view ``view`` (None when the adapter is off), a fixed matrix (the
+        operator's units) normalized by the base's postprocessor's action std over its dims (``normalized_matrix``;
+        the cursor's uniform std leaves it as it is). Raises ``ValueError`` for a fixed matrix without a
+        postprocessor."""
+        if self.adapter.matrix is None:
+            return self.adapter.field(view)
+        stats = self._action_stats()
+        if stats is None:
+            raise self._no_stats("a fixed adapter matrix is normalized")
+        return self.adapter.field(view, std=stats[1][: self.adapter.matrix.shape[-1]])
 
     def _velocity(self, obs: dict):
         """The base policy's velocity field for its batch ``obs`` (the contract's ``velocity_field``)."""

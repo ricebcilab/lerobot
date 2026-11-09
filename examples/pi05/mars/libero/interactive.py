@@ -252,13 +252,13 @@ def cmd_adapter(session: Session, tokens: list[str]) -> None:
         spec = SteeringConfig.from_spec(read_matrix_spec(tokens[1]), basis, device="cpu")
         if spec.adapter_user or spec.adapter_task:  # learned MARS modules
             session.adapter.matrix = spec.fixed_matrix
-            session.adapter.user_module = session.adapter.task_module = None
+            session.adapter.user = session.adapter.task = None
             session.adapter.load_modules(
                 spec.adapter_user, spec.adapter_task, device=next(session.policy.parameters()).device
             )
             print(session.adapter.describe())
             return
-    session.adapter.user_module = session.adapter.task_module = None
+    session.adapter.user = session.adapter.task = None
     build = lambda spec: SteeringConfig.from_spec(spec, basis, device="cpu").fixed_matrix  # noqa: E731
     _cmd_matrix(session, tokens, "adapter", session.adapter, build)
 

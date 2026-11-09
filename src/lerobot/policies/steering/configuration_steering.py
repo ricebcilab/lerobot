@@ -77,8 +77,9 @@ class SteeringConfig(PreTrainedConfig):
             chunk.
         operator_dims: The action dim groups the operator commands (names of ``OPERATOR_DIM_GROUPS``; None: every
             dim, as on the cursor).
-        adapter_matrix: The MARS adapter's fixed user matrix F (rows; normalized, ``n_dims`` x ``n_dims`` for the
-            steering policy, environment-space 7 x 7 in a LIBERO spec), or None.
+        adapter_matrix: The MARS adapter's fixed user matrix F (rows, ``n_dims`` x ``n_dims``; 7 x 7 in a LIBERO
+            spec), or None. In the operator's (environment) units, normalized at use by the base's postprocessor's
+            action statistics (``AdapterModules.normalized_matrix``; the cursor's uniform std leaves it as it is).
         adapter_user: The learned user module's checkpoint (``AdapterModules.save_module``'s format), or None.
         adapter_task: The learned task module's checkpoint, or None. All three None: plain FRS.
         adapter_blocks: The fixed matrix's spec as given (blocks or ``{F: rows}``), which ``build_adapter`` rebuilds

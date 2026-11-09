@@ -29,10 +29,10 @@ from lerobot.policies.cursor_flow.modeling_cursor_flow import CursorFlowPolicy, 
 from lerobot.policies.steering import (
     N_ACTION_DIMS,
     OPERATOR_DIM_GROUPS,
+    AdapterModules,
     Flow,
     FlowControlSteering,
     FlowReversalSteering,
-    ReversalAdapter,
 )
 
 STEPS, CHUNK = 10, 6
@@ -139,7 +139,9 @@ def test_frs_and_mars_run_one_implementation_on_both_samplers(depth, pinned, mar
     pi05_field, cursor_field = fields(N_ACTION_DIMS)
     noise = torch.randn(1, CHUNK, N_ACTION_DIMS, generator=torch.Generator().manual_seed(1))
     command = np.array([0.6, -0.3, 0.2])
-    adapter = ReversalAdapter(matrix=np.diag([1.0, 0.5, 2.0, 1.0, 1.0, 1.0, 1.0])) if mars else None
+    adapter = (
+        AdapterModules(n_dims=None, matrix=np.diag([1.0, 0.5, 2.0, 1.0, 1.0, 1.0, 1.0])) if mars else None
+    )
     robot = FlowReversalSteering(
         MiniPi05(pi05_field, noise),
         Source(command),

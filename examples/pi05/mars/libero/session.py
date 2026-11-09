@@ -35,9 +35,9 @@ from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.steering import (
     GRIPPER_DIM,
     N_ACTION_DIMS,
+    AdapterModules,
     FlowControlSteering,
     FlowReversalSteering,
-    ReversalAdapter,
 )
 from lerobot.utils.constants import ACTION
 
@@ -107,7 +107,7 @@ class Session:
         if settings.operator == "policy":
             self.operator = PolicyOperator(settings.n_action_steps, settings.policy_operator)
             self.chain.attach_operator(self.operator)
-        self.adapter = ReversalAdapter()
+        self.adapter = AdapterModules(n_dims=None)  # the 7-D holder: each module on its own dims
         self.view = LiveView(settings.port, self.keyboard, self._status_extra)
         self.view.start()
         print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
@@ -320,7 +320,7 @@ class Session:
         self.chain.corruption.label = spec_label(control.corruption)
         self.adapter.matrix = control.reversal_adapter_matrix
         self.adapter.label = spec_label(control.reversal_adapter)
-        self.adapter.user_module = self.adapter.task_module = None
+        self.adapter.user = self.adapter.task = None
         self.adapter.user_label = self.adapter.task_label = None
         if control.reversal_adapter_user_path or control.reversal_adapter_task_path:
             self.adapter.load_modules(

@@ -29,11 +29,14 @@ always the model's own output:
   action units per control step, `(per_step * reference_step - mean) / std`.
 
 Both read an operator `TeleopSource` and take the checkpoint's action statistics from the postprocessor
-(`action_mean_std`). `FlowControlSteering.check_steps` (both cores have it) is the one check of their step knobs. `ReversalAdapter`, a `MatrixHolder`, is MARS
-(Modular Adapters for Reversal Steering, the method formerly called FRS-RA). It has two optional parts:
+(`action_mean_std`). `FlowControlSteering.check_steps` (both cores have it) is the one check of their step knobs.
+`AdapterModules`, the one adapter holder of the cores, the policy and the LIBERO session, is MARS (Modular Adapters
+for Reversal Steering, the method formerly called FRS-RA). It has two optional parts:
 
-- a _user module_ that adapts the velocity field of the reversal only: a fixed 7x7 matrix F, typically the known
-  command corruption, or a learned `LearnedUserModule` U(x_t, t);
+- a _user module_ that adapts the velocity field of the reversal only: a fixed matrix F, typically the known
+  command corruption, or a learned `LearnedUserModule` U(x_t, t). F is in the operator's (environment) units and is
+  normalized at use by the postprocessor's action statistics (`normalized_matrix(std)`, S^-1 F S; a uniform std,
+  the cursor's scalar action scale, leaves it as it is);
 - a _task module_ (A(x_t, t, v) v + b) that adapts the field in both directions, so it reshapes every chunk the
   policy produces.
 
@@ -77,8 +80,12 @@ The modules and their losses:
   `LearnedUserModule.apply_correction`, i.e. its `velocity`.
 - `LearnedUserModule` carries its rank knobs. `LearnedTaskModule` reads obstacles when it is given them.
 - Their training losses are `LearnedUserModule.field_loss` and `LearnedTaskModule.field_loss`.
-- `AdapterModules` is the composed adapter of a policy that takes an observation. It carries the checkpoints:
-  `save_module`, `load_module`, `load` and `from_cursor_checkpoint`.
+- `AdapterModules` holds the parts: its `field(obs, std=..., like=...)` is the `AdaptedField` the flows apply
+  (the task module bound to the observation, F normalized by `std` and placed on `like`'s dtype and device). It acts
+  on `n_dims` dims (2 on the cursor); `AdapterModules(n_dims=None)` is the 7-D holder of the pi0.5 cores and the
+  LIBERO session, each module on its own dims. It describes itself (`describe`, `label`, `user_label`,
+  `task_label`), loads modules into its slots (`load_modules`) and carries the checkpoints: `save_module`,
+  `load_module`, `load` and `from_cursor_checkpoint`.
 
 The cores are not pi0.5-specific. They steer any flow policy with pi0.5's sampler interface: a `config`, and a
 `predict_action_chunk` taking `noise_fn`, `flow_start_time`, `num_forward_steps`, `x_t_hook` and `velocity_hook`.

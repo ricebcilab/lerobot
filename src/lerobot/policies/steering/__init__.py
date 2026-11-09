@@ -24,9 +24,8 @@ The package keeps lerobot's layout for a policy:
   interface, which ``PI05Policy`` and ``CursorFlowPolicy`` offer; the cursor example runs it) and the cores it
   wraps: the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's
   ``TeleopSource``; the MARS modules
-  (``LearnedUserModule``, ``LearnedTaskModule``, the composed ``AdapterModules`` with their checkpoints, and the
-  holders ``MatrixHolder`` / ``ReversalAdapter``); ``AdaptedField``; and ``Flow``, the one Euler integrator and what
-  is built on it.
+  (``LearnedUserModule``, ``LearnedTaskModule`` and their one holder, ``AdapterModules``, with their checkpoints);
+  ``AdaptedField``; and ``Flow``, the one Euler integrator and what is built on it.
 - ``processor_steering``: ``make_steering_pre_post_processors``, the steps ``SteeringSceneTokensProcessorStep`` and
   ``SteeringCommandProcessorStep``, and ``SceneEncoder``, the engine of the scene step.
 
@@ -55,8 +54,6 @@ from .modeling_steering import (
     FlowReversalSteering,
     LearnedTaskModule,
     LearnedUserModule,
-    MatrixHolder,
-    ReversalAdapter,
     SteeringPolicy,
     TeleopSource,
     active_rows,
@@ -86,8 +83,6 @@ __all__ = [
     "LearnedTaskModule",
     "AdapterModules",
     "AdaptedField",
-    "MatrixHolder",
-    "ReversalAdapter",
     "Flow",
     "SceneEncoder",
     "as_adapter",

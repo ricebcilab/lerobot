@@ -39,7 +39,7 @@ from lerobot.policies.steering import (
     GRIPPER_CLOSE,
     GRIPPER_DIM,
     GRIPPER_OPEN,
-    MatrixHolder,
+    AdapterModules,
     SteeringConfig,
 )
 from lerobot.teleoperators import readout
@@ -357,7 +357,7 @@ def build_curl(spec, where: str = "corruption") -> Curl | None:
         raise ValueError(f"{where}: {e}") from e
 
 
-class CommandCorruption(MatrixHolder):
+class CommandCorruption:
     """Corrupt a source's translation: x -> clip(M @ x), with `matrix` a 3x3 or None (off), or a curl
     field (`curl`, a `Curl`): a velocity driven by the push, stepped once per control step.
 
@@ -367,11 +367,8 @@ class CommandCorruption(MatrixHolder):
     `advance(step)`, called once per environment step by the rollout; a read integrates the steps
     elapsed since the last read with the push held, so once-per-chunk reads (FC, FRS) and
     once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest.
-    `label` is for display.
+    `label` is for display. Replacing `matrix` takes effect at the next read; the setter checks it is a finite 3x3.
     """
-
-    size = 3
-    where = "corruption matrix"
 
     def __init__(self, source, matrix=None, label: str | None = None, curl: Curl | None = None):
         self.source = source
@@ -380,8 +377,21 @@ class CommandCorruption(MatrixHolder):
         self._clock = 0
         self._integrated = 0
         self._discretization: tuple | None = None
-        super().__init__(matrix, label)
+        self.matrix = matrix
+        self.label = label
         self.curl = curl
+
+    @property
+    def matrix(self) -> np.ndarray | None:
+        return self._matrix
+
+    @matrix.setter
+    def matrix(self, value) -> None:
+        self._matrix = None if value is None else SteeringConfig.checked_matrix(value, 3, "corruption matrix")
+
+    def format(self) -> str:
+        """The matrix on one line, for the terminal (``AdapterModules.format_rows``); "off" when there is none."""
+        return "off" if self._matrix is None else AdapterModules.format_rows(self._matrix)
 
     @property
     def curl(self) -> Curl | None:

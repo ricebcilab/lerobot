@@ -12,7 +12,7 @@ from reproducibility import trial_specs
 from session import RolloutResult, Session
 from teleop import KeyboardReader, PolicyOperator, PolicyOperatorSettings, TeleopChain
 
-from lerobot.policies.steering import ReversalAdapter
+from lerobot.policies.steering import AdapterModules
 
 
 class FakeSession:
@@ -26,7 +26,7 @@ class FakeSession:
     def __init__(self, mode="policy", show_scene=lambda spec: {}, rollout=None):
         self.mode, self.tau, self.lam, self.ic_gain = mode, None, 1, "action"
         self.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
-        self.adapter = ReversalAdapter()
+        self.adapter = AdapterModules(n_dims=None)
         self._show_scene, self._rollout = show_scene, rollout
 
     def set_scene(self, suite, task_id):
@@ -339,7 +339,7 @@ def _bare_session(control):
     """A Session without a policy or simulator, in the state `apply_control` leaves it."""
     session = Session.__new__(Session)
     session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
-    session.adapter = ReversalAdapter()
+    session.adapter = AdapterModules(n_dims=None)
     session.policy = SimpleNamespace(config=SimpleNamespace(num_inference_steps=10))
     session._frs_policy = None
     session.operator = object()  # a synthetic operator, so no SpaceMouse is looked for

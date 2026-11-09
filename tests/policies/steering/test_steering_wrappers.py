@@ -16,7 +16,6 @@ from lerobot.policies.steering import (
     FlowReversalSteering,
     LearnedTaskModule,
     LearnedUserModule,
-    ReversalAdapter,
     SteeringConfig,
     sinusoidal_time_embedding,
 )
@@ -139,13 +138,13 @@ def test_build_reversal_adapter_blocks_and_errors():
 
 
 def test_reversal_adapter_kind_description_and_modules(tmp_path):
-    adapter = ReversalAdapter()
+    adapter = AdapterModules(n_dims=None)
     assert adapter.matrix is None and adapter.kind == "none" and "off" in adapter.describe()
     adapter.matrix, adapter.label = np.eye(7), "identity"
     assert adapter.kind == "user" and "identity" in adapter.describe() and "MARS-U" in adapter.describe()
     with pytest.raises(ValueError):
         adapter.matrix = np.eye(3)
-    adapter.task_module = lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))
+    adapter.task = lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))
     assert adapter.kind == "composed" and "MARS" in adapter.describe()
     adapter.matrix = None
     assert adapter.kind == "task" and "MARS-T" in adapter.describe()
@@ -161,7 +160,7 @@ def test_reversal_adapter_kind_description_and_modules(tmp_path):
     )
     with pytest.raises(ValueError, match="kind"):
         AdapterModules.save_module(user, tmp_path / "bad.pt", kind="policy")
-    loaded = ReversalAdapter()
+    loaded = AdapterModules(n_dims=None)
     loaded.load_modules(user_path=tmp_path / "u.pt", task_path=tmp_path / "t.pt")
     assert loaded.kind == "composed" and "MARS" in loaded.describe()
 
@@ -173,10 +172,12 @@ def test_adapter_normalization_preserves_environment_velocity_transform():
     matrix[:3, :3] = SteeringConfig.rotation(20)
     matrix[0, 3] = 0.2
     normalized_velocity = np.arange(1.0, 8.0)
-    actual = std * (ReversalAdapter(matrix).normalized_matrix(std) @ normalized_velocity)
+    actual = std * (AdapterModules(n_dims=None, matrix=matrix).normalized_matrix(std) @ normalized_velocity)
     np.testing.assert_allclose(actual, matrix @ (std * normalized_velocity))
-    np.testing.assert_allclose(ReversalAdapter(np.eye(7)).normalized_matrix(std), np.eye(7))
-    assert ReversalAdapter().normalized_matrix(std) is None
+    np.testing.assert_allclose(
+        AdapterModules(n_dims=None, matrix=np.eye(7)).normalized_matrix(std), np.eye(7)
+    )
+    assert AdapterModules(n_dims=None).normalized_matrix(std) is None
 
 
 def test_parse_adapter_spec_forms():
@@ -260,7 +261,7 @@ def test_task_slot_acts_in_both_directions_and_composes_before_the_user_module()
     n, eye = N_ACTION_DIMS, torch.eye(N_ACTION_DIMS)
     task = lambda x_t, t, v: (2.0 * eye.expand(v.shape[0], v.shape[1], n, n), torch.zeros_like(v))  # noqa: E731
     user = lambda x_t, t: 3.0 * eye.expand(x_t.shape[0], x_t.shape[1], n, n)  # noqa: E731
-    adapter = ReversalAdapter(user_module=user, task_module=task)
+    adapter = AdapterModules(n_dims=None, user=user, task=task)
     assert adapter.kind == "composed"
     x0 = torch.zeros(1, CHUNK, MAX_DIM)
     back = Flow(_ones, adapter).reverse(x0, NUM_STEPS)  # backward: user(task(v)) = 6 v
@@ -504,7 +505,10 @@ def test_wrapper_converts_adapter_before_reversal():
     matrix = np.eye(7)
     matrix[:3, :3] = SteeringConfig.rotation(90)
     _frs(
-        policy, post=postprocessor(std=std), adapter=ReversalAdapter(matrix), n_reversal_steps=2
+        policy,
+        post=postprocessor(std=std),
+        adapter=AdapterModules(n_dims=None, matrix=matrix),
+        n_reversal_steps=2,
     ).select_action({})
     physical_delta = matrix @ std  # FakePolicy uses normalized v = ones.
     expected = np.array([1.0, 0.0, 0.0]) / std[:3] + 0.2 * physical_delta[:3] / std[:3]
@@ -513,7 +517,7 @@ def test_wrapper_converts_adapter_before_reversal():
 
 def test_a_replaced_adapter_matrix_is_used_even_when_it_reuses_the_old_one_s_memory():
     """Per-trial adapters: clearing the adapter and setting a new matrix must not serve the old one."""
-    policy, adapter = FakePolicy(), ReversalAdapter()
+    policy, adapter = FakePolicy(), AdapterModules(n_dims=None)
     wrapper = _frs(policy, adapter=adapter, n_reversal_steps=1)
     latents = []
     for gain in (2.0, 3.0, 4.0):
@@ -532,12 +536,12 @@ def test_a_replaced_adapter_matrix_is_used_even_when_it_reuses_the_old_one_s_mem
 def test_wrapper_passes_a_velocity_hook_only_with_a_task_module():
     policy = FakePolicy()
     task = lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))  # noqa: E731
-    adapter = ReversalAdapter(task_module=task)
+    adapter = AdapterModules(n_dims=None, task=task)
     _frs(policy, (0.0, 0.0, 0.0), adapter=adapter).select_action({})  # idle: the task module still acts
     assert "velocity_hook" in policy.calls[0] and "noise_fn" not in policy.calls[0]
     _frs(policy, adapter=adapter).select_action({})  # steering: both passes carry the hook, one the reversal
     steered, plain = policy.calls[1:]
     assert "velocity_hook" in steered and "noise_fn" in steered
     assert "velocity_hook" in plain and "noise_fn" not in plain
-    _frs(policy, adapter=ReversalAdapter()).select_action({})
+    _frs(policy, adapter=AdapterModules(n_dims=None)).select_action({})
     assert "velocity_hook" not in policy.calls[-2] and "velocity_hook" not in policy.calls[-1]
