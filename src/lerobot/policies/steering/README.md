@@ -86,7 +86,7 @@ The modules and their losses:
   on `n_dims` dims (2 on the cursor); `AdapterModules(n_dims=None)` is the 7-D holder of the pi0.5 cores and the
   LIBERO session, each module on its own dims. It describes itself (`describe`, `label`, `user_label`,
   `task_label`), loads modules into its slots (`load_modules`) and carries the checkpoints: `save_module`,
-  `load_module`, `load` and `from_cursor_checkpoint`.
+  `load_module` and `load`.
 
 The cores are not pi0.5-specific. They steer any flow policy with pi0.5's sampler interface: a `config`, and a
 `predict_action_chunk` taking `noise_fn`, `flow_start_time`, `num_forward_steps`, `x_t_hook` and `velocity_hook`.

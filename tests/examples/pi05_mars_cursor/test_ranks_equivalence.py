@@ -54,10 +54,10 @@ def _reference(seed, scale=0.1, **ranks):
     return user.eval()
 
 
-def _twin(old):
+def _twin(old, converter):
     """The package's LearnedUserModule with the reference's weights, through the core's checkpoint conversion."""
     new = core.LearnedUserModule(
-        **core.AdapterModules.from_cursor_checkpoint(
+        **converter.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict()}
         )["config"]
     )
@@ -76,9 +76,9 @@ def test_a_fresh_module_draws_the_same_weights_as_the_cursor():
 
 
 @pytest.mark.parametrize("ranks", RANKS, ids=lambda r: "_".join(f"{k}{v}" for k, v in r.items()) or "default")
-def test_velocity_matches_the_cursor(exact, ranks):
+def test_velocity_matches_the_cursor(exact, ranks, converter):
     old = _reference(1, **ranks)
-    new = _twin(old)
+    new = _twin(old, converter)
     g = torch.Generator().manual_seed(2)
     x, t, v = (
         torch.randn(5, 16, 2, generator=g),
@@ -97,12 +97,12 @@ def test_velocity_matches_the_cursor(exact, ranks):
 
 
 @pytest.mark.parametrize("ranks", [{"cross_step_rank": 8}, {"step_rank": 2, "cross_step_rank": 4}])
-def test_reversal_through_the_policy_matches_the_cursor(exact, ranks):
+def test_reversal_through_the_policy_matches_the_cursor(exact, ranks, converter):
     """MARS-U's reversal through a policy's field (the coupling acting at every step), cursor against core."""
     torch.manual_seed(0)
     policy = FlowPolicy().eval()
     old = _reference(3, scale=0.01, **ranks)  # small enough for ten Euler steps to stay finite
-    new = _twin(old)
+    new = _twin(old, converter)
     g = torch.Generator().manual_seed(4)
     obs = {
         "pos": torch.rand(4, 2, generator=g),
@@ -121,10 +121,10 @@ def test_reversal_through_the_policy_matches_the_cursor(exact, ranks):
     _close(new_z, old_z, exact)
 
 
-def test_a_cursor_checkpoint_loads_into_the_same_module(exact, tmp_path):
+def test_a_cursor_checkpoint_loads_into_the_same_module(exact, tmp_path, converter):
     old = _reference(5, step_rank=None, cross_step_rank=2)
     torch.save(  # the reference's checkpoint, as convert_checkpoints.py rewrites it (AdapterModules.load reads that)
-        core.AdapterModules.from_cursor_checkpoint(
+        converter.from_cursor_checkpoint(
             {"kind": "user", "config": old.config, "state_dict": old.state_dict(), "args": {}}
         ),
         tmp_path / "adapter.pt",

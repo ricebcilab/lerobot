@@ -133,13 +133,6 @@ class FlowPolicy(nn.Module):
             self.obstacle_in = mlp(5, d)
             self.obstacle_emb = nn.Parameter(0.02 * torch.randn(d))
 
-    @classmethod
-    def load(cls, path, device="cpu"):
-        ckpt = torch.load(path, map_location=device, weights_only=True)  # torch>=2.7 default, made explicit
-        model = cls(**ckpt["config"])
-        model.load_state_dict(ckpt["state_dict"])
-        return model.to(device).eval()
-
     def forward(self, obs, x=None, t=None):
         """Flow mode: velocity v_theta(x_t, t | obs) for a normalized chunk x at
         flow time t [B]. Regress mode: the normalized chunk (x and t unused)."""

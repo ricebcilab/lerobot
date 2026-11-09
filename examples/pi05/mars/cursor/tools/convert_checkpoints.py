@@ -11,7 +11,7 @@ DIR defaults to examples/pi05/mars/checkpoints (cursor_sa.paths.CHECKPOINTS).
   reloads, so a steering policy that loads the folder by path has the action statistics). The policy.pt is kept as
   policy.pt.orig. A policy folder converted before the pipelines (config.json, no pipelines) is given them.
 - every adapters/**/adapter.pt (the cursor's {kind?, config, state_dict, args, obstacle}) is rewritten in
-  the `AdapterModules.save_module` format (`AdapterModules.from_cursor_checkpoint`; kind, config, weights, meta). The original is
+  the `AdapterModules.save_module` format (`from_cursor_checkpoint`; kind, config, weights, meta). The original is
   kept as adapter.pt.orig.
 - with --steering, every adapters/**/adapter.pt (once in that format) also becomes a lerobot `SteeringPolicy`
   directory beside it: config.json + model.safetensors (`save_pretrained`; MARS, mode frs, the module in its slot,
@@ -154,6 +154,38 @@ def converted(ckpt):
     return "kind" in ckpt and "meta" in ckpt
 
 
+def from_cursor_checkpoint(ckpt: dict) -> dict:
+    """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
+    adapters, saved without ``kind``, are user modules) in the ``save_module`` format. A user
+    module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
+    embedding computes the same frequencies, so outputs agree to float rounding; its ``step_rank`` and
+    ``cross_step_rank``, when set, carry over, and ``cross_step_dims``, which the cursor never had, stays
+    None: the coupling covers both dims), a task module a ``LearnedTaskModule`` (over 2 dims).
+    ``args`` and ``obstacle`` go into ``meta``."""
+    kind = ckpt.get("kind", "user")
+    config = dict(ckpt["config"])
+    meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
+    if kind == "user":
+        ranks = {k: config[k] for k in ("step_rank", "cross_step_rank") if config.get(k)}  # only when set
+        config = {
+            "horizon": config["horizon"],
+            "n_dims": 2,
+            "d": config["d"],
+            "tdim": config["tdim"],
+            **ranks,
+        }
+        return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
+    if kind == "task":
+        config["n_dims"] = 2
+        return {
+            "kind": "task",
+            "config": config,
+            "state_dict": ckpt["state_dict"],
+            "meta": meta,
+        }
+    raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
+
+
 def convert_adapter(path):
     """adapters/**/adapter.pt in place to the `AdapterModules.save_module` format. Returns its kind ("user" or
     "task"), "skipped" for a differing backup, or None when the file is already converted."""
@@ -162,7 +194,7 @@ def convert_adapter(path):
     if converted(ckpt):
         return None
     if "n_dims" not in ckpt["config"]:  # the cursor project's format
-        new = AdapterModules.from_cursor_checkpoint(ckpt)
+        new = from_cursor_checkpoint(ckpt)
     else:  # the cursor trainer since the port: the core's module configs, the cursor's keys
         new = {"kind": ckpt["kind"], "config": dict(ckpt["config"]), "state_dict": ckpt["state_dict"],
                "meta": {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}}

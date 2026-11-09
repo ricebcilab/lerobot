@@ -403,21 +403,17 @@ def test_frs_reversal_uses_the_coupling():
     assert torch.equal(plain_user, plain_cut)
 
 
-def test_convert_cursor_module_maps_the_ranks():
+def test_convert_cursor_module_maps_the_ranks(converter):
     sd = {}
-    plain = steering.AdapterModules.from_cursor_checkpoint(
+    plain = converter.from_cursor_checkpoint(
         {"config": {"horizon": 16, "d": 256, "tdim": 64}, "state_dict": sd}
     )
     assert plain["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64}
     cursor = {"horizon": 16, "d": 256, "tdim": 64, "step_rank": None, "cross_step_rank": 8}
-    ranked = steering.AdapterModules.from_cursor_checkpoint(
-        {"kind": "user", "config": cursor, "state_dict": sd}
-    )
+    ranked = converter.from_cursor_checkpoint({"kind": "user", "config": cursor, "state_dict": sd})
     assert ranked["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "cross_step_rank": 8}
     cursor = {"horizon": 16, "d": 256, "tdim": 64, "step_rank": 2, "cross_step_rank": 0}
-    ranked = steering.AdapterModules.from_cursor_checkpoint(
-        {"kind": "user", "config": cursor, "state_dict": sd}
-    )
+    ranked = converter.from_cursor_checkpoint({"kind": "user", "config": cursor, "state_dict": sd})
     assert ranked["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "step_rank": 2}
     assert "cross_step_dims" not in ranked["config"]
 

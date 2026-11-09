@@ -36,10 +36,9 @@ prints the per-arm table and writes that participant's tables and figures.
 Results go to `examples/pi05/mars/results/`, checkpoints to
 `examples/pi05/mars/checkpoints/` (both gitignored).
 
-The cursor trainers write the cursor project's checkpoint formats (`policy.pt`,
-`adapter.pt`) and the loaders read both; rerun
-`cursor/tools/convert_checkpoints.py` after training to get the lerobot format. When a
-policy folder holds both, `policy.pt` wins, with a warning
+The cursor trainers write lerobot's formats (a `cursor_flow` policy folder, `adapter.pt` in the
+`AdapterModules.save_module` format) and the loaders read only those; the cursor project's older formats
+(`policy.pt`, the old `adapter.pt`) are `cursor/tools/convert_checkpoints.py`'s alone
 ([cursor/README.md](cursor/README.md#training)).
 
 Tests: `uv run --extra mars --extra test pytest tests/examples/pi05_mars_cursor -q`. lerobot's

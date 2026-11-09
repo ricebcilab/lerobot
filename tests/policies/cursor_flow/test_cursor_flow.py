@@ -413,3 +413,14 @@ def test_a_differing_backup_is_never_overwritten(tmp_path, capsys):
         assert after[orig] == before[orig]  # and the file left unconverted
     assert not (tmp_path / "policies" / "p" / "config.json").exists()
     assert not [p for p in (tmp_path / "policies" / "p").iterdir() if p.name.startswith(".convert-")]
+
+
+def test_the_package_has_no_cursor_migration():
+    assert not hasattr(AdapterModules, "from_cursor_checkpoint")
+    assert not hasattr(FlowPolicy, "load")
+    converter = _converter()
+    sd = {}
+    cursor = {"horizon": 16, "d": 256, "tdim": 64, "step_rank": None, "cross_step_rank": 8}
+    converted = converter.from_cursor_checkpoint({"kind": "user", "config": cursor, "state_dict": sd})
+    assert converted["config"] == {"horizon": 16, "n_dims": 2, "d": 256, "tdim": 64, "cross_step_rank": 8}
+    assert converted["kind"] == "user" and converted["state_dict"] is sd

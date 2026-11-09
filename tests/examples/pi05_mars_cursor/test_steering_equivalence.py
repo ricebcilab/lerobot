@@ -293,7 +293,7 @@ def test_core_task_field_loss_matches_the_reference(setup, exact):
 
 
 @pytest.mark.parametrize("kind", ("user", "task"))
-def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_path, kind):
+def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_path, kind, converter):
     old_user, old_task, new_user, new_task = setup["modules"]
     old, new = (old_user, new_user) if kind == "user" else (old_task, new_task)
     cursor = {"config": old.config, "state_dict": old.state_dict(), "args": {"name": "m"}, "obstacle": None}
@@ -309,7 +309,7 @@ def test_reversal_adapter_loads_converted_and_trainer_checkpoints(setup, tmp_pat
     }
     paths = {}
     for name, ckpt in (
-        ("converted", core.AdapterModules.from_cursor_checkpoint(cursor)),
+        ("converted", converter.from_cursor_checkpoint(cursor)),
         ("trainer", trainer),
     ):
         paths[name] = tmp_path / f"{name}.pt"

@@ -53,7 +53,7 @@ def test_integrate_reproduces_cursor_flows_exactly():
         assert torch.equal(Flow(velocity, batch_time=True).integrate(x, t0, (1.0 - t0) / m, m), expect)
 
 
-def test_cursor_user_module_converts_and_matches(tmp_path):
+def test_cursor_user_module_converts_and_matches(tmp_path, converter):
     torch.manual_seed(0)
     old = _perturb(ref.UserModule(16)).eval()
     ckpt = {
@@ -63,7 +63,7 @@ def test_cursor_user_module_converts_and_matches(tmp_path):
         "obstacle": None,
     }
     assert "kind" not in ckpt  # the first adapters were saved without one
-    converted = AdapterModules.from_cursor_checkpoint(ckpt)
+    converted = converter.from_cursor_checkpoint(ckpt)
     assert converted["kind"] == "user" and converted["meta"] == {
         "args": {"name": "u", "seed": 0},
         "obstacle": None,
@@ -76,7 +76,7 @@ def test_cursor_user_module_converts_and_matches(tmp_path):
         torch.testing.assert_close(new(x, t), old(x, t), atol=1e-5, rtol=0)
 
 
-def test_cursor_task_module_converts_and_matches(tmp_path):
+def test_cursor_task_module_converts_and_matches(tmp_path, converter):
     torch.manual_seed(0)
     old = _perturb(ref.TaskModule(16)).eval()
     obstacle = {"kind": "disc"}
@@ -87,7 +87,7 @@ def test_cursor_task_module_converts_and_matches(tmp_path):
         "args": {},
         "obstacle": obstacle,
     }
-    converted = AdapterModules.from_cursor_checkpoint(ckpt)
+    converted = converter.from_cursor_checkpoint(ckpt)
     assert converted["kind"] == "task" and "arch" not in converted
     torch.save(converted, tmp_path / "task.pt")
     new, kind, meta = AdapterModules.load_module(tmp_path / "task.pt")

@@ -885,38 +885,6 @@ class AdapterModules(nn.Module):
         module.load_state_dict(ckpt["state_dict"])
         return module.to(device).eval().requires_grad_(False), kind, ckpt.get("meta", {})
 
-    @staticmethod
-    def from_cursor_checkpoint(ckpt: dict) -> dict:
-        """A cursor example module checkpoint (``{kind?, config, state_dict, args, obstacle}``; the first
-        adapters, saved without ``kind``, are user modules) in the ``save_module`` format. A user
-        module becomes a ``LearnedUserModule`` over 2 dims (same layers, same state-dict keys; its time
-        embedding computes the same frequencies, so outputs agree to float rounding; its ``step_rank`` and
-        ``cross_step_rank``, when set, carry over, and ``cross_step_dims``, which the cursor never had, stays
-        None: the coupling covers both dims), a task module a ``LearnedTaskModule`` (over 2 dims).
-        ``args`` and ``obstacle`` go into ``meta``."""
-        kind = ckpt.get("kind", "user")
-        config = dict(ckpt["config"])
-        meta = {"args": ckpt.get("args"), "obstacle": ckpt.get("obstacle")}
-        if kind == "user":
-            ranks = {k: config[k] for k in ("step_rank", "cross_step_rank") if config.get(k)}  # only when set
-            config = {
-                "horizon": config["horizon"],
-                "n_dims": 2,
-                "d": config["d"],
-                "tdim": config["tdim"],
-                **ranks,
-            }
-            return {"kind": "user", "config": config, "state_dict": ckpt["state_dict"], "meta": meta}
-        if kind == "task":
-            config["n_dims"] = 2
-            return {
-                "kind": "task",
-                "config": config,
-                "state_dict": ckpt["state_dict"],
-                "meta": meta,
-            }
-        raise ValueError(f"unknown cursor module kind {kind!r}; expected 'user' or 'task'")
-
 
 def as_adapter(adapter, device="cpu", n_dims: int | None = 2) -> AdapterModules | None:
     """None or an ``AdapterModules`` as is; a ``LearnedTaskModule`` in the task slot; a user module or any
