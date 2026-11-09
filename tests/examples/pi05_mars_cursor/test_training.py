@@ -434,6 +434,14 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
     for key in ("train", "val"):  # scoring left the training's random state alone
         assert [e[key] for e in log["log"]] == pytest.approx([e[key] for e in plain["log"]], rel=1e-4)
     assert "eval" not in plain
+    assert log["args"]["eval_obstacle"] == log["args"]["obstacle"]  # scored on the task's own layouts by default
+    # a fine-tune on layouts without a goal cue (decoy: any) is scored on the task's placement (--eval_obstacle), or
+    # the score would favour the early weights that do well where the obstacle is out of the way
+    any_ring = json.dumps({**json.loads(json.dumps(log["args"]["obstacle"])), "decoy": "any"})
+    train_policy.main(["--name", "scored_any", "--init", "base", "--obstacle", any_ring, "--eval_obstacle", RING,
+                       "--demo_seconds", "12", *tiny, "--eval_steps", "2", "--eval_trials", "4"])
+    log_any = json.loads((trained / "scored_any" / "train_log.json").read_text())
+    assert log_any["args"]["obstacle"]["decoy"] == "any" and log_any["args"]["eval_obstacle"] == log["args"]["obstacle"]
     args = _args(*TASK, "--obstacle", RING, "--name", "t", "--demo-seconds", "12", "--val-demos", "10")
     data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
                                        *corruption_spec(args.corruption), args.p_free)

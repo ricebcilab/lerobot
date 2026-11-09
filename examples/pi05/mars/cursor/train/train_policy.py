@@ -55,10 +55,11 @@ from train.train_adapter import budget_demos, layouts_for
 
 
 def goal_given_scorer(args, device):
-    """The share of --eval_trials layouts of the task that a policy alone hits with the goal given (the expert_chunk
-    agent with the readout off: grid_task_check's oracle) under --eval_arm's controller. The layouts and the trials'
-    noise come from --eval_seed, and scoring leaves the training's random state as it was."""
-    arm = config.load_arm(args.eval_arm, {"mode": "teleop", "obstacle": args.obstacle})
+    """The share of --eval_trials layouts of the task (its obstacle placed as --eval_obstacle says) that a policy alone
+    hits with the goal given (the expert_chunk agent with the readout off: grid_task_check's oracle) under --eval_arm's
+    controller. The layouts and the trials' noise come from --eval_seed, and scoring leaves the training's random
+    state as it was."""
+    arm = config.load_arm(args.eval_arm, {"mode": "teleop", "obstacle": args.eval_obstacle})
     layouts = sample_layouts(np.random.default_rng(args.eval_seed), args.eval_trials, tuple(arm["targets"]), arm_task(arm))
 
     def score(policy):
@@ -86,6 +87,9 @@ def main(argv=None):
                    "trials (800 and 810)")
     p.add_argument("--eval_arm", default="condition_grid.yaml", help="with --eval_steps: the controller and task geometry "
                    "they run under")
+    p.add_argument("--eval_obstacle", type=yaml.safe_load, help="with --eval_steps: the obstacle spec the layouts scored "
+                   "are drawn with (default: --obstacle's); a policy trained on `decoy: any` layouts is scored on the "
+                   "task's own placement, the obstacle about the goal, or the score would favour early weights")
     p.add_argument("--targets", type=int, nargs=2, default=[1, 8], help="min and max targets per trial")
     p.add_argument("--reach", type=yaml.safe_load, nargs=2, default=[0.2, None], help="min and max reach (null: none)")
     p.add_argument("--obstacle", type=yaml.safe_load, help="an obstacle task to train on; gives the policy obstacle tokens")
@@ -109,6 +113,8 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     args.obstacle = obstacle_spec(args.obstacle, "--obstacle")
+    args.eval_obstacle = (args.obstacle if args.eval_obstacle is None
+                          else obstacle_spec(args.eval_obstacle, "--eval_obstacle"))
     base = None
     if args.init:  # the base policy's architecture (and its weights, below)
         init = load_policy(policy_path(args.init)).model
