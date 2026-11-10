@@ -16,8 +16,8 @@ Reads (results/ is git-ignored, so these are local):
     fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
     fig3  the vision grid's five training seeds: results/sim/sweeps/grid_vision_s<k>/test.json (seed 0 tuned, seeds 1-4
           tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
-          module alone and with the user module) joined trial for trial by MARS-U from grid_s<k>/test.json and the
-          fine-tuned arm from grid_ft_s<k>/test.json, and seed 0's checkpoints for one cell's rollouts (the vision
+          module alone and with the user module) joined trial for trial by the fine-tuned arm from
+          grid_ft_s<k>/test.json, and seed 0's checkpoints for one cell's rollouts (the vision
           module's scene tokens through checkpoints/scene/fig3); for panel e's curve the demonstration-time sweeps,
           results/sim/sweeps/demo_time_{mars,ft}_s<k>/test.json (on the grid's trials), and the fine-tuned policies'
           training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
@@ -68,7 +68,7 @@ SERVED = "#8a3a5b"  # the served (corrupted) command
 OUTCOMES = ("hit", "wrong_target", "timeout")
 OUTCOME_LABEL = {"hit": "Success", "wrong_target": "Wrong target", "collision": "Collision", "timeout": "Timeout"}
 OUTCOME_GRAY = {"hit": "#1f1f1e", "collision": "#1f1f1e", "wrong_target": "#767571", "timeout": "#aeaca4"}  # ordinal ramp
-GRID_METHODS = ["teleop", "ft_flow_control", "ft_frs", "mars_task", "mars_user", "ft_mars_user", "mars"]
+GRID_METHODS = ["teleop", "ft_flow_control", "ft_frs", "mars_task", "ft_mars_user", "mars"]
 GRID_LABEL = {"teleop": "Teleop", "ft_flow_control": "Fine-tuned + flow control", "ft_frs": "Fine-tuned + FRS",
               "mars_user": f"{MARS}-U", "mars_task": f"{MARS}-T", "mars": f"{MARS}-UT",
               "ft_mars_user": f"Fine-tuned + {MARS}-U"}  # MARS-UT: both modules; the fine-tuned arms play each paper's
@@ -703,11 +703,9 @@ TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustratio
 SEED_RUNS = tuple(f"grid_vision_s{k}" for k in range(5))  # the grid's runs on the vision task module, under
 # results/sim/sweeps, one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the
 # demonstrations and are tested at seed 0's settings on the grid's trials (teleop trains nothing, so every seed has the grid's)
-USER_RUNS = tuple(f"grid_s{k}" for k in range(5))  # MARS-U (the user module alone) from the parametric grid's run of the
-# same seed: the user modules are the same, and the vision grid does not replay that arm
 FT_ARM = "ft_mars_user"   # the policy fine-tuned on each obstacle task's 300 demonstrations (as many as its task module's),
 FT_RUNS = tuple(f"grid_ft_s{k}" for k in range(5))  # with the user modules refitted on it: a sweep of its own per seed
-JOINED = {"mars_user": USER_RUNS, FT_ARM: FT_RUNS}  # arm -> the runs it joins the grid's from, per seed
+JOINED = {FT_ARM: FT_RUNS}  # arm -> the runs it joins the grid's from, per seed
 GRID_BASELINES = ("teleop", "ft_flow_control", "ft_frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
 ROLLOUT_SEED = 7  # panel b's trials
@@ -730,7 +728,7 @@ def join_arm(test, other, arm, what):
 
 def grid_data(results):
     """The vision grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the
-    seed D["seeds"][k]), each joined trial for trial by its seed's MARS-U and fine-tuned arm (`JOINED`). Every run is on
+    seed D["seeds"][k]), each joined trial for trial by its seed's fine-tuned arm (`JOINED`). Every run is on
     the grid's trials, so methods compare trial for trial within a seed and a cell's numbers average over the seeds."""
     sweeps = Path(results) / "sim" / "sweeps"
     seeds = [k for k, run in enumerate(SEED_RUNS) if k == 0 or (sweeps / run / "test.json").exists()]
@@ -966,18 +964,13 @@ def build_fig3(out, results, device):
     best_base = {f"{u}x{t}": max(GRID_BASELINES, key=lambda b: seed_mean(D, u, t, b)) for u, t in obstacle}
     lead_best = {f"{u}x{t}": r1(lead_ci(D, u, t, "mars", best_base[f"{u}x{t}"])) for u, t in obstacle}
     over_fine_tuned = {f"{u}x{t}": r1(lead_ci(D, u, t, "mars", FT_ARM)) for u, t in obstacle}
-    gain = {}
-    for u, t in obstacle:
-        g = lead_ci(D, u, t, "mars", "mars_user")
-        gain[f"{u}x{t}"] = dict(points=round(g[0], 1), ci=r1(g[1:]), trained=(u, t) in D["train"])
     obstacle_per_seed = {m: [float(np.mean([100 * D["cell"](u, t, k)["metrics"][m]["success"] for u, t in obstacle]))
                              for k in range(len(seeds))] for m in methods}
     beyond = lambda leads: dict(cells=int(sum(v[1] > 0 for v in leads.values())), of=len(leads),
                                 level=[c for c, v in leads.items() if v[1] <= 0])
     write_stats(out, "fig3", dict(
-        names={"MARS-UT": "user + task modules (mars)", "MARS-U": "user module alone (mars_user)", "MARS-T": "task module alone (mars_task)"},
+        names={"MARS-UT": "user + task modules (mars)", "MARS-T": "task module alone (mars_task)"},
         seeds=seeds, seed_runs=[f"results/sim/sweeps/{SEED_RUNS[k]}" for k in seeds],
-        user_module_runs=[f"results/sim/sweeps/{USER_RUNS[k]}" for k in seeds],
         fine_tuned_runs=[f"results/sim/sweeps/{FT_RUNS[k]}" for k in seeds],
         task_module_note="the task module is the vision module: pi0.5's vision tokens of a picture of the scene (vlm_image, "
                          "relative geometry), trained on 300 demonstrations with 32 rigid copies of each, rank 256",
@@ -1001,8 +994,6 @@ def build_fig3(out, results, device):
         demo_time=demo_time,
         composed_beats_all_baselines=beyond(lead_best), composed_lead_over_best_baseline=lead_best, best_baseline=best_base,
         composed_lead_range=[min(v[0] for v in lead_best.values()), max(v[0] for v in lead_best.values())],
-        task_module_gain=gain, task_module_gain_range=dict(trained=[g["points"] for g in gain.values() if g["trained"]],
-                                                           unseen=[g["points"] for g in gain.values() if not g["trained"]]),
         composed_over_fine_tuned=over_fine_tuned, composed_beats_fine_tuned=beyond(over_fine_tuned),
         t1_user_module_over_teleop={f"{u}x{tasks[0]}": r1(lead_ci(D, u, tasks[0], "mars", "teleop")) for u in users},
         tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},

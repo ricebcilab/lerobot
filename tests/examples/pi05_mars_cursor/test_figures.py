@@ -107,9 +107,9 @@ def test_fig3_builds_from_the_grid(tmp_path):
     assert Image.open(tmp_path / "fig3_grid.png").size == (round(300 * bf.FULL_W), round(300 * bf.FIG3_H))
 
 
-def _grid_results(sweeps, ft_teleop=("hit", "timeout"), user_teleop=("hit", "timeout")):
-    """Seed 0 of a one-user vision grid (teleop, the fine-tuned baselines, MARS-T, MARS-UT), the parametric grid it takes
-    MARS-U from, and its fine-tuned arm, two trials a cell."""
+def _grid_results(sweeps, ft_teleop=("hit", "timeout")):
+    """Seed 0 of a one-user vision grid (teleop, the fine-tuned baselines, MARS-T, MARS-UT) and its fine-tuned arm, two
+    trials a cell."""
     cells = {"U1xT1": None, "U1xT2": {"kind": "disc"}}
     def write(name, methods, teleop):
         test = {f"{c}|1.0": dict(settings=dict.fromkeys(methods),
@@ -122,7 +122,6 @@ def _grid_results(sweeps, ft_teleop=("hit", "timeout"), user_teleop=("hit", "tim
         (sweeps / name / "test.json").write_text(json.dumps(dict(args=dict(sweep=dict(methods=dict.fromkeys(methods, {}), grid=grid),
                                                                            test_trials=2), test=test)))
     write("grid_vision_s0", ["teleop", "ft_flow_control", "ft_frs", "mars_task", "mars"], ("hit", "timeout"))
-    write("grid_s0", ["teleop", "flow_control", "frs", "mars_task", "mars_user", "mars"], user_teleop)
     write("grid_ft_s0", ["teleop", "ft_mars_user"], ft_teleop)
 
 
@@ -144,14 +143,12 @@ def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
 def test_fig3_joins_the_fine_tuned_and_demo_time_sweeps_trial_for_trial(tmp_path, monkeypatch):
     _grid_results(tmp_path / "sim" / "sweeps")
     D = bf.grid_data(tmp_path)
-    assert D["methods"] == bf.GRID_METHODS   # the vision grid's arms, MARS-U and the fine-tuned arm joined in their places
-    assert bf.seed_values(D, "U1", "T2", "ft_mars_user") == [25.0] and bf.seed_values(D, "U1", "T2", "mars_user") == [50.0]
+    assert D["methods"] == bf.GRID_METHODS   # the vision grid's arms, the fine-tuned arm joined in its place
+    assert bf.seed_values(D, "U1", "T2", "ft_mars_user") == [25.0] and "mars_user" not in D["cell"]("U1", "T2")["metrics"]
     assert D["cell"]("U1", "T2")["trials"]["outcome"]["ft_mars_user"] == ["hit", "timeout"]
-    assert "flow_control" not in D["cell"]("U1", "T2")["metrics"]   # the parametric grid's frozen-policy arms stay there
-    for off, kw in (("off_ft", dict(ft_teleop=("timeout", "timeout"))), ("off_user", dict(user_teleop=("timeout", "timeout")))):
-        _grid_results(tmp_path / off / "sim" / "sweeps", **kw)   # a joined sweep off the grid's trials: refused
-        with pytest.raises(ValueError, match="not on its run's trials"):
-            bf.grid_data(tmp_path / off)
+    _grid_results(tmp_path / "off_ft" / "sim" / "sweeps", ft_teleop=("timeout", "timeout"))   # a joined sweep off the grid's trials: refused
+    with pytest.raises(ValueError, match="not on its run's trials"):
+        bf.grid_data(tmp_path / "off_ft")
     results = tmp_path / "results"
     _demo_time_results(results / "sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
     D = bf.demo_time_data(results)
