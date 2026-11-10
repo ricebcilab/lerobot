@@ -605,7 +605,8 @@ def fig_summary(sweep, test, out):
     obstacle = {grid["cells"][n]["task"]: grid["cells"][n]["obstacle"] for n in grid["cells"]}
     limit = {t: method_arm(sweep, methods[0], f"{users[0]}x{t}")["time_limit_s"] for t in tasks}
     corruption = {grid["cells"][n]["user"]: grid["cells"][n]["corruption"] for n in grid["cells"]}
-    others = iter(["#6da7ec", "#eda100", "#eb6834", *COLORS[2:]])  # gray context, the focus in the accent (dataviz checks)
+    others = itertools.cycle(["#6da7ec", "#eda100", "#eb6834", *COLORS[2:]])  # gray context, the focus in the accent
+    # (dataviz checks); a sweep with more methods than colours (the demonstration-time baselines, 17) reuses them
     color = {m: "#8a8984" if m in against else "#1c5cab" if m == focus else next(others) for m in methods}
     label = lambda m: METHOD_LABEL.get(m, m)
     lower = lambda s: s if s[1:2].isupper() else s[:1].lower() + s[1:]
