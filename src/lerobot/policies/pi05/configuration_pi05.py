@@ -100,6 +100,8 @@ class PI05Config(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
+    # Opt in for continuation datasets with padded action windows.
+    mask_padded_actions: bool = False
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
