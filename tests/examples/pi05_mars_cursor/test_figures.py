@@ -91,7 +91,7 @@ def test_fig2_builds_from_the_recorded_sessions(tmp_path):
 
 
 @pytest.mark.skipif(not all((RESULTS / "sim" / "sweeps" / f"{name}_s0" / "test.json").exists()
-                            for name in ("grid_vision", "grid", "grid_ft", "demo_time_mars", "demo_time_ft")),
+                            for name in ("grid_vision", "grid", "grid_ft", "demo_time_vision", "demo_time_ft", "demo_time_baselines")),
                     reason="no grid or demonstration-time results")
 def test_fig3_builds_from_the_grid(tmp_path):
     bf.main(["--only", "fig3", "--out", str(tmp_path), "--device", "cpu"])
@@ -126,7 +126,8 @@ def _grid_results(sweeps, ft_teleop=("hit", "timeout")):
 
 
 def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
-    """Sweep outputs for Figure 3e on two cells: per arm one {method: success} per seed, and the grid's teleop."""
+    """Sweep outputs for Figure 3e on two cells, one per seed: the vision module (mars), Fine-tuned + MARS-U (ft), flow
+    control and FRS on the fine-tuned policy (ft - 0.1 and 0.1), and the grid's teleop."""
     cells = ["U1xT2|1.0", "U2xT3|1.0"]
     def run(methods):
         return {"test": {c: {"metrics": {m: {"success": v} for m, v in methods.items()},
@@ -135,8 +136,10 @@ def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
         (root / name).mkdir(parents=True)
         (root / name / "test.json").write_text(json.dumps(run(methods)))
     for k, (m, f) in enumerate(zip(mars, ft)):
-        write(f"demo_time_mars_s{k}", {"teleop": 0.2, **{f"mars_t{s}": m for s in bf.DEMO_SECONDS}})
+        write(f"demo_time_vision_s{k}", {"teleop": 0.2, **{f"mars_t{s}": m for s in bf.DEMO_SECONDS}})
         write(f"demo_time_ft_s{k}", {"teleop": 0.2, **{f"ft_mars_user_t{s}": f for s in bf.DEMO_SECONDS}})
+        write(f"demo_time_baselines_s{k}", {"teleop": 0.2, **{f"ft_flow_control_t{s}": f - 0.1 for s in bf.DEMO_SECONDS},
+                                           **{f"ft_frs_t{s}": 0.1 for s in bf.DEMO_SECONDS}})
     write("grid_s0", {"teleop": 0.2})
 
 
@@ -152,12 +155,13 @@ def test_fig3_joins_the_fine_tuned_and_demo_time_sweeps_trial_for_trial(tmp_path
     results = tmp_path / "results"
     _demo_time_results(results / "sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
     D = bf.demo_time_data(results)
-    assert D["seeds"] == {"mars": [0, 1], "ft": [0, 1]} and D["curve"]["mars"][300] == pytest.approx([70, 80])
+    assert D["seeds"] == {arm: [0, 1] for arm in bf.DEMO_ARMS} and D["curve"]["mars"][300] == pytest.approx([70, 80])
+    assert D["curve"]["ft_flow_control"][300] == pytest.approx([30, 40]) and D["curve"]["ft_frs"][30] == pytest.approx([10, 10])
     monkeypatch.setattr(bf, "demo_log", lambda task, seconds, seed=0: {"args": {"n_demos": seconds}, "best_step": 5000})
     bf.paper_style()
     fig = bf.plt.figure(figsize=(bf.FULL_W, bf.FIG3_H))
     stats = bf.draw_demo_time(fig, D, (0.6, 0.4, 0.35, 0.15))
-    assert [line.get_color() for line in fig.axes[0].get_lines()] == [bf.DEMO_COLOR["ft"], bf.DEMO_COLOR["mars"]]
+    assert [line.get_color() for line in fig.axes[0].get_lines()] == [bf.GRID_COLOR[arm] for arm in bf.DEMO_ARMS]   # MARS-UT last, on top
     assert stats["success"]["mars"]["300"][0] == pytest.approx(75) and stats["grid_demonstrations_minutes"]["T2"] == pytest.approx(5.0)
     bf.plt.close(fig)
     _demo_time_results(tmp_path / "other" / "sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))

@@ -19,8 +19,9 @@ Reads (results/ is git-ignored, so these are local):
           module alone and with the user module) joined trial for trial by the fine-tuned arm from
           grid_ft_s<k>/test.json, and seed 0's checkpoints for one cell's rollouts (the vision
           module's scene tokens through checkpoints/scene/fig3); for panel e's curve the demonstration-time sweeps,
-          results/sim/sweeps/demo_time_{mars,ft}_s<k>/test.json (on the grid's trials), and the fine-tuned policies'
-          training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
+          results/sim/sweeps/demo_time_{vision,ft,baselines}_s<k>/test.json (the vision module, Fine-tuned + MARS-U,
+          flow control and FRS on the fine-tuned policies, each per budget; on the grid's trials), and the fine-tuned
+          policies' training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
 
 Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
 """
@@ -1010,20 +1011,22 @@ def build_fig3(out, results, device):
 
 
 DEMO_SECONDS = (30, 60, 120, 300, 600, 1200, 3600, 10800)  # the budgets, time spent demonstrating a task (s; _t<s> in names)
-DEMO_ARMS = {"mars": ("demo_time_mars", "mars_t{s}"), "ft": ("demo_time_ft", "ft_mars_user_t{s}")}  # arm: its sweep, its method
-DEMO_COLOR = {"mars": GRID_COLOR["mars"], "ft": GRID_COLOR[FT_ARM]}
+DEMO_ARMS = {"ft_frs": ("demo_time_baselines", "ft_frs_t{s}"), "ft_flow_control": ("demo_time_baselines", "ft_flow_control_t{s}"),
+             FT_ARM: ("demo_time_ft", "ft_mars_user_t{s}"), "mars": ("demo_time_vision", "mars_t{s}")}  # panel d's arm:
+# its sweep and its method per budget (_t<s>), in drawing order (MARS-UT on top); colours and labels are panel d's
 DEMO_TASKS = {"T2": "disc_large", "T3": "wall_gap", "T4": "ring_goal", "T5": "ring_start"}  # the tasks' checkpoint names
 GRID_DEMOS = 300  # the grid's task modules (and panel d's fine-tuned policies): 300 demonstrations of the task
 
 
 def demo_time_data(results):
-    """Each arm's runs, one per training seed found (seed 0 is required). An arm's value at a budget is its success
-    averaged over the 16 obstacle cells, one value per seed. The sweeps play the grid's cells and trials: their teleop's
+    """Each arm's runs (`DEMO_ARMS`), one per training seed found (seed 0 is required). An arm's value at a budget is
+    its success averaged over the 16 obstacle cells, one value per seed. The sweeps play the grid's cells and trials: their teleop's
     outcomes must be the grid's (grid_s0's), trial for trial."""
     sweeps = Path(results) / "sim" / "sweeps"
     load = lambda name: json.loads((sweeps / name / "test.json").read_text())
     found = lambda name: [k for k in range(5) if k == 0 or (sweeps / f"{name}_s{k}" / "test.json").exists()]
-    runs = {arm: {k: load(f"{sweep}_s{k}") for k in found(sweep)} for arm, (sweep, _) in DEMO_ARMS.items()}
+    by_sweep = {sweep: {k: load(f"{sweep}_s{k}") for k in found(sweep)} for sweep in {s for s, _ in DEMO_ARMS.values()}}
+    runs = {arm: by_sweep[sweep] for arm, (sweep, _) in DEMO_ARMS.items()}
     grid = load("grid_s0")
     cells = list(runs["mars"][0]["test"])
     teleop = lambda run, c: run["test"][c]["trials"]["outcome"]["teleop"]
@@ -1050,10 +1053,12 @@ def mean_ci(values):
 
 
 def draw_demo_time(fig, D, rect):
-    """Panel e: each arm's success on the 16 obstacle cells against the time spent demonstrating each task (log), the
-    mean over the training seeds with its 95% t CI as a band, on panel d's success scale, and in grey the time the grid's
-    300 demonstrations take (panel d's task modules and fine-tuned policies; each task's at its mean demonstration, from
-    the largest budget's draw). The methods' legend is the figure's. Returns the panel's numbers."""
+    """Panel e: each arm's success on the 16 obstacle cells against the time spent demonstrating each task (log): MARS-UT
+    with the vision task module trained on the budget, and the three arms on the policy fine-tuned on it (Fine-tuned +
+    MARS-U, flow control, FRS); the mean over the training seeds with its 95% t CI as a band, on panel d's success scale,
+    and in grey the time the grid's 300 demonstrations take (panel d's task modules and fine-tuned policies; each task's
+    at its mean demonstration, from the largest budget's draw). The methods' legend is the figure's. Returns the panel's
+    numbers."""
     ax = fig.add_axes(rect)
     minutes = np.array(DEMO_SECONDS) / 60
     per_demo = {t: DEMO_SECONDS[-1] / demo_log(task, DEMO_SECONDS[-1])["args"]["n_demos"] for t, task in DEMO_TASKS.items()}
@@ -1062,10 +1067,10 @@ def draw_demo_time(fig, D, rect):
     ax.axvspan(lo, hi, color=GRID, alpha=0.7, lw=0, zorder=1)
     ax.text(np.sqrt(lo * hi), 107, f"{GRID_DEMOS} demos (d)", ha="center", va="top", fontsize=FS_TEXT, color=INK_2)
     curve = {arm: np.array([mean_ci(D["curve"][arm][s]) for s in DEMO_SECONDS]) for arm in DEMO_ARMS}
-    for arm in ("ft", "mars"):
+    for arm in DEMO_ARMS:
         if len(D["seeds"][arm]) > 1:
-            ax.fill_between(minutes, curve[arm][:, 1], curve[arm][:, 2], color=DEMO_COLOR[arm], alpha=0.2, lw=0, zorder=2)
-        ax.plot(minutes, curve[arm][:, 0], "-o", color=DEMO_COLOR[arm], lw=1.3, ms=2.6, zorder=3)
+            ax.fill_between(minutes, curve[arm][:, 1], curve[arm][:, 2], color=GRID_COLOR[arm], alpha=0.2, lw=0, zorder=2)
+        ax.plot(minutes, curve[arm][:, 0], "-o", color=GRID_COLOR[arm], lw=1.3, ms=2.6, zorder=3)
     ax.set_xscale("log")
     ax.set_xticks(minutes, [f"{v:g}" for v in minutes])
     ax.minorticks_off()
