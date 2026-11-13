@@ -303,15 +303,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
 
-    if cfg.preserve_checkpoint_normalization and (not processor_pretrained_path or cfg.is_reward_model_training):
+    if cfg.preserve_checkpoint_normalization and (
+        not processor_pretrained_path or cfg.is_reward_model_training
+    ):
         raise ValueError("preserve_checkpoint_normalization requires a pretrained policy checkpoint")
     if cfg.sample_episodes_uniformly and cfg.dataset.streaming:
         raise ValueError("sample_episodes_uniformly requires a non-streaming dataset")
 
     processor_kwargs = {}
-    if not cfg.preserve_checkpoint_normalization:
-        if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
-            processor_kwargs["dataset_stats"] = dataset.meta.stats
+    if not cfg.preserve_checkpoint_normalization and (
+        (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path
+    ):
+        processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta

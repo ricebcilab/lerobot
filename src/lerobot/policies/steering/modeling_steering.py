@@ -125,10 +125,10 @@ class LearnedUserModule(nn.Module):
             raise ValueError(f"step_rank must be None or >= 1, got {step_rank}")
         if cross_step_rank < 0:
             raise ValueError(f"cross_step_rank must be >= 0, got {cross_step_rank}")
-        if cross_step_prefix is not None:
-            if (not cross_step_rank or type(cross_step_prefix) is not int
-                    or not 1 <= cross_step_prefix <= horizon):
-                raise ValueError("cross_step_prefix requires positive rank and an integer in [1, horizon]")
+        if cross_step_prefix is not None and (
+            not cross_step_rank or type(cross_step_prefix) is not int or not 1 <= cross_step_prefix <= horizon
+        ):
+            raise ValueError("cross_step_prefix requires positive rank and an integer in [1, horizon]")
         self.cross_step_prefix = cross_step_prefix
         if cross_step_dims is not None:
             cross_step_dims = [int(i) for i in cross_step_dims]
