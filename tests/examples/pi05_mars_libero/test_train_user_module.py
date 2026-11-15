@@ -5,7 +5,6 @@ import train_user_module as tum
 from teleop import Curl
 
 from lerobot.policies.steering import (
-    DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_OPEN,
     Flow,
@@ -25,28 +24,89 @@ def test_operator_command_follows_the_policy_operator_rule():
     assert tum.operator_command(-chunk, n_action_steps=2)[1] == GRIPPER_OPEN
 
 
-def test_readout_core_matrix_curl_and_idle():
-    m = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
-    np.testing.assert_allclose(tum.readout_core([1.0, 0.0, 0.0], matrix=m), [0.0, 1.0, 0.0])
-    curl = Curl(20.0, 0.1, dt=0.05)
-    decay, drive = curl.discretization()
-    v = np.zeros(3)
-    for _ in range(10):
-        v = decay @ v + drive @ np.array([1.0, 0.0, 0.0])
-    np.testing.assert_allclose(tum.readout_core([1.0, 0.0, 0.0], curl=curl, n_steps=10), np.clip(v, -1, 1))
-    idle = np.array([DEADBAND / 2, 0.0, 0.0])
-    np.testing.assert_allclose(tum.readout_core(idle, matrix=m), idle)
-    np.testing.assert_allclose(tum.readout_core([0.5, 0.0, 0.0]), [0.5, 0.0, 0.0])
+def test_readout_cores_are_what_the_rollouts_reader_serves_along_an_episode():
+    from config import ControlSettings
+    from teleop import InputGain, ReadoutReader
+
+    class Push:
+        gripper = GRIPPER_OPEN
+
+    pushes = np.array(
+        [[0.6, -0.2, 0.4], [0.6, -0.2, 0.4], [0.1, 0.9, 0.0], [0.6, -0.2, 0.4], [0.9, 0.9, 0.9]]
+    )
+    episodes, steps = [0, 0, 0, 1, 1], [0, 10, 20, 0, 10]
+    lag = ControlSettings(corruption_curl=Curl(2.0, 0.5), resolved_input_gain=1.0)
+    cores = tum.readout_cores(pushes, episodes, steps, lag)
+    # a rollout of episode 0: the field stepped at every control step, read at each chunk boundary with the new push
+    source = Push()
+    reader = ReadoutReader(InputGain(source, 1.0), curl=Curl(2.0, 0.5))
+    served = []
+    for step in range(21):
+        if step % 10 == 0:
+            source.translation = pushes[step // 10]
+        reader.advance(step)
+        if step % 10 == 0:
+            served.append(reader.translation)
+    np.testing.assert_array_equal(cores[:3], served)
+    assert not np.allclose(
+        cores[0], cores[1]
+    )  # the lag carries across chunks: the same push is served differently
+    np.testing.assert_array_equal(cores[3], cores[0])  # a new episode starts from rest
+    assert np.linalg.norm(
+        tum.readout_cores(pushes[4:], [0], [0], ControlSettings(resolved_input_gain=1.0))[0]
+    ) == pytest.approx(1.0)
+    keypad = ControlSettings(corruption_quantize=True, resolved_input_gain=1.0)
+    np.testing.assert_array_equal(tum.readout_cores(pushes[:1], [0], [0], keypad), [[1.0, 0.0, 0.0]])
+    stick = ControlSettings(corruption_matrix=np.diag([1.0, 1.0, 0.0]), resolved_input_gain=1.0)
+    np.testing.assert_allclose(tum.readout_cores(pushes[:1], [0], [0], stick), [[0.6, -0.2, 0.0]])
 
 
-def test_serve_adds_noise_only_where_active():
+def test_serve_noises_only_an_active_core():
     rng = np.random.default_rng(0)
-    core = np.array([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]])
-    raw = np.array([[1.0, 0.0, 0.0], [DEADBAND / 2, 0.0, 0.0]])
-    served = tum.serve(core, raw, [0.1, 0.1], rng)
+    core = np.array(
+        [[0.5, 0.0, 0.0], [0.02, 0.0, 0.0]]
+    )  # the second: an active push the readout shrank to idle
+    served = tum.serve(core, [0.1, 0.1], rng)
     assert not np.allclose(served[0], core[0]) and np.all(np.abs(served[0]) <= 1.0)
-    np.testing.assert_allclose(served[1], raw[1])
-    np.testing.assert_allclose(tum.serve(core, raw, 0.0, rng)[0], core[0])
+    np.testing.assert_array_equal(
+        served[1], core[1]
+    )  # the rollouts' rule: an idle command is served as it is
+    np.testing.assert_allclose(tum.serve(core, 0.0, rng)[0], core[0])
+
+
+def test_the_session_is_built_without_the_arms_adapter():
+    from config import ControlSettings
+
+    control = ControlSettings(
+        mode="shared_flow_reversal_steering",
+        corruption={"rotation_z_deg": 20},
+        corruption_matrix=np.eye(3),
+        reversal_adapter={"learned": "outputs/user_modules/rotz20/user.pt"},
+        reversal_adapter_matrix=np.eye(7),
+        reversal_adapter_user_path="outputs/user_modules/rotz20/user.pt",
+        reversal_adapter_task_path="task.pt",
+    )
+    calibration = tum.calibration_control(control)
+    assert calibration.reversal_adapter is None and calibration.reversal_adapter_matrix is None
+    assert calibration.reversal_adapter_user_path is None and calibration.reversal_adapter_task_path is None
+    assert (
+        calibration.corruption == {"rotation_z_deg": 20}
+        and calibration.corruption_matrix is control.corruption_matrix
+    )
+    assert control.reversal_adapter_user_path is not None  # the arm's own settings are left alone
+    args = tum.parse_args(
+        [
+            "--config",
+            "c.yaml",
+            "--out",
+            "o",
+            "--set",
+            "scene.suite=libero_spatial",
+            "--set",
+            "scene.task_ids=[0, 1]",
+        ]
+    )
+    assert args.sets == ["scene.suite=libero_spatial", "scene.task_ids=[0, 1]"]
 
 
 def test_field_loss_is_zero_for_the_exact_path_velocity_and_scales_otherwise():
@@ -79,10 +139,12 @@ def test_regenerate_round_trips_a_constant_field_and_heading_cosine():
 
 
 def test_stack_batches_and_batched_reference():
-    b1 = {"observation.state": torch.zeros(1, 2), "task": ["a"]}
-    b2 = {"observation.state": torch.ones(1, 2), "task": ["b"]}
+    b1 = {"observation.state": torch.zeros(1, 2), "task": ["a"], "action": None, "next.reward": 0.0}
+    b2 = {"observation.state": torch.ones(1, 2), "task": ["b"], "action": None, "next.reward": 0.0}
     stacked = tum.stack_batches([b1, b2])
     assert stacked["observation.state"].shape == (2, 2) and stacked["task"] == ["a", "b"]
+    # the preprocessor's per-transition defaults are carried over, not stacked
+    assert stacked["action"] is None and stacked["next.reward"] == 0.0
     ref = Flow.uniform_reference(
         np.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.0]]),
         np.array([-1.0, 1.0]),
@@ -136,19 +198,23 @@ def test_cross_step_dims_take_action_dim_names_or_indices():
         )  # no coupling to restrict
 
 
-def test_field_loss_applies_the_cross_step_coupling():
-    user = LearnedUserModule(
-        horizon=CHUNK, n_dims=7, d=16, tdim=8, cross_step_rank=2, cross_step_dims=[0, 1, 2]
-    )
-    torch.manual_seed(0)
-    with torch.no_grad():
-        for p in user.parameters():
-            p.add_(0.1 * torch.randn_like(p))
-    a_bci, z_l, t = torch.randn(2, CHUNK, MAX_DIM), torch.randn(2, CHUNK, MAX_DIM), torch.rand(2)
-    field = lambda x_t, tt: 0.5 * x_t  # noqa: E731
-    x_t = (1 - t[:, None, None]) * a_bci + t[:, None, None] * z_l
-    pred = user.velocity(x_t, t, field(x_t, t)[..., :7])
-    expected = ((pred - (z_l - a_bci)[..., :7]) ** 2).mean((1, 2)).mean()
-    torch.testing.assert_close(LearnedUserModule.field_loss(user, field, a_bci, z_l, t), expected)
-    per_step = torch.einsum("bhij,bhj->bhi", user(x_t, t), field(x_t, t)[..., :7])
-    assert not torch.allclose(pred, per_step)  # the coupling is in the loss
+def test_states_are_collected_at_the_chunk_boundaries_from_the_first():
+    from types import SimpleNamespace
+
+    class FakeSession:
+        suite, task_id, task_description = "s", 0, "t"
+
+        def set_mode(self, mode):
+            pass
+
+        def rollout(self, task, recorder=None):
+            for k in range(
+                25
+            ):  # as Session.rollout reports: the step count after the step, the observation before it
+                recorder(step=k + 1, observation={"k": k})
+
+    settings = SimpleNamespace(task_ids=[0], session=SimpleNamespace(suite="s", n_action_steps=10))
+    states = tum.collect_states(FakeSession(), settings, 2, np.random.default_rng(0))
+    assert [(s["episode"], s["step"], s["observation"]["k"]) for s in states] == [
+        (0, 0, 0), (0, 10, 10), (0, 20, 20), (1, 0, 0), (1, 10, 10), (1, 20, 20)
+    ]  # fmt: skip

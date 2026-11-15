@@ -196,7 +196,7 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
 
 
 def noise_line(session: Session) -> str:
-    std = session.chain.noisy.input_noise
+    std = session.chain.readout.input_noise
     return f"Input noise: std {std:.3f} on x/y/z while you command." if std > 0 else "Input noise: off."
 
 
@@ -205,7 +205,7 @@ def cmd_noise(session: Session, tokens: list[str]) -> None:
         if len(tokens) > 2:
             raise ValueError
         if len(tokens) == 2:
-            session.chain.noisy.input_noise = float(tokens[1])
+            session.chain.readout.input_noise = float(tokens[1])
     except ValueError:
         print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
         return
@@ -230,7 +230,7 @@ def _cmd_matrix(session: Session, tokens: list[str], name: str, holder, build) -
 
 
 def cmd_corruption(session: Session, tokens: list[str]) -> None:
-    corruption = session.chain.corruption
+    corruption = session.chain.readout
     if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
         curl = build_curl(read_matrix_spec(tokens[1]))
         if curl is not None:  # a curl field replaces any matrix
@@ -246,7 +246,7 @@ def cmd_corruption(session: Session, tokens: list[str]) -> None:
 
 
 def cmd_adapter(session: Session, tokens: list[str]) -> None:
-    corruption = session.chain.corruption
+    corruption = session.chain.readout
     basis = corruption.curl.steady_state() if corruption.curl is not None else corruption.matrix
     if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
         spec = SteeringConfig.from_spec(read_matrix_spec(tokens[1]), basis, device="cpu")
@@ -321,13 +321,13 @@ def main():
         "Type an instruction (empty = built-in), `tasks`, `task <suite> <id>`, `mode <name> [n]`, "
         "`noise [std]`, `corruption [file|off]`, `adapter [file|off]`, or `quit`.\n"
     )
-    if session.chain.corruption.matrix is not None:
-        print(session.chain.corruption.describe() + "\n")
+    if session.chain.readout.matrix is not None:
+        print(session.chain.readout.describe() + "\n")
     if session.adapter.matrix is not None:
         print(session.adapter.describe() + "\n")
     if session.mode != "policy":
         print(session.announce_mode() + "\n")
-    if session.chain.noisy.input_noise > 0:
+    if session.chain.readout.input_noise > 0:
         print(noise_line(session) + "\n")
 
     try:

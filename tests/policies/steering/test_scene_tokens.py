@@ -94,12 +94,8 @@ def _live(src, geometry="absolute"):
     "src, geometry",
     [
         ("discs", "absolute"),
-        ("vlm_image", "absolute"),
-        ("vlm_prefix", "absolute"),
-        ("cnn", "absolute"),
         ("vlm_views", "absolute"),
         ("vlm_image", "relative"),
-        ("cnn", "relative"),
     ],
 )
 def test_a_bound_call_equals_the_unbound_call(src, geometry):

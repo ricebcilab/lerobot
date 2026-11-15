@@ -346,6 +346,42 @@ def task_targets(trials: pd.DataFrame) -> dict[int, str | None]:
     return targets
 
 
+def suite_task_targets(trials: pd.DataFrame) -> dict[tuple[str, int], str | None]:
+    """`task_targets` per suite, keyed (suite, task id): task ids repeat across suites."""
+    if "suite" not in trials:  # records older than the suite field: one suite, keyed None
+        return {(None, task): target for task, target in task_targets(trials).items()}
+    return {
+        (str(suite), task): target
+        for suite, group in trials.groupby("suite")
+        for task, target in task_targets(group).items()
+    }
+
+
+def wrong_target(trials: pd.DataFrame, targets: dict | None = None) -> pd.Series:
+    """Per trial: 1.0 where what moved most (`mode_expressed`) was a scene element other than the task's target, the
+    robot analogue of the cursor's wrong target; 0.0 where it was the target or nothing moved; NaN where the task's
+    target is unknown, so a rate is taken over the known tasks only.
+
+    `targets` maps (suite, task id), or a bare task id, to the element; the default is `suite_task_targets` of
+    these trials. A frame without the ceiling anchor (a later stage's) should be given the targets of the stage
+    that ran it, or a task every method fails has no target and drops out. The measure sees another element
+    moving, not the right element put in the wrong place: where tasks share an element (LIBERO-Goal's bowl) it
+    under-counts wrong goals, so the study reports it on LIBERO-Object."""
+    known = suite_task_targets(trials) if targets is None else targets
+    suites = trials["suite"] if "suite" in trials else pd.Series(None, index=trials.index)
+    target = pd.Series(
+        [
+            known.get((suite, int(task)), known.get(int(task)))
+            for suite, task in zip(suites, trials["task_id"], strict=True)
+        ],
+        index=trials.index,
+        dtype=object,
+    )
+    moved = trials["mode_expressed"]
+    wrong = (moved.notna() & (moved != target)).astype(float)
+    return wrong.where(target.notna())
+
+
 def _locate(z, element: str):
     """The (kind, (T, d)) track of a scene element in a trial's arrays, or None."""
     for kind, names_key, track_key in (

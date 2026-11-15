@@ -19,9 +19,17 @@ from .configuration_keyboard import (
     KeyboardRoverTeleopConfig,
     KeyboardTeleopConfig,
 )
-from .teleop_keyboard import KeyboardEndEffectorTeleop, KeyboardRoverTeleop, KeyboardTeleop
+from .teleop_keyboard import (
+    KeyboardAxes,
+    KeyboardEndEffectorTeleop,
+    KeyboardRoverTeleop,
+    KeyboardTeleop,
+    key_name,
+)
 
 __all__ = [
+    "KeyboardAxes",
+    "key_name",
     "KeyboardTeleopConfig",
     "KeyboardTeleop",
     "KeyboardEndEffectorTeleopConfig",

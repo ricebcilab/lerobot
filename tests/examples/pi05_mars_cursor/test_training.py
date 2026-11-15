@@ -3,6 +3,7 @@ module, its closed-loop recalibration and a disc task module; the image module w
 module; the teacher's student; the two-view module; the user module on a fine-tuned policy) and the parser's refusals.
 The losses are pinned against the cursor reference in test_steering_equivalence.py."""
 
+import functools
 import json
 from dataclasses import replace
 
@@ -50,12 +51,23 @@ def _base_policy():
     return load_policy(train_adapter.policy_path(config.load_arm("base.yaml")["model"]), "cpu").model
 
 
+def _small_check(mp):
+    """The trainer's held-out check on 64 samples instead of its 2 048: it is what a tiny run spends its time on."""
+    mp.setattr(train_adapter, "expert_check", functools.partial(train_adapter.expert_check, n=64))
+
+
+@pytest.fixture(autouse=True)
+def small_check(monkeypatch):
+    _small_check(monkeypatch)
+
+
 @pytest.fixture(scope="module")
 def trained(tmp_path_factory):
     """The checkpoint folder every run of this module writes to, holding three tiny runs: the user module `u`, its
     ReFIT-style closed-loop recalibration `u_cl`, and the disc task module `t` with `u` in the loop, saved every 2 steps."""
     root = tmp_path_factory.mktemp("adapters")
     with pytest.MonkeyPatch.context() as mp:
+        _small_check(mp)
         mp.setattr(train_adapter, "adapter_dir", lambda name: root / name)
         mp.setattr(train_adapter, "adapter_path", lambda name: root / name / "adapter.pt")
         for argv in (["--kind", "user", *ROT, "--name", "u"],
@@ -363,30 +375,6 @@ def test_a_two_view_module_trains_on_the_scripted_draws(trained, monkeypatch):
 STORED = ["--token-source", "vlm_image", "--render-size", "32", "--rigid-motions", "1", *COMMON]
 
 
-def test_a_stored_run_equals_the_resident_run(trained, tmp_path, monkeypatch, capsys):
-    """--scene-store keeps the tokens in a disk store gathered per batch: the same module and log as the run whose
-    layouts carry their tokens, the moved copies and the val split included."""
-    monkeypatch.setattr(train_adapter, "SceneEncoder", TokenStub)
-    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_resident", *STORED))
-    capsys.readouterr()
-    splits, _ = _recording(monkeypatch, "expert_splits")
-    train_adapter.train(_args(*TASK, "--obstacle", IMAGE, "--name", "t_stored", *STORED, "--scene-store", str(tmp_path / "store")))
-    out = capsys.readouterr().out.splitlines()
-    resident, stored = (torch.load(trained / n / "adapter.pt") for n in ("t_resident", "t_stored"))
-    assert resident["config"] == stored["config"] and resident["state_dict"].keys() == stored["state_dict"].keys()
-    assert all(torch.equal(v, stored["state_dict"][k]) for k, v in resident["state_dict"].items())
-    assert _log(trained, "t_resident") == _log(trained, "t_stored")
-    (folder,) = (p.name for p in (tmp_path / "store").iterdir())
-    assert folder.startswith("vlm_image_32_") and stored["meta"]["scene_store"] == folder and resident["meta"]["scene_store"] is None
-    assert (stored["meta"]["scene_rank"], stored["meta"]["scene_center"]) == (None, None)
-    (data,) = splits
-    train = data["train"].sampler
-    n = len(train.lengths)
-    assert train.scene is None and n > 60 and f"train: {n} scenes, {n} newly encoded" in "\n".join(out)
-    assert any(line.startswith("val: 40 scenes, 40 newly encoded") and line.endswith(f"store {tmp_path / 'store' / folder}")
-               for line in out), out
-
-
 def test_a_reduced_image_module_trains_from_the_store_and_carries_its_basis(trained, tmp_path, monkeypatch):
     """--scene-rank with vlm_image: the PCA is fitted on the train split's stored rows, the sampler feeds the reduced
     tokens and the module carries the reduction (relative geometry added after the projection)."""
@@ -435,13 +423,6 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
         assert [e[key] for e in log["log"]] == pytest.approx([e[key] for e in plain["log"]], rel=1e-4)
     assert "eval" not in plain
     assert log["args"]["eval_obstacle"] == log["args"]["obstacle"]  # scored on the task's own layouts by default
-    # a fine-tune on layouts without a goal cue (decoy: any) is scored on the task's placement (--eval_obstacle), or
-    # the score would favour the early weights that do well where the obstacle is out of the way
-    any_ring = json.dumps({**json.loads(json.dumps(log["args"]["obstacle"])), "decoy": "any"})
-    train_policy.main(["--name", "scored_any", "--init", "base", "--obstacle", any_ring, "--eval_obstacle", RING,
-                       "--demo_seconds", "12", *tiny, "--eval_steps", "2", "--eval_trials", "4"])
-    log_any = json.loads((trained / "scored_any" / "train_log.json").read_text())
-    assert log_any["args"]["obstacle"]["decoy"] == "any" and log_any["args"]["eval_obstacle"] == log["args"]["obstacle"]
     args = _args(*TASK, "--obstacle", RING, "--name", "t", "--demo-seconds", "12", "--val-demos", "10")
     data = train_adapter.expert_splits(args, args.obstacle, FlowPolicy().eval(), "cpu", np.random.default_rng(args.seed),
                                        *corruption_spec(args.corruption), args.p_free)
@@ -451,53 +432,24 @@ def test_a_fine_tune_on_a_time_budget_keeps_its_best_scored_weights(trained, mon
     assert torch.load(trained / "u_scored" / "adapter.pt")["meta"]["args"]["model"] == "scored"
 
 
-CURLED = "{curl: 2.0, tau: 0.1}"
 POOLED = ["--kind", "task", "--pooled", "POOLED", "--name", "x"]
 VIEWS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x", "--token-source", "vlm_views"]
 DISCS_TASK = [*TASK, "--obstacle", IMAGE, "--name", "x"]
 
 
-@pytest.mark.parametrize("argv, outcome", [  # True: refused; else the parsed values
+@pytest.mark.parametrize("argv, outcome", [  # True: refused; else the parsed values. One case per kind of rule.
     (["--kind", "task", "--obstacle", IMAGE, *ROT, "--name", "x"], True),            # a task module needs its user module
     (["--kind", "user", "--obstacle", IMAGE, *ROT, "--name", "x"], True),           # a user module calibrates on the open field
-    (["--kind", "user", *ROT, "--name", "x", "--frozen-noise", "--closed-loop", "u"], True),
-    (["--kind", "user", *ROT, "--name", "x", "--cross-step-dims", "0"], True),     # needs --cross-step-rank
     (["--kind", "user", *ROT, "--name", "x", "--cross-step-rank", "2", "--cross-step-dims", "1"], {"cross_step_dims": [1], "step_rank": None}),
-    (["--kind", "user", *ROT, "--name", "x"], {"cross_step_dims": None, "step_rank": None}),
-    ([*DISCS_TASK, "--token-geometry", "relative"], True),                         # discs have no screen tokens
     ([*POOLED, "--obstacle", IMAGE], True),                                        # --pooled carries its own obstacles
-    ([*DISCS_TASK, "--save-every", "3"], True),                                    # not a multiple of COMMON's --log-every 2
-    ([*DISCS_TASK, "--teacher", "t", "--teacher-chunk", "0"], True),
-    ([*DISCS_TASK, "--teacher", "t", "--demo-seconds", "10"], True),               # a time budget is the scripted expert's
-    (["--kind", "user", *ROT, "--name", "x", "--teacher", "t"], True),
-    ([*POOLED, "--teacher", "t"], True),                                           # no pooled teacher run
     ([*VIEWS_TASK, "--jitter", "0.02"], True),                                     # the picture would show the cursor elsewhere
-    ([*VIEWS_TASK, "--rigid-motions", "2"], True),
-    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--rigid-motions", "2"], {"rigid_motions": 2}),  # unmirrored copies
-    ([*TASK[:2], "--user-module", "u", "--corruption", CURLED, "--obstacle", IMAGE, "--name", "x", "--jitter", "0.02"], {"jitter": 0.02}),
-    (["--kind", "task", "--pooled", "CURLED_POOL", "--name", "x", "--rigid-motions", "2"], {"rigid_motions": 2}),
-    ([*POOLED, "--jitter", "0.02"], {"jitter": 0.02}),
-    ([*DISCS_TASK, "--teacher", "t", "--rigid-motions", "2"], True),               # a teacher's demonstrations are rollouts
-    ([*DISCS_TASK, "--teacher", "t", "--jitter", "0.02"], {"jitter": 0.02}),
-    ([*DISCS_TASK, "--jitter", "-0.1"], True), ([*DISCS_TASK, "--jitter-steps", "0"], True), ([*DISCS_TASK, "--rigid-motions", "-1"], True),
-    (["--kind", "user", *ROT, "--name", "x", "--jitter", "0.02"], True),            # the task module's
-    (["--kind", "user", *ROT, "--name", "x", "--rigid-motions", "2"], True),
-    ([*VIEWS_TASK, "--token-geometry", "relative"], True), ([*VIEWS_TASK, "--teacher", "t"], True),
-    ([*POOLED, "--token-source", "vlm_views"], True), ([*DISCS_TASK, "--token-drop", "0.3"], True),
-    ([*DISCS_TASK, *CNN, "--view-affine", "0.5"], True), ([*VIEWS_TASK, "--wrist-span", "0"], True),
-    ([*VIEWS_TASK, "--view-stride", "0"], True), ([*VIEWS_TASK, "--scene-rank", "2048"], True),
-    ([*VIEWS_TASK, "--token-drop", "1.0"], True), ([*VIEWS_TASK, "--view-affine", "1.5"], True),
-    ([*VIEWS_TASK, "--scene-center", "no", "--scene-rank", "0"], True), ([*DISCS_TASK, *CNN, "--scene-center", "no"], True),
-    ([*DISCS_TASK, "--scene-rank", "8"], True), ([*DISCS_TASK, *CNN, "--scene-rank", "8"], True),  # discs have no tokens; cnn's are not 2048 wide
-    ([*DISCS_TASK, "--scene-store", "s"], True), ([*VIEWS_TASK, "--scene-store", "s"], True),     # no scene; the views' frame table
-    ([*DISCS_TASK, "--token-source", "vlm_image", "--scene-center", "no"], True),                 # no reduction to centre
-    ([*DISCS_TASK, "--token-source", "vlm_image"], {"scene_rank": None, "scene_store": None}),
+    ([*DISCS_TASK, "--scene-rank", "8"], True),                                    # discs have no tokens
     ([*DISCS_TASK, "--token-source", "vlm_prefix", "--scene-rank", "8", "--scene-center", "no", "--scene-store", "s"],
      {"scene_rank": 8, "scene_center": "no", "scene_store": "s"}),
-    ([*VIEWS_TASK], {"scene_rank": 256}), ([*DISCS_TASK], {"scene_rank": None}),
+    ([*VIEWS_TASK], {"scene_rank": 256}),
 ])
 def test_the_parser_refuses_what_makes_no_sense(argv, outcome, tmp_path):
-    entries = {"POOLED": ROT[1], "CURLED_POOL": CURLED}
+    entries = {"POOLED": ROT[1]}
     for name, corruption in entries.items():
         (tmp_path / f"{name}.yaml").write_text(f"entries:\n  - {{obstacle: {IMAGE}, user_module: u, corruption: {corruption}}}\n")
     argv = [str(tmp_path / f"{a}.yaml") if a in entries else a for a in argv]

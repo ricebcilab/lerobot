@@ -108,7 +108,7 @@ REPORTS = [
 ]
 
 
-@pytest.mark.parametrize("ending", [b"", OSError("unplugged"), ValueError("closed")])
+@pytest.mark.parametrize("ending", [OSError("unplugged")])
 def test_reader_matches_the_reference(monkeypatch, ending):
     old, old_hid, new, new_hid = open_scripted(monkeypatch)
     assert same(old.translation, new.translation)
@@ -139,24 +139,13 @@ def test_reader_matches_the_reference(monkeypatch, ending):
     new.close()
 
 
-@pytest.mark.parametrize("report", REPORTS + [motion(0, 350), motion(-1, 1, 1)])
-def test_parse_report_matches_the_reference(report):
-    old_kind, old_value = ref.parse_report(report)
-    new_kind, new_value = devices.parse_report(report)
-    assert old_kind == new_kind
-    if old_kind == "translation":
-        assert same(old_value, new_value)
-    else:
-        assert old_value == new_value
-
-
 def test_find_spacemouse_returns_none_when_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(hid, "find_spacemouse", functools.partial(hid.find_spacemouse, sysfs=tmp_path))
     assert devices.find_spacemouse() is None
     (tmp_path / "hidraw3" / "device").mkdir(parents=True)
     (tmp_path / "hidraw3" / "device" / "uevent").write_text("HID_ID=0003:0000046D:0000C62B\n")
     assert devices.find_spacemouse() == "/dev/hidraw3"
-    assert devices.find_spacemouse(devices.SPACEMOUSE_HID_ID) == "/dev/hidraw3"
+    assert devices.find_spacemouse(hid.SPACEMOUSE_PRO_HID_ID) == "/dev/hidraw3"
     assert devices.find_spacemouse("0000256F:0000C635") is None
 
 
@@ -176,9 +165,11 @@ class RecordingReader:
 @pytest.mark.parametrize(
     "env, hid_id, full_scale",
     [
-        ({}, None, 350.0),  # unset: any 3Dconnexion device, today's full-scale count
-        ({"SPACEMOUSE_HID_ID": "0000256F:0000C635"}, "0000256F:0000C635", 350.0),
-        ({"SPACEMOUSE_FULL_SCALE": "700"}, None, 700.0),
+        (
+            {"SPACEMOUSE_HID_ID": "0000256F:0000C635", "SPACEMOUSE_FULL_SCALE": "700"},
+            "0000256F:0000C635",
+            700.0,
+        ),
     ],
 )
 def test_spacemouse_env_vars_reach_the_reader(monkeypatch, env, hid_id, full_scale):

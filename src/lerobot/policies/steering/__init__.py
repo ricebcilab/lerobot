@@ -23,8 +23,8 @@ The package keeps lerobot's layout for a policy:
   ``matrix_spec``), and the constants its validation reads.
 - ``modeling_steering``: ``SteeringPolicy`` (the lerobot policy, driving every base through pi0.5's sampler
   interface, which ``PI05Policy`` and ``CursorFlowPolicy`` offer; the cursor example runs it) and the cores it
-  wraps: the two methods, ``FlowControlSteering`` and ``FlowReversalSteering``, over the operator's
-  ``TeleopSource``; the MARS modules
+  wraps: the two methods, ``FlowControlSteering`` and ``FlowReversalSteering`` (the command per call, or pulled
+  from an operator's ``TeleopSource``); the MARS modules
   (``LearnedUserModule``, ``LearnedTaskModule`` and their one holder, ``AdapterModules``, with their checkpoints);
   ``AdaptedField``; and ``Flow``, the one Euler integrator and what is built on it.
 - ``processor_steering``: ``make_steering_pre_post_processors``, the steps ``SteeringSceneTokensProcessorStep`` and

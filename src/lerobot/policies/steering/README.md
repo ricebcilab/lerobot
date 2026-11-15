@@ -29,8 +29,11 @@ always the model's own output:
   space without that gripper dim (the cursor's two dims) the command held at `reference_step` (`max_speed * dt`)
   action units per control step, `(per_step * reference_step - mean) / std`.
 
-Both read an operator `TeleopSource` and take the checkpoint's action statistics from the postprocessor
-(`action_mean_std`). `FlowControlSteering.check_steps` (both cores have it) is the one check of their step knobs.
+Both take the checkpoint's action statistics from the postprocessor (`action_mean_std`). A core gets the operator's
+command per call (`steered_chunk(batch, commands)`, one chunk; `chunk_for(batch, commands)`, a rollout's next chunk
+with the state a rollout keeps: FRS's held gripper and its counts), or pulls it from a `TeleopSource` once per chunk
+as a policy of its own (`select_action`). `FlowControlSteering.check_steps` (both cores have it) is the one check of
+their step knobs.
 `AdapterModules`, the one adapter holder of the cores, the policy and the LIBERO session, is MARS (Modular Adapters
 for Reversal Steering, the method formerly called FRS-RA). It has two optional parts:
 
@@ -92,7 +95,9 @@ The cores are not pi0.5-specific. They steer any flow policy with pi0.5's sample
 `predict_action_chunk` taking `noise_fn`, `flow_start_time`, `num_forward_steps`, `x_t_hook` and `velocity_hook`.
 They work in either flow-time convention, and `steered_chunk(batch, commands)` serves a batch of commands. The cursor
 policy offers the interface itself (`CursorFlowPolicy`), so the robot and the cursor run one implementation of each
-method: the cursor example's controller, sweeps and agents take their chunks from `SteeringPolicy` over it.
+method, through one policy: the cursor example's controller, sweeps and agents take their chunks from
+`SteeringPolicy` over it, and the LIBERO session's shared modes are a `SteeringPolicy` over pi0.5 with the session's
+adapter in its slot and the command in the batch.
 
 ## The scene
 
@@ -135,7 +140,9 @@ features, as `CursorFlowConfig`.
 - `predict_action_chunk` returns the steered chunk for `batch["command"]`, the operator's deflection: `(B, n)`,
   `(B, H, n)` per chunk step, or `(n,)` for a single unbatched trial. `n` is at most `n_dims` (a pi0.5 base's
   translation is 3). The chunk is normalized, as the base's: the base's postprocessor unnormalizes it.
-  `select_action` serves the chunk's first `n_action_steps` steps (the base's) one per call. Mode `"none"` is the
+  `select_action` is a rollout's: it serves the chunk's first `n_action_steps` steps (the base's) one per call, takes
+  the command of the batch that starts a chunk, keeps the base's own plan for the step served (`last_policy_action`,
+  from the same noise) and the core's rollout state (`chunk_for`); `reset` starts a new rollout. Mode `"none"` is the
   base's own chunk through the task module, the command ignored; so is a batch without a command, in any mode, and
   `noise` (pi0.5's keyword) starts that chunk from a given noise (a steered chunk draws its own: a command with
   `noise` raises).

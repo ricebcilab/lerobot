@@ -1,0 +1,5 @@
+# U3, misperception and delay: a lag-and-turn field. The served command trails the push with a 0.5 s time
+# constant (one chunk) and settles 45 degrees off in the horizontal plane at 0.71 of its size; z is a plain lag.
+extends: study_object.yaml
+control:
+  corruption: {curl: 2, tau: 0.5}

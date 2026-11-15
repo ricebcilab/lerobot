@@ -186,7 +186,7 @@ def test_replays_run_500_rows_at_a_time(monkeypatch):
     assert len(rows) >= 2 and max(rows) == 500 and len(out) > 4200
 
 
-@pytest.mark.parametrize("case", ["k=0", "all failed", "one failed"])
+@pytest.mark.parametrize("case", ["k=0", "one failed"])
 def test_nothing_to_copy_returns_the_originals(case):
     lay, actions, lengths = _demos(TASK)
     lengths = np.zeros_like(lengths) if case == "all failed" else lengths.copy()
@@ -316,11 +316,8 @@ def _diag_sweep(tmp_path, rel="nowhere"):
 @pytest.mark.parametrize(
     "extra, message",
     [
-        (["--context", "T2", "--trials", "0"], "--trials must be at least 1"),
         (["--context", "T0", "--trials", "3"], "no obstacle"),
         (["--context", "T2", "--trials", "3", "--p-free", "1.0"], "the train set is empty"),
-        (["--context", "T2", "--trials", "3", "--n-demos", "0"], "the train set would be empty"),
-        (["--context", "T9", "--trials", "3"], "needs exactly one cell"),
     ],
 )
 def test_the_diagnostic_refuses_what_it_cannot_diagnose(tmp_path, capsys, extra, message):

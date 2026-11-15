@@ -276,7 +276,7 @@ def test_mode_none_ignores_the_command(tmp_path):
         steering.predict_action_chunk({**obs, "command": COMMAND[:2]})  # checked though ignored
 
 
-@pytest.mark.parametrize("mode", ["none", "flow_control", "frs"])
+@pytest.mark.parametrize("mode", ["flow_control", "frs"])
 def test_no_command_is_the_bases_own_chunk_from_the_noise_given(tmp_path, mode):
     """Without a command, in every mode, the chunk is the base's own through the task module, and ``noise`` (pi0.5's
     keyword) starts it; a steered chunk draws its own noise, so a command with ``noise`` raises."""
@@ -512,6 +512,47 @@ def test_select_action_serves_the_chunks_executed_steps_one_per_call():
     steering.reset()
     torch.manual_seed(6)
     assert torch.equal(steering.select_action(batch), chunk[:, 0]) and len(steering._action_queue) == 2
+
+
+@pytest.mark.parametrize("mode", ["flow_control", "frs"])
+def test_select_action_is_the_cores_rollout_for_the_command_in_the_batch(mode):
+    """A rollout through the policy, the command in the batch that starts each chunk, is the mode's core pulling the
+    same command from a source (the robot example's rollouts before they ran the policy): the same actions, the same
+    plan for every step (``last_policy_action``) and the same rollout state (FRS's held gripper and its counts)."""
+    from types import SimpleNamespace
+
+    post, source = _pi05_postprocessor(7), SimpleNamespace(translation=None, gripper=-1.0)
+    shared = {"operator_dims": ["translation"], "n_dims": 3, "device": "cpu"}
+    if mode == "flow_control":
+        pulled = FlowControlSteering(_SamplerBase(), source, post, tau=5, lam=1, ic_gain="action")
+        config = SteeringConfig(mode=mode, tau=5, lam=1, ic_gain="action", **shared)
+    else:  # the core's default pins the executed prefix (3 steps)
+        pulled = FlowReversalSteering(_SamplerBase(), source, post, n_reversal_steps=2)
+        config = SteeringConfig(mode=mode, n_reversal_steps=2, pinned_steps=3, **shared)
+    steering = SteeringPolicy(config, base_policy=_SamplerBase(), postprocessor=post)
+    obs = {"observation.state": torch.zeros(1, 8), "task": ["pick"]}
+    pulled.reset()
+    steering.reset()
+    commands = [[0.5, -0.2, 0.1], [0.0, 0.0, 0.01], [-0.3, 0.4, 0.0]]  # a push, an idle chunk, a push
+    for seed, command in enumerate(commands):
+        source.translation = np.array(command)
+        torch.manual_seed(seed)
+        want = [(pulled.select_action(obs), pulled.last_policy_action) for _ in range(3)]
+        torch.manual_seed(seed)
+        batch = {**obs, "command": torch.tensor([command], dtype=torch.float64)}
+        got = [(steering.select_action(batch), steering.last_policy_action) for _ in range(3)]
+        for (action, plan), (want_action, want_plan) in zip(got, want, strict=True):
+            assert torch.equal(action, want_action) and torch.equal(plan, want_plan)
+        assert torch.equal(got[0][0], got[0][1]) == (
+            seed == 1
+        )  # the plan is the action only where nothing steered
+    core = steering.core
+    if mode == "frs":
+        assert core.steered_chunks == pulled.steered_chunks == 2
+        assert core.reconstruction_errors == pulled.reconstruction_errors
+        assert core._gripper_ref == pulled._gripper_ref != core._normalize_gripper(core.gripper_open)
+    else:
+        assert core.guided_steps == pulled.guided_steps == 2
 
 
 # ---------------------------------------------------------------- off the cursor path

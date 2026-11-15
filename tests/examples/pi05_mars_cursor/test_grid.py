@@ -8,11 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from cursor_sa import config, session
-from cursor_sa.agents import ExpertAgent
-from lerobot.teleoperators.readout import Readout, corruption_spec
-from lerobot.envs.cursor import TaskConfig, curl_steady_state, obstacle_count, obstacle_spec, place_obstacles, plan_route, route_side, sample_layouts
-from cursor_sa.session import readout_for, load_checkpoints, run_trials
+from cursor_sa import session
+from lerobot.envs.cursor import TaskConfig, obstacle_count, obstacle_spec, place_obstacles, plan_route, route_side, sample_layouts
 from lerobot.policies.steering import LearnedTaskModule, LearnedUserModule
 from run_sweep import cell_groups, cell_key, load_sweep, main as sweep_main, method_arm
 
@@ -79,48 +76,6 @@ def test_asymmetric_scenes_decide_the_side_and_both_sides_occur(spec):
     assert np.mean(agree) > 0.85 and 0.25 < np.mean(np.array(sides) == "left") < 0.75, (np.mean(agree), sides)
     with pytest.raises(ValueError, match="cannot place obstacles"):
         sample_layouts(np.random.default_rng(0), 1, 4, TaskConfig(**STUDY, obstacle=obstacle_spec(dict(RING_GOAL, ring_radius=0.45))))
-
-
-def test_curl_readout_turns_and_slows_the_command_and_resets_per_batch():
-    matrix, curl = corruption_spec({"curl": 20, "tau": 0.1})
-    assert matrix is None and curl == {"curl": 20.0, "tau": 0.1}
-    assert corruption_spec({"scale": [1.0, 0.25]})[1] is None
-    with pytest.raises(ValueError, match="control.corruption"):
-        corruption_spec({"curl": 20})
-    s = curl_steady_state(0.1, 10.0) @ np.array([1.0, 0.0])  # a 45 degree clockwise turn at tau * b = 1
-    assert np.isclose(np.degrees(np.arctan2(s[1], s[0])), -45) and np.isclose(np.linalg.norm(s), 1 / np.sqrt(2))
-    readout = Readout(None, 0.0, curl=curl)
-    readout.reset(2)
-    raw = np.array([[1.0, 0.0], [0.0, -0.5]])
-    for _ in range(200):
-        served = readout(raw)
-    np.testing.assert_allclose(served, raw @ curl_steady_state(0.1, 20).T, atol=1e-9)   # turned 63 degrees clockwise, slowed
-    readout.reset(2)
-    first = readout(raw)
-    assert np.linalg.norm(first, axis=1).max() < 0.25                                    # from rest it builds up
-    np.testing.assert_allclose(readout(np.zeros((2, 2))), np.zeros((2, 2)))              # idle stays idle
-    # the training twin serves the same commands step by step
-    pushes = np.random.default_rng(0).uniform(-1, 1, (3, 30, 2))
-    live = Readout(None, 0.0, curl=curl)
-    live.reset(3)
-    stepped = np.stack([live(pushes[:, k]) for k in range(30)], 1)
-    np.testing.assert_allclose(Readout(curl=curl).core(pushes), stepped, atol=1e-12)
-    with pytest.raises(ValueError, match="one command per trial"):
-        live(pushes[:, :16])
-    out = Readout.serve(torch.tensor([[0.3, 0.2], [0.3, 0.2]]), torch.tensor([[1.0, 0.0], [0.0, 0.0]]), torch.zeros(2))
-    np.testing.assert_allclose(out.numpy(), [[0.3, 0.2], [0.0, 0.0]])                   # noise-free core where active
-    arm = config.load_arm("teleop.yaml", {"corruption": {"curl": 20, "tau": 0.1}, "input_noise": 0.0})
-    assert arm["corruption_matrix"] is None and arm["corruption_curl"] == curl
-    with pytest.raises(ValueError, match="needs a corruption to copy"):
-        config.load_arm("frs.yaml", {"corruption": {"curl": 20, "tau": 0.1}, "reversal_adapter": {"translation": "corruption"}})
-    policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
-    layouts = sample_layouts(np.random.default_rng(1), 6, 4, TaskConfig(**STUDY))
-    recs = run_trials(arm, layouts, ExpertAgent(), readout_for(arm, np.random.default_rng(0)), policies[arm["model"]],
-                      adapters, "cpu")
-    served = np.array(recs[0]["served_commands"])
-    raw = np.array(recs[0]["raw_commands"])
-    late = len(raw) // 2  # mid-reach: the served command lags the push and turns it clockwise
-    assert np.cross(raw[late], served[late]) < 0 and np.linalg.norm(served[late]) < np.linalg.norm(raw[late])
 
 
 GRID = """name: tiny_grid

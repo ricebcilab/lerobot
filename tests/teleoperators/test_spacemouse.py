@@ -19,11 +19,13 @@ import struct
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from lerobot.teleoperators.spacemouse import SpaceMouseConfig, SpaceMouseTeleop, teleop_spacemouse
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SPACEMOUSE_VENDORS,
+    SpaceMouseAxes,
     SpaceMouseReader,
     find_spacemouse,
     parse_report,
@@ -130,6 +132,40 @@ def test_buttons_and_presses():
     assert reader.presses == 3  # 0->1, 1->3 (button 2 added), 0->4; releases do not count
     assert reader.take_press() is True
     assert reader.take_press() is False
+
+
+@pytest.mark.parametrize(
+    "env, hid_id, full_scale",
+    [
+        ({}, None, 350.0),  # unset: any 3Dconnexion device, the default full-scale count
+        (
+            {"SPACEMOUSE_HID_ID": "0000256F:0000C635", "SPACEMOUSE_FULL_SCALE": "700"},
+            "0000256F:0000C635",
+            700.0,
+        ),
+    ],
+)
+def test_axes_map_the_device_channels_with_the_env_defaults(monkeypatch, env, hid_id, full_scale):
+    monkeypatch.delenv("SPACEMOUSE_HID_ID", raising=False)
+    monkeypatch.delenv("SPACEMOUSE_FULL_SCALE", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    r, w = os.pipe()
+    searched = []
+    monkeypatch.setattr(
+        teleop_spacemouse, "find_spacemouse", lambda hid_id=None: searched.append(hid_id) or f"/dev/fd/{r}"
+    )
+    axes = SpaceMouseAxes(source=[1, 0, 2], sign=[1.0, -1.0, -1.0])  # the LIBERO example's map
+    os.close(r)
+    assert searched == [hid_id] and axes.reader.full_scale == full_scale
+    os.write(w, motion(350, -175, 70))
+    wait_for(lambda: axes.reader.reports_handled == 1)
+    device = np.array([350, -175, 70]) / full_scale
+    np.testing.assert_array_equal(axes.translation, [device[1], -device[0], -device[2]])
+    os.close(w)  # unplugged: the last value stays
+    wait_for(lambda: not axes.connected)
+    assert axes.translation.any()
+    axes.close()
 
 
 def test_teleop_get_action(tmp_path, monkeypatch):

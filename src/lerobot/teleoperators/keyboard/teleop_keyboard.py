@@ -17,9 +17,13 @@
 import logging
 import os
 import sys
+import threading
 import time
+from collections.abc import Callable, Iterable, Mapping
 from queue import Queue
 from typing import Any
+
+import numpy as np
 
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -45,6 +49,91 @@ if PYNPUT_AVAILABLE:
     except Exception as e:
         PYNPUT_AVAILABLE = False
         logging.info(f"Could not import pynput: {e}")
+
+
+def key_name(key: Any) -> str:
+    """A key as a lower-case name: a pynput special key by its name (`Key.up` -> "up"), anything else as text
+    (a character, a web page's "ArrowUp", an application's own name)."""
+    return str(getattr(key, "name", None) or key).lower()
+
+
+class KeyboardAxes:
+    """Held keys as a command on an application's axes: the keyboard's counterpart of `SpaceMouseAxes`.
+
+    `pushes` maps a key name (`key_name`) to the push that key adds; the command is the sum over the held keys,
+    each component clipped to [-1, 1] (or, with `unit`, the sum scaled to unit length, so a diagonal is no faster
+    than an axis), times `speed`, or at full scale while one of the `fast` keys is held. With `source` and `sign`
+    the pushes are in a device's channels and are mapped onto the application's axes as `SpaceMouseAxes` maps
+    its stick (axis i is `sign[i]` times channel `source[i]`), so a keyboard can share a stick's tuning.
+
+    The keys come from wherever the application sees them: `hold(keys)` takes the full set of keys now down (a
+    window's key state, a web page's report, or the pressed keys of a `KeyboardTeleop`'s listener,
+    `hold(teleop.get_action())`), so a lost release cannot stick a key. With `stale_after` the keys are dropped
+    after that many seconds without a `hold` (a page that stopped reporting). Safe to feed from one thread and
+    read from another.
+    """
+
+    def __init__(
+        self,
+        pushes: Mapping[str, Iterable[float]],
+        speed: float = 0.5,
+        fast: Iterable[str] = ("shift",),
+        unit: bool = False,
+        source=None,
+        sign=None,
+        stale_after: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.pushes = {key_name(k): np.asarray(v, dtype=np.float64) for k, v in pushes.items()}
+        widths = {v.shape for v in self.pushes.values()}
+        if len(widths) != 1 or len(next(iter(widths))) != 1:
+            raise ValueError(
+                f"every key's push must be one vector of the same length, got shapes {sorted(widths)}"
+            )
+        self.speed, self.unit = speed, unit
+        self.fast = {key_name(k) for k in fast}
+        self.source = None if source is None else np.asarray(source, dtype=np.intp)
+        self.sign = None if sign is None else np.asarray(sign, dtype=np.float64)
+        if (self.source is None) != (self.sign is None):
+            raise ValueError("source and sign come together")
+        self.stale_after = stale_after
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._held: set = set()
+        self._updated = -np.inf
+
+    def hold(self, keys: Iterable) -> None:
+        """The full set of keys now down."""
+        keys = set(keys)
+        with self._lock:
+            self._held, self._updated = keys, self._clock()
+
+    def _fresh(self) -> bool:
+        return self.stale_after is None or self._clock() - self._updated <= self.stale_after
+
+    @property
+    def held(self) -> set:
+        """The keys down as they were given (none once stale)."""
+        with self._lock:
+            return set(self._held) if self._fresh() else set()
+
+    def map(self, push) -> np.ndarray:
+        """A push in the `pushes`' own channels onto the application's axes."""
+        push = np.asarray(push, dtype=np.float64)
+        return push if self.source is None else push[self.source] * self.sign
+
+    @property
+    def translation(self) -> np.ndarray:
+        names = {key_name(k) for k in self.held}
+        push = np.zeros(next(iter(self.pushes.values())).shape)
+        for name in names:
+            if name in self.pushes:
+                push = push + self.pushes[name]
+        scale = 1.0 if names & self.fast else self.speed
+        if not self.unit:
+            return self.map(np.clip(push, -1.0, 1.0)) * scale
+        norm = np.linalg.norm(push)
+        return self.map(push / norm * scale) if norm else np.zeros(self.map(push).shape)
 
 
 class KeyboardTeleop(Teleoperator):

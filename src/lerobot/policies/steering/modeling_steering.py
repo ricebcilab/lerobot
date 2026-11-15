@@ -1219,6 +1219,13 @@ class _ChunkSteering:
         self._policy_queue.clear()
         self._pending_command = None
 
+    def chunk_for(self, batch, commands, field=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """A rollout's next chunk for the operator's ``commands`` ((B, n); None: every row idle) and the policy's
+        own plan from the same noise (``steered_chunk``, paired), with what a rollout keeps from chunk to chunk
+        (each core's own). ``select_action`` serves it for the command read from ``source``; the steering policy's
+        ``select_action`` for the command in its batch."""
+        return self.steered_chunk(batch, commands, field=field)
+
     def select_action(self, batch) -> torch.Tensor:
         if len(self._queue) == 0:
             chunk, plain = self._sample_chunk(batch)
@@ -1416,7 +1423,7 @@ class FlowControlSteering(_ChunkSteering):
         # Hold one consumed command (including its noise) for the whole chunk,
         # matching FRS and the synthetic operator's refresh cadence.
         command = self._read_command(read=bool(self._lam))
-        return self.steered_chunk(batch, None if command is None else np.asarray(command)[None])
+        return self.chunk_for(batch, None if command is None else np.asarray(command)[None])
 
 
 class FlowReversalSteering(_ChunkSteering):
@@ -1687,24 +1694,28 @@ class FlowReversalSteering(_ChunkSteering):
         chunk, plain = Flow.paired_chunks(self._policy, batch, common, noise_fn=noise_fn, **schedule)
         return self._per_row(chunk, plain, steer), plain
 
+    def chunk_for(self, batch, commands, field=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """``steered_chunk``'s chunk and plan, and the rollout's state: the gripper the next reference holds (the
+        model's last executed command, per row), the count of steered chunks, and each steered chunk's mean
+        distance from its reference over the executed translation (std units; the steered rows')."""
+        chunk, plain = self.steered_chunk(batch, commands, field=field)
+        self._last_reference = self._pending_reference  # None when no row steered
+        executed = chunk[:, : self._policy.config.n_action_steps].float().cpu()  # one device sync per chunk
+        if self._has_gripper:
+            last = executed[:, -1, GRIPPER_DIM]
+            self._gripper_ref = float(last[0]) if len(last) == 1 else last.double().numpy()
+        if self._last_reference is not None:
+            self.steered_chunks += 1
+            rows = self._active(commands).cpu()
+            target = self._last_reference[:, : executed.shape[1], :3].float().cpu()
+            self.reconstruction_errors.append((executed[rows][..., :3] - target[rows]).abs().mean().item())
+        return chunk, plain
+
     def _sample_chunk(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         # Sample the operator once per chunk: the forward schedule depends on
         # whether we are steering, so it cannot be decided inside the hook.
-        self._pending_command = self._read_command()
-        steering = self._pending_command is not None
-        chunk, plain = self.steered_chunk(
-            batch, np.asarray(self._pending_command)[None] if steering else None
-        )
-        self._last_reference = self._pending_reference if steering else None
-        if steering:
-            self.steered_chunks += 1
-        executed = chunk[0, : self._policy.config.n_action_steps].float().cpu()  # one device sync per chunk
-        if self._has_gripper:
-            self._gripper_ref = float(executed[-1, GRIPPER_DIM])
-        if self._last_reference is not None:
-            target = self._last_reference[0, : executed.shape[0], :3].float().cpu()
-            self.reconstruction_errors.append((executed[:, :3] - target).abs().mean().item())
-        return chunk, plain
+        command = self._read_command()
+        return self.chunk_for(batch, None if command is None else np.asarray(command)[None])
 
 
 # ---------------------------------------------------------------- the lerobot policy wrapper
@@ -1749,6 +1760,11 @@ class SteeringPolicy(PreTrainedPolicy):
     adapter its own view of it (``_adapter_view``, where the scene tokens become the task module's scene). Chunks
     come out normalized, as the base's: its postprocessor unnormalizes them.
 
+    ``predict_action_chunk`` is stateless (one chunk for one batch of commands). ``select_action`` is a rollout's:
+    it serves a chunk's executed steps one per call, reads the command of the batch that starts a chunk, keeps the
+    policy's own plan for the step just served (``last_policy_action``, from the same noise) and, through the core's
+    ``chunk_for``, the rollout's state (FRS's held gripper, its counts); ``reset`` starts a new rollout.
+
     ``forward`` takes the example trainer's batches (the pre-processor carries their keys through untouched, but
     does not build them): ``batch["kind"]`` ``"task"`` is the task module's flow matching on ``chunk`` (in action
     units, normalized by the postprocessor's statistics, which it needs), ``"user"`` the
@@ -1770,6 +1786,8 @@ class SteeringPolicy(PreTrainedPolicy):
         self._base_preprocessor = None  # the base's own pre-processor, when it is loaded from its folder
         self._core: FlowControlSteering | FlowReversalSteering | None = None
         self._action_queue: deque = deque()
+        self._plan_queue: deque = deque()
+        self.last_policy_action: Tensor | None = None  # the base policy's own plan for the step just served
 
     @staticmethod
     def resolve_module(
@@ -2010,8 +2028,10 @@ class SteeringPolicy(PreTrainedPolicy):
         return self.adapter.parameters()
 
     def reset(self) -> None:
-        """Clears the action queue and the core's queues (and the base policy's)."""
+        """Clears the action queues and the core's queues and rollout state (and the base policy's)."""
         self._action_queue.clear()
+        self._plan_queue.clear()
+        self.last_policy_action = None
         if self._core is not None:
             self._core.reset()
 
@@ -2048,22 +2068,28 @@ class SteeringPolicy(PreTrainedPolicy):
         raise ValueError(f"batch['kind'] must be 'task' or 'user', got {kind!r}")
 
     @torch.no_grad()
+    def _steering_inputs(self, batch: dict) -> tuple[dict, Tensor | None, AdaptedField | None]:
+        """A batch as the cores take it: the base policy's batch, the operator's command (checked in every mode,
+        mode ``"none"`` too; None when there is none) and the adapter's field bound to this observation."""
+        obs = self.observation(batch)
+        view = self._adapter_view(obs)
+        return obs, self._command(batch.get(COMMAND), view), self._field(view)
+
+    def _own_chunk(self, obs: dict, field: AdaptedField | None, noise=None) -> Tensor:
+        """The base policy's own chunk, through the task module (from ``noise`` when given)."""
+        hooks = {"velocity_hook": FlowControlSteering.velocity_hook(field), "noise": noise}
+        return self._sampler().predict_action_chunk(obs, **{k: v for k, v in hooks.items() if v is not None})
+
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
         """The steered chunk (B, H, n) for ``batch["command"]`` (None: the base's own chunk; rows inside the
         deadband: the policy's own chunk, from the same noise; in mode ``"none"`` ignored: the base's own chunk), the
         adapter bound to its view of the observation; normalized, as the base's (its postprocessor unnormalizes it).
         ``noise`` (pi0.5's keyword: the flow's starting noise, (B, H, n)) is the base's own chunk's (mode ``"none"``,
         or no command); a steered chunk draws its own, so a command with ``noise`` raises ``ValueError``."""
-        obs = self.observation(batch)
-        view = self._adapter_view(obs)
-        command = self._command(batch.get(COMMAND), view)  # checked in every mode, mode "none" too
-        field = self._field(view)
+        obs, command, field = self._steering_inputs(batch)
         noise = kwargs.get("noise")
         if self.config.mode == "none" or command is None:  # the base's own chunk, through the task module
-            hooks = {"velocity_hook": FlowControlSteering.velocity_hook(field), "noise": noise}
-            return self._sampler().predict_action_chunk(
-                obs, **{k: v for k, v in hooks.items() if v is not None}
-            )
+            return self._own_chunk(obs, field, noise)
         if noise is not None:
             raise ValueError(
                 "noise starts the base policy's own chunk (mode 'none', or no command); a steered chunk draws its own"
@@ -2093,11 +2119,21 @@ class SteeringPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
-        """One action (B, n) per call: a steered chunk for this batch's command when the queue is empty, its first
-        ``n_action_steps`` steps (the base policy's, the contract's field) then served one per call, as the cores' own
-        ``select_action`` and lerobot's chunking policies serve theirs. ``reset`` empties the queue."""
+        """One action (B, n) per call: a steered chunk for this batch's command when the queue is empty (the core's
+        ``chunk_for``: the chunk ``predict_action_chunk`` gives, from the same generator state, with the rollout's
+        state kept), its first ``n_action_steps`` steps (the base policy's, the contract's field) then served one per
+        call, as the cores' own ``select_action`` and lerobot's chunking policies serve theirs.
+        ``last_policy_action`` is the base policy's own plan for the step served (the action itself where nothing
+        steered). ``reset`` empties the queues."""
         if not self._action_queue:
-            chunk = self.predict_action_chunk(batch)
+            obs, command, field = self._steering_inputs(batch)
+            if self.config.mode == "none":
+                chunk = plan = self._own_chunk(obs, field)
+            else:
+                chunk, plan = self.core.chunk_for(obs, command, field=field)
             n = self.base_policy.config.n_action_steps
-            self._action_queue.extend(chunk[:, :n].transpose(0, 1))
+            actions = list(chunk[:, :n].transpose(0, 1))
+            self._action_queue.extend(actions)
+            self._plan_queue.extend(actions if plan is chunk else plan[:, :n].transpose(0, 1))
+        self.last_policy_action = self._plan_queue.popleft()
         return self._action_queue.popleft()

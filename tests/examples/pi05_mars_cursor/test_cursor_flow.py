@@ -13,12 +13,9 @@ from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, _layout, sample_
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
 from cursor_sa.records import summarize
 from cursor_sa.session import load_checkpoints
-from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, bci_chunk, hide_goal, observation, to_action,
+from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, hide_goal, observation, to_action,
                                 to_deflection)
 
-from lerobot.policies.steering import SteeringConfig
-from lerobot.teleoperators import readout as shared_readout
-from lerobot.teleoperators.readout import Readout, matrix_spec
 
 CFG = TaskConfig()
 
@@ -187,29 +184,6 @@ def test_observation_units_and_adapter_helpers():
     torch.testing.assert_close(as_adapter(F).adapt(hidden, x, torch.zeros(3), v, backward=False), v)
 
 
-def test_the_torch_readout_twins_follow_the_shared_readout():
-    """The cursor's torch versions of the readout (training) give the shared numpy rule's numbers for the same draws."""
-    policy = FlowPolicy().eval()
-    m = matrix_spec({"scale": [1.0, 0.25]}, 2)
-    deflection = torch.tensor([[[0.8, 0.8], [0.02, 0.01], [-0.5, 1.0]]])  # the middle step is idle
-    served = Readout(torch.as_tensor(m, dtype=torch.float32)).chunk(deflection, torch.zeros(1))
-    torch.testing.assert_close(served, torch.as_tensor(Readout(m)(deflection.numpy()), dtype=torch.float32))
-    bci = bci_chunk(to_action(deflection, policy), torch.as_tensor(m, dtype=torch.float32), torch.zeros(1), policy)
-    torch.testing.assert_close(to_deflection(bci, policy), served, atol=1e-6, rtol=1e-6)
-    pushed = torch.tensor([[[0.0, 0.5], [0.02, 0.01]]]).expand(4000, -1, -1)  # noise far from the clip at +-1
-    noisy = Readout(None).chunk(pushed, torch.full((4000,), 0.3))
-    assert abs(noisy[:, 0, 0].std().item() - 0.3) < 0.02 and torch.equal(noisy[:, 1], pushed[:, 1])
-    g = np.random.default_rng(5)
-    raw = g.uniform(-1, 1, (6, 2))
-    raw[1] = 0.02  # idle
-    core, sigma, noise = shared_readout.corrupt(raw, m), g.uniform(0, 2, 6), g.normal(size=(6, 2))
-    out = Readout.serve(torch.tensor(core), torch.tensor(raw), torch.tensor(sigma), torch.tensor(noise))
-    np.testing.assert_allclose(out.numpy(), shared_readout.add_noise(core, raw, sigma, noise), atol=1e-12)
-    chunk = torch.tensor(g.uniform(-1, 1, (6, 4, 2)))
-    np.testing.assert_allclose(Readout(torch.tensor(m)).chunk(chunk, torch.zeros(6)).numpy(), shared_readout.corrupt(chunk.numpy(), m),
-                               atol=1e-12)
-
-
 def test_study_statistics_from_trial_records():
     from cursor_sa.analysis import aligned_path, cumulative_hits, paired_lead, path_efficiency
     # paired lead: trials are paired by (run, layout_id), whatever their order in the list
@@ -294,38 +268,6 @@ def test_gain_scales_the_cursor_by_step_or_by_time():
             played[i] = played.get(i, 0) + share
     assert played.keys() == {0, 1} and all(abs(s - 1) < 1e-9 for s in played.values())
     np.testing.assert_allclose([s for _, s in odd.steps_of(3)], [0.1, 0.2])  # a control step across two planned steps
-
-
-def test_the_readout_corrupts_and_adds_noise_only_while_commanding():
-    np.testing.assert_allclose(matrix_spec({"scale": [1.0, 0.5]}, 2), [[1, 0], [0, 0.5]])
-    np.testing.assert_allclose(matrix_spec({"rotation_deg": 90}, 2) @ [1, 0], [0, 1], atol=1e-12)
-    np.testing.assert_allclose(matrix_spec([[0, 1], [1, 0]], 2), [[0, 1], [1, 0]])
-    assert matrix_spec(None, 2) is None
-    m = matrix_spec({"scale": [2.0, 0.5]}, 2)
-    adapter_matrix = lambda spec, corruption: SteeringConfig.from_spec(spec, corruption, n_dims=2, device="cpu").fixed_matrix
-    np.testing.assert_allclose(adapter_matrix({"translation": "corruption"}, m), m)
-    np.testing.assert_allclose(adapter_matrix({"F": {"scale": [3, 3]}}, None), 3 * np.eye(2))
-    for bad in (lambda: matrix_spec({"scale": [1, 1, 1]}, 2), lambda: adapter_matrix({"translation": "corruption"}, None)):
-        with pytest.raises(ValueError):
-            bad()
-    readout = Readout(matrix_spec({"scale": [1.0, 0.5]}, 2), input_noise=0.3, rng=np.random.default_rng(0))
-    idle = np.array([[0.01, -0.02]] * 1000)
-    np.testing.assert_array_equal(readout(idle), idle)
-    pushed = readout(np.array([[0.4, 0.8]] * 20000))
-    np.testing.assert_allclose(pushed.mean(0), [0.4, 0.4], atol=0.02)
-    assert abs(pushed[:, 0].std() - 0.3) < 0.02
-    np.testing.assert_allclose(Readout(matrix_spec({"scale": [2.0, 2.0]}, 2))(np.array([0.8, -0.1])), [1.0, -0.2])
-    # per-trial matrices and noise levels, on single commands and on chunks
-    ms = np.stack([matrix_spec({"scale": [1.0, 0.5]}, 2), matrix_spec({"rotation_deg": 90}, 2)])
-    raw = np.array([[0.4, 0.8], [0.6, -0.3]])
-    batched = Readout(ms)(raw)
-    for i in range(2):
-        np.testing.assert_allclose(batched[i], Readout(ms[i])(raw[i]))
-    out = Readout(ms, np.array([0.0, 0.0]))(np.tile([[0.4, 0.8]], (2, 16, 1)))
-    np.testing.assert_allclose(out[0], np.tile([[0.4, 0.4]], (16, 1)))
-    np.testing.assert_allclose(out[1], np.tile([[-0.8, 0.4]], (16, 1)), atol=1e-12)
-    noisy = Readout(None, np.array([0.0, 0.2]), np.random.default_rng(0))(np.tile([0.0, 0.5], (2, 2000, 1)))
-    assert np.ptp(noisy[0], axis=0).max() == 0 and abs(noisy[1, :, 0].std() - 0.2) < 0.01
 
 
 def test_shipped_configs_load_and_flags_override_them():

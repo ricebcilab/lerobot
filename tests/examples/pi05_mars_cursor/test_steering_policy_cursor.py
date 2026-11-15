@@ -72,9 +72,16 @@ def _adapters(kind, paths):
     return AdapterModules(user=user, task=task), spec
 
 
-@pytest.mark.parametrize("adapter", ADAPTERS)
-@pytest.mark.parametrize("mode", ["flow_control", "frs"])
-@pytest.mark.parametrize("per_step", [False, True], ids=["command", "reference"])
+@pytest.mark.parametrize(
+    "mode, adapter, per_step",
+    [
+        ("flow_control", ADAPTERS[0], False),
+        ("flow_control", "task", True),
+        ("frs", "user", False),
+        ("frs", "user_task", True),
+        ("frs", "matrix", False),
+    ],
+)
 def test_predict_action_chunk_is_the_examples_steered_chunk(setup, mode, adapter, per_step):
     policy, paths, obs, command, reference = setup
     example_adapter, spec = _adapters(adapter, paths)

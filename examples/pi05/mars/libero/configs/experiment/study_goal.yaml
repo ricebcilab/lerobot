@@ -1,0 +1,7 @@
+# User study, LIBERO-Goal: the six tasks a translation command can express (study_object.yaml otherwise).
+extends: study_object.yaml
+experiment:
+  n_trials: 30                # 5 per task
+scene:
+  suite: libero_goal
+  task_ids: [1, 4, 5, 6, 7, 8]

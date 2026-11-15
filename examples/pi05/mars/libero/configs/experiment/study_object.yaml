@@ -1,0 +1,18 @@
+# User study (docs/superpowers/specs/2026-11-14-mars-libero-user-study-design.md), LIBERO-Object: the policy is
+# told "do something" and the operator's command says which object goes in the basket. This file is the clean
+# readout (U0) under the immediate synthetic operator; the user files extend it with a corruption, and
+# experiments/user_study.sh picks the arm with --set control.mode=... and its depth with --sweep.
+extends: base_rotz20.yaml
+experiment:
+  n_trials: 50                # 5 per task with task_order sequential: the development split
+  task_order: sequential
+  output_dir: outputs/pi05_libero_user_study
+scene:
+  suite: libero_object
+  task_ids: null
+operator: policy
+policy_operator:              # the immediate operator: a new intent at every chunk, consumed at once. The
+  update_every_steps: null    # SpaceMouse-like profile (20 / 4) left no method above the floor in stage 0;
+  delay_steps: 0              # it is a robustness check: --set policy_operator.update_every_steps=20 ...delay_steps=4
+control:
+  corruption: null

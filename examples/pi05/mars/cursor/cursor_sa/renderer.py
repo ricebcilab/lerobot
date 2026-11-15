@@ -17,6 +17,9 @@ TARGET, TARGET_EDGE, GOAL = (236, 235, 230), (201, 200, 193), (251, 227, 161)
 CURSOR, PLAN, COMMAND = (42, 120, 214), (150, 190, 236), (235, 104, 52)
 GOOD, BAD = (27, 150, 100), (210, 60, 60)
 OBSTACLE, OBSTACLE_EDGE = (205, 204, 198), (150, 149, 144)
+# The keys a human agent's keyboard is told about, by the names its reader knows (`devices.KEY_PUSHES`, and shift).
+HELD_KEYS = {"left": (pygame.K_LEFT,), "right": (pygame.K_RIGHT,), "up": (pygame.K_UP,), "down": (pygame.K_DOWN,),
+             "shift": (pygame.K_LSHIFT, pygame.K_RSHIFT)}
 FREE_PLAY_KEYS = {pygame.K_1: ("mode", "policy"), pygame.K_2: ("mode", "teleop"), pygame.K_3: ("mode", "flow_control"),
                   pygame.K_4: ("mode", "frs"), pygame.K_LEFTBRACKET: ("depth", -1), pygame.K_RIGHTBRACKET: ("depth", +1),
                   pygame.K_MINUS: ("speed_gain", -0.1), pygame.K_EQUALS: ("speed_gain", +0.1),
@@ -65,8 +68,7 @@ class Renderer:
                     self.requests.append(FREE_PLAY_KEYS[event.key])
         if agent is not None and hasattr(agent, "keyboard"):
             held = pygame.key.get_pressed()
-            agent.keyboard.update(held[pygame.K_LEFT], held[pygame.K_RIGHT], held[pygame.K_UP], held[pygame.K_DOWN],
-                                  held[pygame.K_LSHIFT] or held[pygame.K_RSHIFT])
+            agent.keyboard.hold(name for name, keys in HELD_KEYS.items() if any(held[k] for k in keys))
         return pressed
 
     # ------------------------------------------------------------ screens

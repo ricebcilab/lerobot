@@ -26,6 +26,7 @@ from teleop import (
 )
 
 from lerobot.policies.steering import OPERATOR_DIM_GROUPS, SteeringConfig
+from lerobot.teleoperators import readout
 
 MODES = ("policy", "shared_override", "shared_flow_control", "shared_flow_reversal_steering", "teleop")
 TASK_ORDERS = ("random", "shuffled", "sequential")
@@ -56,6 +57,7 @@ class ControlSettings:
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
     corruption_family: RandomCorruption | None = field(default=None, repr=False)
     corruption_curl: Curl | None = field(default=None, repr=False)
+    corruption_quantize: bool = field(default=False, repr=False)  # the keypad readout, {quantize: axes}
     reversal_adapter_user_path: str | None = field(default=None, repr=False)  # learned MARS user module
     reversal_adapter_task_path: str | None = field(default=None, repr=False)  # learned MARS task module
     resolved_input_gain: float | None = field(default=None, repr=False)
@@ -82,6 +84,9 @@ class ExperimentSettings:
     n_trials: int = 10
     seed: int = 0
     task_order: str = "random"
+    first_occurrence: int = (
+        0  # each task's trials start at this occurrence of its initial states (a split's offset)
+    )
     output_dir: Path = Path("outputs/pi05_libero_experiments")
     task_ids: list[int] | None = None  # None = every task in the suite
     prompt: str = "do something"
@@ -94,6 +99,7 @@ _RESOLVED = (
     "reversal_adapter_matrix",
     "corruption_family",
     "corruption_curl",
+    "corruption_quantize",
     "reversal_adapter_user_path",
     "reversal_adapter_task_path",
     "resolved_input_gain",
@@ -118,6 +124,7 @@ EXPERIMENT_SCHEMA = {
         "n_trials": "n_trials",
         "seed": "seed",
         "task_order": "task_order",
+        "first_occurrence": "first_occurrence",
         "output_dir": "output_dir",
     },
     "scene": {"suite": "suite", "task_ids": "task_ids"},
@@ -246,7 +253,7 @@ def gain_that_cannot_clip(largest_gain: float) -> float:
 def largest_gain(control: ControlSettings) -> float:
     """The most the corruption in force can lengthen a command (1 without a corruption; a curl field
     never lengthens a push)."""
-    if control.corruption_curl is not None:
+    if control.corruption_curl is not None or control.corruption_quantize:
         return 1.0
     if control.corruption_family is not None:
         return control.corruption_family.max_gain
@@ -317,8 +324,12 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             where,
             f"control.operator_dims must be a non-empty list drawn from {', '.join(OPERATOR_DIM_GROUPS)}, got {dims!r}",
         )
-    control.corruption_curl = build_curl(control.corruption, f"{where}: control.corruption")
-    if control.corruption_curl is not None:  # a curl field: no matrix; its steady-state map stands in for M
+    control.corruption_quantize = readout.quantize_spec(control.corruption, f"{where}: control.corruption")
+    if not control.corruption_quantize:
+        control.corruption_curl = build_curl(control.corruption, f"{where}: control.corruption")
+    if control.corruption_quantize:  # a keypad: no matrix to build a fixed adapter from
+        basis = np.eye(3)
+    elif control.corruption_curl is not None:  # a curl field: no matrix; its steady-state map stands in for M
         basis = control.corruption_curl.steady_state()
     else:
         control.corruption_family = corruption_family(control.corruption, f"{where}: control.corruption")
@@ -426,6 +437,8 @@ def load_experiment_settings(
         _fail(where, f"experiment.n_trials must be a positive integer, got {settings.n_trials!r}")
     if type(settings.seed) is not int or settings.seed < 0:
         _fail(where, "experiment.seed must be a non-negative integer")
+    if type(settings.first_occurrence) is not int or settings.first_occurrence < 0:
+        _fail(where, "experiment.first_occurrence must be a non-negative integer")
     if settings.task_order not in TASK_ORDERS:
         _fail(
             where,

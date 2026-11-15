@@ -15,6 +15,19 @@
 # limitations under the License.
 
 from .configuration_spacemouse import SpaceMouseConfig
-from .teleop_spacemouse import SpaceMouseReader, SpaceMouseTeleop, find_spacemouse, parse_report
+from .teleop_spacemouse import (
+    SpaceMouseAxes,
+    SpaceMouseReader,
+    SpaceMouseTeleop,
+    find_spacemouse,
+    parse_report,
+)
 
-__all__ = ["SpaceMouseConfig", "SpaceMouseReader", "SpaceMouseTeleop", "find_spacemouse", "parse_report"]
+__all__ = [
+    "SpaceMouseAxes",
+    "SpaceMouseConfig",
+    "SpaceMouseReader",
+    "SpaceMouseTeleop",
+    "find_spacemouse",
+    "parse_report",
+]

@@ -1,0 +1,7 @@
+# The rotation user (study_object_rotation.yaml) on LIBERO-Goal's six expressible tasks.
+extends: study_object_rotation.yaml
+experiment:
+  n_trials: 30
+scene:
+  suite: libero_goal
+  task_ids: [1, 4, 5, 6, 7, 8]

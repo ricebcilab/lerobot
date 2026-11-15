@@ -9,8 +9,9 @@ meant. Open-loop calibration with an expert that knows the goal, as in the curso
   state o      a LIBERO observation from a rollout of the task-prompted policy (the synthetic operator)
   label L      the policy's chunk at o under the scene's real task (what the operator means)
   command c    the operator's push for L: the mean translation of the executed prefix, clipped
-               (`PolicyOperator`'s rule), through the arm's readout: corruption M or curl, then noise
-               of std sigma ~ U(sigma_min, sigma_max) where the push is active, held over the chunk
+               (`PolicyOperator`'s rule), through the arm's readout: corruption M, curl or keypad, then
+               noise of std sigma ~ U(sigma_min, sigma_max) where the served command is itself active
+               (the rollouts' rule), held over the chunk
   a_bci        the uniform-velocity reference chunk FRS builds from that served command
   z_L          L reversed through the goal-free field (the arm's prompt, e.g. "do something")
 
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import json
 import math
 import sys
@@ -49,7 +51,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lerobot.policies.steering import (  # noqa: E402
     ACTION_DIMS,
-    DEADBAND,
     GRIPPER_CLOSE,
     GRIPPER_DIM,
     GRIPPER_OPEN,
@@ -98,26 +99,56 @@ def parse_cross_step_dims(value) -> list[int] | None:
     return out
 
 
-def readout_core(command: np.ndarray, matrix=None, curl=None, n_steps: int = 10) -> np.ndarray:
-    """What the arm's readout serves before noise for a push held over `n_steps` control steps:
-    clip(M @ c) for a matrix corruption, the curl field's velocity from rest after `n_steps` for a curl,
-    the push itself without either. Idle pushes pass through unchanged, as in the readout."""
-    command = np.asarray(command, dtype=np.float64)
-    if curl is not None:
-        decay, drive = curl.discretization()
-        vel = np.zeros(3)
-        for _ in range(n_steps):
-            vel = readout.curl_step(vel, command, decay, drive)
-        return readout.curl_serve(vel, command)
-    return readout.corrupt(command, matrix)
+class _Push:
+    """The operator's push as a teleop source, for the rollouts' readers."""
+
+    translation = np.zeros(3)
+    gripper = GRIPPER_OPEN
 
 
-def serve(core: np.ndarray, raw: np.ndarray, sigma, rng: np.random.Generator) -> np.ndarray:
-    """The readout's last stage for a batch: `core` (B, 3) plus N(0, sigma^2) noise per axis (sigma (B,)),
-    clipped, where the raw push (B, 3) is active; idle pushes are served as they are."""
-    core, raw = np.atleast_2d(core), np.atleast_2d(raw)
+def readout_cores(pushes, episodes, steps, control) -> np.ndarray:
+    """What the arm's readout serves before noise for the operator's pushes (B, 3) along the collected episodes,
+    by the rollouts' own readers (`teleop.InputGain` at the arm's gain, then `teleop.ReadoutReader` with its
+    corruption): read once per chunk boundary at control step `steps[i]`, as FRS reads them, a curl field carried
+    from one chunk to the next and started from rest at each new entry of `episodes`. (B, 3)."""
+    from teleop import InputGain, ReadoutReader
+
+    source = _Push()
+    reader = ReadoutReader(
+        InputGain(source, control.resolved_input_gain),
+        control.corruption_matrix,
+        curl=control.corruption_curl,
+        quantize=control.corruption_quantize,
+    )
+    cores, current = [], object()
+    for push, episode, step in zip(pushes, episodes, steps, strict=True):
+        if episode != current:
+            reader.reset()
+            current = episode
+        source.translation = np.asarray(push, dtype=np.float64)
+        reader.advance(int(step))
+        cores.append(reader.translation)
+    return np.stack(cores)
+
+
+def serve(core: np.ndarray, sigma, rng: np.random.Generator) -> np.ndarray:
+    """The readout's last stage for a batch, by the rollouts' rule: `core` (B, 3) plus N(0, sigma^2) noise per
+    axis (sigma (B,)), clipped, where the core is itself outside the deadband; an idle core is served as it is."""
+    core = np.atleast_2d(core)
     sigma = np.broadcast_to(np.asarray(sigma, dtype=np.float64), (core.shape[0],))
-    return readout.add_noise(core, raw, sigma, rng.normal(size=core.shape))
+    return readout.add_noise(core, core, sigma, rng.normal(size=core.shape))
+
+
+def calibration_control(control):
+    """The arm's control settings for calibration: its readout (corruption, noise, gain) without its reversal
+    adapter, so a run can start from the arm file that names the module it is about to train."""
+    return dataclasses.replace(
+        control,
+        reversal_adapter=None,
+        reversal_adapter_matrix=None,
+        reversal_adapter_user_path=None,
+        reversal_adapter_task_path=None,
+    )
 
 
 def as_tensors(obj):
@@ -158,13 +189,17 @@ def load_states(path) -> list[dict]:
 
 
 def stack_batches(batches: list[dict]) -> dict:
-    """Batches of size 1 (tensors and lists) into one batch of size B."""
+    """Batches of size 1 into one batch of size B: tensors concatenated and lists joined; any other field (the
+    preprocessor's empty action, its reward and done defaults, its info) is the first batch's."""
     out = {}
     for key in batches[0]:
         values = [b[key] for b in batches]
-        out[key] = (
-            torch.cat(values, dim=0) if torch.is_tensor(values[0]) else sum((list(v) for v in values), [])
-        )
+        if torch.is_tensor(values[0]):
+            out[key] = torch.cat(values, dim=0)
+        elif isinstance(values[0], list | tuple):
+            out[key] = [item for v in values for item in v]
+        else:
+            out[key] = values[0]
     return out
 
 
@@ -183,9 +218,18 @@ def collect_states(session, settings, episodes: int, rng: np.random.Generator) -
             session.set_scene(settings.session.suite, task_id)
         task = session.task_description
 
-        def recorder(step, observation, _task=task, _task_id=task_id, **_):
-            if step % n == 0:
-                states.append({"observation": copy.deepcopy(observation), "task": _task, "task_id": _task_id})
+        def recorder(step, observation, _task=task, _task_id=task_id, _episode=episode, **_):
+            at = int(step) - 1  # the rollout reports the count after the step, with the observation before it
+            if at % n == 0:
+                states.append(
+                    {
+                        "observation": copy.deepcopy(observation),
+                        "task": _task,
+                        "task_id": _task_id,
+                        "episode": _episode,
+                        "step": at,
+                    }
+                )
 
         torch.manual_seed(int(rng.integers(2**31)))
         session.rollout(task, recorder=recorder)
@@ -196,16 +240,14 @@ def collect_states(session, settings, episodes: int, rng: np.random.Generator) -
 @torch.no_grad()
 def label_states(session, states: list[dict], generic_prompt: str, control, mean, std) -> None:
     """Add to every state its label L (normalized chunk, (chunk, 7)), its latent z_L under the goal-free field
-    ((chunk, max_dim)), the operator's raw push, the readout's core and the gripper reference."""
+    ((chunk, max_dim)), the operator's raw push, the readout's core (`readout_cores`: what the rollouts' reader
+    serves at that chunk boundary of its episode) and the gripper reference."""
     policy, cfg = session.policy, session.policy.config
     n_out = N_ACTION_DIMS
     for i, state in enumerate(states):
         chunk = session.policy_chunk(state["observation"], state["task"])[0, :, :n_out].float()
         env_chunk = chunk.cpu().numpy() * std + mean
         raw, gripper = operator_command(env_chunk, session.settings.n_action_steps)
-        core = readout_core(
-            raw, control.corruption_matrix, control.corruption_curl, session.settings.n_action_steps
-        )
         padded = torch.zeros(1, cfg.chunk_size, cfg.max_action_dim, device=chunk.device)
         padded[0, :, :n_out] = chunk
         with session.autocast_ctx:
@@ -215,11 +257,18 @@ def label_states(session, states: list[dict], generic_prompt: str, control, mean
             label=chunk.cpu(),
             latent=z_l[0].float().cpu(),
             raw=raw,
-            core=core,
             gripper_normalized=float((gripper - mean[GRIPPER_DIM]) / std[GRIPPER_DIM]),
         )
         if (i + 1) % 50 == 0:
             print(f"labelled {i + 1}/{len(states)} states", flush=True)
+    cores = readout_cores(
+        [state["raw"] for state in states],
+        [state["episode"] for state in states],
+        [state["step"] for state in states],
+        control,
+    )
+    for state, core in zip(states, cores, strict=True):
+        state["core"] = core
 
 
 # ---------------------------------------------------------------- the training loop
@@ -292,14 +341,14 @@ def train(args) -> None:
 
     from lerobot.policies.steering import FlowControlSteering
 
-    settings = load_experiment_settings(args.config, {})
-    control = settings.session.control
+    settings = load_experiment_settings(args.config, {}, args.sets)
+    control = calibration_control(settings.session.control)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
-    session = Session(settings.session)
+    session = Session(dataclasses.replace(settings.session, control=control))
     policy, cfg = session.policy, session.policy.config
     device = next(policy.parameters()).device
     mean, std = FlowControlSteering.action_mean_std(session.postprocessor)
@@ -332,7 +381,7 @@ def train(args) -> None:
         with torch.inference_mode(), session.autocast_ctx:
             velocity = policy.velocity_field(batch)
         sigma = rng.uniform(args.sigma[0], args.sigma[1], size=len(rows))
-        served = serve(np.stack([r["core"] for r in rows]), np.stack([r["raw"] for r in rows]), sigma, rng)
+        served = serve(np.stack([r["core"] for r in rows]), sigma, rng)
         a_bci = Flow.uniform_reference(
             served,
             np.array([r["gripper_normalized"] for r in rows]),
@@ -343,9 +392,7 @@ def train(args) -> None:
         ).to(device)
         z_l = torch.stack([r["latent"] for r in rows]).to(device)
         label = torch.stack([r["label"] for r in rows]).to(device)
-        active = torch.as_tensor(
-            np.max(np.abs(np.stack([r["raw"] for r in rows])), -1) >= DEADBAND, device=device
-        )
+        active = torch.as_tensor(readout.is_active(served), device=device)  # the commands FRS would steer on
         return velocity, a_bci, z_l, label, active
 
     def batch_loss(step):
@@ -374,6 +421,9 @@ def train(args) -> None:
     log = _train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every)
     meta = {
         "corruption": control.corruption,
+        "suite": settings.session.suite,
+        "task_ids": settings.task_ids,
+        "sets": list(args.sets),
         "policy_path": settings.session.policy_path,
         "prompt": settings.prompt,
         "n_action_steps": settings.session.n_action_steps,
@@ -393,6 +443,15 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, help="an arm file: its corruption, policy, scene and prompt")
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--set",
+        dest="sets",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override a key of the arm file, as experiment.py does (repeatable), e.g. the calibration scenes: "
+        "--set scene.suite=libero_spatial",
+    )
     p.add_argument("--states", default=None, help="reuse a states.pt from an earlier run (skips collection)")
     p.add_argument("--episodes", type=int, default=20, help="task-prompted rollouts to collect states from")
     p.add_argument(

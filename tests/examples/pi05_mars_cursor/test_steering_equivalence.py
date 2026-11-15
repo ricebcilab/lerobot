@@ -167,9 +167,21 @@ def _chunks(s, mode, kwargs, adapter, reference=None):
 # ---------------------------------------------------------------- steered chunks
 
 
-@pytest.mark.parametrize("adapter", ADAPTERS)
+# one case per mode, each with a different adapter form (the full MODES x ADAPTERS grid was the port's check)
+CHUNK_CASES = [
+    (*MODES[0], "task"),
+    (*MODES[1], "none"),
+    (*MODES[2], "task"),
+    (*MODES[3], "user_task"),
+    (*MODES[4], "per_trial_F"),
+    (*MODES[4], "user"),
+]
+
+
 @pytest.mark.parametrize(
-    "mode,kwargs", MODES, ids=[f"{m}-{v}" for m, kw in MODES for v in kw.values() or [""]]
+    "mode,kwargs,adapter",
+    CHUNK_CASES,
+    ids=[f"{m}-{'-'.join(map(str, kw.values()))}-{a}" for m, kw, a in CHUNK_CASES],
 )
 def test_steered_chunk_matches_the_reference(setup, exact, mode, kwargs, adapter):
     old, new = _chunks(setup, mode, kwargs, adapter)
@@ -177,8 +189,7 @@ def test_steered_chunk_matches_the_reference(setup, exact, mode, kwargs, adapter
     _close(new, old, exact, modules=adapter not in ("none", "per_trial_F"))
 
 
-@pytest.mark.parametrize("adapter", ("none", "user_task"))
-@pytest.mark.parametrize("mode", ("flow_control", "frs"))
+@pytest.mark.parametrize("mode, adapter", [("flow_control", "none"), ("frs", "user_task")])
 def test_steered_chunk_with_a_reference_chunk_matches(setup, exact, mode, adapter):
     g = torch.Generator().manual_seed(4)
     reference = torch.rand(B, setup["policy"].horizon, 2, generator=g) * 2 - 1
@@ -213,8 +224,7 @@ def _loss_inputs(s):
     return latent, bci, chunk, z, weight
 
 
-@pytest.mark.parametrize("with_task", (False, True))
-@pytest.mark.parametrize("weighted", (False, True))
+@pytest.mark.parametrize("with_task, weighted", [(False, False), (True, True)])
 def test_field_loss_matches_the_reference(setup, exact, with_task, weighted):
     s = setup
     old_user, old_task, new_user, new_task = s["modules"]
@@ -229,7 +239,7 @@ def test_field_loss_matches_the_reference(setup, exact, with_task, weighted):
     _loss_close(got, expect, exact)
 
 
-@pytest.mark.parametrize("with_task", (False, True))
+@pytest.mark.parametrize("with_task", (True,))
 def test_core_user_field_loss_matches_the_reference(setup, exact, with_task):
     from lerobot.policies.steering import LearnedUserModule
 

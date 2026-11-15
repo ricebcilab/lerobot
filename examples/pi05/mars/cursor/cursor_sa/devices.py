@@ -3,32 +3,22 @@
 Each exposes `translation`, the current command [x, y] in [-1, 1] (x right, y up
 on screen). The command then goes through `readout.Readout`.
 
-The SpaceMouse is read by lerobot's SpaceMouse teleoperator
-(`lerobot.teleoperators.spacemouse`), which the LIBERO example
-(examples/pi05/mars/libero/teleop.py) uses too: same raw /dev/hidraw reports and
-full-scale count, but only the stick's two horizontal axes are used, so pushing
-the stick forward moves the cursor up the screen.
+The SpaceMouse is lerobot's axis-mapped reader
+(`lerobot.teleoperators.spacemouse.SpaceMouseAxes`), which the LIBERO example
+(examples/pi05/mars/libero/teleop.py) uses too: same raw /dev/hidraw reports,
+full-scale count and environment variables (SPACEMOUSE_HID_ID,
+SPACEMOUSE_FULL_SCALE), but only the stick's two horizontal axes are used, so
+pushing the stick forward moves the cursor up the screen.
 """
-
-import os
 
 import numpy as np
 
+from lerobot.teleoperators.keyboard import KeyboardAxes
 from lerobot.teleoperators.spacemouse import teleop_spacemouse as hid
 
-SPACEMOUSE_HID_ID = "0000046D:0000C62B"  # a SpaceMouse Pro's HID id: the form the SPACEMOUSE_HID_ID env var takes
-AXIS_SCALE = 350.0            # raw counts at full deflection (SPACEMOUSE_FULL_SCALE's default)
-
-
-def spacemouse_hid_id():
-    """The `SPACEMOUSE_HID_ID` environment variable (a HID id such as `SPACEMOUSE_HID_ID` above, as in
-    /sys/class/hidraw/*/device/uevent), or None when unset: then any 3Dconnexion device is taken."""
-    return os.environ.get("SPACEMOUSE_HID_ID") or None
-
-
-def spacemouse_full_scale():
-    """The `SPACEMOUSE_FULL_SCALE` environment variable (raw counts at full deflection), default AXIS_SCALE."""
-    return float(os.environ.get("SPACEMOUSE_FULL_SCALE") or AXIS_SCALE)
+# The screen's axes from the device's: screen x is a push to the right (device x), screen y a push
+# forward (device y is a pull toward you, so its negative).
+SCREEN_SOURCE, SCREEN_SIGN = (0, 1), (1.0, -1.0)
 
 
 def find_spacemouse(hid_id=None):
@@ -39,63 +29,31 @@ def find_spacemouse(hid_id=None):
         return None
 
 
-def _screen(x, y):
-    """Device x, y (already in [-1, 1]) -> screen [x, y]; `+ 0.0` keeps a zero y at +0.0."""
-    return np.array([x, -y], dtype=float) + 0.0
+class SpaceMouse(hid.SpaceMouseAxes):
+    """lerobot's axis-mapped SpaceMouse on the screen's two axes, read in a background thread.
+    `connected` turns False if it is unplugged, and the command is then at rest."""
 
-
-def parse_report(report):
-    """Raw hidraw report -> ("translation", [x, y]) | ("buttons", bitmask) | ("other", None).
-
-    Device axes: x is a push to the right (+), y a pull toward you (+), so
-    screen y is the negated device y.
-    """
-    kind, value = hid.parse_report(report)
-    if kind == "translation":
-        x, y, _ = np.clip(np.array(value, dtype=float) / AXIS_SCALE, -1.0, 1.0)
-        return kind, _screen(x, y)
-    return kind, value
-
-
-class SpaceMouse:
-    """Reads the stick in a background thread. `connected` turns False if it is unplugged."""
-
-    def __init__(self, path, full_scale=AXIS_SCALE):
-        self.path = path
-        self._reader = hid.SpaceMouseReader(path, full_scale=full_scale)
-
-    @property
-    def connected(self):
-        return self._reader.connected
+    def __init__(self, path, full_scale=None):
+        super().__init__(SCREEN_SOURCE, SCREEN_SIGN, path, full_scale=full_scale)
 
     @property
     def translation(self):
-        if not self._reader.connected:  # unplugged: at rest
+        if not self.connected:  # unplugged: at rest
             return np.zeros(2)
-        x, y, _ = self._reader.axes
-        return _screen(x, y)
+        return super().translation + 0.0  # `+ 0.0` keeps a zero y at +0.0
 
     def take_button(self):
         """True once per button press since the last call."""
-        return self._reader.take_press()
-
-    def close(self):
-        self._reader.close()
+        return self.reader.take_press()
 
 
-class Keyboard:
-    """Arrow keys: half deflection by default, full while Shift is held.
-    The app calls `update` once per frame with the keys currently held."""
+# Arrow keys as pushes on the screen's axes (x right, y up).
+KEY_PUSHES = {"left": (-1.0, 0.0), "right": (1.0, 0.0), "up": (0.0, 1.0), "down": (0.0, -1.0)}
 
-    def __init__(self, speed=0.5):
-        self.speed = speed
-        self._translation = np.zeros(2)
 
-    def update(self, left, right, up, down, fast=False):
-        push = np.array([right - left, up - down], dtype=float)
-        norm = np.linalg.norm(push)
-        self._translation = push / norm * (1.0 if fast else self.speed) if norm else np.zeros(2)
-
-    @property
-    def translation(self):
-        return self._translation.copy()
+def Keyboard(speed=0.5):  # noqa: N802 (the device's name, like SpaceMouse)
+    """The arrow keys through lerobot's held-keys reader (`lerobot.teleoperators.keyboard.KeyboardAxes`, the LIBERO
+    example's too): half deflection by default, full while Shift is held, a diagonal no faster than an axis. The
+    app calls `hold` once per frame with the names of the keys currently down ("left", "right", "up", "down",
+    "shift")."""
+    return KeyboardAxes(KEY_PUSHES, speed=speed, unit=True)

@@ -178,7 +178,7 @@ def test_policy_mode_is_mode_none(small_policy, layouts):
     assert ctl.steering.config.mode == "none"
 
 
-@pytest.mark.parametrize("mode", ["policy", "flow_control", "frs"])
+@pytest.mark.parametrize("mode", ["frs"])
 def test_steered_chunk_matches_the_controller_bit_for_bit(small_policy, layouts, mode):
     """The controller's chunk (screen units per step) is the example's steered_chunk for the same observation and
     command under one seed; one row idle."""

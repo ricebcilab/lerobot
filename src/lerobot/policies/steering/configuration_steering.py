@@ -70,7 +70,8 @@ class SteeringConfig(PreTrainedConfig):
             command ignored; no steering core).
         tau: Flow control: the chunk steps the command is written into (None: the whole chunk).
         lam: Flow control: the Euler steps the command is written at (lambda; 1 = the initial condition only).
-        ic_gain: Flow control: the command's scale in the noise prior (a full push writes ``ic_gain`` sigma).
+        ic_gain: Flow control: the command's scale in the noise prior (a full push writes ``ic_gain`` sigma), or
+            ``"action"``: the command in the base policy's action units (needs its postprocessor's statistics).
         n_reversal_steps: FRS: the Euler steps of the reversal (None: all the way to noise).
         pinned_steps: FRS: the leading chunk steps the reference pins (None: all of them).
         deadband: Below this (the operator's units) the operator counts as idle and the row gets the policy's own
@@ -109,7 +110,7 @@ class SteeringConfig(PreTrainedConfig):
     mode: str = "frs"
     tau: int | None = 5
     lam: int = 1
-    ic_gain: float = 1.0
+    ic_gain: float | str = 1.0
     n_reversal_steps: int | None = None
     pinned_steps: int | None = None
     deadband: float = readout.DEADBAND

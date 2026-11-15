@@ -572,3 +572,36 @@ def test_paired_test_uses_wilcoxon_for_a_continuous_metric_and_head_to_head_draw
     assert ax.get_ylabel() == "End-effector path length (m)" and len(ax.patches) == 2
     assert comparisons.iloc[0]["p"] == pytest.approx(result["p"])
     plt.close(fig)
+
+
+def test_wrong_target_is_another_element_moving_most(tmp_path):
+    def rec(ok, moved):
+        return {"success": ok, "mode_expressed": moved, "suite": "libero_object"}
+
+    write_run(
+        tmp_path, "a_ceiling", config("policy", prompt="task"), [rec(True, "ketchup_1")], task_of=lambda i: 0
+    )
+    write_run(
+        tmp_path,
+        "b_frs",
+        config(),
+        [rec(True, "ketchup_1"), rec(False, "milk_1"), rec(False, None), rec(False, "milk_1")],
+        task_of=lambda i: [0, 0, 0, 1][i],
+    )
+    trials, _ = analyze.load_runs(analyze.find_runs(tmp_path))
+    steered = trials[trials["method"] == "FRS"]
+    wrong = analyze.wrong_target(trials)
+    assert wrong.index.equals(trials.index)
+    # the target, another object, nothing moved; task 1 never succeeded here, so its target is unknown: not counted
+    np.testing.assert_array_equal(wrong[steered.index], [0.0, 1.0, 0.0, np.nan])
+    # a frame without the ceiling (a later stage's) takes the targets of the stage that ran it, per suite and task
+    suite = "libero_object"
+    known = {(suite, 0): "ketchup_1", (suite, 1): "butter_1"}
+    np.testing.assert_array_equal(analyze.wrong_target(steered, targets=known), [0.0, 1.0, 0.0, 1.0])
+    assert analyze.suite_task_targets(trials) == {(suite, 0): "ketchup_1", (suite, 1): None}
+    table = analyze.summary_table(
+        steered.assign(wrong_target=wrong[steered.index]), ["method"], "wrong_target"
+    )
+    assert table["n"].item() == 3 and table["value"].item() == pytest.approx(
+        1 / 3
+    )  # a rate over the known tasks

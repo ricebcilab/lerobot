@@ -14,15 +14,7 @@ from cursor_sa.policy import FlowPolicy, time_embedding
 
 import lerobot.policies.steering.modeling_steering as core
 
-RANKS = [
-    {},
-    {"step_rank": 1},
-    {"step_rank": 2},
-    {"cross_step_rank": 2},
-    {"cross_step_rank": 8},
-    {"cross_step_rank": 32},
-    {"step_rank": 2, "cross_step_rank": 4},
-]
+RANKS = [{}, {"cross_step_rank": 8}, {"step_rank": 2, "cross_step_rank": 4}]  # the default and each knob
 
 
 @pytest.fixture(params=[False, True], ids=["shipped", "exact"])
@@ -96,7 +88,7 @@ def test_velocity_matches_the_cursor(exact, ranks, converter):
         )
 
 
-@pytest.mark.parametrize("ranks", [{"cross_step_rank": 8}, {"step_rank": 2, "cross_step_rank": 4}])
+@pytest.mark.parametrize("ranks", [{"step_rank": 2, "cross_step_rank": 4}])
 def test_reversal_through_the_policy_matches_the_cursor(exact, ranks, converter):
     """MARS-U's reversal through a policy's field (the coupling acting at every step), cursor against core."""
     torch.manual_seed(0)

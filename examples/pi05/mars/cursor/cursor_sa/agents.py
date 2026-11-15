@@ -18,8 +18,9 @@ import numpy as np
 import torch
 
 from lerobot.teleoperators.readout import Readout, is_active
+from lerobot.teleoperators.spacemouse.teleop_spacemouse import env_hid_id
 from lerobot.envs.cursor import AVOID_CLEARANCE, densify, plan_route
-from .devices import Keyboard, SpaceMouse, find_spacemouse, spacemouse_full_scale, spacemouse_hid_id
+from .devices import Keyboard, SpaceMouse, find_spacemouse
 
 
 class StepAgent:
@@ -195,8 +196,8 @@ class HumanAgent(StepAgent):
 
     The SpaceMouse is found on the first `poll()` and again if it is unplugged;
     the SPACEMOUSE_HID_ID and SPACEMOUSE_FULL_SCALE environment variables pin the
-    device and set its full-scale count (see devices.py).
-    The renderer feeds the keyboard state through `keyboard.update(...)`.
+    device and set its full-scale count (lerobot's `SpaceMouseAxes`).
+    The renderer feeds the keyboard state through `keyboard.hold(...)`.
     """
 
     name = "human"
@@ -212,12 +213,12 @@ class HumanAgent(StepAgent):
         now = time.monotonic()
         if (self.spacemouse is None or not self.spacemouse.connected) and now >= self._next_scan:
             self._next_scan, self.spacemouse = now + self.rescan_s, None
-            path = find_spacemouse(spacemouse_hid_id())
+            path = find_spacemouse(env_hid_id())
             if path is None:
                 self.status = "not found"
             else:
                 try:
-                    self.spacemouse, self.status = SpaceMouse(path, spacemouse_full_scale()), f"connected ({path})"
+                    self.spacemouse, self.status = SpaceMouse(path), f"connected ({path})"
                 except OSError as e:
                     self.status = f"found at {path} but cannot open it ({e.strerror})"
         return self.spacemouse is not None

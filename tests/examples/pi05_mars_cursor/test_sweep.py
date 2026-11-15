@@ -76,13 +76,6 @@ def test_the_expert_chunk_agent_plans_goal_given_chunks_and_holds_each_planned_s
     np.testing.assert_allclose(ctl.hist[:, -1], raws[2] * ctl.max_speed * ctl.dt, rtol=1e-6)
 
 
-def test_load_checkpoints_serves_cursor_flow_policies_and_the_hand_built_wrapper_is_gone():
-    arm = config.load_arm("teleop.yaml")
-    policies, _ = load_checkpoints({arm["name"]: arm}, "cpu")
-    assert policies and all(isinstance(p, CursorFlowPolicy) and not p.training for p in policies.values())
-    assert not hasattr(cursor_sa.steering, "steering_wrapper")
-
-
 def test_every_shipped_sweep_resolves_every_method():
     for path in sorted((config.CONFIG_DIR / "sweeps").glob("*.yaml")):
         sweep = load_sweep(path)

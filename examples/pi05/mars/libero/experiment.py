@@ -61,7 +61,7 @@ EXPERIMENT_CONFIG_DIR = CONFIG_DIR / "experiment"
 def build_trial_specs(settings: ExperimentSettings, schedule: list[int]):
     suite = settings.session.suite
     counts = {task: Session.initial_state_count(suite, task) for task in set(schedule)}
-    return trial_specs(schedule, suite, settings.seed, counts)
+    return trial_specs(schedule, suite, settings.seed, counts, settings.first_occurrence)
 
 
 class TrialMatrices(NamedTuple):
@@ -336,6 +336,7 @@ def _provenance(
         "n_trials": settings.n_trials,
         "seed": settings.seed,
         "task_order": settings.task_order,
+        "first_occurrence": settings.first_occurrence,
         "output_dir": str(settings.output_dir),
         "suite": settings.session.suite,
         "task_ids": settings.task_ids,
@@ -441,7 +442,7 @@ def run_block(
     trials_path = run_dir / "trials.jsonl"
     for trial, spec in enumerate(specs):
         matrices = trial_matrices(control, spec)  # the same on every trial unless the corruption is random
-        session.chain.corruption.matrix = matrices.corruption
+        session.chain.readout.matrix = matrices.corruption
         session.adapter.matrix = matrices.adapter
         task_id = spec.task_id
         if (settings.session.suite, task_id) != (session.suite, session.task_id):
@@ -513,7 +514,7 @@ def run_block(
             "ic_gain": session.ic_gain if mode == "shared_flow_control" else None,
             "input_noise": control.input_noise,
             "input_gain": control.resolved_input_gain,
-            "corruption": session.chain.corruption.label,
+            "corruption": session.chain.readout.label,
             "reversal_adapter": session.adapter.label,
             **matrices.record(),
             "success": bool(result.success),

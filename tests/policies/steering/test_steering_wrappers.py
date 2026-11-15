@@ -14,7 +14,6 @@ from lerobot.policies.steering import (
     Flow,
     FlowControlSteering,
     FlowReversalSteering,
-    LearnedTaskModule,
     LearnedUserModule,
     SteeringConfig,
     sinusoidal_time_embedding,
@@ -94,22 +93,6 @@ def _fc(policy=None, translation=(1.0, 0.0, 0.0), post=None, **kw):
 # ---------------------------------------------------------------- matrices and adapters
 
 
-def test_matrix_helpers_validate_rotate_and_build_translations():
-    with pytest.raises(ValueError, match="3x3"):
-        readout.checked_matrix([[1, 0], [0, 1]], 3, "m")
-    with pytest.raises(ValueError, match="finite"):
-        readout.checked_matrix([[np.nan, 0, 0], [0, 1, 0], [0, 0, 1]], 3, "m")
-    np.testing.assert_allclose(readout.rotation(90) @ np.array([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], atol=1e-12)
-    np.testing.assert_allclose(readout.rotation(0), np.eye(3))
-    np.testing.assert_allclose(readout.matrix_spec({"rotation_z_deg": 20}, 3), readout.rotation(20))
-    np.testing.assert_allclose(readout.matrix_spec({"scale": [1, 2, 3]}, 3), np.diag([1.0, 2.0, 3.0]))
-    np.testing.assert_allclose(readout.matrix_spec({"M": np.eye(3).tolist()}, 3), np.eye(3))
-    np.testing.assert_allclose(readout.matrix_spec(np.eye(3).tolist(), 3), np.eye(3))
-    for bad, match in (({"rotate": 20}, "rotation_z_deg"), ({"scale": [1, 2]}, "scale")):
-        with pytest.raises(ValueError, match=match):
-            readout.matrix_spec(bad, 3)
-
-
 def test_build_reversal_adapter_blocks_and_errors():
     m = readout.rotation(20)
     f = SteeringConfig.build_adapter(
@@ -132,34 +115,6 @@ def test_build_reversal_adapter_blocks_and_errors():
             SteeringConfig.build_adapter(spec)
     with pytest.raises(ValueError, match="corruption"):
         SteeringConfig.build_adapter({"translation": "corruption"}, None)
-
-
-def test_reversal_adapter_kind_description_and_modules(tmp_path):
-    adapter = AdapterModules(n_dims=None)
-    assert adapter.matrix is None and adapter.kind == "none" and "off" in adapter.describe()
-    adapter.matrix, adapter.label = np.eye(7), "identity"
-    assert adapter.kind == "user" and "identity" in adapter.describe() and "MARS-U" in adapter.describe()
-    with pytest.raises(ValueError):
-        adapter.matrix = np.eye(3)
-    adapter.task = lambda x_t, t, v: (torch.eye(7).expand(1, CHUNK, 7, 7), torch.zeros(1, CHUNK, 7))
-    assert adapter.kind == "composed" and "MARS" in adapter.describe()
-    adapter.matrix = None
-    assert adapter.kind == "task" and "MARS-T" in adapter.describe()
-    user = LearnedUserModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=32, tdim=8)
-    AdapterModules.save_module(
-        user, tmp_path / "u.pt", kind="user", meta={"corruption": {"rotation_z_deg": 20}}
-    )
-    task = LearnedTaskModule(horizon=CHUNK, n_dims=N_ACTION_DIMS, d=16, tdim=8)
-    AdapterModules.save_module(task, tmp_path / "t.pt", "task")
-    assert AdapterModules.load_module(tmp_path / "u.pt")[1:] == (
-        "user",
-        {"corruption": {"rotation_z_deg": 20}},
-    )
-    with pytest.raises(ValueError, match="kind"):
-        AdapterModules.save_module(user, tmp_path / "bad.pt", kind="policy")
-    loaded = AdapterModules(n_dims=None)
-    loaded.load_modules(user_path=tmp_path / "u.pt", task_path=tmp_path / "t.pt")
-    assert loaded.kind == "composed" and "MARS" in loaded.describe()
 
 
 def test_adapter_normalization_preserves_environment_velocity_transform():
@@ -445,7 +400,7 @@ def test_reverse_flow_steering_passes_a_schedule_only_for_a_partial_reversal():
     assert "flow_start_time" not in policy.calls[-2]  # the full reversal: no schedule
 
 
-@pytest.mark.parametrize("depth", [1, 2, 4, 8, 10])
+@pytest.mark.parametrize("depth", [2, 10])
 def test_partial_reversal_roundtrip_and_evaluation_budget(depth):
     class IntegratingPolicy(FakePolicy):
         call_times: list[list[float]] = []

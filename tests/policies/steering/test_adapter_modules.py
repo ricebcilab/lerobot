@@ -24,7 +24,6 @@ import numpy as np
 import pytest
 import torch
 
-import lerobot.policies.steering as steering
 from lerobot.policies.steering import (
     N_ACTION_DIMS,
     AdaptedField,
@@ -36,7 +35,6 @@ from lerobot.policies.steering import (
     SteeringConfig,
     SteeringPolicy,
     as_adapter,
-    modeling_steering,
 )
 
 H = 4
@@ -293,12 +291,6 @@ def test_frs_without_statistics_refuses_a_fixed_matrix():
         _SamplerBase(), None, adapter=AdapterModules(user=_user()), reference_fn=lambda c: c
     )
     assert core._adapter_field(torch.zeros(1, 8, 2)).matrix is None
-
-
-def test_the_old_holders_are_gone():
-    for name in ("ReversalAdapter", "MatrixHolder"):
-        assert not hasattr(steering, name) and name not in steering.__all__
-        assert not hasattr(modeling_steering, name)
 
 
 def test_an_empty_adapter_mapping_is_refused_and_null_means_none():

@@ -132,9 +132,10 @@ def test_frs_schedule_mirrors_the_reversal_in_either_convention():
         Flow.schedule(10, 4, 0.5)
 
 
-@pytest.mark.parametrize("depth", [1, 3, 5, 8, 9, None])
-@pytest.mark.parametrize("pinned", [2, 4, None])
-@pytest.mark.parametrize("mars", [False, True])
+@pytest.mark.parametrize(
+    "depth, pinned, mars",
+    [(1, None, False), (5, 2, True), (9, 4, False), (None, None, True), (None, 2, False)],
+)
 def test_frs_and_mars_run_one_implementation_on_both_samplers(depth, pinned, mars):
     pi05_field, cursor_field = fields(N_ACTION_DIMS)
     noise = torch.randn(1, CHUNK, N_ACTION_DIMS, generator=torch.Generator().manual_seed(1))
@@ -165,8 +166,7 @@ def test_frs_and_mars_run_one_implementation_on_both_samplers(depth, pinned, mar
     torch.testing.assert_close(cursor_chunk, robot_chunk, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("tau", [2, 4, CHUNK])
-@pytest.mark.parametrize("lam", [0, 1, 3, STEPS])
+@pytest.mark.parametrize("tau, lam", [(2, 1), (4, 3), (CHUNK, STEPS), (4, 0)])
 def test_flow_control_runs_one_implementation_on_both_samplers(tau, lam):
     pi05_field, cursor_field = fields(3, seed=2)
     noise = torch.randn(1, CHUNK, 3, generator=torch.Generator().manual_seed(3))

@@ -33,11 +33,14 @@ from lerobot.envs import (
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.steering import (
+    DEADBAND,
     GRIPPER_DIM,
     N_ACTION_DIMS,
     AdapterModules,
     FlowControlSteering,
     FlowReversalSteering,
+    SteeringConfig,
+    SteeringPolicy,
 )
 from lerobot.utils.constants import ACTION
 
@@ -48,6 +51,8 @@ RATE_HZ = 20  # LIBERO control rate; caps the loop so teleop feels real-time
 # LIBERO's step() replaces the horizon `done` with task success, so exceeding
 # the horizon raises "executing action in terminated episode" instead of ending.
 TELEOP_MAX_STEPS = 900
+# The shared modes are lerobot's steering policy's (`SteeringPolicy`, the cursor example's too) over pi0.5
+STEERING_MODES = {"shared_flow_control": "flow_control", "shared_flow_reversal_steering": "frs"}
 
 
 @dataclass
@@ -144,8 +149,8 @@ class Session:
             self.operator_mean, self.operator_std = FlowControlSteering.action_mean_std(self.postprocessor)
 
         self._zero_policy = _ZeroPolicy()
-        self._flow_policy: FlowControlSteering | None = None
-        self._frs_policy: FlowReversalSteering | None = None
+        self._steering: SteeringPolicy | None = None  # the shared mode's steering policy, built on first use
+        self._steering_fields: dict | None = None  # the config fields it was built with
         self.mode = "policy"
         self._scene_names: dict | None = None
         self.apply_control(control)
@@ -261,20 +266,21 @@ class Session:
 
     def _status_extra(self) -> dict:
         return {
-            "input_noise": self.chain.noisy.input_noise,
-            "corruption": self.chain.corruption.label,
+            "input_noise": self.chain.readout.input_noise,
+            "corruption": self.chain.readout.label,
             "reversal_adapter": self.adapter.label,
         }
 
     def resolved_matrices(self) -> dict:
         """For run provenance: the matrices in force, as lists (None when off)."""
-        m, f = self.chain.corruption.matrix, self.adapter.matrix
+        m, f = self.chain.readout.matrix, self.adapter.matrix
         _, std = FlowControlSteering.action_mean_std(self.postprocessor)
         normalized = self.adapter.normalized_matrix(std[:N_ACTION_DIMS])
-        curl = self.chain.corruption.curl
+        curl = self.chain.readout.curl
         return {
             "corruption_matrix": matrix_list(m),
             "corruption_curl": None if curl is None else {"curl": curl.curl, "tau": curl.tau, "dt": curl.dt},
+            "corruption_quantize": self.chain.readout.quantize,
             "reversal_adapter_matrix": matrix_list(f),
             "reversal_adapter_coordinates": "environment",
             "reversal_adapter_normalized_matrix": matrix_list(normalized),
@@ -314,10 +320,12 @@ class Session:
 
     def apply_control(self, control: ControlSettings) -> None:
         """Put the session in the state a `control:` block describes (mode, depths, noise, gain, matrices)."""
-        self.chain.corruption.curl = None
-        self.chain.corruption.matrix = control.corruption_matrix
-        self.chain.corruption.curl = control.corruption_curl
-        self.chain.corruption.label = spec_label(control.corruption)
+        self.chain.readout.quantize = False
+        self.chain.readout.curl = None
+        self.chain.readout.matrix = control.corruption_matrix
+        self.chain.readout.curl = control.corruption_curl
+        self.chain.readout.quantize = control.corruption_quantize
+        self.chain.readout.label = spec_label(control.corruption)
         self.adapter.matrix = control.reversal_adapter_matrix
         self.adapter.label = spec_label(control.reversal_adapter)
         self.adapter.user = self.adapter.task = None
@@ -329,7 +337,7 @@ class Session:
                 device=next(self.policy.parameters()).device,
             )
         self.tau, self.lam, self.ic_gain = control.tau, control.lam, control.ic_gain
-        self.chain.noisy.input_noise = control.input_noise
+        self.chain.readout.input_noise = control.input_noise
         self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
         self.chain.gain.gain = control.resolved_input_gain
         FlowReversalSteering.check_steps(
@@ -342,14 +350,12 @@ class Session:
         )
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
         self.operator_dims = tuple(control.operator_dims)
-        if self._frs_policy is not None:
-            self._frs_policy.operator_dims = self.operator_dims
         self.set_mode(control.mode)
 
     def refresh_input_gain(self) -> str:
         """Re-derive an `auto` gain from the corruption now in force (the REPL swaps M live); returns a status line."""
         if self.input_gain == "auto":
-            m = self.chain.corruption.matrix
+            m = self.chain.readout.matrix
             self.chain.gain.gain = gain_that_cannot_clip(1.0 if m is None else float(np.linalg.norm(m, 2)))
         gain = self.chain.gain.gain
         if gain is None:
@@ -432,47 +438,68 @@ class Session:
         }
         if self.mode == "shared_override":
             kwargs["action_hook"] = _teleop_hook(source, paste_gripper=False)
-        elif self.mode == "shared_flow_control":
-            if self._flow_policy is None:
-                self._flow_policy = FlowControlSteering(
-                    self.policy, source, self.postprocessor, tau=self.tau, lam=self.lam, ic_gain=self.ic_gain
-                )
-            self._flow_policy.tau = self.tau
-            self._flow_policy.lam = self.lam
-            self._flow_policy.ic_gain = self.ic_gain
-            kwargs["policy"] = self._flow_policy
-        elif self.mode == "shared_flow_reversal_steering":
-            if self._frs_policy is None:
-                self._frs_policy = FlowReversalSteering(
-                    self.policy,
-                    source,
-                    self.postprocessor,
-                    adapter=self.adapter,
-                    operator_dims=self.operator_dims,
-                )
-            self._frs_policy.n_reversal_steps = self.n_reversal_steps
-            self._frs_policy.operator_dims = self.operator_dims
-            kwargs["policy"] = self._frs_policy
+        elif self.mode in STEERING_MODES:
+            kwargs["policy"] = self.steering_policy()
         return kwargs
+
+    def steering_policy(self) -> SteeringPolicy:
+        """lerobot's `SteeringPolicy` for the current shared mode and its knobs, over the loaded pi0.5 and its
+        postprocessor, with this session's adapter in its adapter slot (the 7-D holder, read on every chunk, so
+        a matrix or module swapped in the REPL takes effect at once). Built on first use and again when a knob
+        changes. The command reaches it in the batch (`chunk_command`), as on the cursor."""
+        cfg = self.policy.config
+        fields = {
+            "mode": STEERING_MODES[self.mode],
+            "deadband": DEADBAND,
+            "n_dims": 3,  # the commanded translation
+            "base_policy_type": self.policy_cfg.type,
+            "base_policy_path": str(self.settings.policy_path),
+            "device": str(cfg.device),
+        }
+        if self.mode == "shared_flow_control":  # the command is written into the translation dims
+            fields.update(tau=self.tau, lam=self.lam, ic_gain=self.ic_gain, operator_dims=["translation"])
+        else:  # the reference pins the executed prefix; the rest of the chunk is the policy's
+            fields.update(
+                n_reversal_steps=self.n_reversal_steps,
+                pinned_steps=cfg.n_action_steps,
+                operator_dims=list(self.operator_dims),
+            )
+        if self._steering is None or fields != self._steering_fields:
+            steering = SteeringPolicy(
+                SteeringConfig(**fields), base_policy=self.policy, postprocessor=self.postprocessor
+            )
+            steering.adapter = self.adapter
+            _ = steering.core  # built now: its knobs are checked before the rollout starts
+            self._steering, self._steering_fields = steering, fields
+        return self._steering
+
+    def chunk_command(self) -> torch.Tensor | None:
+        """The operator's command for the chunk about to be sampled: one read of the teleop chain, (1, 3) in env
+        units and float64 as read (the steering cores convert it; inside the deadband the chunk is the policy's
+        own). None, with no read, when flow control writes nothing (lambda 0)."""
+        if self.mode == "shared_flow_control" and not self.lam:
+            return None
+        return torch.as_tensor(np.asarray(self.chain.source.translation, dtype=np.float64))[None]
 
     def metrics(self) -> dict:
         """Steering statistics of the last rollout in the current mode."""
-        if self.mode == "shared_flow_control" and self._flow_policy is not None:
+        steering = self._steering
+        if steering is None or steering.config.mode != STEERING_MODES.get(self.mode):
+            return {}
+        core = steering.core
+        if self.mode == "shared_flow_control":
             return {
-                "guided_steps": int(self._flow_policy.guided_steps),
-                "tau": self._flow_policy.tau,
-                "lambda": self._flow_policy.lam,
-                "ic_gain": self._flow_policy.ic_gain,
+                "guided_steps": int(core.guided_steps),
+                "tau": core.tau,
+                "lambda": core.lam,
+                "ic_gain": core.ic_gain,
             }
-        if self.mode == "shared_flow_reversal_steering" and self._frs_policy is not None:
-            errors = self._frs_policy.reconstruction_errors
-            return {
-                "n_reversal_steps": self._frs_policy.n_reversal_steps
-                or self.policy.config.num_inference_steps,
-                "steered_chunks": int(self._frs_policy.steered_chunks),
-                "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
-            }
-        return {}
+        errors = core.reconstruction_errors
+        return {
+            "n_reversal_steps": core.n_reversal_steps or self.policy.config.num_inference_steps,
+            "steered_chunks": int(core.steered_chunks),
+            "reconstruction_error_mean": float(np.mean(errors)) if errors else None,
+        }
 
     def stats_line(self) -> str:
         metrics = self.metrics()
@@ -516,7 +543,7 @@ class Session:
         if observation is None:
             observation = self.show_scene(trial_spec)
         if trial_spec is not None:
-            self.chain.noisy._rng = np.random.default_rng(trial_spec.input_noise_seed)
+            self.chain.readout.rng = np.random.default_rng(trial_spec.input_noise_seed)
         max_steps = max_steps or k["max_steps"] or int(vec_env.call("_max_episode_steps")[0])
         frames = [_frame(observation)]  # what show_scene has already published
         stream.set_status(
@@ -539,12 +566,15 @@ class Session:
             obs["task"] = [prompt]
             obs = env_preprocessor(obs)
             obs = preprocessor(obs)
-            if trial_spec is not None and step % self.settings.n_action_steps == 0:
+            new_chunk = step % self.settings.n_action_steps == 0
+            if new_chunk and self.mode in STEERING_MODES:
+                obs["command"] = self.chunk_command()  # read once per chunk and held, as the policy plans
+            if trial_spec is not None and new_chunk:
                 torch.manual_seed((trial_spec.policy_seed + chunk_index) % 2**32)
             with torch.inference_mode(), self.autocast_ctx:
                 action = policy.select_action(obs)
-            # The policy's own plan for this step: the steering wrappers expose the chunk
-            # they would have produced without the operator; elsewhere it is the action
+            # The policy's own plan for this step: the steering policy exposes the chunk the
+            # base would have produced without the operator; elsewhere it is the action
             # itself, before any operator hook.
             plan = getattr(policy, "last_policy_action", None)
             action_numpy = env_postprocessor({ACTION: postprocessor(action)})[ACTION].to("cpu").numpy()

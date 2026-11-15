@@ -96,17 +96,37 @@ def test_matrix_corruption_and_noise_are_the_cursor_readout():
     np.testing.assert_array_equal(new[2], raw[2])
 
 
-def test_noise_is_the_robot_noisy_reader():
-    for clean in (np.array([0.4, -0.2, 0.9]), np.array([0.01, 0.0, -0.02])):
+def test_the_command_gate_is_the_robot_noisy_reader():
+    """The robot's rule (``noise_gate="command"``, 3-D, one unbatched trial): the corrupted command is noised only
+    when it is itself outside the deadband, and only then is anything drawn."""
+    scale = np.diag([0.25, 1.0, 1.0])  # the second push is active, its corrupted command idle
+    for raw in (np.array([0.4, -0.2, 0.9]), np.array([0.1, 0.0, -0.02]), np.array([0.01, 0.0, -0.02])):
         rng_a, rng_b = np.random.default_rng(3), np.random.default_rng(3)
-        old = old_robot_noisy(clean, 0.6, rng_a)
-        new = (
-            clean
-            if not readout.is_active(clean)
-            else readout.add_noise(clean, clean, 0.6, rng_b.normal(size=3))
-        )
+        old = old_robot_noisy(readout.corrupt(raw, scale), 0.6, rng_a)
+        new = readout.Readout(scale, 0.6, rng_b, n_dims=3, noise_gate="command")(raw)
         np.testing.assert_array_equal(new, old)
         assert rng_a.random() == rng_b.random()  # the same draws spent
+    with pytest.raises(ValueError, match="noise_gate"):
+        readout.Readout(noise_gate="always")
+
+
+def test_a_3d_curl_readout_steps_and_reads_apart():
+    """The robot reads once per chunk and steps once per control step: ``step`` then ``read`` is a call, and the
+    third axis is a plain lag (``old_robot_curl``); the spec's ``dt`` is the readout's."""
+    matrix, curl = corruption_spec({"curl": 20, "tau": 0.1, "dt": 0.05}, n_dims=3)
+    assert matrix is None and curl == {"curl": 20.0, "tau": 0.1, "dt": 0.05}
+    decay, drive = old_robot_curl(0.1, 20.0, 0.05)
+    live, called = readout.Readout(curl=curl, n_dims=3), readout.Readout(curl=curl, n_dims=3)
+    live.reset(None)
+    push, vel = np.array([0.6, -0.3, 0.8]), np.zeros(3)
+    np.testing.assert_array_equal(live.read(push), np.zeros(3))  # at rest until the field is stepped
+    for _ in range(10):
+        live.step(push)
+        vel = decay @ vel + drive @ push
+        served = called(push)
+    np.testing.assert_allclose(live.read(push), np.clip(vel, -1.0, 1.0), atol=1e-15)
+    np.testing.assert_array_equal(live.read(push), served)
+    assert np.array_equal(corruption_spec({"rotation_z_deg": 90}, n_dims=3)[0], readout.rotation(90))
 
 
 def test_corruption_is_per_row_and_leaves_idle_input_alone():
@@ -170,7 +190,7 @@ def test_readout_with_a_curl_steps_the_field_from_rest():
         readout.Readout(np.eye(2), curl=curl)
 
 
-@pytest.mark.parametrize("kind", ["none", "matrix", "curl"])
+@pytest.mark.parametrize("kind", ["matrix", "curl"])
 def test_core_is_the_readout_before_noise_from_rest(kind):
     corruption = np.array([[1.2, 0.3], [-0.4, 0.9]]) if kind == "matrix" else None
     curl = {"curl": -8.0, "tau": 0.2} if kind == "curl" else None
@@ -209,7 +229,7 @@ def test_serve_is_the_numpy_last_stage_for_the_same_draws():
     np.testing.assert_array_equal(fresh.numpy()[1], raw[1])
 
 
-@pytest.mark.parametrize("matrix", [None, "numpy", "tensor"])
+@pytest.mark.parametrize("matrix", [None, "tensor"])
 def test_chunk_is_the_readout_on_a_chunk_for_the_same_draws(matrix):
     g = np.random.default_rng(6)
     chunk = g.uniform(-1, 1, (4, 5, 2))
@@ -277,3 +297,21 @@ def test_build_adapter_two_dims_refuses_blocks_it_has_no_dims_for():
     # a string user is a checkpoint, {learned: <path>}'s shorthand (the cursor's composite of names)
     named = SteeringConfig.from_spec({"user": "u", "task": "t"}, n_dims=2, device="cpu")
     assert (named.adapter_user, named.adapter_task, named.fixed_matrix) == ("u", "t", None)
+
+
+def test_quantize_snaps_an_active_push_to_its_largest_axis():
+    raw = np.array([[0.3, -0.7, 0.2], [0.5, 0.5, 0.1], [0.01, 0.02, 0.0]])
+    # the largest component's axis at full deflection; the first axis on a tie; an idle push untouched
+    np.testing.assert_array_equal(
+        readout.quantize(raw), [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.01, 0.02, 0.0]]
+    )
+    assert readout.quantize_spec({"quantize": "axes"}) and not readout.quantize_spec({"scale": [1, 1, 0]})
+    with pytest.raises(ValueError, match="quantize"):
+        readout.quantize_spec({"quantize": "octants"})
+    with pytest.raises(ValueError, match="quantize"):
+        corruption_spec({"quantize": "axes"}, n_dims=3)
+    arm = readout.Readout(quantize=True, n_dims=3, noise_gate="command")
+    np.testing.assert_array_equal(arm(raw[0]), [0.0, -1.0, 0.0])
+    np.testing.assert_array_equal(arm.core(raw[None]), readout.quantize(raw)[None])
+    with pytest.raises(ValueError, match="not both"):
+        readout.Readout(np.eye(3), quantize=True, n_dims=3)

@@ -22,10 +22,12 @@ button changes. Device channels: x is a push to the right (+), y a pull toward y
 press down (+). Rotation reports (id 2) are ignored.
 
 `SpaceMouseReader` keeps the latest state in a background thread; `SpaceMouseTeleop` wraps it
-as a LeRobot teleoperator. Mapping the device channels onto an application's axes is left to
-the caller.
+as a LeRobot teleoperator. `SpaceMouseAxes` is a reader mapped onto an application's axes (which
+device channel feeds each axis, and with which sign), found and scaled from the
+`SPACEMOUSE_HID_ID` and `SPACEMOUSE_FULL_SCALE` environment variables unless told otherwise.
 """
 
+import os
 import struct
 import threading
 from pathlib import Path
@@ -42,6 +44,11 @@ SPACEMOUSE_VENDORS = ("046D", "256F")  # 3Dconnexion: under Logitech's vendor id
 # Logitech's vendor id also covers its keyboards, mice and receivers; 3Dconnexion's products
 # under it are 0xC6xx (C603 SpaceMouse Plus ... C62B SpaceMouse Pro, C640 NuLOOQ).
 LOGITECH_3DCONNEXION_PRODUCT_PREFIX = "C6"
+
+# A SpaceMouse Pro's HID id (vendor:product, as in /sys/class/hidraw/*/device/uevent): the form the
+# SPACEMOUSE_HID_ID environment variable takes to pin one device.
+SPACEMOUSE_PRO_HID_ID = "0000046D:0000C62B"
+FULL_SCALE = 350.0  # raw counts at full deflection (SPACEMOUSE_FULL_SCALE's default)
 
 REPORT_TRANSLATION = 1
 REPORT_BUTTONS = 3
@@ -180,6 +187,60 @@ class SpaceMouseReader:
 
     def close(self) -> None:
         self._file.close()
+
+
+def env_hid_id() -> str | None:
+    """The `SPACEMOUSE_HID_ID` environment variable (a HID id such as `SPACEMOUSE_PRO_HID_ID`), or None when
+    unset: then any 3Dconnexion device is taken."""
+    return os.environ.get("SPACEMOUSE_HID_ID") or None
+
+
+def env_full_scale() -> float:
+    """The `SPACEMOUSE_FULL_SCALE` environment variable (raw counts at full deflection), default `FULL_SCALE`."""
+    return float(os.environ.get("SPACEMOUSE_FULL_SCALE") or FULL_SCALE)
+
+
+class SpaceMouseAxes:
+    """A SpaceMouse mapped onto an application's axes: axis i is `sign[i]` times the device channel
+    `source[i]` (0: x, a push to the right; 1: y, a pull toward you; 2: z, a press down), in [-1, 1].
+
+    Without `path` the device is searched for by `hid_id` (default: the SPACEMOUSE_HID_ID environment
+    variable, unset = any 3Dconnexion device); `full_scale` defaults to SPACEMOUSE_FULL_SCALE (unset =
+    `FULL_SCALE`). `reader` is the `SpaceMouseReader` underneath (buttons, presses, report counts);
+    like it, `translation` keeps its last value when the device is unplugged.
+    """
+
+    def __init__(
+        self,
+        source,
+        sign,
+        path: str | None = None,
+        hid_id: str | None = None,
+        full_scale: float | None = None,
+    ):
+        self.source = np.asarray(source, dtype=np.intp)
+        self.sign = np.asarray(sign, dtype=np.float64)
+        if self.source.shape != self.sign.shape or self.source.ndim != 1:
+            raise ValueError(f"source and sign must be two lists of one length, got {source!r} and {sign!r}")
+        self.path = path or find_spacemouse(hid_id if hid_id is not None else env_hid_id())
+        self.reader = SpaceMouseReader(
+            self.path, full_scale=full_scale if full_scale is not None else env_full_scale()
+        )
+
+    def map(self, device_xyz) -> np.ndarray:
+        """Device (x, y, z) onto the application's axes."""
+        return np.asarray(device_xyz, dtype=np.float64)[self.source] * self.sign
+
+    @property
+    def connected(self) -> bool:
+        return self.reader.connected
+
+    @property
+    def translation(self) -> np.ndarray:
+        return self.map(self.reader.axes)
+
+    def close(self) -> None:
+        self.reader.close()
 
 
 class SpaceMouseTeleop(Teleoperator):

@@ -14,17 +14,17 @@ Where the operator's command comes from and what happens to it on the way to
 the policy:
 
     SpaceMouse + keyboard -> CombinedReader -> InputGain (optional)
-        -> RecordingReader (raw) -> CommandCorruption (M @ x)
-        -> NoisyReader (+ noise) -> RecordingReader (served)
+        -> RecordingReader (raw) -> ReadoutReader (M @ x or a curl, + noise)
+        -> RecordingReader (served)
 
-`TeleopChain` builds that pipeline; the modes consume `chain.source`. Every
+`TeleopChain` builds that pipeline; the modes consume `chain.source`. The
+corruption and the noise are lerobot's shared operator readout
+(`lerobot.teleoperators.readout.Readout`, the cursor example's, in 3-D). Every
 reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
 (-1 open, +1 close), the `TeleopSource` protocol from
 `lerobot.policies.steering`.
 """
 
-import os
-import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -42,9 +42,9 @@ from lerobot.policies.steering import (
     AdapterModules,
 )
 from lerobot.teleoperators import readout
+from lerobot.teleoperators.keyboard import KeyboardAxes
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
-    SpaceMouseReader as HidReader,
-    find_spacemouse,
+    SpaceMouseAxes,
     parse_report,
 )
 from lerobot.utils.rotation import Rotation
@@ -52,10 +52,6 @@ from lerobot.utils.rotation import Rotation
 # re-exported for readers of this module
 __all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN", "parse_report"]
 
-# A SpaceMouse Pro's HID id (vendor:product in /sys uevent): the form the SPACEMOUSE_HID_ID
-# environment variable takes to pin one device. Unset, the search takes any 3Dconnexion device.
-SPACEMOUSE_HID_ID = "0000046D:0000C62B"
-AXIS_SCALE = 350.0  # raw counts at full deflection (SPACEMOUSE_FULL_SCALE's default)
 # Map device axes (0=x: right push +, 1=y: pull-toward-you push +, 2=z:
 # press-down +) onto the arm action dims [Δx, Δy, Δz]. Tuned by feel on the
 # real device so each push moves the arm the same way: forward push → forward,
@@ -65,30 +61,9 @@ AXIS_SOURCE = np.array([1, 0, 2])  # device axis feeding each action dim
 AXIS_SIGN = np.array([1.0, -1.0, -1.0])
 
 
-def spacemouse_hid_id() -> str | None:
-    """The `SPACEMOUSE_HID_ID` environment variable (e.g. `SPACEMOUSE_HID_ID` above), or None when unset."""
-    return os.environ.get("SPACEMOUSE_HID_ID") or None
-
-
-def spacemouse_full_scale() -> float:
-    """The `SPACEMOUSE_FULL_SCALE` environment variable (raw counts at full deflection), default AXIS_SCALE."""
-    return float(os.environ.get("SPACEMOUSE_FULL_SCALE") or AXIS_SCALE)
-
-
-def find_spacemouse_device(hid_id: str | None = None) -> str:
-    """Locate the SpaceMouse /dev/hidraw node via /sys/class/hidraw (any 3Dconnexion device unless `hid_id`)."""
-    return find_spacemouse(hid_id)
-
-
-def normalize(raw_xyz: tuple[int, int, int]) -> np.ndarray:
-    """Raw int16 counts → env-action range [-1, 1] via the AXIS_SOURCE/AXIS_SIGN map."""
-    scaled = np.clip(np.array(raw_xyz, dtype=np.float64) / AXIS_SCALE, -1.0, 1.0)
-    return scaled[AXIS_SOURCE] * AXIS_SIGN
-
-
-class SpaceMouseReader:
-    """Background thread reading translation + buttons from the SpaceMouse
-    (lerobot's `SpaceMouseReader`, mapped onto the arm's axes).
+class SpaceMouseReader(SpaceMouseAxes):
+    """Translation + gripper from the SpaceMouse: lerobot's axis-mapped reader
+    (`lerobot.teleoperators.spacemouse.SpaceMouseAxes`, the cursor example's too) on the arm's axes.
 
     `translation` is the current stick deflection in [-1, 1]^3 (zero at rest —
     the device sends a zeroing report on release). Any button press toggles
@@ -105,25 +80,21 @@ class SpaceMouseReader:
         hid_id: str | None = None,
         full_scale: float | None = None,
     ):
-        self.device_path = device_path or find_spacemouse_device(
-            hid_id if hid_id is not None else spacemouse_hid_id()
-        )
-        self._reader = HidReader(
-            self.device_path, full_scale=full_scale if full_scale is not None else spacemouse_full_scale()
-        )
+        super().__init__(AXIS_SOURCE, AXIS_SIGN, device_path, hid_id, full_scale)
+
+    @property
+    def device_path(self) -> str:
+        return self.path
 
     @property
     def translation(self) -> np.ndarray:
-        if self._reader.motion_reports == 0:
+        if self.reader.motion_reports == 0:
             return np.zeros(3)
-        return np.array(self._reader.axes, dtype=np.float64)[AXIS_SOURCE] * AXIS_SIGN
+        return super().translation
 
     @property
     def gripper(self) -> float:
-        return GRIPPER_CLOSE if self._reader.presses % 2 else GRIPPER_OPEN
-
-    def close(self) -> None:
-        self._reader.close()
+        return GRIPPER_CLOSE if self.reader.presses % 2 else GRIPPER_OPEN
 
 
 DEFAULT_SPEED = 0.5  # fraction of full-scale deflection a held key produces
@@ -131,7 +102,7 @@ FAST_KEY = "shift"  # hold for full-scale (1.0) deflection
 STALE_AFTER = 1.0  # seconds without a page update before held keys are dropped
 
 # Each key is a full-scale push on the SpaceMouse's *device* axes (x: right +,
-# y: toward-you +, z: press-down +) and goes through normalize(), so
+# y: toward-you +, z: press-down +) and goes through the stick's axis map, so
 # the keyboard inherits the AXIS_SOURCE/AXIS_SIGN tuning of the physical stick:
 # ArrowUp moves the arm exactly like pushing the stick forward.
 KEY_PUSH = {
@@ -146,8 +117,9 @@ KEY_PUSH = {
 }
 
 
-class KeyboardReader:
-    """Translation + gripper from the keys held in the browser page.
+class KeyboardReader(KeyboardAxes):
+    """Translation + gripper from the keys held in the browser page: lerobot's held-keys reader
+    (`lerobot.teleoperators.keyboard.KeyboardAxes`, the cursor example's too) with the stick's axis map.
 
     `update(held, toggles)` arrives with every key event and heartbeat: `held` is the full
     set of pressed keys (so a lost event cannot stick a key), `toggles` the page's count of
@@ -160,52 +132,31 @@ class KeyboardReader:
         stale_after: float = STALE_AFTER,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.speed = speed
-        self.stale_after = stale_after
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._held: set[str] = set()
-        self._translation = np.zeros(3)
+        super().__init__(
+            KEY_PUSH,
+            speed=speed,
+            fast=(FAST_KEY,),
+            source=AXIS_SOURCE,
+            sign=AXIS_SIGN,
+            stale_after=stale_after,
+            clock=clock,
+        )
         self._gripper = GRIPPER_OPEN
         self._toggles = 0
-        self._updated = -np.inf
 
     def update(self, held: Iterable[str], toggles: int) -> None:
-        held = set(held)
-        keys = {k.lower() for k in held}
-        push = np.zeros(3)
-        for key in keys:
-            if key in KEY_PUSH:
-                push += KEY_PUSH[key]
-        scale = 1.0 if FAST_KEY in keys else self.speed
-        translation = normalize(tuple(push * AXIS_SCALE)) * scale
+        self.hold(held)
         with self._lock:
-            self._held = held
-            self._translation = translation
-            self._updated = self._clock()
             if toggles < self._toggles:  # page reloaded: its counter restarted
                 self._toggles = 0
             if (toggles - self._toggles) % 2:
                 self._gripper = GRIPPER_CLOSE if self._gripper == GRIPPER_OPEN else GRIPPER_OPEN
             self._toggles = toggles
 
-    def _fresh(self) -> bool:
-        return self._clock() - self._updated <= self.stale_after
-
-    @property
-    def translation(self) -> np.ndarray:
-        with self._lock:
-            return self._translation.copy() if self._fresh() else np.zeros(3)
-
     @property
     def gripper(self) -> float:
         with self._lock:
             return self._gripper
-
-    @property
-    def held(self) -> set[str]:
-        with self._lock:
-            return set(self._held) if self._fresh() else set()
 
 
 class CombinedReader:
@@ -342,55 +293,106 @@ class Curl:
 
 
 def build_curl(spec, where: str = "corruption") -> Curl | None:
-    """The `Curl` a `{curl: b, tau: s[, dt: d]}` spec describes; None for any other (matrix) spec."""
+    """The `Curl` a `{curl: b, tau: s[, dt: d]}` spec describes (``readout.corruption_spec`` in 3-D); None for any
+    other (matrix) spec."""
     if not isinstance(spec, dict) or "curl" not in spec:
         return None
-    unknown = set(spec) - {"curl", "tau", "dt"}
-    if unknown or "tau" not in spec:
-        raise ValueError(
-            f"{where}: a curl corruption takes curl and tau (and optionally dt), got {sorted(spec)}"
-        )
-    try:
-        return Curl(float(spec["curl"]), float(spec["tau"]), float(spec.get("dt", CONTROL_DT)))
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{where}: {e}") from e
+    _, curl = readout.corruption_spec(spec, where, n_dims=3)
+    return Curl(curl["curl"], curl["tau"], curl.get("dt", CONTROL_DT))
 
 
-class CommandCorruption:
-    """Corrupt a source's translation: x -> clip(M @ x), with `matrix` a 3x3 or None (off), or a curl
-    field (`curl`, a `Curl`): a velocity driven by the push, stepped once per control step.
+class ReadoutReader:
+    """The operator's readout on a source's translation: lerobot's shared `Readout`
+    (`lerobot.teleoperators.readout`, the cursor example's) in 3-D, with the robot's noise rule.
 
-    The matrix can change at any time and is only applied while the source commands beyond
-    DEADBAND, so an idle source stays idle. With a curl the field keeps evolving while the push is
-    idle (the cursor readout's rule), but an idle push is still served as is. The curl's clock is
-    `advance(step)`, called once per environment step by the rollout; a read integrates the steps
+    The corruption is x -> clip(M @ x), with `matrix` a 3x3 or None (off), or a curl field (`curl`, a
+    `Curl`): a velocity driven by the push, stepped once per control step, or a keypad (`quantize`): the
+    command snapped to the axis of its largest component at full deflection. Then N(0, `input_noise`^2)
+    is added to each of x, y, z, clipped to [-1, 1]; 0 is off.
+
+    The matrix and the noise can change at any time and apply only while the source commands beyond
+    DEADBAND, so an idle source stays idle (noise is drawn only for a corrupted command that is itself
+    beyond it: the readout's `noise_gate="command"`). With a curl the field keeps evolving while the
+    push is idle (the cursor readout's rule), but an idle push is still served as is. The curl's clock
+    is `advance(step)`, called once per environment step by the rollout; a read integrates the steps
     elapsed since the last read with the push held, so once-per-chunk reads (FC, FRS) and
-    once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest.
-    `label` is for display. Replacing `matrix` takes effect at the next read; the setter checks it is a finite 3x3.
+    once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest. `rng` is
+    the noise's generator (a trial sets its own). `label` is for display. Replacing `matrix` takes
+    effect at the next read; the setter checks it is a finite 3x3.
     """
 
-    def __init__(self, source, matrix=None, label: str | None = None, curl: Curl | None = None):
+    def __init__(
+        self,
+        source,
+        matrix=None,
+        label: str | None = None,
+        curl: Curl | None = None,
+        input_noise: float = 0.0,
+        rng: np.random.Generator | None = None,
+        quantize: bool = False,
+    ):
         self.source = source
-        self._curl: Curl | None = None
-        self._vel = np.zeros(3)
+        self._readout = readout.Readout(rng=rng, n_dims=3, noise_gate="command")
         self._clock = 0
         self._integrated = 0
-        self._discretization: tuple | None = None
+        self._curl: Curl | None = None
+        self._quantize = False
         self.matrix = matrix
         self.label = label
         self.curl = curl
+        self.input_noise = input_noise
+        self.quantize = quantize
+
+    def _rebuild(self, matrix, curl: Curl | None) -> None:
+        """The shared readout for a curl (or none), keeping the matrix, the noise and its generator."""
+        old = self._readout
+        field = None if curl is None else {"curl": curl.curl, "tau": curl.tau, "dt": curl.dt}
+        self._readout = readout.Readout(
+            matrix,
+            old.input_noise,
+            old.rng,
+            curl=field,
+            n_dims=3,
+            noise_gate="command",
+            quantize=self._quantize,
+        )
+        self._curl = curl
+        self.reset()  # a new field starts from rest
 
     @property
     def matrix(self) -> np.ndarray | None:
-        return self._matrix
+        return self._readout.corruption
 
     @matrix.setter
     def matrix(self, value) -> None:
-        self._matrix = None if value is None else readout.checked_matrix(value, 3, "corruption matrix")
+        if value is not None and self._quantize:
+            raise ValueError("a corruption is a matrix, a curl field or a keypad, not both")
+        self._readout.corruption = (
+            None if value is None else readout.checked_matrix(value, 3, "corruption matrix")
+        )
+
+    @property
+    def rng(self) -> np.random.Generator:
+        return self._readout.rng
+
+    @rng.setter
+    def rng(self, value: np.random.Generator) -> None:
+        self._readout.rng = value
+
+    @property
+    def input_noise(self) -> float:
+        return float(self._readout.input_noise)
+
+    @input_noise.setter
+    def input_noise(self, value: float) -> None:
+        value = float(value)
+        if not value >= 0.0:  # also rejects NaN
+            raise ValueError(f"input_noise must be >= 0, got {value}")
+        self._readout.input_noise = np.asarray(value)
 
     def format(self) -> str:
         """The matrix on one line, for the terminal (``AdapterModules.format_rows``); "off" when there is none."""
-        return "off" if self._matrix is None else AdapterModules.format_rows(self._matrix)
+        return "off" if self.matrix is None else AdapterModules.format_rows(self.matrix)
 
     @property
     def curl(self) -> Curl | None:
@@ -400,15 +402,24 @@ class CommandCorruption:
     def curl(self, value: Curl | None) -> None:
         if value is not None and not isinstance(value, Curl):
             raise ValueError(f"curl must be a Curl or None, got {value!r}")
-        if value is not None and self._matrix is not None:
-            raise ValueError("a corruption is a matrix or a curl field, not both")
-        self._curl = value
-        self._discretization = None if value is None else value.discretization()
-        self.reset()
+        if value is not None and (self.matrix is not None or self._quantize):
+            raise ValueError("a corruption is a matrix, a curl field or a keypad, not both")
+        self._rebuild(self.matrix, value)
+
+    @property
+    def quantize(self) -> bool:
+        return self._quantize
+
+    @quantize.setter
+    def quantize(self, value: bool) -> None:
+        if value and (self.matrix is not None or self._curl is not None):
+            raise ValueError("a corruption is a matrix, a curl field or a keypad, not both")
+        self._quantize = bool(value)
+        self._rebuild(self.matrix, self._curl)
 
     def reset(self) -> None:
         """A new trial: the curl's velocity starts from rest and the clock from step 0."""
-        self._vel = np.zeros(3)
+        self._readout.reset(None)
         self._clock = 0
         self._integrated = 0
 
@@ -419,24 +430,23 @@ class CommandCorruption:
     @property
     def translation(self) -> np.ndarray:
         clean = np.asarray(self.source.translation, dtype=np.float64)
-        if self._curl is not None:
-            if self._matrix is not None:
-                raise ValueError("a corruption is a matrix or a curl field, not both")
-            decay, drive = self._discretization
-            for _ in range(self._clock - self._integrated):
-                self._vel = readout.curl_step(self._vel, clean, decay, drive)
-            self._integrated = max(self._integrated, self._clock)
-            return readout.curl_serve(self._vel, clean)
-        return readout.corrupt(clean, self._matrix)
+        if self._curl is not None and self.matrix is not None:
+            raise ValueError("a corruption is a matrix or a curl field, not both")
+        for _ in range(self._clock - self._integrated):
+            self._readout.step(clean)
+        self._integrated = max(self._integrated, self._clock)
+        return self._readout.read(clean)
 
     @property
     def gripper(self) -> float:
         return self.source.gripper
 
     def describe(self) -> str:
+        if self._quantize:
+            return "Command corruption: keypad, x/y/z snapped to the axis of the largest push."
         if self._curl is not None:
             return f"Command corruption: curl field on x/y/z, {self._curl.label()}."
-        if self._matrix is None:
+        if self.matrix is None:
             return "Command corruption: off."
         return (
             f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {self.format()}."
@@ -526,7 +536,7 @@ class InputGain:
     """Limit the operator's command to unit length (keeping its direction) and scale it by `gain`.
 
     A corruption that lengthens a command by at most 1 / gain then stays inside [-1, 1], so
-    the clip in `CommandCorruption` never acts. `gain = None` passes the command through.
+    the readout's clip never acts. `gain = None` passes the command through.
     """
 
     def __init__(self, source, gain: float | None = None):
@@ -553,45 +563,10 @@ class InputGain:
         return self.source.gripper
 
 
-class NoisyReader:
-    """Add N(0, std^2) noise to each of x, y, z on every read, clipped to [-1, 1].
-
-    Noise is only added while the source commands beyond DEADBAND, so an idle source stays
-    idle. `input_noise` can change at any time; 0 is off.
-    """
-
-    def __init__(self, source, input_noise: float = 0.0, rng: np.random.Generator | None = None):
-        self.source = source
-        self.input_noise = input_noise
-        self._rng = rng if rng is not None else np.random.default_rng()
-
-    @property
-    def input_noise(self) -> float:
-        return self._input_noise
-
-    @input_noise.setter
-    def input_noise(self, value: float) -> None:
-        value = float(value)
-        if not value >= 0.0:  # also rejects NaN
-            raise ValueError(f"input_noise must be >= 0, got {value}")
-        self._input_noise = value
-
-    @property
-    def translation(self) -> np.ndarray:
-        clean = np.asarray(self.source.translation, dtype=np.float64)
-        if self._input_noise == 0.0 or not readout.is_active(clean):  # draws only while the source pushes
-            return clean
-        return readout.add_noise(clean, clean, self._input_noise, self._rng.normal(size=3))
-
-    @property
-    def gripper(self) -> float:
-        return self.source.gripper
-
-
 class RecordingReader:
     """Pass-through that remembers the last command it served.
 
-    `NoisyReader` draws fresh noise on every read, so a separate read for logging would record
+    The readout draws fresh noise on every read, so a separate read for logging would record
     a value never used; `last_translation` / `last_gripper` hold what was handed out and
     `reads` counts the samples.
     """
@@ -618,10 +593,11 @@ class RecordingReader:
 class TeleopChain:
     """The teleop input pipeline shared by the REPL and the experiment runner:
 
-        SpaceMouse + keyboard -> gain -> raw -> M @ x -> + noise -> served
+        SpaceMouse + keyboard -> gain -> raw -> readout (M @ x or a curl, + noise) -> served
 
     `source` is what the modes consume; `raw` (the operator's intent, after the gain) and
-    `served` (what the policy got) are the recorders an experiment logs.
+    `served` (what the policy got) are the recorders an experiment logs; `readout` holds the
+    corruption and the noise.
     """
 
     def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
@@ -631,9 +607,8 @@ class TeleopChain:
         self.combined = CombinedReader([keyboard])
         self.gain = InputGain(self.combined)
         self.raw = RecordingReader(self.gain)
-        self.corruption = CommandCorruption(self.raw)
-        self.noisy = NoisyReader(self.corruption, input_noise=input_noise)
-        self.served = RecordingReader(self.noisy)
+        self.readout = ReadoutReader(self.raw, input_noise=input_noise)
+        self.served = RecordingReader(self.readout)
 
     @property
     def source(self) -> RecordingReader:
@@ -641,11 +616,11 @@ class TeleopChain:
 
     def reset(self) -> None:
         """A new trial: a curl corruption starts from rest."""
-        self.corruption.reset()
+        self.readout.reset()
 
     def advance(self, step: int) -> None:
         """Once per environment step, before the modes read the source: the curl's clock."""
-        self.corruption.advance(step)
+        self.readout.advance(step)
 
     def attach_operator(self, operator) -> None:
         """Put a synthetic operator (e.g. `PolicyOperator`) in front of every human source."""

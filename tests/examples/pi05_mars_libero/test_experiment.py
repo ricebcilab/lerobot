@@ -156,6 +156,7 @@ def test_rollout_keeps_preview_state_and_separates_operator_policy_randomness(
 
         session = Session.__new__(Session)
         session.settings = SessionSettings(n_action_steps=chunk_steps, operator="policy")
+        session.mode = "policy"
         session.operator = PolicyOperator(chunk_steps, PolicyOperatorSettings(update_steps, delay))
         session.operator.refresh(np.ones((1, 7)), step=100)  # prior trial must be discarded
         session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
@@ -341,10 +342,57 @@ def _bare_session(control):
     session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
     session.adapter = AdapterModules(n_dims=None)
     session.policy = SimpleNamespace(config=SimpleNamespace(num_inference_steps=10))
-    session._frs_policy = None
     session.operator = object()  # a synthetic operator, so no SpaceMouse is looked for
     session.apply_control(control)
     return session
+
+
+def test_the_shared_modes_run_lerobots_steering_policy(tmp_path):
+    """A shared mode's policy is lerobot's `SteeringPolicy` over the loaded base with the session's adapter and the
+    mode's knobs (FRS pins the executed prefix), rebuilt only when a knob changes; the command it steers by is one
+    read of the teleop chain per chunk, in the batch."""
+    from lerobot.policies.steering import SteeringPolicy
+
+    base = SimpleNamespace(
+        config=SimpleNamespace(
+            num_inference_steps=10, chunk_size=50, max_action_dim=32, n_action_steps=10, device="cpu"
+        ),
+        predict_action_chunk=lambda batch, **hooks: None,
+        reset=lambda: None,
+    )
+    stats = SimpleNamespace(stats={"action": {"mean": np.zeros(7), "std": np.ones(7)}}, norm_map=None)
+    session = Session.__new__(Session)
+    session.settings = SessionSettings(policy_path="some/pi05")
+    session.policy, session.policy_cfg = base, SimpleNamespace(type="pi05")
+    session.postprocessor = SimpleNamespace(steps=[stats])
+    keyboard = KeyboardReader(clock=lambda: 0.0)
+    session.chain = TeleopChain(keyboard)
+    session.adapter = AdapterModules(n_dims=None)
+    session._steering = session._steering_fields = None  # as `__init__` leaves them
+    session.operator = object()  # a synthetic operator, so no SpaceMouse is looked for
+    control = _settings(tmp_path, "mode: shared_flow_reversal_steering, n_reversal_steps: 4").session.control
+    session.apply_control(control)
+
+    frs = session.steering_policy()
+    assert isinstance(frs, SteeringPolicy) and frs.adapter is session.adapter and frs.base_policy is base
+    assert (frs.config.mode, frs.config.n_reversal_steps, frs.config.pinned_steps) == ("frs", 4, 10)
+    assert frs.core.operator_dims == ("translation",) and session.steering_policy() is frs
+    session.set_mode("shared_flow_reversal_steering", n_reversal_steps=2)
+    assert session.steering_policy() is not frs and session.steering_policy().core.n_reversal_steps == 2
+
+    keyboard.update({"ArrowRight"}, toggles=0)
+    reads = session.chain.served.reads
+    command = session.chunk_command()
+    assert (
+        command.shape == (1, 3) and command.dtype == torch.float64 and session.chain.served.reads == reads + 1
+    )
+    np.testing.assert_array_equal(command[0], session.chain.served.last_translation)
+
+    session.set_mode("shared_flow_control", tau=5, lam=0, ic_gain=2.0)
+    fc = session.steering_policy()
+    assert (fc.config.mode, fc.core.tau, fc.core.lam, fc.core.ic_gain) == ("flow_control", 5, 0, 2.0)
+    assert session.chunk_command() is None and session.chain.served.reads == reads + 1  # lambda 0: no read
+    assert session.metrics() == {"guided_steps": 0, "tau": 5, "lambda": 0, "ic_gain": 2.0}
 
 
 def _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trials=3):
@@ -353,7 +401,7 @@ def _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trial
     session = FakeSession(
         mode=settings.session.control.mode,
         rollout=lambda session, **kwargs: in_force.append(
-            (session.chain.corruption.matrix, session.adapter.matrix)
+            (session.chain.readout.matrix, session.adapter.matrix)
         ),
     )
     run_block(session, settings, [4] * n_trials, tmp_path)
@@ -425,7 +473,7 @@ def test_run_block_records_empty_matrices_when_nothing_is_in_force(tmp_path, run
 def test_apply_control_turns_the_input_gain_on_and_off_with_the_block(tmp_path):
     session = _bare_session(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control)
     assert session.chain.gain.gain == 0.25
-    assert session.chain.corruption.matrix is None  # nothing is in force until a trial draws it
+    assert session.chain.readout.matrix is None  # nothing is in force until a trial draws it
     fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
     session.apply_control(fixed.session.control)
     assert session.chain.gain.gain is None
@@ -436,13 +484,13 @@ def test_an_auto_gain_follows_a_live_corruption_change_but_a_number_does_not(tmp
         _settings(tmp_path, "mode: shared_flow_control, input_gain: auto").session.control
     )
     assert session.chain.gain.gain == 1.0
-    session.chain.corruption.matrix = np.diag([4.0, 1.0, 1.0])  # what the REPL's `corruption <file>` does
+    session.chain.readout.matrix = np.diag([4.0, 1.0, 1.0])  # what the REPL's `corruption <file>` does
     assert "0.25" in session.refresh_input_gain() and session.chain.gain.gain == 0.25
-    session.chain.corruption.matrix = None  # `corruption off`
+    session.chain.readout.matrix = None  # `corruption off`
     session.refresh_input_gain()
     assert session.chain.gain.gain == 1.0
     session.apply_control(_settings(tmp_path, "mode: shared_flow_control, input_gain: 0.2").session.control)
-    session.chain.corruption.matrix = np.diag([4.0, 1.0, 1.0])
+    session.chain.readout.matrix = np.diag([4.0, 1.0, 1.0])
     assert "0.2" in session.refresh_input_gain() and session.chain.gain.gain == 0.2
 
 
@@ -470,3 +518,23 @@ def test_the_dry_run_description_states_the_family_and_the_gain_in_force(tmp_pat
     text = experiment._describe_block(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}"))
     assert "random(rotation_deg=30..90, scale=1..4)" in text
     assert "input gain: 0.25" in text
+
+
+def test_first_occurrence_continues_a_tasks_states_where_a_shorter_run_stopped(tmp_path):
+    counts = {0: 7, 1: 7}
+    long = trial_specs([0, 1] * 12, "libero_object", seed=3, state_counts=counts)
+    later = trial_specs([0, 1] * 7, "libero_object", seed=3, state_counts=counts, first_occurrence=5)
+    # each task's occurrences 5 to 11 of the long run, past the reshuffle at 7: same states, same seeds
+    assert later == long[10:24]
+    first = trial_specs([0, 1] * 5, "libero_object", seed=3, state_counts=counts)
+    assert first == long[:10]  # the default is unchanged
+    assert not {s.metadata()["pair_id"] for s in first} & {s.metadata()["pair_id"] for s in later}
+    assert {s.init_state_id for s in first[::2]}.isdisjoint(
+        {s.init_state_id for s in later[:4:2]}
+    )  # within a pass
+    path = tmp_path / "split.yaml"
+    path.write_text("experiment: {first_occurrence: 5}\noperator: policy\n")
+    assert load_experiment_settings(path, {}).first_occurrence == 5
+    assert load_experiment_settings(path, {}, ["experiment.first_occurrence=null"]).first_occurrence == 0
+    with pytest.raises(ValueError, match="first_occurrence"):
+        load_experiment_settings(path, {}, ["experiment.first_occurrence=-1"])

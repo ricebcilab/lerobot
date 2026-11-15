@@ -1,0 +1,10 @@
+# U1, decoding error: one random 3-D rotation, fixed for the user. Drawn by
+# RandomCorruption(rotation_deg=(60, 60)).sample(np.random.default_rng(0)): 60 degrees about the axis
+# (0.189, -0.198, 0.962), 16 degrees off vertical.
+extends: study_object.yaml
+control:
+  corruption:
+    M:
+      - [0.5178259522584652, -0.8516415231601563, -0.0810123397826696]
+      - [0.814182033060436, 0.5196793609982981, -0.25892272745739364]
+      - [0.2626097869638315, 0.06811811639974716, 0.9624946867432368]
