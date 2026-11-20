@@ -127,8 +127,8 @@ def parse_args():
         help="YAML adapter spec for shared_flow_reversal_steering's reverse integration (x_t += h * F @ v)",
     )
     parser.add_argument(
-        "--input-noise",
-        dest="input_noise",
+        "--translation-noise",
+        dest="translation_noise",
         type=float,
         default=None,
         metavar="STD",
@@ -196,8 +196,12 @@ def cmd_mode(session: Session, tokens: list[str]) -> None:
 
 
 def noise_line(session: Session) -> str:
-    std = session.chain.readout.input_noise
-    return f"Input noise: std {std:.3f} on x/y/z while you command." if std > 0 else "Input noise: off."
+    std = session.chain.readout.translation_noise
+    return (
+        f"Translation noise: std {std:.3f} on x/y/z while you command."
+        if std > 0
+        else "Translation noise: off."
+    )
 
 
 def cmd_noise(session: Session, tokens: list[str]) -> None:
@@ -205,7 +209,7 @@ def cmd_noise(session: Session, tokens: list[str]) -> None:
         if len(tokens) > 2:
             raise ValueError
         if len(tokens) == 2:
-            session.chain.readout.input_noise = float(tokens[1])
+            session.chain.readout.translation_noise = float(tokens[1])
     except ValueError:
         print("usage: noise <std>   e.g. noise 0.1   (std >= 0, 0 = off)")
         return
@@ -238,11 +242,11 @@ def cmd_corruption(session: Session, tokens: list[str]) -> None:
             corruption.curl = curl
             corruption.label = spec_label(read_matrix_spec(tokens[1]))
             print(corruption.describe())
-            print(session.refresh_input_gain())
+            print(session.refresh_translation_gain())
             return
     corruption.curl = None
     _cmd_matrix(session, tokens, "corruption", corruption, build_corruption)
-    print(session.refresh_input_gain())  # an `auto` gain follows the corruption in force
+    print(session.refresh_translation_gain())  # an `auto` gain follows the corruption in force
 
 
 def cmd_adapter(session: Session, tokens: list[str]) -> None:
@@ -327,7 +331,7 @@ def main():
         print(session.adapter.describe() + "\n")
     if session.mode != "policy":
         print(session.announce_mode() + "\n")
-    if session.chain.readout.input_noise > 0:
+    if session.chain.readout.translation_noise > 0:
         print(noise_line(session) + "\n")
 
     try:

@@ -72,6 +72,8 @@ class SteeringConfig(PreTrainedConfig):
         lam: Flow control: the Euler steps the command is written at (lambda; 1 = the initial condition only).
         ic_gain: Flow control: the command's scale in the noise prior (a full push writes ``ic_gain`` sigma), or
             ``"action"``: the command in the base policy's action units (needs its postprocessor's statistics).
+        zeroed_dims: Flow control: the action dim groups set to 0 in the steps the command is written into (names
+            of ``OPERATOR_DIM_GROUPS``; Kao et al. on LIBERO, App. G.1: rotation), or None: they keep their noise.
         n_reversal_steps: FRS: the Euler steps of the reversal (None: all the way to noise).
         pinned_steps: FRS: the leading chunk steps the reference pins (None: all of them).
         deadband: Below this (the operator's units) the operator counts as idle and the row gets the policy's own
@@ -111,6 +113,7 @@ class SteeringConfig(PreTrainedConfig):
     tau: int | None = 5
     lam: int = 1
     ic_gain: float | str = 1.0
+    zeroed_dims: list[str] | None = None
     n_reversal_steps: int | None = None
     pinned_steps: int | None = None
     deadband: float = readout.DEADBAND
@@ -143,6 +146,7 @@ class SteeringConfig(PreTrainedConfig):
         if self.token_geometry is not None and self.token_geometry not in TOKEN_GEOMETRIES:
             raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {self.token_geometry!r}")
         self.check_operator_dims(self.operator_dims or ())
+        self.check_operator_dims(self.zeroed_dims or ())
         if (
             self.adapter_matrix is not None
         ):  # a square of numbers, kept as lists so the config compares and serializes

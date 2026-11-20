@@ -23,8 +23,8 @@ and idle input stays exactly idle at every stage. The stages, in order:
 - or a curl field on the command: the served command is a velocity v driven by the push u through
   dv/dt = (u - v) / tau + curl * R v (R a clockwise quarter turn in the first two axes, any further axis a plain
   lag), stepped exactly over each control step (``curl_discretization``, ``curl_step``), then clipped;
-- or a discrete input (``quantize``): the command snapped to the axis of its largest component at full deflection,
-  what a keypad with one key per direction delivers;
+- or a discrete input (``quantize``): the command snapped to the axis of its largest component at its own length,
+  so only its direction is lost: the nearest of the 2n key directions;
 - Gaussian noise of std sigma per axis, clipped (``add_noise``).
 
 The functions are numpy and batched over leading axes: a command is (..., n), a matrix (n, n) or one per row
@@ -113,11 +113,13 @@ def curl_serve(vel, raw, deadband: float = DEADBAND) -> np.ndarray:
 
 def quantize(raw, deadband: float = DEADBAND) -> np.ndarray:
     """A discrete input: an active command (..., n) snapped to the axis of its largest component (the first on a
-    tie), at full deflection with that component's sign; an idle command unchanged."""
+    tie), with that component's sign and the command's own length, so only its direction is lost (a length beyond
+    full deflection is capped at 1, as every stage's output is); an idle command unchanged."""
     raw = np.asarray(raw, dtype=np.float64)
     axis = np.argmax(np.abs(raw), axis=-1)[..., None]
+    length = np.minimum(np.linalg.norm(raw, axis=-1, keepdims=True), 1.0)
     snapped = np.zeros_like(raw)
-    np.put_along_axis(snapped, axis, np.sign(np.take_along_axis(raw, axis, axis=-1)), axis=-1)
+    np.put_along_axis(snapped, axis, np.sign(np.take_along_axis(raw, axis, axis=-1)) * length, axis=-1)
     return np.where(is_active(raw, deadband)[..., None], snapped, raw)
 
 
@@ -234,7 +236,8 @@ class Readout:
     curl's own `dt` when it has one).
 
     With `quantize` the corruption is the discrete input instead: the command
-    snapped to the axis of its largest component (`quantize`), then the noise.
+    snapped to the axis of its largest component at its own length (`quantize`),
+    then the noise.
 
     Batched: commands are [B, n], or [B, H, n] for a whole chunk per trial (not
     with a curl), or [n] for a single unbatched trial; n = `n_dims` (2: the cursor;

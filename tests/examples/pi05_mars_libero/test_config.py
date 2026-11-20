@@ -79,7 +79,7 @@ def test_shipped_interactive_config_loads():
     assert isinstance(s, SessionSettings)
     assert s.control.mode == "policy" and s.control.corruption_matrix is None
     assert s.output_dir == Path("outputs/pi05_libero_interactive")
-    assert s.control.resolved_input_gain is not None  # the REPL cannot clip either
+    assert s.control.resolved_translation_gain is not None  # the REPL cannot clip either
 
 
 def test_interactive_cli_overrides_win_over_file():
@@ -102,8 +102,8 @@ def _check_shipped_condition(name):
     assert s.session.suite in ("libero_goal", "libero_object") and s.seed == 0 and s.prompt == "do something"
     # every shipped condition turns the command down enough that its corruption cannot clip
     control = s.session.control
-    assert control.resolved_input_gain is not None
-    assert control.resolved_input_gain * largest_gain(control) <= 1.0
+    assert control.resolved_translation_gain is not None
+    assert control.resolved_translation_gain * largest_gain(control) <= 1.0
 
 
 def test_arm_files_resolve():
@@ -187,7 +187,7 @@ def test_curl_corruption_resolves():
     from teleop import Curl
 
     text = (
-        "control:\n  mode: shared_flow_reversal_steering\n  input_gain: auto\n"
+        "control:\n  mode: shared_flow_reversal_steering\n  translation_gain: auto\n"
         "  corruption: {curl: 20, tau: 0.1}\n  reversal_adapter: {translation: corruption_inverse}\n"
     )
     path = CONFIG_DIR.parent / "_curl_test.yaml"
@@ -199,7 +199,7 @@ def test_curl_corruption_resolves():
     assert (
         c.corruption_curl == Curl(20.0, 0.1) and c.corruption_matrix is None and c.corruption_family is None
     )
-    assert c.resolved_input_gain == 1.0  # a curl never lengthens a push
+    assert c.resolved_translation_gain == 1.0  # a curl never lengthens a push
     np.testing.assert_allclose(
         c.reversal_adapter_matrix[:3, :3], np.linalg.inv(Curl(20.0, 0.1).steady_state())
     )
@@ -268,6 +268,14 @@ def test_experiment_validation_errors(tmp_path):
         _load(tmp_path, "control: {reversal_adapter: {translation: corruption}}")
     with pytest.raises(ValueError, match="n_reversal_steps"):
         _load(tmp_path, "control: {n_reversal_steps: 0}")
+    with pytest.raises(ValueError, match="pinned_steps must"):
+        _load(tmp_path, "control: {pinned_steps: 0}")
+    for key in ("rotation_noise", "gripper_noise"):
+        with pytest.raises(ValueError, match=f"{key} must"):
+            _load(tmp_path, f"control: {{{key}: -0.1}}")
+    for bad in ("[translation]", "[wrist]", "rotation"):
+        with pytest.raises(ValueError, match="zeroed_dims must"):
+            _load(tmp_path, f"control: {{zeroed_dims: {bad}}}")
     for value in (-1, 0.5, True):
         with pytest.raises(ValueError, match="seed"):
             _load(tmp_path, f"experiment: {{seed: {value}}}")
@@ -304,7 +312,7 @@ def test_operator_settings():
         load_experiment_settings(path, {}, sets=["control.operator_dims=translation"])
 
 
-# ---------------------------------------------------------------- random corruption and input gain
+# ---------------------------------------------------------------- random corruption and translation gain
 
 
 def test_random_corruption_spec_becomes_a_family_and_leaves_the_matrices_to_each_trial(tmp_path):
@@ -350,20 +358,20 @@ def test_a_random_corruption_needs_trials_so_the_interactive_runner_rejects_it(t
         ("{scale: [0.5, 0.5, 0.5]}", 1.0),  # a corruption that only shrinks: the gain never exceeds 1
     ],
 )
-def test_input_gain_auto_is_the_largest_gain_that_cannot_clip(tmp_path, corruption, largest_safe_gain):
-    control = _load(tmp_path, f"control: {{corruption: {corruption}, input_gain: auto}}")
-    assert control.resolved_input_gain == pytest.approx(largest_safe_gain)
+def test_translation_gain_auto_is_the_largest_gain_that_cannot_clip(tmp_path, corruption, largest_safe_gain):
+    control = _load(tmp_path, f"control: {{corruption: {corruption}, translation_gain: auto}}")
+    assert control.resolved_translation_gain == pytest.approx(largest_safe_gain)
 
 
-def test_input_gain_is_off_by_default_and_a_number_is_checked_against_the_corruption(tmp_path):
-    assert _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}}").resolved_input_gain is None
-    control = _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, input_gain: 0.2}")
-    assert control.resolved_input_gain == pytest.approx(0.2)
-    with pytest.raises(ValueError, match=r"control.input_gain.*0\.25"):  # names the largest safe gain
-        _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, input_gain: 0.5}")
+def test_translation_gain_is_off_by_default_and_a_number_is_checked_against_the_corruption(tmp_path):
+    assert _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}}").resolved_translation_gain is None
+    control = _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, translation_gain: 0.2}")
+    assert control.resolved_translation_gain == pytest.approx(0.2)
+    with pytest.raises(ValueError, match=r"control.translation_gain.*0\.25"):  # names the largest safe gain
+        _load(tmp_path, "control: {corruption: {scale: [4, 1, 1]}, translation_gain: 0.5}")
     for bad in ("0", "-1", "1.5", "fast", "true", "[0.5]"):
-        with pytest.raises(ValueError, match="control.input_gain"):
-            _load(tmp_path, f"control: {{input_gain: {bad}}}")
+        with pytest.raises(ValueError, match="control.translation_gain"):
+            _load(tmp_path, f"control: {{translation_gain: {bad}}}")
 
 
 @pytest.mark.parametrize("arm", ["mars"])
@@ -371,26 +379,26 @@ def test_the_shipped_random_family_cannot_clip_and_only_the_adapted_arm_has_an_a
     control = load_experiment_settings(CONFIG_DIR / "experiment" / f"{arm}_random.yaml", {}).session.control
     assert control.corruption_family is not None
     # the gain in force times the most the family can lengthen a command stays inside the unit cube
-    assert control.resolved_input_gain * control.corruption_family.max_gain <= 1.0
+    assert control.resolved_translation_gain * control.corruption_family.max_gain <= 1.0
     assert (control.reversal_adapter is not None) == (arm == "mars")
 
 
 def test_quantize_and_singular_corruptions_resolve(tmp_path):
     keypad = _load(
         tmp_path,
-        "control:\n  mode: shared_flow_reversal_steering\n  input_gain: auto\n  corruption: {quantize: axes}\n",
+        "control:\n  mode: shared_flow_reversal_steering\n  translation_gain: auto\n  corruption: {quantize: axes}\n",
     )
     assert keypad.corruption_quantize is True and keypad.corruption_matrix is None
     assert keypad.corruption_curl is None and keypad.corruption_family is None
-    assert keypad.resolved_input_gain == 1.0  # a snap is never clipped
+    assert keypad.resolved_translation_gain == 1.0  # a snap is never clipped
     stick = _load(
         tmp_path,
-        "control:\n  mode: shared_flow_reversal_steering\n  input_gain: auto\n  corruption: {scale: [1, 1, 0]}\n",
+        "control:\n  mode: shared_flow_reversal_steering\n  translation_gain: auto\n  corruption: {scale: [1, 1, 0]}\n",
     )
     np.testing.assert_array_equal(
         stick.corruption_matrix, np.diag([1.0, 1.0, 0.0])
     )  # a dropped axis is accepted
-    assert stick.corruption_quantize is False and stick.resolved_input_gain == 1.0
+    assert stick.corruption_quantize is False and stick.resolved_translation_gain == 1.0
 
 
 def test_the_study_rotation_is_the_recorded_draw():

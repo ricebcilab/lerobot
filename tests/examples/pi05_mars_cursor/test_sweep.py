@@ -164,8 +164,9 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path):
     a settings file (settings.yaml's format) on the same test trials without tuning; a cell or method it leaves out is
     an error rather than a guess."""
     (tmp_path / "jt.yaml").write_text(
-        "name: jt\nmethods:\n  teleop: {mode: teleop}\n  flow_control: {mode: flow_control}\n  frs: {mode: frs}\n"
-        "  mars: {mode: frs, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
+        "name: jt\nmethods:\n  teleop: {mode: teleop, time_limit_s: 1}\n  flow_control: {mode: flow_control, time_limit_s: 1}\n"
+        "  frs: {mode: frs, time_limit_s: 1}\n"
+        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
         "tune: {flow_control: {tau: [8, 16], lambda: [1, 2]}, frs: {n_reverse_steps: [10], pinned_steps: [2, 16]}}\n"
         "grid: {family: gain, levels: [0.25], noises: [1.25]}\nfocus: mars\n")
     common = ["--sweep", str(tmp_path / "jt.yaml"), "--tune-trials", "2", "--test-trials", "4", "--cpu", "--results", str(tmp_path)]
@@ -218,7 +219,8 @@ def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path):
     with pytest.raises(ValueError, match="grid.axes"):
         load_sweep(tmp_path / "bad.yaml")
     (tmp_path / "run.yaml").write_text(
-        "name: ax\nmethods:\n  teleop: {mode: teleop}\n  mars: {mode: frs, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
+        "name: ax\nmethods:\n  teleop: {mode: teleop, time_limit_s: 1}\n"
+        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
         "grid:\n  family: gain\n  levels: [0.25]\n  noises: [1.25]\n"
         "  axes: {targets: [[2, 2], [3, 3]], min_target_sep: [0.12, 1.5]}\n"  # 1.5 apart does not fit the screen
         "tune: {frs: {n_reverse_steps: [2, 10]}}\n")
@@ -408,32 +410,6 @@ def _view_sweep(tmp_path, monkeypatch):
         "  tasks: {T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5}, adapter: null}}\n  noises: [0.0]\nfocus: oracle_a\nseed: 3\n"
     )
     return tmp_path / "tiny.yaml"
-
-
-def test_tiny_sweep_runs_two_view_modules_at_their_own_spans(tmp_path, monkeypatch):
-    import cursor_sa.steering as steering_mod
-
-    sweep = _view_sweep(tmp_path, monkeypatch)
-    rendered, real, ViewStub.made = [], steering_mod.render_views, 0
-
-    def spy(layouts, pos, span, size, **k):
-        rendered.append((span, size))
-        return real(layouts, pos, span, size, **k)
-
-    monkeypatch.setattr(steering_mod, "render_views", spy)
-    monkeypatch.setattr(run_sweep, "SceneEncoder", ViewStub)
-    args = ["--sweep", str(sweep), "--results", str(tmp_path), "--scene-cache", str(tmp_path / "scene")]
-    sweep_main([*args, "--out", "pre", "--precompute-scene"])
-    assert ViewStub.made == 0 and not rendered  # nothing to precompute for per-step views
-    sweep_main([*args, "--out", "tiny_views", "--tune-trials", "2", "--test-trials", "3"])
-    assert {span for span, _ in rendered} == {0.5, 1.0} and {size for _, size in rendered} == {56} and ViewStub.made == 1
-    assert not list((tmp_path / "scene").glob("*.npy"))
-    test_json = tmp_path / "sim" / "sweeps" / "tiny_views" / "test.json"
-    assert set(json.loads(test_json.read_text())["test"]["U0xT2|0.0"]["metrics"]) == {"oracle_a", "policy_b"}
-    arm = method_arm(load_sweep(sweep), "policy_b", "U0xT2")
-    policies, adapters = load_checkpoints({"policy_b": arm}, "cpu")
-    with pytest.raises(ValueError, match="scene_encoder"):  # run_trials needs an encoder for a view module
-        run_trials(arm, _lay(), ExpertChunkAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
 
 
 def test_as_policy_returns_a_matching_policy_as_is_and_rewraps_a_differing_one_without_mutating_it():

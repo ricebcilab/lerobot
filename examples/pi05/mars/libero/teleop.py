@@ -13,7 +13,7 @@
 Where the operator's command comes from and what happens to it on the way to
 the policy:
 
-    SpaceMouse + keyboard -> CombinedReader -> InputGain (optional)
+    SpaceMouse + keyboard -> CombinedReader -> TranslationGain (optional)
         -> RecordingReader (raw) -> ReadoutReader (M @ x or a curl, + noise)
         -> RecordingReader (served)
 
@@ -22,7 +22,10 @@ corruption and the noise are lerobot's shared operator readout
 (`lerobot.teleoperators.readout.Readout`, the cursor example's, in 3-D). Every
 reader exposes `translation` (shape 3, env units in [-1, 1]) and `gripper`
 (-1 open, +1 close), the `TeleopSource` protocol from
-`lerobot.policies.steering`.
+`lerobot.policies.steering`, and `rotation` (shape 3, env units), which only
+teleop mode executes: the synthetic operator's, zero from the devices. The
+gain and the corruption act on the translation alone; the readout's noise
+reaches all three parts, each at its own level.
 """
 
 import time
@@ -175,6 +178,14 @@ class CombinedReader:
         return np.zeros(3)
 
     @property
+    def rotation(self) -> np.ndarray:
+        """The rotation command of the first source that gives one (the devices give none: zero)."""
+        for source in self.sources:
+            if hasattr(source, "rotation"):
+                return np.asarray(source.rotation, dtype=np.float64)
+        return np.zeros(3)
+
+    @property
     def gripper(self) -> float:
         n_closed = sum(source.gripper == GRIPPER_CLOSE for source in self.sources)
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
@@ -199,9 +210,9 @@ class PolicyOperatorSettings:
 class PolicyOperator:
     """A synthetic operator: the task-prompted policy's own plan, sampled like a SpaceMouse.
 
-    `refresh(chunk, step)` turns an action chunk (env units) into a translation (mean over the
-    first `n_action_steps` steps, clipped to [-1, 1]) and a gripper command (close iff the mean
-    is > 0), held until the next delivery. Update period and delay are in environment steps;
+    `refresh(chunk, step)` turns an action chunk (env units) into a translation and a rotation
+    (each the mean over the first `n_action_steps` steps, clipped to [-1, 1]) and a gripper
+    command (close iff the mean is > 0), held until the next delivery. Update period and delay are in environment steps;
     the defaults are the immediate once-per-chunk oracle. It sits in front of the human sources
     (`TeleopChain.attach_operator`), so corruption, noise and recorders treat it like a person.
     """
@@ -217,6 +228,7 @@ class PolicyOperator:
 
     def reset(self) -> None:
         self._translation = np.zeros(3)
+        self._rotation = np.zeros(3)
         self._gripper = GRIPPER_OPEN
         self.oracle_translation = np.zeros(3)
         self._pending: deque = deque()
@@ -231,9 +243,10 @@ class PolicyOperator:
         """Compute intent from the observation at `step`; deliver it after the configured delay."""
         chunk = np.asarray(chunk, dtype=np.float64)[: self.n_action_steps]
         translation = np.clip(chunk[:, :3].mean(axis=0), -1.0, 1.0)
+        rotation = np.clip(chunk[:, 3:6].mean(axis=0), -1.0, 1.0)
         gripper = GRIPPER_CLOSE if chunk[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
         self.oracle_translation = translation.copy()
-        self._pending.append((step + self.settings.delay_steps, step, translation, gripper))
+        self._pending.append((step + self.settings.delay_steps, step, translation, rotation, gripper))
         self.refreshes += 1
         self.advance(step)
 
@@ -241,7 +254,7 @@ class PolicyOperator:
         """Deliver the commands due by `step` and hold the latest; idle until the first one arrives."""
         self._step = step
         while self._pending and self._pending[0][0] <= step:
-            _, self._generated_at, self._translation, self._gripper = self._pending.popleft()
+            _, self._generated_at, self._translation, self._rotation, self._gripper = self._pending.popleft()
 
     @property
     def command_age_steps(self) -> int:
@@ -250,6 +263,10 @@ class PolicyOperator:
     @property
     def translation(self) -> np.ndarray:
         return self._translation.copy()
+
+    @property
+    def rotation(self) -> np.ndarray:
+        return self._rotation.copy()
 
     @property
     def gripper(self) -> float:
@@ -301,14 +318,25 @@ def build_curl(spec, where: str = "corruption") -> Curl | None:
     return Curl(curl["curl"], curl["tau"], curl.get("dt", CONTROL_DT))
 
 
+def _noise_level(value, name: str) -> float:
+    value = float(value)
+    if not np.isfinite(value) or value < 0:
+        raise ValueError(f"{name}: a noise must be >= 0, got {value}")
+    return value
+
+
 class ReadoutReader:
     """The operator's readout on a source's translation: lerobot's shared `Readout`
     (`lerobot.teleoperators.readout`, the cursor example's) in 3-D, with the robot's noise rule.
 
     The corruption is x -> clip(M @ x), with `matrix` a 3x3 or None (off), or a curl field (`curl`, a
     `Curl`): a velocity driven by the push, stepped once per control step, or a keypad (`quantize`): the
-    command snapped to the axis of its largest component at full deflection. Then N(0, `input_noise`^2)
-    is added to each of x, y, z, clipped to [-1, 1]; 0 is off.
+    command snapped to the axis of its largest component at its own length. Then N(0, `translation_noise`^2)
+    is added to each of x, y, z, clipped to [-1, 1]; 0 is off. The rotation and the gripper pass the
+    corruption untouched and carry their own noise, drawn at every read from the same generator:
+    N(0, `rotation_noise`^2) on each rotation axis (clipped), and the gripper served as the sign of its
+    command plus N(0, `gripper_noise`^2) (the simulator reads only that sign); 0, the default, is off.
+    Only teleop mode reads those two parts.
 
     The matrix and the noise can change at any time and apply only while the source commands beyond
     DEADBAND, so an idle source stays idle (noise is drawn only for a corrupted command that is itself
@@ -327,9 +355,11 @@ class ReadoutReader:
         matrix=None,
         label: str | None = None,
         curl: Curl | None = None,
-        input_noise: float = 0.0,
+        translation_noise: float = 0.0,
         rng: np.random.Generator | None = None,
         quantize: bool = False,
+        rotation_noise: float = 0.0,
+        gripper_noise: float = 0.0,
     ):
         self.source = source
         self._readout = readout.Readout(rng=rng, n_dims=3, noise_gate="command")
@@ -340,8 +370,10 @@ class ReadoutReader:
         self.matrix = matrix
         self.label = label
         self.curl = curl
-        self.input_noise = input_noise
+        self.translation_noise = translation_noise
         self.quantize = quantize
+        self.rotation_noise = rotation_noise
+        self.gripper_noise = gripper_noise
 
     def _rebuild(self, matrix, curl: Curl | None) -> None:
         """The shared readout for a curl (or none), keeping the matrix, the noise and its generator."""
@@ -380,14 +412,14 @@ class ReadoutReader:
         self._readout.rng = value
 
     @property
-    def input_noise(self) -> float:
+    def translation_noise(self) -> float:
         return float(self._readout.input_noise)
 
-    @input_noise.setter
-    def input_noise(self, value: float) -> None:
+    @translation_noise.setter
+    def translation_noise(self, value: float) -> None:
         value = float(value)
         if not value >= 0.0:  # also rejects NaN
-            raise ValueError(f"input_noise must be >= 0, got {value}")
+            raise ValueError(f"translation_noise must be >= 0, got {value}")
         self._readout.input_noise = np.asarray(value)
 
     def format(self) -> str:
@@ -438,8 +470,34 @@ class ReadoutReader:
         return self._readout.read(clean)
 
     @property
+    def rotation_noise(self) -> float:
+        return self._rotation_noise
+
+    @rotation_noise.setter
+    def rotation_noise(self, value: float) -> None:
+        self._rotation_noise = _noise_level(value, "rotation_noise")
+
+    @property
+    def gripper_noise(self) -> float:
+        return self._gripper_noise
+
+    @gripper_noise.setter
+    def gripper_noise(self, value: float) -> None:
+        self._gripper_noise = _noise_level(value, "gripper_noise")
+
+    @property
+    def rotation(self) -> np.ndarray:
+        rotation = np.asarray(self.source.rotation, dtype=np.float64)
+        if not self._rotation_noise:
+            return rotation
+        return np.clip(rotation + self._rotation_noise * self.rng.normal(size=rotation.shape), -1.0, 1.0)
+
+    @property
     def gripper(self) -> float:
-        return self.source.gripper
+        gripper = self.source.gripper
+        if not self._gripper_noise:
+            return gripper
+        return GRIPPER_CLOSE if gripper + self._gripper_noise * self.rng.normal() > 0 else GRIPPER_OPEN
 
     def describe(self) -> str:
         if self._quantize:
@@ -525,14 +583,14 @@ class RandomCorruption:
         return CorruptionDraw(rotation @ np.diag(scale), axis, angle, scale)
 
 
-def check_input_gain(value) -> float:
-    """`value` as an input gain, a number in (0, 1]; raises ValueError otherwise (bool, str, NaN included)."""
+def check_translation_gain(value) -> float:
+    """`value` as an translation gain, a number in (0, 1]; raises ValueError otherwise (bool, str, NaN included)."""
     if isinstance(value, bool | str) or not 0.0 < float(value) <= 1.0:
-        raise ValueError(f"input gain must be a number in (0, 1] or null, got {value!r}")
+        raise ValueError(f"translation gain must be a number in (0, 1] or null, got {value!r}")
     return float(value)
 
 
-class InputGain:
+class TranslationGain:
     """Limit the operator's command to unit length (keeping its direction) and scale it by `gain`.
 
     A corruption that lengthens a command by at most 1 / gain then stays inside [-1, 1], so
@@ -549,7 +607,7 @@ class InputGain:
 
     @gain.setter
     def gain(self, value: float | None) -> None:
-        self._gain = None if value is None else check_input_gain(value)
+        self._gain = None if value is None else check_translation_gain(value)
 
     @property
     def translation(self) -> np.ndarray:
@@ -557,6 +615,10 @@ class InputGain:
         if self._gain is None:
             return command
         return self._gain * command / max(1.0, float(np.linalg.norm(command)))
+
+    @property
+    def rotation(self) -> np.ndarray:
+        return self.source.rotation
 
     @property
     def gripper(self) -> float:
@@ -585,6 +647,10 @@ class RecordingReader:
         return translation
 
     @property
+    def rotation(self) -> np.ndarray:
+        return self.source.rotation
+
+    @property
     def gripper(self) -> float:
         self.last_gripper = self.source.gripper
         return self.last_gripper
@@ -600,14 +666,14 @@ class TeleopChain:
     corruption and the noise.
     """
 
-    def __init__(self, keyboard: KeyboardReader, input_noise: float = 0.0):
+    def __init__(self, keyboard: KeyboardReader, translation_noise: float = 0.0):
         self.keyboard = keyboard
         self.spacemouse = None
         self.operator = None
         self.combined = CombinedReader([keyboard])
-        self.gain = InputGain(self.combined)
+        self.gain = TranslationGain(self.combined)
         self.raw = RecordingReader(self.gain)
-        self.readout = ReadoutReader(self.raw, input_noise=input_noise)
+        self.readout = ReadoutReader(self.raw, translation_noise=translation_noise)
         self.served = RecordingReader(self.readout)
 
     @property

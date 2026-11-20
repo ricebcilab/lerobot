@@ -86,13 +86,15 @@ def _frame(observation) -> np.ndarray:
     return observation["pixels"]["image"][0][::-1, ::-1]
 
 
-def _teleop_hook(source, paste_gripper: bool) -> Callable[[np.ndarray], np.ndarray]:
-    """Paste the teleop translation (and, for teleop mode, gripper) into the env action."""
+def _teleop_hook(source, full: bool) -> Callable[[np.ndarray], np.ndarray]:
+    """Paste the teleop command into the env action: its translation (shared override), or the whole of it,
+    translation, rotation and gripper (`full`, teleop mode: nothing of the action is the policy's)."""
 
     def hook(action: np.ndarray) -> np.ndarray:
         action = action.copy()
         action[0, :3] = source.translation
-        if paste_gripper:
+        if full:
+            action[0, 3:6] = source.rotation
             action[0, GRIPPER_DIM] = source.gripper
         return action
 
@@ -104,9 +106,10 @@ class Session:
         self.settings = settings
         control = settings.control
         self.tau, self.lam, self.ic_gain = control.tau, control.lam, control.ic_gain  # FC knobs
+        self.zeroed_dims = tuple(control.zeroed_dims)
 
         self.keyboard = KeyboardReader()
-        self.chain = TeleopChain(self.keyboard, input_noise=control.input_noise)
+        self.chain = TeleopChain(self.keyboard, translation_noise=control.translation_noise)
         # A synthetic operator (the task-prompted policy) replaces the SpaceMouse/keyboard.
         self.operator: PolicyOperator | None = None
         if settings.operator == "policy":
@@ -266,7 +269,7 @@ class Session:
 
     def _status_extra(self) -> dict:
         return {
-            "input_noise": self.chain.readout.input_noise,
+            "translation_noise": self.chain.readout.translation_noise,
             "corruption": self.chain.readout.label,
             "reversal_adapter": self.adapter.label,
         }
@@ -337,9 +340,14 @@ class Session:
                 device=next(self.policy.parameters()).device,
             )
         self.tau, self.lam, self.ic_gain = control.tau, control.lam, control.ic_gain
-        self.chain.readout.input_noise = control.input_noise
-        self.input_gain = control.input_gain  # the setting (null, auto or a number); see refresh_input_gain
-        self.chain.gain.gain = control.resolved_input_gain
+        self.zeroed_dims = tuple(control.zeroed_dims)
+        self.chain.readout.translation_noise = control.translation_noise
+        self.chain.readout.rotation_noise = control.rotation_noise
+        self.chain.readout.gripper_noise = control.gripper_noise
+        self.translation_gain = (
+            control.translation_gain
+        )  # the setting (null, auto or a number); see refresh_translation_gain
+        self.chain.gain.gain = control.resolved_translation_gain
         FlowReversalSteering.check_steps(
             "n_reversal_steps",
             control.n_reversal_steps,
@@ -349,19 +357,20 @@ class Session:
             optional=True,
         )
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
+        self.pinned_steps = control.pinned_steps  # None = the executed prefix; the steering core checks it
         self.operator_dims = tuple(control.operator_dims)
         self.set_mode(control.mode)
 
-    def refresh_input_gain(self) -> str:
+    def refresh_translation_gain(self) -> str:
         """Re-derive an `auto` gain from the corruption now in force (the REPL swaps M live); returns a status line."""
-        if self.input_gain == "auto":
+        if self.translation_gain == "auto":
             m = self.chain.readout.matrix
             self.chain.gain.gain = gain_that_cannot_clip(1.0 if m is None else float(np.linalg.norm(m, 2)))
         gain = self.chain.gain.gain
         if gain is None:
-            return "Input gain: off (the corruption can clip the command)."
-        auto = " (auto)" if self.input_gain == "auto" else ""
-        return f"Input gain: {gain:g}{auto}: your command is limited to unit length and scaled by it."
+            return "Translation gain: off (the corruption can clip the command)."
+        auto = " (auto)" if self.translation_gain == "auto" else ""
+        return f"Translation gain: {gain:g}{auto}: your command is limited to unit length and scaled by it."
 
     def mode_label(self) -> str:
         """Short label for the terminal and the live view."""
@@ -382,7 +391,8 @@ class Session:
             )
         total = self.policy.config.num_inference_steps
         if self.mode == "teleop":
-            lines.append("Teleop: you drive x/y/z and the gripper; the model is not involved.")
+            lines.append("Teleop: you drive x/y/z and the gripper (a synthetic operator turns the hand too);")
+            lines.append("the model is not involved.")
             lines.append("Press Enter to start a rollout.")
         elif self.mode == "shared_override":
             lines.append("Shared override: pi0.5 drives, your x/y/z replaces its translation.")
@@ -424,8 +434,9 @@ class Session:
                 "env_postprocessor": _identity,
                 "preprocessor": _identity,
                 "postprocessor": _identity,
-                "action_hook": _teleop_hook(source, paste_gripper=True),
-                "max_steps": TELEOP_MAX_STEPS,
+                "action_hook": _teleop_hook(source, full=True),
+                # a person gets teleop's longer limit; a synthetic operator the suite's, as in every other arm
+                "max_steps": TELEOP_MAX_STEPS if self.operator is None else None,
             }
         kwargs = {
             "policy": self.policy,
@@ -437,7 +448,7 @@ class Session:
             "max_steps": None,
         }
         if self.mode == "shared_override":
-            kwargs["action_hook"] = _teleop_hook(source, paste_gripper=False)
+            kwargs["action_hook"] = _teleop_hook(source, full=False)
         elif self.mode in STEERING_MODES:
             kwargs["policy"] = self.steering_policy()
         return kwargs
@@ -457,11 +468,17 @@ class Session:
             "device": str(cfg.device),
         }
         if self.mode == "shared_flow_control":  # the command is written into the translation dims
-            fields.update(tau=self.tau, lam=self.lam, ic_gain=self.ic_gain, operator_dims=["translation"])
-        else:  # the reference pins the executed prefix; the rest of the chunk is the policy's
+            fields.update(
+                tau=self.tau,
+                lam=self.lam,
+                ic_gain=self.ic_gain,
+                zeroed_dims=list(self.zeroed_dims) or None,
+                operator_dims=["translation"],
+            )
+        else:  # the reference pins a prefix (default: the executed steps); the rest is the policy's
             fields.update(
                 n_reversal_steps=self.n_reversal_steps,
-                pinned_steps=cfg.n_action_steps,
+                pinned_steps=cfg.n_action_steps if self.pinned_steps is None else self.pinned_steps,
                 operator_dims=list(self.operator_dims),
             )
         if self._steering is None or fields != self._steering_fields:

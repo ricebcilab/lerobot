@@ -26,7 +26,7 @@ def test_operator_command_follows_the_policy_operator_rule():
 
 def test_readout_cores_are_what_the_rollouts_reader_serves_along_an_episode():
     from config import ControlSettings
-    from teleop import InputGain, ReadoutReader
+    from teleop import ReadoutReader, TranslationGain
 
     class Push:
         gripper = GRIPPER_OPEN
@@ -35,11 +35,11 @@ def test_readout_cores_are_what_the_rollouts_reader_serves_along_an_episode():
         [[0.6, -0.2, 0.4], [0.6, -0.2, 0.4], [0.1, 0.9, 0.0], [0.6, -0.2, 0.4], [0.9, 0.9, 0.9]]
     )
     episodes, steps = [0, 0, 0, 1, 1], [0, 10, 20, 0, 10]
-    lag = ControlSettings(corruption_curl=Curl(2.0, 0.5), resolved_input_gain=1.0)
+    lag = ControlSettings(corruption_curl=Curl(2.0, 0.5), resolved_translation_gain=1.0)
     cores = tum.readout_cores(pushes, episodes, steps, lag)
     # a rollout of episode 0: the field stepped at every control step, read at each chunk boundary with the new push
     source = Push()
-    reader = ReadoutReader(InputGain(source, 1.0), curl=Curl(2.0, 0.5))
+    reader = ReadoutReader(TranslationGain(source, 1.0), curl=Curl(2.0, 0.5))
     served = []
     for step in range(21):
         if step % 10 == 0:
@@ -53,11 +53,11 @@ def test_readout_cores_are_what_the_rollouts_reader_serves_along_an_episode():
     )  # the lag carries across chunks: the same push is served differently
     np.testing.assert_array_equal(cores[3], cores[0])  # a new episode starts from rest
     assert np.linalg.norm(
-        tum.readout_cores(pushes[4:], [0], [0], ControlSettings(resolved_input_gain=1.0))[0]
+        tum.readout_cores(pushes[4:], [0], [0], ControlSettings(resolved_translation_gain=1.0))[0]
     ) == pytest.approx(1.0)
-    keypad = ControlSettings(corruption_quantize=True, resolved_input_gain=1.0)
-    np.testing.assert_array_equal(tum.readout_cores(pushes[:1], [0], [0], keypad), [[1.0, 0.0, 0.0]])
-    stick = ControlSettings(corruption_matrix=np.diag([1.0, 1.0, 0.0]), resolved_input_gain=1.0)
+    keypad = ControlSettings(corruption_quantize=True, resolved_translation_gain=1.0)
+    np.testing.assert_allclose(tum.readout_cores(pushes[:1], [0], [0], keypad), [[np.sqrt(0.56), 0.0, 0.0]])
+    stick = ControlSettings(corruption_matrix=np.diag([1.0, 1.0, 0.0]), resolved_translation_gain=1.0)
     np.testing.assert_allclose(tum.readout_cores(pushes[:1], [0], [0], stick), [[0.6, -0.2, 0.0]])
 
 
@@ -164,6 +164,9 @@ def test_state_cache_round_trips_with_a_safe_load(tmp_path):
         "task_id": 1,
         "label": torch.zeros(CHUNK, 7),
         "latent": torch.ones(CHUNK, MAX_DIM),
+        "path": torch.ones(3, CHUNK, MAX_DIM),
+        "cue_path": torch.ones(2, 3, CHUNK, MAX_DIM),
+        "cue_served": np.zeros((2, 3)),
         "raw": np.array([0.2, 0.0, 0.0]),
         "core": np.array([0.1, 0.0, 0.0]),
         "gripper_normalized": -1.0,
@@ -174,6 +177,8 @@ def test_state_cache_round_trips_with_a_safe_load(tmp_path):
     np.testing.assert_array_equal(back["observation"]["img"], state["observation"]["img"])
     assert isinstance(back["raw"], np.ndarray) and isinstance(back["observation"]["state"], np.ndarray)
     assert torch.is_tensor(back["label"]) and torch.is_tensor(back["latent"])
+    assert torch.is_tensor(back["path"]) and back["path"].shape == (3, CHUNK, MAX_DIM)
+    assert torch.is_tensor(back["cue_path"]) and isinstance(back["cue_served"], np.ndarray)
 
 
 def test_cross_step_dims_take_action_dim_names_or_indices():
@@ -201,20 +206,161 @@ def test_cross_step_dims_take_action_dim_names_or_indices():
 def test_states_are_collected_at_the_chunk_boundaries_from_the_first():
     from types import SimpleNamespace
 
+    resets, prompts = [], []
+
+    class FakeEnv:
+        def reset(self, seed=None, options=None):
+            resets.append(options["init_state_id"])
+            return {"reset": len(resets)}, {}
+
     class FakeSession:
-        suite, task_id, task_description = "s", 0, "t"
+        suite, task_id, task_description, vec_env = "s", 0, "t", FakeEnv()
 
         def set_mode(self, mode):
             pass
 
-        def rollout(self, task, recorder=None):
+        def set_scene(self, suite, task_id):
+            self.task_id = task_id
+
+        def rollout(self, task, recorder=None, initial_observation=None, max_steps=None):
+            assert initial_observation == {"reset": len(resets)}  # the rollout starts from the state just set
+            prompts.append((task, max_steps))
             for k in range(
-                25
+                max_steps or 25
             ):  # as Session.rollout reports: the step count after the step, the observation before it
                 recorder(step=k + 1, observation={"k": k})
 
-    settings = SimpleNamespace(task_ids=[0], session=SimpleNamespace(suite="s", n_action_steps=10))
+    settings = SimpleNamespace(
+        task_ids=[0], prompt="do something", session=SimpleNamespace(suite="s", n_action_steps=10)
+    )
     states = tum.collect_states(FakeSession(), settings, 2, np.random.default_rng(0))
     assert [(s["episode"], s["step"], s["observation"]["k"]) for s in states] == [
         (0, 0, 0), (0, 10, 10), (0, 20, 20), (1, 0, 0), (1, 10, 10), (1, 20, 20)
     ]  # fmt: skip
+
+    # two tasks, four episodes: each pass over the tasks starts from a task's next initial state
+    resets.clear()
+    settings.task_ids = [3, 7]
+    states = tum.collect_states(FakeSession(), settings, 4, np.random.default_rng(0))
+    assert resets == [0, 0, 1, 1]
+    assert [s["task_id"] for s in states[::3]] == [3, 7, 3, 7]
+
+    # rollouts under the arm's own prompt follow, from the same start states, kept up to a step, with the scene's task
+    resets.clear()
+    prompts.clear()
+    states = tum.collect_states(FakeSession(), settings, 2, np.random.default_rng(0), 2, 15)
+    assert prompts == [("t", None), ("t", None), ("do something", 15), ("do something", 15)]
+    assert resets == [0, 0, 0, 0]
+    generic = [s for s in states if s["rollout"] == "generic"]
+    assert [(s["episode"], s["step"], s["task"], s["task_id"]) for s in generic] == [
+        (2, 0, "t", 3), (2, 10, "t", 3), (3, 0, "t", 7), (3, 10, "t", 7)
+    ]  # fmt: skip
+    assert {s["rollout"] for s in states[:6]} == {"task"}
+
+
+def test_command_targets_bring_the_users_reference_onto_the_intended_reversal():
+    n = 10
+    field = lambda x, t: 0.5 * x + 1.0  # noqa: E731  (a field that depends on where the chunk is)
+    intended = torch.randn(2, CHUNK, MAX_DIM)
+    path = tum.reversal_path(Flow(field), intended, n)
+    assert path.shape == (2, n + 1, CHUNK, MAX_DIM)
+    torch.testing.assert_close(path[:, 0], intended)
+    torch.testing.assert_close(path[:, -1], Flow(field).reverse(intended, n), atol=1e-5, rtol=0)
+    served = intended.clone()
+    served[..., :3] += torch.randn(2, CHUNK, 3)  # the user's reference: another translation
+    for correct_by in (n, 4):  # over the whole reversal, or done by its fourth step
+        x = served
+        for k in range(n):
+            at, target = tum.command_target(path, served, torch.full((2,), k), correct_by)
+            # the regression's points are the adapted reversal's own
+            torch.testing.assert_close(at, x, atol=1e-4, rtol=0)
+            x = x + target / n
+            if k + 1 >= correct_by:  # on the intended reversal from there on
+                torch.testing.assert_close(x, path[:, k + 1], atol=1e-4, rtol=0)
+    # a faithful command needs no correction: the plain field's own steps
+    rows, k = torch.arange(2), torch.tensor([3, 7])
+    at, target = tum.command_target(path, intended, k, 4)
+    torch.testing.assert_close(at, path[rows, k])
+    torch.testing.assert_close(target, (path[rows, k + 1] - path[rows, k]) * n)
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o"])
+    assert (args.target, args.correct_by) == ("label", None)  # the cursor's recipe unless asked
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--target", "command", "--correct-by", "4"])
+    assert (args.target, args.correct_by) == ("command", 4)
+
+
+def test_translation_loss_trains_the_translation_rows_only():
+    torch.manual_seed(0)
+    user = LearnedUserModule(horizon=CHUNK, n_dims=7, d=16, tdim=8)  # the identity at init
+    x, v = torch.randn(4, CHUNK, MAX_DIM), torch.randn(4, CHUNK, MAX_DIM)
+    t = torch.tensor([0.0, 0.1, 0.5, 0.9])
+    field = lambda x_t, tt: v  # noqa: E731
+    target = v.clone()
+    target[..., :3] = 2 * v[..., :3]
+    target[..., 3:7] = 5.0  # the other dims' targets do not count
+    assert tum.translation_loss(user, field, x, t, v).item() == pytest.approx(0.0, abs=1e-6)
+    start = tum.translation_loss(user, field, x, t, target)
+    assert start.item() == pytest.approx((v[..., :3] ** 2).mean().item(), rel=1e-5)
+    one = tum.translation_loss(user, field, x, t, target, weight=torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    assert one.item() == pytest.approx((v[0, :, :3] ** 2).mean().item(), rel=1e-5)
+    opt = torch.optim.SGD(user.parameters(), lr=0.05)
+    for _ in range(20):
+        opt.zero_grad()
+        tum.translation_loss(user, field, x, t, target).backward()
+        opt.step()
+    assert tum.translation_loss(user, field, x, t, target).item() < 0.9 * start.item()
+    with torch.no_grad():  # rotation and gripper rows stay the identity: their velocity passes unchanged
+        torch.testing.assert_close(user(x, t)[..., 3:, :], torch.eye(7)[3:].expand(4, CHUNK, 4, 7))
+
+
+def test_commands_are_relabelled_through_the_arms_readout_and_a_faithful_one():
+    from config import ControlSettings
+
+    turn = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    raw = np.array([0.6, -0.2, 0.4])
+    states = [{"raw": raw, "episode": 0, "step": 0, "core": np.zeros(3)}]  # cores from another user's file
+    tum.label_commands(states, ControlSettings(corruption_matrix=turn, resolved_translation_gain=1.0))
+    np.testing.assert_allclose(states[0]["core"], turn @ raw)
+    np.testing.assert_allclose(states[0]["intent"], raw)  # what a readout without the corruption serves
+    tum.label_commands(states, ControlSettings(corruption_quantize=True, resolved_translation_gain=1.0))
+    np.testing.assert_allclose(states[0]["core"], [np.sqrt(0.56), 0.0, 0.0])
+    np.testing.assert_allclose(states[0]["intent"], raw)
+
+
+def test_executed_summary_splits_by_whether_the_plan_agrees_with_the_intent():
+    intent = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.01]])  # the last: idle
+    plan = np.array([[2.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    arms = {
+        "none": np.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+        "user": np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+    }
+    out = tum.executed_summary(intent, plan, arms)
+    assert (out["off_n"], out["on_n"]) == (1, 2)
+    assert out["off_plan"] == pytest.approx(-1.0) and out["on_plan"] == pytest.approx(1.0)
+    assert out["off_none"] == pytest.approx(0.0) and out["on_none"] == pytest.approx(0.5)
+    assert out["off_user"] == pytest.approx(1.0) and out["on_user"] == pytest.approx(1.0)
+    empty = tum.executed_summary(intent[:1], plan[:1], {"none": arms["none"][:1]})
+    assert empty["off_n"] == 0 and empty["off_none"] is None
+
+
+def test_cued_pushes_keep_each_length_and_hold_an_evenly_drawn_direction():
+    rng = np.random.default_rng(0)
+    lengths = np.full(6000, 0.5)
+    lengths[:6] = [0.2, 0.4, 0.6, 0.8, 0.5, 0.5]
+    episodes = np.repeat(np.arange(1000), 6)  # six chunk boundaries an episode
+    pushes = tum.cue_pushes(lengths, episodes, rng, hold=3)
+    np.testing.assert_allclose(np.linalg.norm(pushes, axis=1), lengths)  # the state's own push length
+    blocks = (pushes / lengths[:, None]).reshape(-1, 3, 3)  # (cue, chunk of the hold, xyz)
+    np.testing.assert_allclose(blocks[:, 0], blocks[:, 1])
+    np.testing.assert_allclose(blocks[:, 0], blocks[:, 2])  # one direction for the three chunks of a cue
+    assert not np.allclose(blocks[0, 0], blocks[1, 0])  # then another, within the episode
+    assert np.abs(blocks[:, 0].mean(0)).max() < 0.05  # no preferred direction over the session
+    short = tum.cue_pushes(np.ones(4), [0, 0, 1, 1], np.random.default_rng(1), hold=3)
+    assert np.allclose(short[0], short[1]) and not np.allclose(short[1], short[2])  # a new episode, a new cue
+    long = tum.cue_pushes(np.full(50, 1.7), np.zeros(50), rng, hold=1)
+    assert np.abs(long).max() <= 1.0  # clipped as the operator's pushes are
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o"])
+    assert (args.cues, args.cue_hold, args.cue_noise) == (0, 3, "recorded")  # off unless asked
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--target", "command", "--cues", "4"])
+    assert args.cues == 4
+    with pytest.raises(SystemExit):  # a cue's label is its own reference: the command target
+        tum.parse_args(["--config", "c.yaml", "--out", "o", "--cues", "4"])

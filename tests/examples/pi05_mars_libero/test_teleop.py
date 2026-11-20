@@ -92,14 +92,14 @@ def test_build_corruption_and_read_matrix_spec(tmp_path):
 
 def test_noisy_reader_is_seeded_and_idle_stays_idle():
     source = Source((0.5, 0.5, 0.5))
-    a = ReadoutReader(source, input_noise=0.1, rng=np.random.default_rng(1)).translation
-    b = ReadoutReader(source, input_noise=0.1, rng=np.random.default_rng(1)).translation
+    a = ReadoutReader(source, translation_noise=0.1, rng=np.random.default_rng(1)).translation
+    b = ReadoutReader(source, translation_noise=0.1, rng=np.random.default_rng(1)).translation
     np.testing.assert_array_equal(a, b)
     assert not np.array_equal(a, source.translation)
     source.translation = np.zeros(3)
-    np.testing.assert_array_equal(ReadoutReader(source, input_noise=0.1).translation, 0)
+    np.testing.assert_array_equal(ReadoutReader(source, translation_noise=0.1).translation, 0)
     with pytest.raises(ValueError):
-        ReadoutReader(source, input_noise=-1)
+        ReadoutReader(source, translation_noise=-1)
 
 
 def test_recording_reader_counts_reads():
@@ -112,10 +112,31 @@ def test_recording_reader_counts_reads():
     assert rec.gripper == GRIPPER_CLOSE and rec.last_gripper == GRIPPER_CLOSE
 
 
+def test_rotation_and_gripper_carry_their_own_seeded_noise():
+    source = Source((0.5, 0.0, 0.0), gripper=GRIPPER_CLOSE)
+    source.rotation = np.array([0.02, 0.0, -0.01])
+    quiet = ReadoutReader(source)  # off by default: both served as given
+    np.testing.assert_array_equal(quiet.rotation, source.rotation)
+    assert quiet.gripper == GRIPPER_CLOSE
+    reader = ReadoutReader(source, rotation_noise=0.04, gripper_noise=1.0, rng=np.random.default_rng(0))
+    turns = np.array([reader.rotation for _ in range(2000)])
+    np.testing.assert_allclose(turns.mean(0), source.rotation, atol=0.004)
+    np.testing.assert_allclose(turns.std(0), 0.04, atol=0.004)
+    grips = np.array([reader.gripper for _ in range(2000)])
+    assert set(grips) == {GRIPPER_OPEN, GRIPPER_CLOSE}  # served as a command: the sign of the noisy one
+    assert (grips == GRIPPER_OPEN).mean() == pytest.approx(0.159, abs=0.03)  # P(N(0, 1) < -1)
+    np.testing.assert_array_equal(
+        reader.translation, source.translation
+    )  # the translation's noise is its own
+    for bad in ({"rotation_noise": -1}, {"gripper_noise": -1}):
+        with pytest.raises(ValueError, match="noise must be >= 0"):
+            ReadoutReader(source, **bad)
+
+
 def test_teleop_chain_order_and_records():
     kb = KeyboardReader(clock=lambda: 0.0)
     kb.update({"ArrowRight"}, toggles=0)  # full push right at half speed
-    chain = TeleopChain(kb, input_noise=0.0)
+    chain = TeleopChain(kb, translation_noise=0.0)
     chain.readout.matrix = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     served = chain.source.translation
     raw = chain.raw.last_translation
@@ -128,15 +149,22 @@ def test_teleop_chain_order_and_records():
 def test_policy_operator_averages_the_executed_prefix_and_clips():
     op = teleop.PolicyOperator(n_action_steps=2)
     np.testing.assert_array_equal(op.translation, np.zeros(3))
+    np.testing.assert_array_equal(op.rotation, np.zeros(3))
     assert op.gripper == GRIPPER_OPEN
     chunk = np.array(
-        [[0.4, 0.0, 0.0, 0, 0, 0, 1.0], [0.8, 0.0, 0.0, 0, 0, 0, 1.0], [9.0, 9.0, 9.0, 0, 0, 0, -1.0]]
+        [
+            [0.4, 0.0, 0.0, 0.2, 0, -0.4, 1.0],
+            [0.8, 0.0, 0.0, 0.4, 0, -0.2, 1.0],
+            [9.0, 9.0, 9.0, 9, 9, 9, -1.0],
+        ]
     )
     op.refresh(chunk)
     np.testing.assert_allclose(op.translation, [0.6, 0.0, 0.0])
+    np.testing.assert_allclose(op.rotation, [0.3, 0.0, -0.3])  # the whole command: the hand's turn too
     assert op.gripper == GRIPPER_CLOSE
-    op.refresh(np.array([[2.0, -3.0, 0.0, 0, 0, 0, -1.0]]))
+    op.refresh(np.array([[2.0, -3.0, 0.0, 0, 5.0, 0, -1.0]]))
     np.testing.assert_allclose(op.translation, [1.0, -1.0, 0.0])
+    np.testing.assert_allclose(op.rotation, [0.0, 1.0, 0.0])
     assert op.gripper == GRIPPER_OPEN
 
 
@@ -146,9 +174,14 @@ def test_teleop_chain_attach_operator_takes_priority():
     op = teleop.PolicyOperator(n_action_steps=1)
     chain.attach_operator(op)
     assert chain.combined.sources[0] is op
-    op.refresh(np.array([[0.5, 0.0, 0.0, 0, 0, 0, -1.0]]))
+    np.testing.assert_array_equal(TeleopChain(keyboard).source.rotation, np.zeros(3))  # the devices give none
+    op.refresh(np.array([[0.5, 0.0, 0.0, 0.1, 0, -0.2, -1.0]]))
     np.testing.assert_allclose(chain.source.translation, [0.5, 0.0, 0.0])
     np.testing.assert_allclose(chain.raw.last_translation, [0.5, 0.0, 0.0])
+    chain.readout.matrix, chain.readout.translation_noise = [[0, -1, 0], [1, 0, 0], [0, 0, 1]], 0.5
+    np.testing.assert_allclose(
+        chain.source.rotation, [0.1, 0.0, -0.2]
+    )  # a user corrupts the translation only
 
 
 def test_operator_delays_snapshots_holds_continuous_commands_and_resets():
@@ -279,12 +312,12 @@ def test_random_corruption_rejects_impossible_ranges(ranges):
         teleop.RandomCorruption(**ranges)
 
 
-# ---------------------------------------------------------------- input gain: no clipping
+# ---------------------------------------------------------------- translation gain: no clipping
 
 
-def test_input_gain_keeps_the_direction_and_shortens_the_command():
+def test_translation_gain_keeps_the_direction_and_shortens_the_command():
     source = Source((1.0, 1.0, 0.0), GRIPPER_CLOSE)
-    limited = teleop.InputGain(source, gain=0.5)
+    limited = teleop.TranslationGain(source, gain=0.5)
     # two axes at full deflection: same direction, length 1 before the gain, 0.5 after
     np.testing.assert_allclose(limited.translation, [0.35355339, 0.35355339, 0.0])
     assert limited.gripper == GRIPPER_CLOSE
@@ -296,12 +329,12 @@ def test_input_gain_keeps_the_direction_and_shortens_the_command():
 
 
 @pytest.mark.parametrize("gain", [0, 1.5, "auto"])
-def test_input_gain_rejects_values_outside_zero_to_one(gain):
+def test_translation_gain_rejects_values_outside_zero_to_one(gain):
     with pytest.raises(ValueError, match="gain"):
-        teleop.InputGain(Source(), gain=gain)
+        teleop.TranslationGain(Source(), gain=gain)
 
 
-def test_chain_with_input_gain_never_clips_a_corruption_from_the_family():
+def test_chain_with_translation_gain_never_clips_a_corruption_from_the_family():
     family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
     stick = Source()
     chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
@@ -381,7 +414,7 @@ def test_build_curl_spec():
 def test_teleop_chain_advances_and_resets_the_curl():
     kb = KeyboardReader(clock=lambda: 0.0)
     kb.update({"ArrowRight"}, toggles=0)
-    chain = TeleopChain(kb, input_noise=0.0)
+    chain = TeleopChain(kb, translation_noise=0.0)
     chain.readout.curl = Curl(curl=20.0, tau=0.1, dt=0.05)
     chain.advance(0)
     served = chain.source.translation
@@ -394,7 +427,9 @@ def test_teleop_chain_advances_and_resets_the_curl():
 
 def test_a_keypad_readout_snaps_and_a_dropped_axis_goes_idle():
     keypad = ReadoutReader(Source((0.3, -0.7, 0.2)), quantize=True)
-    np.testing.assert_array_equal(keypad.translation, [0.0, -1.0, 0.0])
+    np.testing.assert_allclose(
+        keypad.translation, [0.0, -np.sqrt(0.62), 0.0]
+    )  # the nearest axis, the push's length
     assert "keypad" in keypad.describe()
     with pytest.raises(ValueError, match="not both"):
         keypad.matrix = np.eye(3)

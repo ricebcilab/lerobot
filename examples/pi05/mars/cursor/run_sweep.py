@@ -746,7 +746,8 @@ def fig_showcase(sweep, test, key, out):
     for i, m in enumerate(sweep["methods"]):
         s, (_, lo, hi) = cell["metrics"][m]["success"], cell["success_ci"][m]
         ax.bar(i, 100 * s, color=COLORS[i % len(COLORS)], width=0.6)
-        ax.errorbar(i, 100 * s, yerr=[[100 * (s - lo)], [100 * (hi - s)]], color=INK, capsize=4, lw=1.2)
+        # a bootstrap bound can fall on the wrong side of the estimate when a cell has a handful of trials
+        ax.errorbar(i, 100 * s, yerr=[[100 * max(s - lo, 0.0)], [100 * max(hi - s, 0.0)]], color=INK, capsize=4, lw=1.2)
         d = cell["settings"][m]
         if d is not None:
             ax.text(i, 3, setting_key(d), ha="center", color="white", fontsize=6, rotation=90)

@@ -9,7 +9,7 @@ import yaml
 from config import ExperimentSettings, SessionSettings, load_experiment_settings
 from experiment import TrialRecorder, build_schedule, expand_blocks, prompt_for
 from reproducibility import trial_specs
-from session import RolloutResult, Session
+from session import TELEOP_MAX_STEPS, RolloutResult, Session
 from teleop import KeyboardReader, PolicyOperator, PolicyOperatorSettings, TeleopChain
 
 from lerobot.policies.steering import AdapterModules
@@ -320,9 +320,9 @@ def test_trial_recorder_keeps_scene_rows_and_saves_them(tmp_path):
     assert list(z["object_names"]) == ["bowl"] and z["articulation_qpos"].shape == (3, 1)
 
 
-# ---------------------------------------------------------------- per-trial corruption and input gain
+# ---------------------------------------------------------------- per-trial corruption and translation gain
 
-RANDOM = "corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}, input_gain: auto"
+RANDOM = "corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}, translation_gain: auto"
 ADAPTED = (
     "mode: shared_flow_reversal_steering, n_reversal_steps: 1, reversal_adapter: {translation: corruption}"
 )
@@ -379,6 +379,14 @@ def test_the_shared_modes_run_lerobots_steering_policy(tmp_path):
     assert frs.core.operator_dims == ("translation",) and session.steering_policy() is frs
     session.set_mode("shared_flow_reversal_steering", n_reversal_steps=2)
     assert session.steering_policy() is not frs and session.steering_policy().core.n_reversal_steps == 2
+    # FRS's own knob on the cursor: the leading chunk steps the reference pins (default: the executed prefix)
+    pinned = _settings(tmp_path, "mode: shared_flow_reversal_steering, pinned_steps: 25").session.control
+    assert pinned.pinned_steps == 25 and control.pinned_steps is None
+    session.apply_control(pinned)
+    core = session.steering_policy().config
+    assert (core.n_reversal_steps, core.pinned_steps) == (None, 25)
+    session.apply_control(control)
+    assert session.steering_policy().config.pinned_steps == 10
 
     keyboard.update({"ArrowRight"}, toggles=0)
     reads = session.chain.served.reads
@@ -393,6 +401,12 @@ def test_the_shared_modes_run_lerobots_steering_policy(tmp_path):
     assert (fc.config.mode, fc.core.tau, fc.core.lam, fc.core.ic_gain) == ("flow_control", 5, 0, 2.0)
     assert session.chunk_command() is None and session.chain.served.reads == reads + 1  # lambda 0: no read
     assert session.metrics() == {"guided_steps": 0, "tau": 5, "lambda": 0, "ic_gain": 2.0}
+    assert fc.config.zeroed_dims is None and fc.core.zeroed == ()
+    # Kao et al.'s LIBERO recipe: rotation set to 0 in the steered steps
+    zeroed = _settings(tmp_path, "mode: shared_flow_control, ic_gain: 1.5, tau: 10, zeroed_dims: [rotation]")
+    session.apply_control(zeroed.session.control)
+    fc = session.steering_policy()
+    assert fc.config.zeroed_dims == ["rotation"] and fc.core.zeroed == (slice(3, 6),)
 
 
 def _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trials=3):
@@ -407,6 +421,30 @@ def _run_block_recording_what_is_in_force(tmp_path, run_block, settings, n_trial
     run_block(session, settings, [4] * n_trials, tmp_path)
     saved = [json.loads(line) for line in (tmp_path / "trials.jsonl").read_text().splitlines()]
     return in_force, saved
+
+
+def test_teleop_executes_the_operators_whole_command_and_override_only_its_translation():
+    """Teleop is the operator alone: its translation (through the readout), rotation and gripper replace every dim
+    of the action, for the suite's own episode length when the operator is synthetic (a person keeps the longer
+    limit). Shared override replaces the translation of the policy's action only."""
+    session = Session.__new__(Session)
+    session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
+    session.operator = PolicyOperator(n_action_steps=1)
+    session.chain.attach_operator(session.operator)
+    session.operator.refresh(np.array([[0.5, 0.0, -0.2, 0.1, 0.0, -0.3, 1.0]]))
+    session._zero_policy = session.policy = session.postprocessor = session.preprocessor = None
+    session.env_preprocessor = session.env_postprocessor = None
+    session.mode = "teleop"
+    kwargs = session._rollout_kwargs()
+    np.testing.assert_allclose(
+        kwargs["action_hook"](np.zeros((1, 7))), [[0.5, 0.0, -0.2, 0.1, 0.0, -0.3, 1.0]]
+    )
+    assert kwargs["max_steps"] is None  # the suite's episode length, as in every other arm
+    session.mode = "shared_override"
+    hook = session._rollout_kwargs()["action_hook"]
+    np.testing.assert_allclose(hook(np.full((1, 7), 9.0)), [[0.5, 0.0, -0.2, 9.0, 9.0, 9.0, 9.0]])
+    session.mode, session.operator = "teleop", None
+    assert session._rollout_kwargs()["max_steps"] == TELEOP_MAX_STEPS
 
 
 def test_every_method_draws_the_same_corruption_on_a_trial_and_the_adapter_follows_it(tmp_path):
@@ -450,11 +488,11 @@ def test_run_block_puts_each_trial_s_corruption_in_force_and_records_it(tmp_path
         np.testing.assert_allclose(record["corruption_matrix"], corruption)
         np.testing.assert_allclose(record["reversal_adapter_matrix"], adapter)
         assert set(record["corruption_parameters"]) == {"rotation_axis", "rotation_deg", "scale"}
-        assert record["input_gain"] == 0.25
+        assert record["translation_gain"] == 0.25
         with np.load(tmp_path / f"trial_{trial:03d}.npz") as z:
             np.testing.assert_allclose(z["corruption_matrix"], corruption)
             np.testing.assert_allclose(z["reversal_adapter_matrix"], adapter)
-            assert float(z["input_gain"]) == 0.25
+            assert float(z["translation_gain"]) == 0.25
     assert not np.allclose(in_force[0][0], in_force[1][0])  # and it changed from one trial to the next
 
 
@@ -464,34 +502,43 @@ def test_run_block_records_empty_matrices_when_nothing_is_in_force(tmp_path, run
     assert in_force == [(None, None)]
     record = saved[0]
     assert record["corruption_matrix"] is None and record["reversal_adapter_matrix"] is None
-    assert record["corruption_parameters"] is None and record["input_gain"] is None
+    assert record["corruption_parameters"] is None and record["translation_gain"] is None
     with np.load(tmp_path / "trial_000.npz") as z:  # loadable without pickle: NaN stands for "off"
         assert z["corruption_matrix"].shape == (3, 3) and np.isnan(z["corruption_matrix"]).all()
-        assert z["reversal_adapter_matrix"].shape == (7, 7) and np.isnan(z["input_gain"])
+        assert z["reversal_adapter_matrix"].shape == (7, 7) and np.isnan(z["translation_gain"])
 
 
-def test_apply_control_turns_the_input_gain_on_and_off_with_the_block(tmp_path):
+def test_apply_control_turns_the_translation_gain_on_and_off_with_the_block(tmp_path):
     session = _bare_session(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control)
     assert session.chain.gain.gain == 0.25
     assert session.chain.readout.matrix is None  # nothing is in force until a trial draws it
     fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
     session.apply_control(fixed.session.control)
     assert session.chain.gain.gain is None
+    assert (session.chain.readout.rotation_noise, session.chain.readout.gripper_noise) == (0.0, 0.0)
+    noisy = _settings(
+        tmp_path, "mode: teleop, translation_noise: 0.5, rotation_noise: 0.04, gripper_noise: 1.0"
+    )
+    session.apply_control(noisy.session.control)  # the three parts of a command carry their own noise
+    readout = session.chain.readout
+    assert (readout.translation_noise, readout.rotation_noise, readout.gripper_noise) == (0.5, 0.04, 1.0)
 
 
 def test_an_auto_gain_follows_a_live_corruption_change_but_a_number_does_not(tmp_path):
     session = _bare_session(
-        _settings(tmp_path, "mode: shared_flow_control, input_gain: auto").session.control
+        _settings(tmp_path, "mode: shared_flow_control, translation_gain: auto").session.control
     )
     assert session.chain.gain.gain == 1.0
     session.chain.readout.matrix = np.diag([4.0, 1.0, 1.0])  # what the REPL's `corruption <file>` does
-    assert "0.25" in session.refresh_input_gain() and session.chain.gain.gain == 0.25
+    assert "0.25" in session.refresh_translation_gain() and session.chain.gain.gain == 0.25
     session.chain.readout.matrix = None  # `corruption off`
-    session.refresh_input_gain()
+    session.refresh_translation_gain()
     assert session.chain.gain.gain == 1.0
-    session.apply_control(_settings(tmp_path, "mode: shared_flow_control, input_gain: 0.2").session.control)
+    session.apply_control(
+        _settings(tmp_path, "mode: shared_flow_control, translation_gain: 0.2").session.control
+    )
     session.chain.readout.matrix = np.diag([4.0, 1.0, 1.0])
-    assert "0.2" in session.refresh_input_gain() and session.chain.gain.gain == 0.2
+    assert "0.2" in session.refresh_translation_gain() and session.chain.gain.gain == 0.2
 
 
 def test_a_random_block_s_config_lists_every_trial_s_corruption_in_plain_yaml(tmp_path):
@@ -502,7 +549,7 @@ def test_a_random_block_s_config_lists_every_trial_s_corruption_in_plain_yaml(tm
     )
     resolved = experiment._provenance(settings, experiment.Block("block", []), [4, 4, 4], specs, session)
     written = yaml.safe_load(yaml.safe_dump(resolved))  # what lands in config.yaml
-    assert written["input_gain"] == "auto" and written["resolved_input_gain"] == 0.25
+    assert written["translation_gain"] == "auto" and written["resolved_translation_gain"] == 0.25
     assert len(written["trial_corruptions"]) == 3
     for spec, entry in zip(specs, written["trial_corruptions"], strict=True):
         in_trial = experiment.trial_matrices(settings.session.control, spec).corruption
@@ -517,7 +564,7 @@ def test_a_random_block_s_config_lists_every_trial_s_corruption_in_plain_yaml(tm
 def test_the_dry_run_description_states_the_family_and_the_gain_in_force(tmp_path):
     text = experiment._describe_block(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}"))
     assert "random(rotation_deg=30..90, scale=1..4)" in text
-    assert "input gain: 0.25" in text
+    assert "translation gain: 0.25" in text
 
 
 def test_first_occurrence_continues_a_tasks_states_where_a_shorter_run_stopped(tmp_path):

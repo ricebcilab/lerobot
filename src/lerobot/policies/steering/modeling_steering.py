@@ -1300,8 +1300,12 @@ class FlowControlSteering(_ChunkSteering):
         ic_gain: float | str = "action",
         deadband: float = DEADBAND,
         dims=slice(0, 3),
+        zeroed: tuple[slice, ...] = (),
     ):
         super().__init__(policy, source, deadband)
+        self.zeroed = tuple(
+            zeroed
+        )  # dims set to 0 where the command is written (Kao et al. on LIBERO: rotation)
         self._mean = self._std = None
         if postprocessor is not None:
             mean, std = self.action_mean_std(postprocessor)
@@ -1357,18 +1361,25 @@ class FlowControlSteering(_ChunkSteering):
         lam: int,
         dims=slice(None),
         steer: torch.Tensor | None = None,
+        zeroed: tuple[slice, ...] = (),
     ) -> torch.Tensor:
         """Flow control's one rule (Kao et al. 2026): at the start of each of the first ``lam`` (lambda) Euler steps
         of a chunk's denoising, the first ``tau`` chunk steps of ``x_t``'s ``dims`` take ``written``, the command
         already in the noise prior's units ((n,) for every row, or (B, H, n) per row and step), in the rows where
         ``steer`` (B, 1, 1, bool) holds (all rows without it); the flow itself runs unmodified. lambda 1 writes the
         initial condition only (Kao et al.'s method), 0 nothing, more re-writes as the flow proceeds (the lab's
-        variant). ``x_t`` is written in place and returned."""
+        variant). The dims in ``zeroed`` are set to 0 in the same steps and rows (Kao et al. on LIBERO, App. G.1:
+        the rotation dims). ``x_t`` is written in place and returned."""
         if step >= lam:
             return x_t
         w = written[:, :tau] if written.dim() == 3 else written
         region = x_t[:, :tau, dims]
         x_t[:, :tau, dims] = w if steer is None else torch.where(steer, w.expand_as(region), region)
+        for group in zeroed:
+            region = x_t[:, :tau, group]
+            x_t[:, :tau, group] = (
+                0.0 if steer is None else torch.where(steer, torch.zeros_like(region), region)
+            )
         return x_t
 
     def reset(self) -> None:
@@ -1395,7 +1406,16 @@ class FlowControlSteering(_ChunkSteering):
             )  # (B, n): one per row, every step
         steer = None if self._pending_steer is None else self._pending_steer.to(x_t.device)
         self.guided_steps += 1
-        return self.write(x_t, step, self._pending_target, self._tau, self._lam, dims=self._dims, steer=steer)
+        return self.write(
+            x_t,
+            step,
+            self._pending_target,
+            self._tau,
+            self._lam,
+            dims=self._dims,
+            steer=steer,
+            zeroed=self.zeroed,
+        )
 
     def steered_chunk(
         self, batch, commands, field=None, paired: bool = True
@@ -1949,6 +1969,7 @@ class SteeringPolicy(PreTrainedPolicy):
                     ic_gain=cfg.ic_gain,
                     deadband=cfg.deadband,
                     dims=written,
+                    zeroed=tuple(OPERATOR_DIM_GROUPS[name] for name in cfg.zeroed_dims or ()),
                 )
             else:
                 stats = self._action_stats()

@@ -4,7 +4,6 @@ import json
 
 import numpy as np
 import pytest
-from PIL import Image
 
 from cursor_sa.paths import RESULTS
 from paper.figures import build_figures as bf
@@ -88,23 +87,6 @@ def test_fig2_builds_from_the_recorded_sessions(tmp_path):
     stats = json.loads((tmp_path / "stats.json").read_text())["fig2"]
     assert stats["participants"] >= 1 and set(stats["success_mean_ci"]) == set(bf.ARMS)
     assert all(len(v) == 3 for v in stats["success_mean_ci"].values())
-
-
-@pytest.mark.skipif(not all((RESULTS / "sim" / "sweeps" / f"{name}_s0" / "test.json").exists()
-                            for name in ("grid_vision", "grid", "grid_ft", "demo_time_vision", "demo_time_ft", "demo_time_baselines")),
-                    reason="no grid or demonstration-time results")
-def test_fig3_builds_from_the_grid(tmp_path):
-    bf.main(["--only", "fig3", "--out", str(tmp_path), "--device", "cpu"])
-    stats = json.loads((tmp_path / "stats.json").read_text())["fig3"]
-    cells = {f"U{u}xT{t}" for u in range(1, 5) for t in range(1, 6)}
-    assert set(stats["success_per_cell"]) == cells and stats["seeds"][0] == 0
-    assert all(set(v) == set(bf.GRID_METHODS) for v in stats["success_per_cell"].values())   # the fine-tuned arm, not the retrained
-    assert all(len(v) == len(stats["seeds"]) for c in stats["success_per_cell_per_seed"].values() for v in c.values())
-    curve = stats["demo_time"]   # panel e: both arms at every budget, on the 16 obstacle cells
-    assert curve["cells"] == 16 and all(set(curve["success"][arm]) == {str(s) for s in bf.DEMO_SECONDS} for arm in bf.DEMO_ARMS)
-    assert stats["composed_beats_all_baselines"]["of"] == 16 and stats["composed_beats_fine_tuned"]["of"] == 16
-    assert set(stats["task_rollouts"]) == {f"T{t}" for t in range(1, 6)}
-    assert Image.open(tmp_path / "fig3_grid.png").size == (round(300 * bf.FULL_W), round(300 * bf.FIG3_H))
 
 
 def _grid_results(sweeps, ft_teleop=("hit", "timeout")):

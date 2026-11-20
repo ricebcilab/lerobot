@@ -351,14 +351,18 @@ def _provenance(
         "tau": control.tau,
         "lambda": control.lam,
         "ic_gain": control.ic_gain,
+        "zeroed_dims": list(control.zeroed_dims),
         "n_reversal_steps": control.n_reversal_steps,
+        "pinned_steps": control.pinned_steps,
         "reversal_adapter_modules": {
             "user": control.reversal_adapter_user_path,
             "task": control.reversal_adapter_task_path,
         },
-        "input_noise": control.input_noise,
-        "input_gain": control.input_gain,
-        "resolved_input_gain": control.resolved_input_gain,
+        "translation_noise": control.translation_noise,
+        "rotation_noise": control.rotation_noise,
+        "gripper_noise": control.gripper_noise,
+        "translation_gain": control.translation_gain,
+        "resolved_translation_gain": control.resolved_translation_gain,
         "max_steps": control.max_steps,
         "corruption": control.corruption,
         "reversal_adapter": control.reversal_adapter,
@@ -383,15 +387,15 @@ def _describe_block(settings: ExperimentSettings) -> str:
     lines = [
         f'VLA prompt: "{settings.prompt}"'
         + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else ""),
-        f"mode: {control.mode}   tau: {control.tau}   lambda: {control.lam}   ic_gain: {control.ic_gain}   "
-        f"n_reversal_steps: {control.n_reversal_steps}",
+        f"mode: {control.mode}   tau: {control.tau}   lambda: {control.lam}   ic_gain: {control.ic_gain}   zeroed_dims: {control.zeroed_dims}   "
+        f"n_reversal_steps: {control.n_reversal_steps}   pinned_steps: {control.pinned_steps}",
         f"operator: {settings.session.operator}   operator commands: {', '.join(control.operator_dims)}",
     ]
     if settings.session.operator == "policy":
         lines.append(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")
-    if control.resolved_input_gain is not None:
+    if control.resolved_translation_gain is not None:
         lines.append(
-            f"input gain: {control.resolved_input_gain:g} ({control.input_gain}): commands are limited to "
+            f"translation gain: {control.resolved_translation_gain:g} ({control.translation_gain}): commands are limited to "
             "unit length and scaled by it, so the corruption cannot clip"
         )
     for name, spec, matrix, per_trial in (
@@ -494,7 +498,9 @@ def run_block(
             mode=mode,
             corruption_matrix=matrices.array("corruption"),
             reversal_adapter_matrix=matrices.array("adapter"),
-            input_gain=np.nan if control.resolved_input_gain is None else control.resolved_input_gain,
+            translation_gain=np.nan
+            if control.resolved_translation_gain is None
+            else control.resolved_translation_gain,
             **identity,
         )
         motion = summarize_scene_motion(recorder.scene_first, recorder.scene_last)
@@ -512,8 +518,8 @@ def run_block(
             "tau": session.tau if mode == "shared_flow_control" else None,
             "lambda": session.lam if mode == "shared_flow_control" else None,
             "ic_gain": session.ic_gain if mode == "shared_flow_control" else None,
-            "input_noise": control.input_noise,
-            "input_gain": control.resolved_input_gain,
+            "translation_noise": control.translation_noise,
+            "translation_gain": control.resolved_translation_gain,
             "corruption": session.chain.readout.label,
             "reversal_adapter": session.adapter.label,
             **matrices.record(),

@@ -24,8 +24,8 @@ control:
   lambda: 1                   # FC: Euler steps at whose start it is written (1 = the initial condition, Kao et al.)
   ic_gain: action             # FC: the command's scale in the noise prior; `action` = the checkpoint's action units
   n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
-  input_noise: 0.0
-  input_gain: auto            # scale the command so the corruption cannot clip it (null = off)
+  translation_noise: 0.0
+  translation_gain: auto            # scale the command so the corruption cannot clip it (null = off)
   max_steps: null             # null = the suite's own episode length
   # A fresh draw on every trial, the same one for every arm: a rotation about a random axis times per-axis gains.
   corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}

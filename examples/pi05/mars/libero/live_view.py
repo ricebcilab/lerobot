@@ -156,7 +156,7 @@ async function poll() {
     }
     const focus = document.hasFocus() ? "" : ' <span class="focus">(click the page to give it keyboard focus)</span>';
     const heldKeys = s.keys.length ? ' <span class="held">held: ' + s.keys.join(" ") + '</span>' : "";
-    const noise = s.input_noise > 0 ? ' &middot; <span class="held">input noise &sigma;=' + s.input_noise.toFixed(2) + '</span>' : "";
+    const noise = s.translation_noise > 0 ? ' &middot; <span class="held">translation noise &sigma;=' + s.translation_noise.toFixed(2) + '</span>' : "";
     const corruption = s.corruption ? ' &middot; <span class="held">corruption: ' + s.corruption + '</span>' : "";
     const adapter = s.reversal_adapter ? ' &middot; <span class="held">reversal adapter: ' + s.reversal_adapter + '</span>' : "";
     document.getElementById("keys").innerHTML =

@@ -16,8 +16,8 @@ control:
   lambda: 1                   # FC: denoising steps at whose start it is written (1 = the initial condition)
   ic_gain: action             # FC: scale in the noise prior, or `action` = the checkpoint's action units
   n_reversal_steps: null      # FRS: steps the reference is reversed through; null = all the way to noise
-  input_noise: 0.0            # std of the noise added to your command (0 = off)
-  input_gain: auto            # scale your command so the corruption cannot clip it (null = off)
+  translation_noise: 0.0            # std of the noise added to your command (0 = off)
+  translation_gain: auto            # scale your command so the corruption cannot clip it (null = off)
   corruption: null            # the robot gets M @ your command, e.g. {rotation_z_deg: 20}
   reversal_adapter: null      # MARS, e.g. {translation: corruption, ...} (fixed F) or {learned: path/to/user.pt}
 

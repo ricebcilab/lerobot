@@ -22,7 +22,7 @@ from teleop import (
     RandomCorruption,
     build_corruption,
     build_curl,
-    check_input_gain,
+    check_translation_gain,
 )
 
 from lerobot.policies.steering import OPERATOR_DIM_GROUPS, SteeringConfig
@@ -45,9 +45,13 @@ class ControlSettings:
     ic_gain: float | str = (
         "action"  # FC: the command's scale in the noise prior; "action" = the checkpoint's action units
     )
+    zeroed_dims: list[str] = field(default_factory=list)  # FC: dim groups set to 0 in the steered steps
     n_reversal_steps: int | None = None
-    input_noise: float = 0.0
-    input_gain: float | str | None = None  # null = off, `auto`, or a number in (0, 1]
+    pinned_steps: int | None = None  # FRS: leading chunk steps the reference pins; None = the executed prefix
+    translation_noise: float = 0.0  # std on each axis of the translation command
+    rotation_noise: float = 0.0  # std on each axis of the rotation command (teleop mode reads it)
+    gripper_noise: float = 0.0  # std on the gripper command, served as its sign (teleop mode reads it)
+    translation_gain: float | str | None = None  # null = off, `auto`, or a number in (0, 1]
     max_steps: int | None = None
     corruption: dict | list | None = None  # spec as written
     reversal_adapter: dict | None = None  # spec as written
@@ -60,7 +64,7 @@ class ControlSettings:
     corruption_quantize: bool = field(default=False, repr=False)  # the keypad readout, {quantize: axes}
     reversal_adapter_user_path: str | None = field(default=None, repr=False)  # learned MARS user module
     reversal_adapter_task_path: str | None = field(default=None, repr=False)  # learned MARS task module
-    resolved_input_gain: float | None = field(default=None, repr=False)
+    resolved_translation_gain: float | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -102,7 +106,7 @@ _RESOLVED = (
     "corruption_quantize",
     "reversal_adapter_user_path",
     "reversal_adapter_task_path",
-    "resolved_input_gain",
+    "resolved_translation_gain",
 )
 # `lambda` is the YAML key of the `lam` field (a Python keyword); `n_guided_steps` is its old name.
 _CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if k not in _RESOLVED and k != "lam"}
@@ -246,7 +250,7 @@ def corruption_family(spec, where: str) -> RandomCorruption | None:
 
 
 def gain_that_cannot_clip(largest_gain: float) -> float:
-    """The largest input gain that keeps a corruption of at most `largest_gain` from clipping."""
+    """The largest translation gain that keeps a corruption of at most `largest_gain` from clipping."""
     return 1.0 if largest_gain <= 1.0 else 1.0 / largest_gain
 
 
@@ -262,9 +266,9 @@ def largest_gain(control: ControlSettings) -> float:
     return float(np.linalg.norm(control.corruption_matrix, 2))
 
 
-def resolve_input_gain(control: ControlSettings, where: str) -> float | None:
-    """`control.input_gain` as a number: `auto` is the largest gain the corruption can never clip."""
-    spec = control.input_gain
+def resolve_translation_gain(control: ControlSettings, where: str) -> float | None:
+    """`control.translation_gain` as a number: `auto` is the largest gain the corruption can never clip."""
+    spec = control.translation_gain
     if spec is None:
         return None
     largest = largest_gain(control)
@@ -272,13 +276,13 @@ def resolve_input_gain(control: ControlSettings, where: str) -> float | None:
     if spec == "auto":
         return safe
     try:
-        gain = check_input_gain(spec)
+        gain = check_translation_gain(spec)
     except (TypeError, ValueError) as e:
-        _fail(where, f"control.input_gain: {e} (or auto)")
+        _fail(where, f"control.translation_gain: {e} (or auto)")
     if gain > safe * (1 + 1e-9):
         _fail(
             where,
-            f"control.input_gain {gain:g} can clip: this corruption lengthens a command by up to "
+            f"control.translation_gain {gain:g} can clip: this corruption lengthens a command by up to "
             f"{largest:.3g}, so the largest gain that never clips is {safe:.3g} (or use auto)",
         )
     return gain
@@ -308,14 +312,30 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             where,
             "control.ic_gain must be a positive number (noise-prior units) or 'action' (the checkpoint's action units)",
         )
+    if not isinstance(control.zeroed_dims, list) or any(
+        d not in ("rotation", "gripper") for d in control.zeroed_dims
+    ):
+        _fail(
+            where,
+            "control.zeroed_dims must be a list from rotation, gripper (dims flow control sets to 0 in the steered steps)",
+        )
     if control.n_reversal_steps is not None and (
         not isinstance(control.n_reversal_steps, int) or control.n_reversal_steps < 1
     ):
         _fail(
             where, "control.n_reversal_steps must be a positive integer or null (null = all the way to noise)"
         )
-    if not isinstance(control.input_noise, int | float) or control.input_noise < 0:
-        _fail(where, "control.input_noise must be >= 0")
+    if control.pinned_steps is not None and (
+        type(control.pinned_steps) is not int or control.pinned_steps < 1
+    ):
+        _fail(
+            where,
+            "control.pinned_steps must be a positive integer or null (chunk steps the reference pins; null = the executed prefix)",
+        )
+    for key in ("translation_noise", "rotation_noise", "gripper_noise"):
+        value = getattr(control, key)
+        if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+            _fail(where, f"control.{key} must be >= 0")
     if control.max_steps is not None and (not isinstance(control.max_steps, int) or control.max_steps < 1):
         _fail(where, "control.max_steps must be a positive integer or null")
     dims = control.operator_dims
@@ -349,7 +369,7 @@ def build_control(flat: dict, where: str) -> ControlSettings:
         adapter.adapter_user,
         adapter.adapter_task,
     )
-    control.resolved_input_gain = resolve_input_gain(control, where)
+    control.resolved_translation_gain = resolve_translation_gain(control, where)
     return control
 
 

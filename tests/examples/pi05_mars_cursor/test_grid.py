@@ -138,7 +138,7 @@ def test_grid_sweep_loads_cells_and_resolves_cell_adapters(tmp_path):
 # the run: one user, two tasks (resolution is pinned on GRID above), the shortest trials the checks allow
 RUN_GRID = (GRID.replace("  per_task: {mode: frs, model: {T0: flow_goaldrop, T1: flow_goaldrop}, reversal_adapter: {user: {T0: cell, T1: {U1: user_b, U2: user_a}}}}\n", "")
             .replace("    U2: {corruption: {curl: 20, tau: 0.1}, adapter: user_b}\n", "")
-            .replace("adapter: task_a}", "adapter: task_a, time_limit_s: 2.0}").replace("trials: {tune: 3, test: 3}", "trials: {tune: 1, test: 3}"))
+            .replace("adapter: task_a}", "adapter: task_a, time_limit_s: 1.0}").replace("time_limit_s: 5.0", "time_limit_s: 1.0").replace("trials: {tune: 3, test: 3}", "trials: {tune: 1, test: 3}"))
 
 
 def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
@@ -147,7 +147,7 @@ def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
         torch.save(dict(kind=kind, config=module.config, state_dict=module.state_dict(), args={}, obstacle=None),
                    tmp_path / name / "adapter.pt")
     monkeypatch.setattr(session, "adapter_path", lambda name: tmp_path / name / "adapter.pt")
-    assert "per_task" not in RUN_GRID and "U2" not in RUN_GRID and "time_limit_s: 2.0" in RUN_GRID and "tune: 1," in RUN_GRID
+    assert "per_task" not in RUN_GRID and "U2" not in RUN_GRID and "time_limit_s: 1.0" in RUN_GRID and "tune: 1," in RUN_GRID
     (tmp_path / "grid.yaml").write_text(RUN_GRID + "tune: {frs: {n_reverse_steps: [10]}}\n")
     argv = ["--sweep", str(tmp_path / "grid.yaml"), "--results", str(tmp_path), "--cpu", "--out", "grid"]
     sweep_main(argv)

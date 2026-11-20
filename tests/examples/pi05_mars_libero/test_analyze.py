@@ -91,6 +91,16 @@ def outcomes(*flags):
 # ---------------------------------------------------------------- loading and describing
 
 
+def test_a_run_recorded_under_the_old_names_loads_with_the_new_ones(tmp_path):
+    old = write_run(tmp_path, "old", config(), [{"success": True, "input_noise": 0.5, "input_gain": 1.0}])
+    new = write_run(
+        tmp_path, "new", config(), [{"success": True, "translation_noise": 0.5, "translation_gain": 1.0}]
+    )
+    df, _ = analyze.load_runs([old, new])
+    assert list(df["translation_noise"]) == [0.5, 0.5] and list(df["translation_gain"]) == [1.0, 1.0]
+    assert "input_noise" not in df and "input_gain" not in df
+
+
 def test_operator_profiles_cannot_be_silently_pooled(tmp_path):
     a = write_run(tmp_path, "immediate", config(operator="policy"), outcomes(True))
     b = write_run(
@@ -124,6 +134,8 @@ def test_method_and_depth():
     assert (analyze.method_of(c), analyze.depth_of(c)) == ("FC", 6.0)
     assert analyze.method_of(config("policy")) == "policy (floor)"
     assert analyze.method_of(config("policy", prompt="task")) == "policy (ceiling)"
+    assert analyze.method_of(config("teleop")) == "Teleop"  # the operator alone, named as on the cursor
+    assert analyze.method_of(config("shared_override")) == "shared_override"  # not a study arm
     assert np.isnan(analyze.depth_of(config("policy")))
 
 

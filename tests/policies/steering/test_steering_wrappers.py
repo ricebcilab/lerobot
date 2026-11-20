@@ -327,6 +327,22 @@ def test_flow_control_writes_the_command_into_tau_chunk_steps():
     np.testing.assert_allclose(policy.last_chunk[0, :, :3].numpy(), np.tile(expected, (CHUNK, 1)), atol=1e-6)
 
 
+def test_flow_control_zeroes_the_named_dims_in_the_steered_steps():
+    # Kao et al. on LIBERO (App. G.1): the dims the command does not set, there rotation, are 0 in the steered steps;
+    # the gripper, the padding, the later steps and an idle row keep their noise.
+    x_t = torch.ones(2, CHUNK, MAX_DIM)
+    steer = torch.tensor([True, False])[:, None, None]
+    out = FlowControlSteering.write(
+        x_t, 0, torch.full((2, 1, 3), 1.5), tau=2, lam=1, dims=slice(0, 3), steer=steer, zeroed=(slice(3, 6),)
+    )
+    assert (out[0, :2, :3] == 1.5).all() and (out[0, :2, 3:6] == 0).all()
+    assert (out[0, :2, 6:] == 1).all() and (out[0, 2:] == 1).all() and (out[1] == 1).all()
+    core = _fc(
+        FakePolicy(), post=postprocessor(mean=[0.0] * 7, std=[1.0] * 7), ic_gain=1.5, zeroed=(slice(3, 6),)
+    )
+    assert core.zeroed == (slice(3, 6),) and _fc(FakePolicy(), ic_gain=1.5).zeroed == ()
+
+
 def test_flow_control_runs_the_policy_alone_when_idle_or_at_lambda_zero():
     policy = FakePolicy()
     wrapper = _fc(policy, lam=0)

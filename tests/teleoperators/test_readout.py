@@ -299,11 +299,13 @@ def test_build_adapter_two_dims_refuses_blocks_it_has_no_dims_for():
     assert (named.adapter_user, named.adapter_task, named.fixed_matrix) == ("u", "t", None)
 
 
-def test_quantize_snaps_an_active_push_to_its_largest_axis():
-    raw = np.array([[0.3, -0.7, 0.2], [0.5, 0.5, 0.1], [0.01, 0.02, 0.0]])
-    # the largest component's axis at full deflection; the first axis on a tie; an idle push untouched
-    np.testing.assert_array_equal(
-        readout.quantize(raw), [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.01, 0.02, 0.0]]
+def test_quantize_snaps_an_active_push_to_its_largest_axis_at_its_own_length():
+    raw = np.array([[0.3, -0.7, 0.2], [0.5, 0.5, 0.1], [0.01, 0.02, 0.0], [0.9, 0.9, 0.9]])
+    # the largest component's axis (the first on a tie) at the push's own length, so only its direction is lost;
+    # an idle push untouched; a push longer than full deflection capped there
+    np.testing.assert_allclose(
+        readout.quantize(raw),
+        [[0.0, -np.sqrt(0.62), 0.0], [np.sqrt(0.51), 0.0, 0.0], [0.01, 0.02, 0.0], [1.0, 0.0, 0.0]],
     )
     assert readout.quantize_spec({"quantize": "axes"}) and not readout.quantize_spec({"scale": [1, 1, 0]})
     with pytest.raises(ValueError, match="quantize"):
@@ -311,7 +313,7 @@ def test_quantize_snaps_an_active_push_to_its_largest_axis():
     with pytest.raises(ValueError, match="quantize"):
         corruption_spec({"quantize": "axes"}, n_dims=3)
     arm = readout.Readout(quantize=True, n_dims=3, noise_gate="command")
-    np.testing.assert_array_equal(arm(raw[0]), [0.0, -1.0, 0.0])
+    np.testing.assert_allclose(arm(raw[0]), [0.0, -np.sqrt(0.62), 0.0])
     np.testing.assert_array_equal(arm.core(raw[None]), readout.quantize(raw)[None])
     with pytest.raises(ValueError, match="not both"):
         readout.Readout(np.eye(3), quantize=True, n_dims=3)

@@ -5,7 +5,8 @@ matrices in force), `trials.jsonl` (one record per completed trial) and per
 trial a `.npz` of step arrays. Every trial row is tagged with the run's
 *method* (FC = shared flow control, FRS = flow reversal steering without an
 adapter, MARS = flow reversal with a reversal adapter, the method formerly
-called FRS-RA (old notebooks may still say so; `LEGACY_METHODS` maps it), or a
+called FRS-RA (old notebooks may still say so; `LEGACY_METHODS` maps it), Teleop
+= the operator's command alone, no policy (mode `teleop`), or a
 policy-only anchor: floor = the arm's prompt, ceiling = the scene's own
 instruction), its *depth* (`tau`, the chunk steps the command is written into,
 for FC runs recorded with Kao et al.'s knobs, `n_guided_steps` for older FC runs,
@@ -31,9 +32,12 @@ from scipy import stats
 
 from lerobot.policies.steering import DEADBAND
 
-METHODS = ("FC", "FRS", "MARS", "policy (floor)", "policy (ceiling)")
+METHODS = ("Teleop", "FC", "FRS", "MARS", "policy (floor)", "policy (ceiling)")
 STEERED = ("FC", "FRS", "MARS")
 LEGACY_METHODS = {"FRS-RA": "MARS"}  # the adapted arm's old name, accepted wherever a method is named
+# Trial fields renamed on 2026-11-16, when the rotation and the gripper got a noise of their own: old runs load
+# under the new names.
+LEGACY_COLUMNS = {"input_noise": "translation_noise", "input_gain": "translation_gain"}
 CHUNK_SIZE = 50  # pi0.5's action chunk: FC's `tau: null` writes the whole chunk
 # One fixed colour per method in every figure (identity is never cycled). The three
 # steered hues are colourblind-safe as a set (worst adjacent CVD dE 9.2); the anchors
@@ -91,7 +95,9 @@ def method_of(config: dict) -> str:
         return "MARS" if config.get("reversal_adapter") is not None else "FRS"
     if mode == "policy":
         return "policy (ceiling)" if config.get("prompt") == PROMPT_FROM_TASK else "policy (floor)"
-    return mode  # shared_override / teleop: not part of the study
+    if mode == "teleop":
+        return "Teleop"  # the operator alone, as on the cursor: its translation, rotation and gripper
+    return mode  # shared_override: not part of the study
 
 
 def depth_of(config: dict) -> float:
@@ -128,6 +134,7 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
     config = yaml.safe_load((run_dir / "config.yaml").read_text())
     columns = ["trial", "task_id", "success", "steps", "duration_s", "steps_file", "mode_expressed"]
     df = pd.DataFrame(trials, columns=columns) if not trials else pd.DataFrame(trials)
+    df = df.rename(columns=LEGACY_COLUMNS)
     df["success"] = df["success"].astype(bool)
     method, depth = method_of(config), depth_of(config)
     df["run"] = run_dir.name

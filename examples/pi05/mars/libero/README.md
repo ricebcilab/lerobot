@@ -119,6 +119,8 @@ The policy denoises each action chunk in 10 flow-matching steps; the two
 shared-autonomy modes differ in where your command enters that schedule.
 
 - `mode teleop` — you drive x/y/z and the gripper; the model is not involved.
+  A synthetic operator turns the hand too (its planned rotation); the devices
+  give no rotation.
 - `mode shared_override` — pi0.5 drives, but your x/y/z replaces the model's
   translation in the executed action.
 - `mode shared_flow_control [tau] [lambda]` (**FC**, shared flow control, Kao
@@ -150,9 +152,11 @@ shared-autonomy modes differ in where your command enters that schedule.
   `t = n/10` for a partial one. This is Tang et al.'s noise-space in-painting
   (App. D.1), but the paper pins fewer steps than it executes: a 5-step
   reference (`action_repeats`) in a 15-step chunk, 10 of them executed, so the
-  policy fills in half of what runs. Our default pins every executed step (the
-  steering config's `pinned_steps`, not yet a setting here; half of
-  `n_action_steps` would be the paper's ratio).
+  policy fills in half of what runs. Our default pins every executed step;
+  `control.pinned_steps` sets another prefix (5 is that interface's ratio; in the
+  paper's own LIBERO runs the reference covers its whole 10-step chunk, all of it
+  executed, and rotation and gripper stay in the reference instead of being
+  handed back).
   A steered chunk costs `10 + n` velocity evaluations against 10 for FC or an
   unsteered chunk. After each rollout the REPL prints how many chunks were
   steered and how far the executed translation landed from the reference (in
@@ -178,7 +182,7 @@ at once; the SpaceMouse wins while deflected):
 Three ways to make the operator's command less than perfect, and one to keep
 what is left of it undistorted:
 
-- **Input noise** — `--input-noise STD` (or `noise STD` in the REPL) adds
+- **Translation noise** — `--translation-noise STD` (or `noise STD` in the REPL) adds
   independent Gaussian noise to Δx, Δy and Δz whenever the command is sampled
   while you are commanding (once per chunk in FC/FRS, once per control step in
   teleop/override); `0` (the default) is off.
@@ -194,7 +198,7 @@ what is left of it undistorted:
   corruption: {M: [[..3 rows..]]}       # literal (bare rows work too)
   corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}   # experiments only: a new M on every trial
   corruption: {curl: 20, tau: 0.1}      # a curl field (1/s, + = clockwise in x-y) on a command with inertia tau (s)
-  corruption: {quantize: axes}          # a keypad: the command snapped to the axis of its largest component, at full deflection
+  corruption: {quantize: axes}          # a keypad: the command snapped to the axis of its largest component, at its own length
   ```
 
   The curl field is the cursor project's dynamic corruption: the served command
@@ -202,7 +206,7 @@ what is left of it undistorted:
   once per control step (`dt`, default 0.05 s) from rest at every trial. A held
   push comes out turned clockwise by `atan(tau·curl)` and slowed by
   `1/sqrt(1 + (tau·curl)^2)`; the field keeps evolving while you are idle, but an
-  idle push is served as is. A curl never lengthens a command, so `input_gain:
+  idle push is served as is. A curl never lengthens a command, so `translation_gain:
 auto` is 1.
 
   The `random` form draws `M = R · diag(gains)` afresh for every trial: each
@@ -248,7 +252,7 @@ auto` is 1.
   (velocities have no mean offset); learned modules work in the normalized space
   directly. The matrices and the module paths are saved in the run config.
 
-- **Input gain** — `control.input_gain` turns the operator's command down so
+- **Translation gain** — `control.translation_gain` turns the operator's command down so
   that the corruption can never push it into the env's `[-1, 1]` clip. The
   command is first limited to unit length, keeping its direction (a stick
   pushed on several axes at once can otherwise reach √3), and then multiplied
@@ -356,7 +360,7 @@ file's stem plus any `--set`/`--sweep` values.
 | Key                                  | Default                           | Meaning                                                                                                                                                                                                                       |
 | ------------------------------------ | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `experiment.n_trials`                | `10`                              | Number of trials                                                                                                                                                                                                              |
-| `experiment.seed`                    | `0`                               | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and input-noise streams                                                                                        |
+| `experiment.seed`                    | `0`                               | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and noise streams                                                                                              |
 | `experiment.task_order`              | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                                                                                   |
 | `experiment.first_occurrence`        | `0`                               | Each task's trials start at this occurrence of its initial states: `5` continues where a 5-per-task run stopped, so a development and a test split share no state within a pass                                               |
 | `experiment.output_dir`              | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                                                                                   |
@@ -370,9 +374,13 @@ file's stem plus any `--set`/`--sweep` values.
 | `control.tau`                        | `null`                            | `shared_flow_control`: chunk steps (of 50) the command is written into; `null` = the whole chunk                                                                                                                              |
 | `control.lambda`                     | `1`                               | `shared_flow_control`: denoising steps at whose start it is written (1 = the initial condition, Kao et al.; 0 = policy alone). `n_guided_steps` is accepted as the old name                                                   |
 | `control.ic_gain`                    | `action`                          | `shared_flow_control`: the command's scale in the noise prior (a full push writes `ic_gain` sigma), or `action` for the checkpoint's action units                                                                             |
+| `control.zeroed_dims`                | `[]`                              | `shared_flow_control`: dim groups (`rotation`, `gripper`) set to 0 in the steps the command is written into; Kao et al. on LIBERO zero rotation                                                                               |
 | `control.n_reversal_steps`           | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                                                                        |
-| `control.input_noise`                | `0.0`                             | Std of the Gaussian noise added to the x/y/z command                                                                                                                                                                          |
-| `control.input_gain`                 | `null`                            | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)                                             |
+| `control.pinned_steps`               | `null`                            | `shared_flow_reversal_steering` only: leading chunk steps the reference pins, the rest is the policy's; `null` = the executed steps                                                                                           |
+| `control.translation_noise`          | `0.0`                             | Std of the Gaussian noise added to the x/y/z command                                                                                                                                                                          |
+| `control.rotation_noise`             | `0.0`                             | Std of the Gaussian noise added to each axis of the rotation command; only teleop mode executes that command                                                                                                                  |
+| `control.gripper_noise`              | `0.0`                             | Std of the Gaussian noise added to the gripper command, which is then served as its sign (open or close); only teleop mode executes it                                                                                        |
+| `control.translation_gain`           | `null`                            | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)                                             |
 | `control.max_steps`                  | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                                                                       |
 | `control.corruption`                 | `null`                            | Matrix spec applied to the operator's command, `{curl: b, tau: s}` for a curl field, `{quantize: axes}` for a keypad, or `{random: ...}` for a new matrix per trial — see [Perturbing the operator](#perturbing-the-operator) |
 | `control.reversal_adapter`           | `null`                            | MARS adapter spec for `shared_flow_reversal_steering`: a fixed `F`, `{learned: path}` or `{user: ..., task: ...}` — see [Perturbing the operator](#perturbing-the-operator)                                                   |
@@ -390,7 +398,7 @@ corresponding `--set`.
 Experiments reset once per trial, to an explicit initial-state ID and
 environment seed: the single `seed` draws each task's initial states from a
 seeded permutation (reshuffling after a complete pass) and seeds the policy,
-operator and input-noise streams separately, so the assignments are the same
+operator and noise streams separately, so the assignments are the same
 in every block and at every depth. Different seeds can reuse states; they do
 not define disjoint development/evaluation sets by themselves.
 
@@ -416,7 +424,7 @@ Each run creates `<output_dir>/<YYYYmmdd_HHMMSS>_<config stem>/` containing:
 
 `trials.jsonl` fields: `trial`, `suite`, `task_id`, `task_description`,
 `vla_prompt`, `operator`, `policy_operator`, `operator_dims`, `mode`,
-`tau`, `lambda`, `ic_gain` (older runs: `n_guided_steps`), `input_noise`, `input_gain` (the gain in force, `null` when
+`tau`, `lambda`, `ic_gain` (older runs: `n_guided_steps`), `translation_noise`, `translation_gain` (`input_noise` and `input_gain` in runs recorded before 2026-11-16, which `analyze.py` loads under the new names; the gain in force, `null` when
 off), `corruption`, `reversal_adapter` (a short label
 of the spec, e.g. `rotation_z_deg=20`, or the loaded file's name; `null` when
 off), `corruption_matrix` and `reversal_adapter_matrix` (the 3×3 `M` and 7×7 `F`
@@ -440,7 +448,7 @@ steering statistics (`guided_steps`, or `n_reversal_steps`, `steered_chunks` and
 | ------------------------------------------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `t`                                                                                   | `(T,)`                     | Seconds since the rollout started                                                                                                                                                  |
 | `action`                                                                              | `(T, 7)`                   | The env action actually executed: `Δx Δy Δz Δroll Δpitch Δyaw gripper`                                                                                                             |
-| `user_translation`                                                                    | `(T, 3)`                   | The operator command **as consumed** — after the corruption matrix and the input noise                                                                                             |
+| `user_translation`                                                                    | `(T, 3)`                   | The operator command **as consumed** — after the corruption matrix and the translation noise                                                                                       |
 | `user_translation_raw`                                                                | `(T, 3)`                   | The same command **before** corruption and noise, i.e. the operator's true intent                                                                                                  |
 | `user_gripper`                                                                        | `(T,)`                     | Operator gripper command (−1 open, +1 close)                                                                                                                                       |
 | `user_reads`                                                                          | `(T,)`                     | How many times the input was sampled during that step; `0` = the policy did not consult it (the flow modes read once per chunk)                                                    |
@@ -453,7 +461,7 @@ steering statistics (`guided_steps`, or `n_reversal_steps`, `steered_chunks` and
 | `reward`, `terminated`, `truncated`                                                   | `(T,)`                     | Environment response                                                                                                                                                               |
 | `object_names`, `object_pos`                                                          | `(K,)`, `(T, K, 3)`        | Every scene object / fixture and its position before each step (the state the action was applied to)                                                                               |
 | `articulation_names`, `articulation_qpos`                                             | `(J,)`, `(T, J)`           | Every non-robot slide / hinge joint (drawers, knobs, doors) and its value before each step                                                                                         |
-| `corruption_matrix`, `reversal_adapter_matrix`, `input_gain`                          | `(3, 3)`, `(7, 7)`, scalar | The `M`, `F` and input gain in force on this trial; NaN when off                                                                                                                   |
+| `corruption_matrix`, `reversal_adapter_matrix`, `translation_gain`                    | `(3, 3)`, `(7, 7)`, scalar | The `M`, `F` and translation gain in force on this trial; NaN when off                                                                                                             |
 | `task_description`, `vla_prompt`, `mode`, `task_id`, `success` and the reset identity | scalars                    | Trial identity, so a single `.npz` stands alone                                                                                                                                    |
 
 Missing robot-state fields are recorded as `NaN` rather than aborting a trial.
@@ -546,7 +554,7 @@ follows the next arms. `TASK`, `N_TRIALS`, `SEED`, `FC_DEPTHS`, `FRS_DEPTHS`
 environment variables; vary the arm order across participants to spread
 practice and fatigue. The pilots recorded so far (`human_pilot/p01`,
 `human_pilot_rotz40/p01`, `human_pilot_scalex4/p01`) ran with `MAX_STEPS=600`
-and before the input gain existed (`--set control.input_gain=null` restores
+and before the translation gain existed (`--set control.translation_gain=null` restores
 that). Afterwards set `ROOT` in
 [`analyze_human_pilot.ipynb`](notebooks/analyze_human_pilot.ipynb) to that
 `OUT` and Run All: it checks counts and reset pairing, labels incomplete data
@@ -635,11 +643,53 @@ that profile is a robustness check, not the main condition.
 
 ```bash
 U=./examples/pi05/mars/libero/experiments/user_study.sh
-"$U" 0                  # the anchors: floor, ceiling, FC and FRS on the clean readout, both operator timings
-"$U" prep               # before stage 1, on the clean readout: FC's lambda and gain, the noise level, FRS depths 1 and 4
-NOISE=0.3 FC="tau=10,lambda=6 tau=10,lambda=8 tau=50,ic_gain=3" "$U" 1    # the baselines under every user
-"$U" prep --dry-run     # validate a stage's runs without loading a policy
+"$U" 0                             # the anchors: floor, ceiling, FC and FRS on the clean readout, both operator timings
+TRANSLATION_NOISE=0.5 "$U" gain             # FC's gain, once: 1.5, 3, 5, 8, 12 at tau 10 and 50 on the clean readout
+TRANSLATION_NOISE=0.5 FC_GAIN=3 "$U" 1      # the baselines under every user (ARMS="frs teleop" for some of them)
+"$U" modules                                # one user module per user, calibrated on the Goal tasks outside Goal-6
+TRANSLATION_NOISE=0.5 "$U" 2                # MARS with those modules: reversal depth x pinned prefix
+CONTROL=1 DEPTHS="6 4 2 1" USERS="clean rotation lowdof lag keypad" TRANSLATION_NOISE=0.5 "$U" 2   # the same loop without a module
+TRANSLATION_NOISE=0.5 "$U" 2 --dry-run      # validate a stage's runs without loading a policy
 ```
+
+`SUITES="goal"` keeps a stage to one suite, `ARMS="frs fc teleop floor ceiling"`
+adds the policy-alone anchors to stage 1, `SPLIT=1` gives every knob value its
+own run, and any extra flag reaches every run, e.g.
+`--set policy.path=<checkpoint>` for another policy (`MODULES` and `OUT` then
+name where that policy's modules and runs go).
+
+Stage 2 trains one user module per user (`modules`: `train_user_module.py` in
+the LIBERO-Goal scene on the four tasks outside Goal-6 (0, 2, 3, 9), five start
+states each, through that user's readout, into
+`outputs/pi05_libero_user_study/user_modules/<user>/`), so a module has seen
+the scene but none of the six evaluation tasks. Calibration takes 20 episodes
+of the task-prompted policy and 20 of the policy under the arm's own prompt
+(their first 120 steps). The second kind is there because a task-prompted
+rollout only visits states where the policy's own plan is already what the
+operator means: modules calibrated on those alone learned to discard the
+command. MARS then runs with the module on the development split over the
+reversal depth (1, 2, 4, 6, 10; `DEPTHS` picks some) and the pinned prefix (5,
+10, 25, 50), as on the cursor grid. `CONTROL=1` runs the same loop without a
+module (FRS at a partial reversal), so a gain at a shallow depth can be told
+from the module's.
+
+The baselines are their papers' methods, each with its one knob tuned per user
+on the development split, as on the cursor. FRS (Tang et al.) keeps the full
+reversal and tunes the pinned prefix (`control.pinned_steps` over 5, 10, 25,
+50). FC (Kao et al.) writes the initial condition only (`lambda` 1) with
+rotation set to 0 in the steered steps (`control.zeroed_dims: [rotation]`, their
+LIBERO recipe) and tunes `tau` (5 to 50); its gain is chosen once on the clean
+readout, as the cursor's was. Teleop, as on the cursor, is the operator alone
+(`control.mode: teleop`): its translation through the user's readout, its
+rotation and gripper, and no policy. A user's corruption acts on the
+translation; its noise reaches every part of the command, at 0.5 on the
+translation, 0.04 on the rotation and 1.0 on the gripper (the same noise
+relative to how large the operator's commands of each kind are). Every user carries translation noise 0.5. What differs
+from the papers' own LIBERO runs: the checkpoint (lerobot's conversion,
+fine-tuned, with 50-step chunks and mean/std action statistics, against
+openpi's 10-step chunks and quantiles), rotation and gripper handed back to
+the policy in FRS, the command's own length written in FC (theirs is a unit
+direction), and a policy that knows the tasks but is not told which.
 
 The launcher runs several experiments at a time across the GPUs (a worker
 takes the next run as it finishes one). Results go to
@@ -654,13 +704,56 @@ the cursor project's recipe ported to pi0.5. It rolls out the task-prompted
 policy (the synthetic operator) to collect states at chunk boundaries, labels
 each with the operator's chunk `L` under the real task, the push that chunk
 implies (the `PolicyOperator` rule) through the arm's readout (its corruption or
-curl, then input noise of std `sigma ~ U(sigma_min, sigma_max)`), the reference
+curl, then translation noise of std `sigma ~ U(sigma_min, sigma_max)`), the reference
 chunk `a_bci` FRS builds from that served command, and `z_L`, `L` reversed through
 the goal-free field (the arm's prompt). The module `U(x_t, t)` then minimizes the
 field regression `U(x_t, t) P(x_t, t) = z_L − a_bci` along `x_t = (1 − t) a_bci +
 t z_L`, so that a full reversal of what the readout delivered lands on the latent
-of what the operator meant. The log reports, on held-out states, the heading
-cosine between the regenerated chunk and `L` with and without the module.
+of what the operator meant. `--generic-episodes N` adds `N` rollouts of the
+policy under the arm's own prompt (`--generic-steps` control steps of each),
+labelled the same way with the scene's task: states where the unsteered policy
+may be heading somewhere else than the operator means.
+
+`--target command` changes what a reversed command should land on. The latent
+of the operator's whole chunk holds much that a command cannot say (the later
+steps, rotation, the gripper), and a module that sees only the command chunk
+cannot predict it. With `--target command` the label is where steering takes a
+faithful command: the plain reversal, through the same goal-free field, of the
+reference FRS builds from the operator's push itself. The regression runs at
+the reversal's own steps and on the translation dims only (what steering keeps
+of a command; the module's other rows stay the identity), so that the reversal
+of `a_bci` closes its distance to that path over the first `--correct-by`
+steps (default: all of them) and follows it afterwards. A faithful command
+leaves the module the identity, i.e. plain FRS. `--states <file>` reuses the
+states of an earlier run for any arm: rollouts and labels do not depend on the
+user, and the commands are served again through the arm's own readout.
+
+`--cues N` (with `--target command`) trains on a cued calibration session
+instead of the tasks' own pushes, using only what a real session records: the
+cue, and the command the readout delivered for it, noise included. Every state
+gets `N` cues, each the state's push length in a direction drawn evenly on the
+sphere. A cue's direction is held for `--cue-hold` chunks (default 3, so that a
+lagging readout settles) and changes at each new episode. Each cue is served
+through the arm's readout and recorded once with its noise
+(`--cue-noise redrawn` draws the noise anew at every batch, the limit of a long
+session). Its label is the reversal path of the cued push's own reference. A
+task's pushes cluster in a few directions, and a module fitted to noisy
+commands learns that cluster as a prior. Even cues leave it only the readout's
+distortion and the noise to learn, so it tends to shorten a noisy command as
+well as re-aim it. The validation still serves the tasks' own pushes, which a
+cued module never sees.
+
+The log reports, on held-out states, what the rollouts' steering would execute
+(`FlowReversalSteering`, the executed prefix pinned) at each of `--val-depths`:
+the cosine between the executed steps' mean translation and the operator's
+push, for the policy's own plan from the same noise (`plan`), FRS on the
+user's command (`none`), the same through the module (`user`), FRS on a
+faithful readout's command with the same noise draw (`clean`) and on the push
+itself (`ideal`), where the plan disagrees with the push (`d<depth>_off_*`)
+and where it agrees (`d<depth>_on_*`). A module repairs the command if
+`off_user` moves from `off_none` toward `off_clean`; one that only weakens the
+steering raises `on_user` alone. Few held-out states have a disagreeing plan,
+so this is a monitor; judge a module on all the calibration states.
 
 ```bash
 python examples/pi05/mars/libero/train_user_module.py \
@@ -673,6 +766,9 @@ The trainer takes the arm's readout and ignores its reversal adapter, so it star
 from the arm file that names the module it is about to write. `--set KEY=VALUE`
 overrides the file as in `experiment.py`; calibrating on other scenes than the
 arm evaluates on is `--set scene.suite=libero_spatial` (and `scene.task_ids`).
+The episodes cycle through the tasks, each pass from a task's next initial
+state. The log's validation serves each held-out state's command at the
+middle of the `--sigma` range.
 Calibration commands are served by the rollouts' rule: noise only where the
 corrupted command is itself outside the deadband.
 
@@ -803,6 +899,41 @@ Increase the batch size or use distributed training according to available
 VRAM. The published LeRobot result used an effective batch size of 256 on eight
 H100 GPUs; the command above deliberately starts with a safer per-process batch
 size of 1.
+
+### The generic prompt (prompt dropout)
+
+The released checkpoint always saw a task sentence. Under `do something` it
+follows one fixed behaviour per scene: two samples from fresh noise head the
+same way at every early state, on all four suites. Steering then has to force
+the policy off that default; it cannot choose among behaviours the policy
+already offers, as it does on the cursor, whose policy was trained with goal
+dropout.
+
+`train_generic_prompt.py` is `lerobot-train` with prompt dropout: every
+training sample keeps its task sentence with probability `1 - p` and gets the
+generic prompt otherwise. Under the generic prompt the policy learns the mix of
+tasks the demonstrations show for that image, and it still follows a task
+sentence. Expect a spread only where one scene carries several tasks
+(LIBERO-Goal: ten tasks, one scene); where the layout gives the task away
+(LIBERO-Spatial, LIBERO-Object) it learns that layout's own task.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+CUDA_VISIBLE_DEVICES=0,1 uv run --locked --extra pi --extra libero --extra training \
+  accelerate launch --multi_gpu --num_processes=2 \
+  examples/pi05/mars/libero/train_generic_prompt.py --prompt-dropout 0.5 \
+  --policy.path=lerobot/pi05_libero_finetuned --policy.push_to_hub=false \
+  --policy.compile_model=true --policy.train_expert_only=true \
+  --dataset.repo_id=HuggingFaceVLA/libero --batch_size=32 --steps=6000 \
+  --save_freq=1000 --eval_freq=0 --wandb.enable=false \
+  --output_dir=outputs/pi05_libero_generic_prompt
+```
+
+On one RTX 6000 Ada (49 GB), batch 32: training the action expert only with
+the compiled model takes 4.4 s per step and 26 GB; the whole model takes
+10.3 s per step (not compiled) and 48 GB. Gradient checkpointing has to stay
+on (batch 32 does not fit without it). Every flag but `--prompt-dropout` and
+`--generic-prompt` is `lerobot-train`'s.
 
 ## Troubleshooting
 
