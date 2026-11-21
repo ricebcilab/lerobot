@@ -1,0 +1,8 @@
+# FC (Kao et al. 2026): the command, scaled by ic_gain into the noise prior, is written into the first
+# tau chunk steps of x_t at the start of each of the first lam Euler steps; the flow runs unmodified.
+# tau 14 / lam 1 is the initial condition only. Sweep the depth:  --trials ... (see the LIBERO configs).
+extends: base.yaml
+steering:
+  mode: fc
+  tau: 14
+  lam: 1

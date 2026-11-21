@@ -1,0 +1,5 @@
+# Teleop: the operator's stick alone. No policy is loaded, the arm's joint velocity is the command turned
+# through the Jacobian, and the gripper is the operator's button (the only arm where it is not the policy's).
+extends: base.yaml
+steering:
+  mode: teleop

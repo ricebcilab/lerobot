@@ -1,0 +1,7 @@
+# Floor: the policy alone with the generic prompt, the operator's command ignored. The anchor the steered
+# arms are compared against.
+extends: base.yaml
+steering:
+  mode: floor
+policy:
+  prompt_generic: "do something"

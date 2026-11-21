@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""What turns a station observation into the policy's batch: the camera map and the tensors.
+
+pi05_droid wants a proprioception state, three letterboxed images in its own feature names, and the task.
+The station sends two cameras under its own names, so this module is the one place that knows both naming
+schemes: `CameraMap` names the feeds, and the preprocessor's rename step (built with the same map) does the
+renaming. Nothing here imports torch at module import time; the batch is a torch batch only when it is made.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+from config import ExperimentConfig
+from interfaces import StationManifest
+from station import IMAGE_SIZE, resize_with_pad, state_from_obs
+
+__all__ = ["CameraMap", "camera_map", "observation_batch", "unnormalized"]
+
+DROID_IMAGE_KEYS = (
+    "observation.images.base_0_rgb",
+    "observation.images.left_wrist_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+)
+"""pi05_droid's three camera inputs, in the checkpoint's feature names (DESIGN.md)."""
+
+
+@dataclass(frozen=True)
+class CameraMap:
+    """Which checkpoint image each station camera feeds, and the feeds the station does not have.
+
+    `sources` is keyed by the checkpoint's feature name; a `None` value is a camera the checkpoint wants and
+    this station does not supply, which the runner fills black (`DESIGN.md`: the checkpoint wants three, the
+    station feeds two). The rename map is what the preprocessor's rename step takes.
+    """
+
+    sources: Mapping[str, str | None]
+
+    def rename_map(self) -> dict[str, str]:
+        """The station observation key to checkpoint key map the preprocessor's rename step takes."""
+        return {
+            f"observation.images.{source}": name
+            for name, source in self.sources.items()
+            if source is not None
+        }
+
+    def black(self) -> tuple[str, ...]:
+        """The checkpoint image keys the station does not feed."""
+        return tuple(name for name, source in self.sources.items() if source is None)
+
+
+def camera_map(config: ExperimentConfig, manifest: StationManifest) -> CameraMap:
+    """The checkpoint's three image feeds, from the config's two names or the station's own order.
+
+    The per-arm file names the station's exterior and wrist feeds once the probe has filled them in; until
+    then the manifest's order is the station's own and is used as-is. Every named feed must be one the
+    station actually sends, and the checkpoint's third feed is black.
+    """
+    exterior, wrist = config.cameras.exterior, config.cameras.wrist
+    if exterior is None or wrist is None:
+        if len(manifest.cameras) < 2:
+            raise ValueError(
+                f"the station sends cameras {manifest.cameras}; the runner needs an exterior and a wrist feed"
+            )
+        exterior = exterior or manifest.cameras[0]
+        wrist = wrist or manifest.cameras[1]
+    missing = [name for name in (exterior, wrist) if name not in manifest.cameras]
+    if missing:
+        raise ValueError(f"cameras {missing} are not among the station's {manifest.cameras}")
+    return CameraMap({DROID_IMAGE_KEYS[0]: exterior, DROID_IMAGE_KEYS[1]: wrist, DROID_IMAGE_KEYS[2]: None})
+
+
+def observation_batch(
+    obs: Mapping[str, np.ndarray], arm: str, cameras: CameraMap, prompt: str
+) -> dict[str, Any]:
+    """One station observation as the preprocessor's input batch: state, three images, and the task.
+
+    The images keep the station's keys, `observation.images.<feed>`, so the checkpoint's rename step is what
+    maps them to its own feature names; the black feed is written under its checkpoint name directly, since
+    there is no station key to rename from. Frames are resized with openpi's letterbox and scaled to [0, 1],
+    the preparation the DROID client does.
+    """
+    import torch
+
+    state = state_from_obs(obs, arm).astype(np.float32)
+    batch: dict[str, Any] = {"observation.state": torch.from_numpy(state)}
+    for name, source in cameras.sources.items():
+        if source is None:
+            frame = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+            key = name
+        else:
+            frame = np.array(resize_with_pad(np.asarray(obs[source]), IMAGE_SIZE), copy=True)
+            key = f"observation.images.{source}"
+        image = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+        batch[key] = image
+    batch["task"] = prompt
+    return batch
+
+
+def unnormalized(postprocessor, value) -> np.ndarray:
+    """A policy action after the postprocessor, as one flat float array of its action dims.
+
+    The pipeline's action form is a tensor; a caller holding a transition-shaped mapping is accepted too, so
+    the runner does not depend on which of the two a checkpoint's postprocessor returns.
+    """
+    from lerobot.utils.constants import ACTION
+
+    out = postprocessor(value)
+    if isinstance(out, Mapping):
+        out = out[ACTION]
+    if hasattr(out, "detach"):
+        out = out.detach().cpu()
+    return np.asarray(out, dtype=np.float64).reshape(-1)

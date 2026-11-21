@@ -1,0 +1,39 @@
+# Shared settings for the Franka MARS arms; every arm file `extends:` this one and names only what it changes.
+# The schema is config.py's, section by section. `null` keeps the dataclass default, so a value here that is
+# null is documented as "the built-in" rather than as an override.
+
+station:
+  host: "10.42.0.1"
+  port: 9090
+  arm: null                     # null = the manifest's only arm
+cameras:
+  exterior: null                # the probe fills these in; null = the manifest's first two feeds
+  wrist: null
+policy:
+  path: "lerobot/pi05_droid"
+  prompt_generic: "do something"  # the floor arm's prompt
+  n_action_steps: 15              # the checkpoint's chunk; the executed prefix pins it whole
+command:
+  qdot_full: 0.5                # rad/s at a full stick deflection
+  twist_full: 0.11              # m/s at a full stick deflection, before the Jacobian
+arm:
+  q_min: null                   # null = the station's own joint limits
+  q_max: null
+  qdot_max: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]  # safety cap, not the arm's datasheet limit
+  gripper_range: [0.0, 1.0]
+  gripper_closed_at: 1.0
+readout:
+  corruption: null              # a matrix spec, a curl, or null for a clean command
+  input_noise: 0.0
+steering:
+  mode: frs                     # one of MODE_MAP's arms; an arm file names its own
+  tau: 14                       # FC: the chunk steps the command is written into
+  lam: 1                        # FC: the Euler steps it is written at (1 = the initial condition)
+  ic_gain: 1.0                  # FC: the command's scale in the noise prior
+  n_reversal_steps: 5           # FRS: the steps the reference is reversed through
+  pinned_steps: null            # FRS: the executed prefix; null = policy.n_action_steps
+  adapter_user: null            # MARS-U: a learned user.pt
+  adapter_matrix: null          # MARS-fixed: the runner fills it with J+ M J at the start pose
+trial:
+  trials: 20
+  max_steps: 300                # station ticks (one action may be held over several)
