@@ -96,6 +96,10 @@ class SteeringConfig(PreTrainedConfig):
         max_speed: The command's speed at full deflection, in action units per second (FRS's reference in an action
             space without the 7-D operator space's gripper dim, the cursor's; pi0.5's uses the command as is).
         dt: The control period in seconds (that reference: a full push moves ``max_speed * dt`` per step).
+        reference_step: The action units one full deflection commands per control step (None: the action space's own
+            rule). Set it to force FRS's held-command reference in an action space whose statistics are wider than the
+            7-D operator space.
+        gripper_dim: The action dim holding the gripper (None: the 7-D operator space's index 6).
         base_policy_type: The registered type of the policy whose chunks are steered.
         base_policy_path: Its checkpoint (a directory or a Hub repo id), loaded when no base policy is passed.
         scene_source: The task module's token source (``SCENE_SOURCES``).
@@ -128,6 +132,8 @@ class SteeringConfig(PreTrainedConfig):
     n_dims: int = 2
     max_speed: float = 1.2
     dt: float = 0.02
+    reference_step: float | None = None
+    gripper_dim: int | None = None
     base_policy_type: str = "cursor_flow"
     base_policy_path: str | None = None
     scene_source: str | None = None
@@ -145,6 +151,14 @@ class SteeringConfig(PreTrainedConfig):
             raise ValueError(f"scene_source must be one of {SCENE_SOURCES}, got {self.scene_source!r}")
         if self.token_geometry is not None and self.token_geometry not in TOKEN_GEOMETRIES:
             raise ValueError(f"token_geometry must be one of {TOKEN_GEOMETRIES}, got {self.token_geometry!r}")
+        if self.reference_step is not None and self.reference_step <= 0:
+            raise ValueError(
+                f"reference_step must be > 0 (action units per control step), got {self.reference_step!r}"
+            )
+        if self.gripper_dim is not None and not 0 <= self.gripper_dim < self.n_dims:
+            raise ValueError(
+                f"gripper_dim must be in [0, n_dims) = [0, {self.n_dims}), got {self.gripper_dim!r}"
+            )
         self.check_operator_dims(self.operator_dims or ())
         self.check_operator_dims(self.zeroed_dims or ())
         if (

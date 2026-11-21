@@ -1451,8 +1451,9 @@ class FlowReversalSteering(_ChunkSteering):
     wrapper (shared_flow_reversal_steering).
 
     While the operator pushes, a reference chunk built from the command (``reference_chunk``: by default a
-    uniform-velocity chunk in the commanded direction, rotation zero, gripper held at the model's last executed
-    command, `gripper_open` before the first chunk; with ``reference_step`` the command held at that step per control
+    uniform-velocity chunk in the commanded direction, rotation zero, gripper, the action space's gripper index
+    (``gripper_dim``; the 7-D operator space's 6 when unset), held at the model's last executed command,
+    `gripper_open` before the first chunk; with ``reference_step`` the command held at that step per control
     step; any ``reference_fn(commands) -> (B, H, D)`` in the model's normalized space otherwise) is
     integrated *backward* through the policy's own velocity field to the latent noise that maps to it
     (``Flow.latent``); the normal forward flow then denoises from that noise instead of a random one, on
@@ -1494,12 +1495,15 @@ class FlowReversalSteering(_ChunkSteering):
         gripper_open: float = GRIPPER_OPEN,
         reference_fn: Callable | None = None,
         reference_step: float | None = None,
+        gripper_dim: int | None = None,
     ):
         super().__init__(policy, source, deadband)
         self._adapter = adapter
         self.gripper_open = gripper_open
         self._reference_fn = reference_fn
         self._reference_step = reference_step
+        self._gripper_dim = gripper_dim
+        self._gripper_index = GRIPPER_DIM if gripper_dim is None else gripper_dim
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
         self._operator_dims = None if operator_dims is None else tuple(operator_dims)
         # The setter validates the pinned steps and builds the delegation mask (checking operator_dims)
@@ -1508,7 +1512,7 @@ class FlowReversalSteering(_ChunkSteering):
         self._mean = self._std = None
         if postprocessor is not None:
             mean, std = self.action_mean_std(postprocessor)
-            self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
+            self._mean, self._std = mean, std
             if self._has_gripper:
                 self._gripper_ref = self._normalize_gripper(gripper_open)
         elif reference_fn is None:
@@ -1522,13 +1526,18 @@ class FlowReversalSteering(_ChunkSteering):
 
     @staticmethod
     def delegation_mask(
-        chunk_size: int, max_action_dim: int, operator_dims: tuple[str, ...] | None, pinned_steps: int | None
+        chunk_size: int,
+        max_action_dim: int,
+        operator_dims: tuple[str, ...] | None,
+        pinned_steps: int | None,
+        gripper_dim: int | None = None,
     ) -> torch.Tensor:
         """(chunk_size, max_action_dim) bool mask of the reference elements left to the policy.
 
         True = delegated: the dims outside ``operator_dims`` (names from OPERATOR_DIM_GROUPS; None = every dim is
-        commanded, as on the cursor), the padding dims beyond the env's 7, and every dim of the steps from
-        ``pinned_steps`` on (None = the whole chunk stays pinned).
+        commanded, as on the cursor), the gripper's own dim when ``gripper_dim`` is set (the config's index, which
+        operator_dims does not name in an action space wider than the 7-D operator space's), the padding dims beyond
+        the env's 7, and every dim of the steps from ``pinned_steps`` on (None = the whole chunk stays pinned).
         """
         if operator_dims is None:
             mask = torch.zeros(chunk_size, max_action_dim, dtype=torch.bool)
@@ -1539,6 +1548,8 @@ class FlowReversalSteering(_ChunkSteering):
                 mask[:, OPERATOR_DIM_GROUPS[name]] = False
         if pinned_steps is not None:
             mask[pinned_steps:, :] = True
+        if gripper_dim is not None:
+            mask[:, gripper_dim] = True
         return mask
 
     @property
@@ -1549,7 +1560,10 @@ class FlowReversalSteering(_ChunkSteering):
     def operator_dims(self, value) -> None:
         cfg = self._policy.config
         dims = None if value is None else tuple(value)
-        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps)
+        gripper_dim = None if self._gripper_dim is None else self._gripper_index
+        self._delegated = self.delegation_mask(
+            cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps, gripper_dim=gripper_dim
+        )
         self._operator_dims = dims
 
     @property
@@ -1560,7 +1574,10 @@ class FlowReversalSteering(_ChunkSteering):
     def pinned_steps(self, value: int | None) -> None:
         cfg = self._policy.config
         self.check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
-        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
+        gripper_dim = None if self._gripper_dim is None else self._gripper_index
+        self._delegated = self.delegation_mask(
+            cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value, gripper_dim=gripper_dim
+        )
         self._pinned_steps = value
 
     @property
@@ -1582,10 +1599,10 @@ class FlowReversalSteering(_ChunkSteering):
     @property
     def _has_gripper(self) -> bool:
         """Whether this core's action statistics have the gripper dim: only then is a gripper reference held."""
-        return self.has_gripper_dim(self._mean)
+        return self._mean is not None and self._mean.shape[0] > self._gripper_index
 
     def _normalize_gripper(self, gripper: float) -> float:
-        return float((gripper - self._mean[GRIPPER_DIM]) / self._std[GRIPPER_DIM])
+        return float((gripper - self._mean[self._gripper_index]) / self._std[self._gripper_index])
 
     def reset(self) -> None:
         super().reset()
@@ -1618,7 +1635,12 @@ class FlowReversalSteering(_ChunkSteering):
                     f"statistics have {self._mean.shape[0]} dims; Flow.uniform_reference is the 7-D operator space's)"
                 )
             return Flow.uniform_reference(
-                command, self._gripper_ref, self._mean, self._std, cfg.chunk_size, cfg.max_action_dim
+                command,
+                self._gripper_ref,
+                self._mean[:N_ACTION_DIMS],
+                self._std[:N_ACTION_DIMS],
+                cfg.chunk_size,
+                cfg.max_action_dim,
             )
         command = torch.as_tensor(command if torch.is_tensor(command) else np.asarray(command))
         command = command[None] if command.dim() == 1 else command
@@ -1975,7 +1997,11 @@ class SteeringPolicy(PreTrainedPolicy):
                 stats = self._action_stats()
                 if stats is None:
                     raise self._no_stats("frs builds its reference")
-                step = None if FlowReversalSteering.has_gripper_dim(stats[0]) else cfg.max_speed * cfg.dt
+                step = (
+                    cfg.reference_step
+                    if cfg.reference_step is not None
+                    else (None if FlowReversalSteering.has_gripper_dim(stats[0]) else cfg.max_speed * cfg.dt)
+                )
                 self._core = FlowReversalSteering(
                     base,
                     None,
@@ -1985,6 +2011,7 @@ class SteeringPolicy(PreTrainedPolicy):
                     pinned_steps=cfg.pinned_steps,
                     deadband=cfg.deadband,
                     reference_step=step,
+                    gripper_dim=cfg.gripper_dim,
                 )
         return self._core
 
