@@ -491,6 +491,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="one fake-station trial; print actions, write nothing")
     parser.add_argument("--fake-station", action="store_true", help="drive station.FakeStation")
     parser.add_argument("--seed", type=int, default=0, help="pairing seed")
+    parser.add_argument(
+        "--corruption",
+        default=None,
+        help="a readout corruption spec in YAML, overriding readout.corruption ('{rotation_z_deg: 20}')",
+    )
+    parser.add_argument(
+        "--adapter", default=None, help="a user.pt for mars_learned, overriding steering.adapter_user"
+    )
     parser.add_argument("--start-pose", dest="start_pose", type=_start_pose, default=None, help="seven joint angles")
     parser.add_argument(
         "--reset-tolerance",
@@ -590,6 +598,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_steps=args.max_steps if args.max_steps is not None else config.trial.max_steps,
         ),
     )
+    if args.corruption is not None:
+        config = replace(
+            config, readout=replace(config.readout, corruption=yaml.safe_load(args.corruption))
+        )
+    if args.adapter is not None:
+        config = replace(config, steering=replace(config.steering, adapter_user=args.adapter))
     stats_path = Path(args.stats) if args.stats is not None else DEFAULT_STATS
     if config.steering.mode != "teleop" and not stats_path.exists():
         raise SystemExit(f"--stats: {stats_path} does not exist (the checkpoint ships no statistics)")

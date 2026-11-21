@@ -332,3 +332,13 @@ def test_a_run_writes_the_flat_config_yaml(tmp_path):
     assert flat["prompt"] == "do something"
     assert flat["operator"] == "human"
     assert len((tmp_path / "trials.jsonl").read_text().splitlines()) == 2
+
+
+def test_the_command_line_can_set_the_corruption_and_the_adapter(tmp_path):
+    """The two knobs a block varies: the injected corruption and, for `mars_learned`, the module."""
+    from runner import parse_args
+
+    args = parse_args(
+        ["--arm", "mars_learned", "--corruption", "{rotation_z_deg: 20}", "--adapter", "u.pt"]
+    )
+    assert args.corruption == "{rotation_z_deg: 20}" and args.adapter == "u.pt"
