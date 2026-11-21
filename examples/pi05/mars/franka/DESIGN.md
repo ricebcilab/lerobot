@@ -19,6 +19,37 @@ This is read off a previous project's c3po adapter on this arm, and slice 0 conf
 It removes the integration step: the station integrates the velocity, so the runner holds one action per
 `ceil(control_rate / action_rate)` station ticks instead of sending position targets.
 
+## The checkpoint, as published
+
+`lerobot/pi05_droid` is on the Hub, ungated, in LeRobot's format: `config.json`, `model.safetensors`,
+`policy_preprocessor.json`, `policy_postprocessor.json`. Read from the artifact, not from documentation:
+
+```
+chunk_size 15   n_action_steps 15   num_inference_steps 10   max_action_dim 32
+use_relative_actions false          rtc_config null
+images: observation.images.base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb
+```
+
+Three consequences. A chunk is 15 steps at 15 Hz, so `pinned_steps = 15` pins the whole chunk and nothing is
+delegated past it. One chunk is one second, so the FRS pause is a large fraction of the window. And the
+checkpoint wants three cameras; a station with two feeds a black third.
+
+**The published repo carries no normalization statistics.** Its processor JSONs list `features: {}`, there are
+no `policy_*_step_*.safetensors` beside them (the LIBERO finetune has them), and `config.json` has no
+`dataset_stats`. Without statistics the state and action pass through unnormalized, and
+`FlowControlSteering.action_mean_std` raises, so FRS cannot build its reference. The statistics come from
+openpi's `assets/droid/norm_stats.json`, converted to LeRobot's `dataset.meta.stats` shape and injected as
+pipeline overrides, which `_NormalizationMixin` preserves through `load_state_dict`:
+
+```python
+make_pre_post_processors(
+    policy_cfg, pretrained_path="lerobot/pi05_droid",
+    preprocessor_overrides={"normalizer_processor": {"stats": stats},
+                            "rename_observations_processor": {"rename_map": cameras}},
+    postprocessor_overrides={"unnormalizer_processor": {"stats": stats}},
+)
+```
+
 ## The action and the command
 
 - **Action**, 8 numbers in the checkpoint's units: `(qdot_1..qdot_7, gripper)`. Unnormalized by the
