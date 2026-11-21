@@ -396,7 +396,11 @@ class ExperimentConfig:
             "gripper_dim": GRIPPER_DIM,
             "operator_dims": None,
             "reference_step": self.command.qdot_full,
-            "pinned_steps": self.policy.n_action_steps or None,
+            "pinned_steps": (
+                self.steering.pinned_steps
+                if self.steering.pinned_steps is not None
+                else (self.policy.n_action_steps or None)
+            ),
             "tau": steering.tau,
             "lam": steering.lam,
             "ic_gain": steering.ic_gain,

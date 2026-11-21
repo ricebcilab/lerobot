@@ -298,3 +298,17 @@ def test_camera_names_wait_for_the_probe(tmp_path):
         config.camera_names()
     probed = _config(tmp_path, cameras={"exterior": "cam_high", "wrist": "cam_wrist"})
     assert probed.camera_names() == ("cam_high", "cam_wrist")
+
+
+def test_a_condition_file_may_pin_its_own_prefix(tmp_path):
+    """`steering.pinned_steps` reaches the steering config, and the executed prefix is the fallback."""
+    from config import ExperimentConfig
+
+    path = tmp_path / "arm.yaml"
+    path.write_text(
+        "steering: {mode: frs, pinned_steps: 5}\n"
+        "policy: {path: x, prompt_generic: y, n_action_steps: 15}\n"
+    )
+    assert ExperimentConfig.from_yaml(path).steering_config()["pinned_steps"] == 5
+    path.write_text("steering: {mode: frs}\npolicy: {path: x, prompt_generic: y, n_action_steps: 15}\n")
+    assert ExperimentConfig.from_yaml(path).steering_config()["pinned_steps"] == 15
