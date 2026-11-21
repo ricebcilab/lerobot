@@ -633,7 +633,8 @@ def test_a_base_loaded_from_its_folder_brings_its_processors_for_frs(tmp_path, m
     }
     chunk = steering.predict_action_chunk(batch)
     assert chunk.shape == (2, 6, 8) and steering.base_preprocessor is not None
-    np.testing.assert_allclose(steering.core._std, np.full(7, 2.0))  # the folder's action statistics
+    # the folder's action statistics, all of them: an action wider than the 7-D operator space keeps its width
+    np.testing.assert_allclose(steering.core._std, np.full(8, 2.0))
     bare = SteeringPolicy(
         SteeringConfig(
             base_policy_type="stub", base_policy_path=_base_folder(tmp_path / "bare", False), device="cpu"

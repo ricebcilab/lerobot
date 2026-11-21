@@ -114,3 +114,13 @@ def test_the_action_space_knobs_are_validated():
     with pytest.raises(ValueError, match="gripper_dim"):
         SteeringConfig(gripper_dim=-1)
     assert SteeringConfig(reference_step=0.5, gripper_dim=1).gripper_dim == 1
+
+
+def test_the_gripper_may_sit_just_past_the_commanded_dims():
+    """A command of one width inside an action of another: 7 commanded joints, the gripper at index 7."""
+    config = SteeringConfig(mode="frs", n_dims=7, gripper_dim=7, reference_step=0.5)
+    assert config.gripper_dim == 7
+    with pytest.raises(ValueError, match=r"gripper_dim must be in \[0, n_dims\]"):
+        SteeringConfig(mode="frs", n_dims=7, gripper_dim=8)
+    with pytest.raises(ValueError, match=r"gripper_dim must be in \[0, n_dims\]"):
+        SteeringConfig(mode="frs", n_dims=7, gripper_dim=-1)

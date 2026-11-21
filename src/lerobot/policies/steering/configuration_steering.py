@@ -99,7 +99,8 @@ class SteeringConfig(PreTrainedConfig):
         reference_step: The action units one full deflection commands per control step (None: the action space's own
             rule). Set it to force FRS's held-command reference in an action space whose statistics are wider than the
             7-D operator space.
-        gripper_dim: The action dim holding the gripper (None: the 7-D operator space's index 6).
+        gripper_dim: The action dim holding the gripper (None: the 7-D operator space's index 6). It may be
+            ``n_dims`` itself, for an action whose gripper sits just past the commanded dims.
         base_policy_type: The registered type of the policy whose chunks are steered.
         base_policy_path: Its checkpoint (a directory or a Hub repo id), loaded when no base policy is passed.
         scene_source: The task module's token source (``SCENE_SOURCES``).
@@ -155,9 +156,11 @@ class SteeringConfig(PreTrainedConfig):
             raise ValueError(
                 f"reference_step must be > 0 (action units per control step), got {self.reference_step!r}"
             )
-        if self.gripper_dim is not None and not 0 <= self.gripper_dim < self.n_dims:
+        if self.gripper_dim is not None and not 0 <= self.gripper_dim <= self.n_dims:
             raise ValueError(
-                f"gripper_dim must be in [0, n_dims) = [0, {self.n_dims}), got {self.gripper_dim!r}"
+                f"gripper_dim must be in [0, n_dims] = [0, {self.n_dims}], got {self.gripper_dim!r} "
+                "(n_dims itself when the command is narrower than the action, so the gripper is the action's "
+                "next dim and stays outside the adapter's width)"
             )
         self.check_operator_dims(self.operator_dims or ())
         self.check_operator_dims(self.zeroed_dims or ())
