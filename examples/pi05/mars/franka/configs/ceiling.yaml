@@ -1,0 +1,8 @@
+# Ceiling: the policy alone with the task's own instruction, the operator's command ignored. The VLA prompt
+# is the task prompt for the trial being run, so pass it with `--prompt` (or `--task`); the value below is
+# the first task's and is there so the file can be read without the command line.
+extends: base.yaml
+steering:
+  mode: ceiling
+policy:
+  prompt_generic: "put the red block in the green bowl"

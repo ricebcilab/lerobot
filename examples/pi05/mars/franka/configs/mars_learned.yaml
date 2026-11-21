@@ -1,0 +1,7 @@
+# MARS, learned user module: FRS with a user module trained on this arm's task, loaded instead of a fixed
+# matrix. `outputs/user_modules/<name>/user.pt` is a placeholder: train one, then point adapter_user at the
+# file its checkpoint wrote. The runner passes the path to SteeringConfig unchanged.
+extends: base.yaml
+steering:
+  mode: mars_learned
+  adapter_user: outputs/user_modules/<name>/user.pt  # placeholder: the trained user module's checkpoint

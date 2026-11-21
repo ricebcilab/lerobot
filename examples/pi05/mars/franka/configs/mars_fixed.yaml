@@ -1,0 +1,9 @@
+# MARS, fixed adapter: FRS whose reversal adapter F is the corruption expressed on joint velocities. The
+# matrix is left null on purpose: runner.py builds F = J+ M J at the start pose, where J is this arm's
+# geometric Jacobian and M = [M3, 0; 0, I3] is readout.corruption on the three translation axes, because the
+# corruption acts on the Cartesian twist and not on the joints. Hard-coding a matrix here would go stale the
+# moment the start pose, the arm or the corruption changed.
+extends: base.yaml
+steering:
+  mode: mars_fixed
+  adapter_matrix: null

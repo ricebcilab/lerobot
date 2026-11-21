@@ -1,0 +1,6 @@
+# FRS (Tang et al. 2026): the reference chunk is reversed through n_reversal_steps and the executed prefix is
+# pinned (policy.n_action_steps, 15, the whole chunk). No adapter: this is FRS without MARS.
+extends: base.yaml
+steering:
+  mode: frs
+  n_reversal_steps: 5
