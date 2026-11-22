@@ -99,9 +99,20 @@ def overrides(
     return pre, post
 
 
-def action_width(stats: Mapping[str, Mapping[str, Any]]) -> int:
-    """How many action dims the statistics describe: the checkpoint's real action width, not its padding."""
-    return int(np.asarray(stats[ACTION]["q01"]).shape[0])
+def real_width(stats: Mapping[str, Mapping[str, Any]]) -> int:
+    """How many action dims carry signal, ignoring the padding to the model's `max_action_dim`.
+
+    DROID's published statistics are 32 wide because the policy's action feature is: the seven joint
+    velocities and the gripper occupy the first eight, and every dim after them has `q01 == q99 == 0`. The
+    width the operator's command and the adapter act on is the meaningful one, so it is measured rather than
+    assumed. A dim that never moved in the data would read as padding here, which is the one way to fool it.
+    """
+    q01 = np.asarray(stats[ACTION]["q01"], dtype=np.float64)
+    q99 = np.asarray(stats[ACTION]["q99"], dtype=np.float64)
+    moving = np.flatnonzero(q01 != q99)
+    if not moving.size:
+        raise ValueError("the action statistics are constant in every dim; they describe nothing")
+    return int(moving[-1]) + 1
 
 
-__all__ = ["ACTION", "STATE", "action_width", "overrides", "read_openpi_stats"]
+__all__ = ["ACTION", "STATE", "overrides", "read_openpi_stats", "real_width"]

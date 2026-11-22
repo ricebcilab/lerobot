@@ -22,14 +22,23 @@ def _openpi(tmp_path, *, keys=("state", "actions"), width=8, wrap=True):
 def test_openpi_export_maps_to_lerobot_features(tmp_path):
     found = stats.read_openpi_stats(_openpi(tmp_path))
     assert set(found) == {stats.STATE, stats.ACTION}
-    assert stats.action_width(found) == 8
+    assert stats.real_width(found) == 8
     np.testing.assert_allclose(found[stats.ACTION]["q01"], np.full(8, -1.0))
     np.testing.assert_allclose(found[stats.ACTION]["std"], np.full(8, 3.0))
 
 
 def test_a_bare_mapping_reads_and_a_singular_actions_key_reads(tmp_path):
     found = stats.read_openpi_stats(_openpi(tmp_path, keys=("state", "action"), wrap=False))
-    assert stats.action_width(found) == 8
+    assert stats.real_width(found) == 8
+
+
+def test_padding_does_not_count_as_an_action_dim(tmp_path):
+    """DROID's file is 32 wide: eight dims of signal, then zeros. The command's width is the eight."""
+    path = tmp_path / "norm_stats.json"
+    q01 = [-1.0] * 8 + [0.0] * 24
+    q99 = [1.0] * 8 + [0.0] * 24
+    path.write_text(json.dumps({"norm_stats": {"state": {"q01": q01, "q99": q99}, "actions": {"q01": q01, "q99": q99}}}))
+    assert stats.real_width(stats.read_openpi_stats(path)) == 8
 
 
 def test_missing_quantiles_raise_rather_than_normalize_with_zeros(tmp_path):

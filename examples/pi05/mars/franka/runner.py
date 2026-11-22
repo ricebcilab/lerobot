@@ -181,6 +181,12 @@ def build_policy(
         )
     base = PI05Policy.from_pretrained(config.policy.path)
     statistics = checkpoint_stats.read_openpi_stats(stats_path)
+    width = checkpoint_stats.real_width(statistics)
+    if width != ACTION_DIMS:
+        raise SystemExit(
+            f"--stats: {stats_path} describes {width} action dims, and this example drives {ACTION_DIMS} "
+            "(seven joint velocities and a gripper position); it is not this checkpoint's statistics"
+        )
     pre_overrides, post_overrides = checkpoint_stats.overrides(statistics, rename_map)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=base.config,
