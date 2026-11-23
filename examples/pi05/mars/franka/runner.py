@@ -46,7 +46,7 @@ from batches import CameraMap, camera_map, observation_batch, unnormalized
 from config import MODE_MAP, ExperimentConfig
 from interfaces import ARM_DIMS, GRIPPER_DIM, ArmSpec, JacobianPort, RobotPort, StationManifest
 from jacobian import PandaJacobian
-from record import TrialRecorder, flat_settings, initial_state_hash, nan_matrix, pair_id_for, provenance
+from record import scene_digest, TrialRecorder, flat_settings, initial_state_hash, nan_matrix, pair_id_for, provenance
 from station import IMAGE_SIZE, C3poStation, FakeStation, action_dict, build_arm_spec
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
@@ -306,6 +306,7 @@ def run_trial(
     obs = station.reset()
     q = np.asarray(obs[f"{arm_name}/joint_position"], dtype=np.float64)
     state_hash = initial_state_hash(obs, arm_name, wired.manifest.cameras)
+    scene = scene_digest(obs, wired.manifest.cameras)
     require_start_pose(q, start_pose, tolerance)
 
     if wired.policy is not None:
@@ -401,6 +402,7 @@ def run_trial(
     record = {
         "pair_id": pair_id_for(seed, trial),
         "initial_state_hash": state_hash,
+        "scene_digest": scene,
         "trial": int(trial),
         **settings,
         "success": bool(success),
@@ -424,6 +426,7 @@ def run_trial(
             reversal_adapter_matrix=nan_matrix(settings["reversal_adapter_matrix"], 7),
             pair_id=record["pair_id"],
             initial_state_hash=state_hash,
+            scene_digest=scene,
             trial=int(trial),
             success=bool(success),
         )

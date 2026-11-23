@@ -241,13 +241,17 @@ def test_require_start_pose_refuses_a_pose_outside_the_tolerance():
     require_start_pose(np.full(7, 5.0), None, 0.05)  # no configured pose: no check
 
 
-def test_reset_hash_changes_with_the_pose_and_the_frame():
+def test_the_reset_hash_changes_with_the_pose_and_ignores_the_frame():
+    """The pose keys a pair; the frames are the room's business, recorded separately as the scene digest."""
+    from record import scene_digest
+
     cameras = ("exterior", "wrist")
     a = initial_state_hash(observation(np.zeros(7)), ARM, cameras)
     assert a != initial_state_hash(observation(np.ones(7)), ARM, cameras)
     moved = observation(np.zeros(7))
     moved["exterior"] = np.ones((8, 8, 3), dtype=np.uint8)
-    assert a != initial_state_hash(moved, ARM, cameras)
+    assert a == initial_state_hash(moved, ARM, cameras)
+    assert scene_digest(observation(np.zeros(7)), cameras) != scene_digest(moved, cameras)
 
 
 # ---------------------------------------------------------------- the fixed adapter
@@ -450,3 +454,17 @@ def test_operator_activity_separates_a_silent_stick_from_a_hard_task():
     assert (pushed, peak) == (2, 0.9)
     assert operator_activity([{"user_translation": np.zeros(3)}]) == (0, 0.0)
     assert operator_activity([]) == (0, 0.0)
+
+
+def test_a_pair_is_keyed_by_the_pose_not_by_the_pixels(monkeypatch):
+    """A live scene is never bit-identical, so a hash that included frames would pair nothing."""
+    from record import initial_state_hash, scene_digest
+
+    first = observation(DROID_RESET_Q)
+    second = observation(DROID_RESET_Q)
+    second["exterior"] = np.full_like(second["exterior"], 7)  # same pose, a different picture
+    assert initial_state_hash(first, ARM, ("exterior",)) == initial_state_hash(second, ARM, ("exterior",))
+    assert scene_digest(first, ("exterior",)) != scene_digest(second, ("exterior",))
+
+    moved = observation(np.asarray(DROID_RESET_Q) + 0.01)
+    assert initial_state_hash(moved, ARM, ("exterior",)) != initial_state_hash(first, ARM, ("exterior",))

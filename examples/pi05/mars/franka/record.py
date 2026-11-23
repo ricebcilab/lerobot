@@ -54,17 +54,41 @@ MODE_LABELS = {
 
 
 def initial_state_hash(obs: Mapping[str, np.ndarray], arm: str, cameras: Sequence[str]) -> str:
-    """The reset's digest: the joint pose to four decimals, then every camera frame's bytes.
+    """The reset's digest: the arm's joint pose and gripper to four decimals, and nothing else.
 
-    The pose is rounded because the station's encoders and the config's start pose need not agree to the last
-    bit; the frames are digested as they arrive, because a different scene is exactly what the pairing must
-    not hide. Cheap: one pass over each frame, once per trial.
+    Only what the station's reset controls may key a pair. The camera frames are *not* in it: a live scene's
+    pixels are never bit-identical between trials, so a digest that included them would match nothing and every
+    paired comparison would be silently skipped. The scene is recorded beside it as `scene_digest`, which says
+    how repeatable the room was without pretending to decide whether two trials are the same trial. The pose is
+    rounded because the station's encoders and the config's start pose need not agree to the last bit.
     """
     digest = hashlib.sha256()
     q = np.asarray(obs[f"{arm}/joint_position"], dtype=np.float64)
+    gripper = np.asarray(obs[f"{arm}/gripper_position"], dtype=np.float64)
     digest.update(np.round(q, 4).tobytes())
+    digest.update(np.round(gripper, 4).tobytes())
+    return digest.hexdigest()
+
+
+def scene_digest(obs: Mapping[str, np.ndarray], cameras: Sequence[str], size: int = 16) -> str:
+    """A coarse digest of the frames, for the record: provenance for "was the room the same", not a key.
+
+    Each frame is block-averaged to `size` by `size` before hashing, so sensor noise alone does not change it.
+    Hand-placed objects still will, which is the point: it reports how repeatable the scene was.
+    """
+    digest = hashlib.sha256()
     for name in cameras:
-        digest.update(np.ascontiguousarray(np.asarray(obs[name])).tobytes())
+        frame = np.asarray(obs[name])
+        if frame.ndim != 3:
+            continue
+        step_y, step_x = max(1, frame.shape[0] // size), max(1, frame.shape[1] // size)
+        rows, columns = frame.shape[0] // step_y, frame.shape[1] // step_x
+        blocks = (
+            frame[: rows * step_y, : columns * step_x]
+            .reshape(rows, step_y, columns, step_x, -1)
+            .mean((1, 3))
+        )
+        digest.update(np.round(blocks, 1).astype(np.float32).tobytes())
     return digest.hexdigest()
 
 
