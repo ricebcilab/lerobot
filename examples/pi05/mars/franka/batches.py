@@ -27,7 +27,7 @@ from config import ExperimentConfig
 from interfaces import StationManifest
 from station import IMAGE_SIZE, resize_with_pad, state_from_obs
 
-__all__ = ["CameraMap", "camera_map", "observation_batch", "unnormalized"]
+__all__ = ["CameraMap", "camera_map", "observation_batch", "suggested_cameras", "unnormalized"]
 
 DROID_IMAGE_KEYS = (
     "observation.images.base_0_rgb",
@@ -61,6 +61,46 @@ class CameraMap:
         return tuple(name for name, source in self.sources.items() if source is None)
 
 
+_EXTERIOR_ROLES = ("scene", "front", "base", "ext", "external", "overview")
+_WRIST_ROLES = ("wrist", "hand", "gripper", "tool")
+
+"""Name fragments that say which role a feed plays. `scene_zed` is the exterior view and `wrist_zed` the
+wrist one; a station whose names say neither falls back to its own order. The config always wins, so this is
+only what an unnamed feed defaults to."""
+
+
+def _first(feeds: list[str], roles: tuple[str, ...]) -> str | None:
+    """The first feed whose name carries one of `roles`, or None."""
+    return next((name for name in feeds if any(role in name.lower() for role in roles)), None)
+
+
+def _is_depth(name: str) -> bool:
+    """Whether a station feed is a depth or mono image rather than an RGB frame.
+
+    These stations send a depth map beside each ZED, and it is one channel: the checkpoint cannot read it, and
+    picking it as the wrist feed would fail deep inside the batch with a shape error instead of here.
+    """
+    return any(token in name.lower() for token in ("depth", "mono", "ir_"))
+
+
+def suggested_cameras(manifest: StationManifest) -> dict[str, str]:
+    """Which station feeds to use when the config names none: the exterior view and the wrist one.
+
+    Feeds whose names carry a role (`scene`, `front`, `base` for the exterior; `wrist`, `hand` for the wrist)
+    win, and a depth or mono feed never qualifies. A station that names neither falls back to its own order.
+    The config always overrides this, so it is a suggestion the probe prints and a default the runner takes.
+    """
+    feeds = [name for name in manifest.cameras if not _is_depth(name)]
+    if len(feeds) < 2:
+        raise ValueError(
+            f"the station sends cameras {manifest.cameras}; the runner needs an exterior and a wrist feed, and "
+            "neither can be a depth or mono feed (name them in `cameras:`)"
+        )
+    exterior = _first(feeds, _EXTERIOR_ROLES) or feeds[0]
+    wrist = _first(feeds, _WRIST_ROLES) or next(name for name in feeds if name != exterior)
+    return {"exterior": exterior, "wrist": wrist}
+
+
 def camera_map(config: ExperimentConfig, manifest: StationManifest) -> CameraMap:
     """The checkpoint's three image feeds, from the config's two names or the station's own order.
 
@@ -70,12 +110,15 @@ def camera_map(config: ExperimentConfig, manifest: StationManifest) -> CameraMap
     """
     exterior, wrist = config.cameras.exterior, config.cameras.wrist
     if exterior is None or wrist is None:
-        if len(manifest.cameras) < 2:
+        feeds = [name for name in manifest.cameras if not _is_depth(name)]
+        if len(feeds) < 2:
             raise ValueError(
-                f"the station sends cameras {manifest.cameras}; the runner needs an exterior and a wrist feed"
+                f"the station sends cameras {manifest.cameras}; the runner needs an exterior and a wrist feed, "
+                "and neither can be a depth or mono feed (name them in `cameras:`)"
             )
-        exterior = exterior or manifest.cameras[0]
-        wrist = wrist or manifest.cameras[1]
+        roles = suggested_cameras(manifest)
+        exterior = exterior or roles["exterior"]
+        wrist = wrist or roles["wrist"]
     missing = [name for name in (exterior, wrist) if name not in manifest.cameras]
     if missing:
         raise ValueError(f"cameras {missing} are not among the station's {manifest.cameras}")

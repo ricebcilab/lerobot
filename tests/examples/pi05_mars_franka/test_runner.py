@@ -13,7 +13,7 @@ import pytest
 import torch
 import yaml
 from arms import fixed_adapter_matrix
-from config import ExperimentConfig, SteeringSettings, TrialSettings
+from config import ExperimentConfig, PolicySettings, SteeringSettings, TrialSettings
 from interfaces import ArmSpec
 from record import initial_state_hash
 from runner import DROID_RESET_Q, PolicyBundle, build, require_start_pose, run, run_trial
@@ -342,3 +342,55 @@ def test_the_command_line_can_set_the_corruption_and_the_adapter(tmp_path):
         ["--arm", "mars_learned", "--corruption", "{rotation_z_deg: 20}", "--adapter", "u.pt"]
     )
     assert args.corruption == "{rotation_z_deg: 20}" and args.adapter == "u.pt"
+
+
+def test_a_depth_feed_is_never_picked_as_an_rgb_camera():
+    """A ZED station sends `wrist_zed`, `wrist_zed_depth`, `scene_zed`; the depth map is not a camera."""
+    from batches import camera_map
+    from config import ExperimentConfig
+    from interfaces import StationManifest
+
+    manifest = StationManifest(
+        arms=("follower",),
+        cameras=("wrist_zed", "wrist_zed_depth", "scene_zed"),
+        action_keys=("follower/joint_velocity", "follower/gripper_position"),
+        control_rate=15.0,
+    )
+    found = camera_map(ExperimentConfig(), manifest)
+    assert found.sources["observation.images.base_0_rgb"] == "scene_zed"
+    assert found.sources["observation.images.left_wrist_0_rgb"] == "wrist_zed"
+    assert found.sources["observation.images.right_wrist_0_rgb"] is None
+
+
+def test_the_suggested_cameras_are_the_ones_the_station_names():
+    """The probe prints this line; the runner takes it as the default when a condition file is silent."""
+    from batches import suggested_cameras
+    from interfaces import StationManifest
+
+    manifest = StationManifest(
+        arms=("follower",),
+        cameras=("wrist_zed", "wrist_zed_depth", "scene_zed"),
+        action_keys=("follower/joint_velocity", "follower/gripper_position"),
+        control_rate=15.0,
+    )
+    assert suggested_cameras(manifest) == {"exterior": "scene_zed", "wrist": "wrist_zed"}
+
+
+def test_a_zero_velocity_brake_precedes_each_replan(tmp_path):
+    """At the station's own rate the policy's pause would otherwise hold a stale velocity."""
+    # 15 Hz station, 15 Hz actions, two actions per chunk: one tick per action, so the chunk boundary shows.
+    config = ExperimentConfig(
+        steering=SteeringSettings(mode="frs"),
+        policy=PolicySettings(n_action_steps=2),
+        trial=TrialSettings(trials=1, max_steps=6),
+    )
+    wired, station, policy, _ = _wired(config, control_rate=15.0)
+    _run(wired, tmp_path, max_steps=6)
+
+    sent = [action[f"{ARM}/joint_velocity"] for action in station.actions]
+    # ticks 0 and 1 are the chunk's two actions; tick 2 brakes; tick 3 is the next chunk's first action.
+    assert len(sent) == 6
+    assert not np.allclose(sent[0], 0.0)
+    assert np.allclose(sent[2], 0.0), "the replan must be preceded by a zero-velocity tick"
+    assert not np.allclose(sent[3], 0.0)
+    assert np.allclose(sent[5], 0.0), "the next chunk's boundary brakes too"

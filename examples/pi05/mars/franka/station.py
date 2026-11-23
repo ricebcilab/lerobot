@@ -173,6 +173,11 @@ def resize_with_pad(image: np.ndarray, size: int = IMAGE_SIZE) -> np.ndarray:
     off-distribution before it ever saw a pixel. PIL sizes are ``(width, height)`` while the array
     is ``(height, width, channels)``.
     """
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(
+            f"a camera frame must be (H, W, 3) uint8, got {image.shape}; a depth or mono feed is not a "
+            "camera the checkpoint can read, so name an RGB feed in `cameras:`"
+        )
     if image.shape[:2] == (size, size):
         return image
     current_height, current_width = image.shape[:2]
