@@ -4,7 +4,6 @@ import json
 
 import numpy as np
 import pytest
-
 import stats
 
 
@@ -37,7 +36,9 @@ def test_padding_does_not_count_as_an_action_dim(tmp_path):
     path = tmp_path / "norm_stats.json"
     q01 = [-1.0] * 8 + [0.0] * 24
     q99 = [1.0] * 8 + [0.0] * 24
-    path.write_text(json.dumps({"norm_stats": {"state": {"q01": q01, "q99": q99}, "actions": {"q01": q01, "q99": q99}}}))
+    path.write_text(
+        json.dumps({"norm_stats": {"state": {"q01": q01, "q99": q99}, "actions": {"q01": q01, "q99": q99}}})
+    )
     assert stats.real_width(stats.read_openpi_stats(path)) == 8
 
 

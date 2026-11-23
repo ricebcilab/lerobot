@@ -24,7 +24,6 @@ open, so the rest of the example never branches on whether a SpaceMouse exists.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import numpy as np
 

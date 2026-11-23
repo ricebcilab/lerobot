@@ -201,6 +201,7 @@ def test_format_spacemouse_names_the_node_and_scale():
 def test_the_node_can_be_pinned_for_a_device_with_several_interfaces(monkeypatch, tmp_path):
     """`SPACEMOUSE_HIDRAW` wins over discovery, because a device's HID id names all of its interfaces."""
     import readout_chain
+
     from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseReader
 
     node = tmp_path / "hidraw7"
@@ -220,9 +221,10 @@ def test_the_node_can_be_pinned_for_a_device_with_several_interfaces(monkeypatch
 
 def test_the_live_stick_read_decodes_a_translation_report(tmp_path, monkeypatch, capsys):
     """A node that speaks must reach the printed line: the import that decodes it is as load-bearing as the read."""
+    import probe
+
     import lerobot.teleoperators.spacemouse as spacemouse_package
     import lerobot.teleoperators.spacemouse.teleop_spacemouse as spacemouse_module
-    import probe
 
     node = tmp_path / "hidraw7"
     node.write_bytes(b"\x01" + struct.pack("<hhh", 120, -60, 0))

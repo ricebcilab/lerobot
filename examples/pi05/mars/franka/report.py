@@ -215,7 +215,9 @@ def _paired_line(first: ArmSummary, second: ArmSummary) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the report for the run directories given."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("runs", nargs="+", type=Path, metavar="RUN_DIR")
     parser.add_argument(
         "--pair", nargs=2, metavar=("ARM_A", "ARM_B"), default=None, help="the two arms to compare"

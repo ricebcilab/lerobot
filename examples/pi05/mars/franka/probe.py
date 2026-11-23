@@ -385,9 +385,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--policy", required=True, type=Path, help="checkpoint folder (weights are not read)")
     parser.add_argument("--station", default="10.42.0.1", help="c3po station host")
     parser.add_argument("--port", default=9090, type=int, help="c3po WebSocket port")
-    parser.add_argument(
-        "--stats", default=None, help=f"openpi's norm_stats.json (default: {DEFAULT_STATS})"
-    )
+    parser.add_argument("--stats", default=None, help=f"openpi's norm_stats.json (default: {DEFAULT_STATS})")
     parser.add_argument(
         "--stick",
         nargs="?",

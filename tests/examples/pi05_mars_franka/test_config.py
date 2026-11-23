@@ -306,8 +306,7 @@ def test_a_condition_file_may_pin_its_own_prefix(tmp_path):
 
     path = tmp_path / "arm.yaml"
     path.write_text(
-        "steering: {mode: frs, pinned_steps: 5}\n"
-        "policy: {path: x, prompt_generic: y, n_action_steps: 15}\n"
+        "steering: {mode: frs, pinned_steps: 5}\npolicy: {path: x, prompt_generic: y, n_action_steps: 15}\n"
     )
     assert ExperimentConfig.from_yaml(path).steering_config()["pinned_steps"] == 5
     path.write_text("steering: {mode: frs}\npolicy: {path: x, prompt_generic: y, n_action_steps: 15}\n")

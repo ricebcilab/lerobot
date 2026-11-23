@@ -43,9 +43,12 @@ pipeline overrides, which `_NormalizationMixin` preserves through `load_state_di
 
 ```python
 make_pre_post_processors(
-    policy_cfg, pretrained_path="lerobot/pi05_droid",
-    preprocessor_overrides={"normalizer_processor": {"stats": stats},
-                            "rename_observations_processor": {"rename_map": cameras}},
+    policy_cfg,
+    pretrained_path="lerobot/pi05_droid",
+    preprocessor_overrides={
+        "normalizer_processor": {"stats": stats},
+        "rename_observations_processor": {"rename_map": cameras},
+    },
     postprocessor_overrides={"unnormalizer_processor": {"stats": stats}},
 )
 ```

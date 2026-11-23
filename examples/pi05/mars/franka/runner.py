@@ -44,9 +44,25 @@ from actions import clamp_joint_velocity, command_from_qdot, ticks_per_action
 from arms import _with_fixed_adapter
 from batches import CameraMap, camera_map, observation_batch, unnormalized
 from config import MODE_MAP, ExperimentConfig
-from interfaces import ARM_DIMS, GRIPPER_DIM, ArmSpec, JacobianPort, RobotPort, StationManifest
+from interfaces import (
+    ACTION_DIMS,
+    ARM_DIMS,
+    GRIPPER_DIM,
+    ArmSpec,
+    JacobianPort,
+    RobotPort,
+    StationManifest,
+)
 from jacobian import PandaJacobian
-from record import scene_digest, TrialRecorder, flat_settings, initial_state_hash, nan_matrix, pair_id_for, provenance
+from record import (
+    TrialRecorder,
+    flat_settings,
+    initial_state_hash,
+    nan_matrix,
+    pair_id_for,
+    provenance,
+    scene_digest,
+)
 from station import IMAGE_SIZE, C3poStation, FakeStation, action_dict, build_arm_spec
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
@@ -172,6 +188,7 @@ def build_policy(
     named here rather than failing half-way through loading the weights.
     """
     import stats as checkpoint_stats
+
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
     from lerobot.policies.steering import SteeringConfig, SteeringPolicy
@@ -344,9 +361,7 @@ def run_trial(
                 chunk_done = False
                 served_from_chunk = 0  # the next compute starts a new chunk
                 served = np.asarray(chain.translation, dtype=np.float64).reshape(-1)
-                brake_action = clamp_action(
-                    np.concatenate([np.zeros(ARM_DIMS), [gripper]]), q, arm, dt
-                )
+                brake_action = clamp_action(np.concatenate([np.zeros(ARM_DIMS), [gripper]]), q, arm, dt)
                 recorder.add(
                     q=q, action=brake_action, plan=plan, served=served, raw=raw, gripper=gripper, reads=0
                 )
@@ -487,8 +502,7 @@ def run(
             f"trial {trial + 1}/{wired.config.trial.trials}: "
             f"{'SUCCESS' if record['success'] else 'no success'} after {record['steps']} steps "
             f"({record['duration_s']:.1f}s), operator pushed on {pushed}/{len(result.rows)} ticks "
-            f"(peak {peak:.2f})"
-            + ("  [aborted]" if record["aborted"] else "")
+            f"(peak {peak:.2f})" + ("  [aborted]" if record["aborted"] else "")
         )
         if record["aborted"]:
             break
@@ -526,16 +540,22 @@ def _config_path(args: argparse.Namespace) -> Path:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """The runner's flags."""
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--arm", choices=sorted(MODE_MAP), default="frs", help="condition file in configs/")
     parser.add_argument("--config", metavar="PATH", help="a condition file, as given or under configs/")
     parser.add_argument("--trials", type=int, default=None, help="override trial.trials")
-    parser.add_argument("--max-steps", dest="max_steps", type=int, default=None, help="override trial.max_steps")
+    parser.add_argument(
+        "--max-steps", dest="max_steps", type=int, default=None, help="override trial.max_steps"
+    )
     parser.add_argument("--prompt", default=None, help="the VLA's prompt (default: the config's)")
     parser.add_argument("--task", default=None, help="the operator's task description (default: --prompt)")
     parser.add_argument("--stats", default=None, help=f"openpi's norm_stats.json (default: {DEFAULT_STATS})")
     parser.add_argument("--out", default=None, metavar="DIR", help="run directory (default: under outputs/)")
-    parser.add_argument("--dry-run", action="store_true", help="one fake-station trial; print actions, write nothing")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="one fake-station trial; print actions, write nothing"
+    )
     parser.add_argument("--fake-station", action="store_true", help="drive station.FakeStation")
     parser.add_argument("--seed", type=int, default=0, help="pairing seed")
     parser.add_argument(
@@ -546,7 +566,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--adapter", default=None, help="a user.pt for mars_learned, overriding steering.adapter_user"
     )
-    parser.add_argument("--start-pose", dest="start_pose", type=_start_pose, default=None, help="seven joint angles")
+    parser.add_argument(
+        "--start-pose", dest="start_pose", type=_start_pose, default=None, help="seven joint angles"
+    )
     parser.add_argument(
         "--reset-tolerance",
         dest="reset_tolerance",
@@ -646,9 +668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     if args.corruption is not None:
-        config = replace(
-            config, readout=replace(config.readout, corruption=yaml.safe_load(args.corruption))
-        )
+        config = replace(config, readout=replace(config.readout, corruption=yaml.safe_load(args.corruption)))
     if args.adapter is not None:
         config = replace(config, steering=replace(config.steering, adapter_user=args.adapter))
     stats_path = Path(args.stats) if args.stats is not None else DEFAULT_STATS

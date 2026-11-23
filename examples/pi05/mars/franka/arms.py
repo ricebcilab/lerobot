@@ -89,14 +89,20 @@ def corruption_matrix(spec: Any) -> np.ndarray:
     from lerobot.teleoperators import readout
 
     if readout.quantize_spec(spec):
-        raise ValueError("steering.mode 'mars_fixed' needs a matrix corruption, but readout.corruption is a quantizer")
+        raise ValueError(
+            "steering.mode 'mars_fixed' needs a matrix corruption, but readout.corruption is a quantizer"
+        )
     matrix, _curl = readout.corruption_spec(spec, n_dims=3)
     if matrix is None:
-        raise ValueError("steering.mode 'mars_fixed' needs a matrix corruption, but readout.corruption is a curl field")
+        raise ValueError(
+            "steering.mode 'mars_fixed' needs a matrix corruption, but readout.corruption is a curl field"
+        )
     return np.asarray(matrix, dtype=np.float64)
 
 
-def _with_fixed_adapter(config: ExperimentConfig, jacobian: JacobianPort, q_start: np.ndarray) -> ExperimentConfig:
+def _with_fixed_adapter(
+    config: ExperimentConfig, jacobian: JacobianPort, q_start: np.ndarray
+) -> ExperimentConfig:
     """The config a `mars_fixed` run uses, with its null matrix filled from the Jacobian at the start pose."""
     if config.steering.adapter_matrix is not None:
         return config

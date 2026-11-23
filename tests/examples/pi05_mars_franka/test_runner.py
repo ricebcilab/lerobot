@@ -261,7 +261,6 @@ def test_fixed_adapter_matrix_on_a_two_joint_toy():
     jac = np.array([[1.0, 0.5], [0.2, 2.0]])
     corruption = np.array([[0.8, 0.1], [-0.3, 1.2]])
     toy = LinearJacobian(jac)
-    fake = np.array([[0.0, 0.0]])
     matrix = fixed_adapter_matrix(toy, np.zeros(2), corruption)
 
     assert matrix == pytest.approx(np.linalg.pinv(jac) @ corruption @ jac)
@@ -307,8 +306,11 @@ def test_build_skips_the_policy_for_teleop():
     assert wired.arm.joint_names == tuple(f"{ARM}/joint_{i + 1}" for i in range(7))
     assert isinstance(wired.arm, ArmSpec)
 
+
 def test_a_run_writes_the_flat_config_yaml(tmp_path):
-    config = ExperimentConfig(steering=SteeringSettings(mode="frs"), trial=TrialSettings(trials=2, max_steps=2))
+    config = ExperimentConfig(
+        steering=SteeringSettings(mode="frs"), trial=TrialSettings(trials=2, max_steps=2)
+    )
     wired, _, _, _ = _wired(config)
     records = run(
         wired,
@@ -328,8 +330,18 @@ def test_a_run_writes_the_flat_config_yaml(tmp_path):
         "trials.jsonl",
     ]
     flat = yaml.safe_load((tmp_path / "config.yaml").read_text())
-    for key in ("mode", "tau", "lambda", "n_reversal_steps", "reversal_adapter", "prompt", "operator",
-                "n_action_steps", "pinned_steps", "qdot_full"):
+    for key in (
+        "mode",
+        "tau",
+        "lambda",
+        "n_reversal_steps",
+        "reversal_adapter",
+        "prompt",
+        "operator",
+        "n_action_steps",
+        "pinned_steps",
+        "qdot_full",
+    ):
         assert key in flat, key
     assert flat["arm"] == "frs"
     assert flat["mode"] == "shared_flow_reversal_steering"
@@ -342,9 +354,7 @@ def test_the_command_line_can_set_the_corruption_and_the_adapter(tmp_path):
     """The two knobs a block varies: the injected corruption and, for `mars_learned`, the module."""
     from runner import parse_args
 
-    args = parse_args(
-        ["--arm", "mars_learned", "--corruption", "{rotation_z_deg: 20}", "--adapter", "u.pt"]
-    )
+    args = parse_args(["--arm", "mars_learned", "--corruption", "{rotation_z_deg: 20}", "--adapter", "u.pt"])
     assert args.corruption == "{rotation_z_deg: 20}" and args.adapter == "u.pt"
 
 

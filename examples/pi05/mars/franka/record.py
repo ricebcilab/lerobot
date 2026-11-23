@@ -84,9 +84,7 @@ def scene_digest(obs: Mapping[str, np.ndarray], cameras: Sequence[str], size: in
         step_y, step_x = max(1, frame.shape[0] // size), max(1, frame.shape[1] // size)
         rows, columns = frame.shape[0] // step_y, frame.shape[1] // step_x
         blocks = (
-            frame[: rows * step_y, : columns * step_x]
-            .reshape(rows, step_y, columns, step_x, -1)
-            .mean((1, 3))
+            frame[: rows * step_y, : columns * step_x].reshape(rows, step_y, columns, step_x, -1).mean((1, 3))
         )
         digest.update(np.round(blocks, 1).astype(np.float32).tobytes())
     return digest.hexdigest()
