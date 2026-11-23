@@ -303,6 +303,26 @@ def test_reference_chunk_uses_last_gripper_and_normalization():
     assert wrapper._gripper_ref == pytest.approx((0.0 - 0.5) / 2.0)  # a 0/1 gripper's open state
 
 
+def test_a_fixed_gripper_reference_is_held_at_every_chunk():
+    """`gripper_reference` (Tang et al. on LIBERO, App. D.2: the gripper halfway between open and closed): every
+    reference holds that environment value, where the default moves on to the model's last executed command."""
+    post = postprocessor(mean=[0.0] * 6 + [0.5], std=[2.0] * 7)
+    opened, halfway = (-1.0 - 0.5) / 2.0, (0.0 - 0.5) / 2.0
+
+    def gripper_after_a_chunk(**kw):
+        wrapper = _frs(post=post, **kw)
+        wrapper.select_action({})  # a steered chunk: the default takes the model's gripper command from it
+        return wrapper.reference_chunk(np.array([1.0, 0.0, 0.0]))[0, 0, GRIPPER_DIM].item(), wrapper
+
+    assert gripper_after_a_chunk()[0] != pytest.approx(opened)
+    value, wrapper = gripper_after_a_chunk(gripper_reference=0.0)
+    assert value == pytest.approx(halfway)
+    wrapper.reset()
+    assert wrapper._gripper_ref == pytest.approx(halfway)
+    with pytest.raises(ValueError, match="gripper_reference"):  # an action space without the gripper dim
+        FlowReversalSteering(FakePolicy(), Source(), None, reference_fn=lambda c: c, gripper_reference=0.0)
+
+
 # ---------------------------------------------------------------- flow control
 
 

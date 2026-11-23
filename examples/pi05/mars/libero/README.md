@@ -156,7 +156,9 @@ shared-autonomy modes differ in where your command enters that schedule.
   `control.pinned_steps` sets another prefix (5 is that interface's ratio; in the
   paper's own LIBERO runs the reference covers its whole 10-step chunk, all of it
   executed, and rotation and gripper stay in the reference instead of being
-  handed back).
+  handed back: `control.operator_dims=[translation,rotation,gripper]` keeps them,
+  and `control.gripper_reference=0` holds the gripper halfway between open and
+  closed as they do, where the default holds the model's last gripper command).
   A steered chunk costs `10 + n` velocity evaluations against 10 for FC or an
   unsteered chunk. After each rollout the REPL prints how many chunks were
   steered and how far the executed translation landed from the reference (in
@@ -377,7 +379,7 @@ file's stem plus any `--set`/`--sweep` values.
 | `control.zeroed_dims`                | `[]`                              | `shared_flow_control`: dim groups (`rotation`, `gripper`) set to 0 in the steps the command is written into; Kao et al. on LIBERO zero rotation                                                                               |
 | `control.n_reversal_steps`           | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                                                                        |
 | `control.pinned_steps`               | `null`                            | `shared_flow_reversal_steering` only: leading chunk steps the reference pins, the rest is the policy's; `null` = the executed steps                                                                                           |
-| `control.translation_noise`          | `0.0`                             | Std of the Gaussian noise added to the x/y/z command                                                                                                                                                                          |
+| `control.translation_noise`          | `0.0`                             | Std of the Gaussian noise added to the x/y/z command at every read, the operator resting or not                                                                                                                               |
 | `control.rotation_noise`             | `0.0`                             | Std of the Gaussian noise added to each axis of the rotation command; only teleop mode executes that command                                                                                                                  |
 | `control.gripper_noise`              | `0.0`                             | Std of the Gaussian noise added to the gripper command, which is then served as its sign (open or close); only teleop mode executes it                                                                                        |
 | `control.translation_gain`           | `null`                            | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)                                             |
@@ -388,7 +390,9 @@ file's stem plus any `--set`/`--sweep` values.
 | `operator`                           | `human`                           | `human` (SpaceMouse / keyboard) or `policy` — see [Synthetic operator](#synthetic-operator)                                                                                                                                   |
 | `policy_operator.update_every_steps` | `null`                            | Environment steps between synthetic intent queries; `null` uses `policy.n_action_steps`. Requires `operator: policy`                                                                                                          |
 | `policy_operator.delay_steps`        | `0`                               | Environment steps from observing the scene to delivering that synthetic command                                                                                                                                               |
+| `policy_operator.let_go_cosine`      | `null`                            | Under a steering arm (FC, FRS, MARS) the operator rests (zero command) for the next update while the robot's executed motion heads with its intent at this cosine or more; `null` = it always pushes                          |
 | `server.port`                        | `8765`                            | Live view port                                                                                                                                                                                                                |
+| `server.headless`                    | `false`                           | No live view: no page, no frame stream, no browser tab; for runs of the synthetic operator (the study files set it), refused with a human operator                                                                            |
 
 `--n-trials`, `--seed`, `--output-dir` and `--port` are aliases for the
 corresponding `--set`.
@@ -499,7 +503,13 @@ policy_operator:
 ```
 
 It holds the preceding command until delivery, starts idle with the gripper
-open, and resets its queue every trial. This models intent update timing, not
+open, and resets its queue every trial. With `let_go_cosine` (the study files
+set 0.5) it watches what the robot executes: when the robot's mean executed
+translation since its last update heads with its new intent at that cosine or
+more, it lets go for the next update (zero translation and rotation, its
+gripper kept), as a person stops pushing while the robot does the right thing.
+The readout still serves its noise then, so the steering acts on a noisy rest.
+Under teleop it never lets go, since nothing else moves the robot. This models intent update timing, not
 the hardware's sampling rate; the numbers are assumptions, not a validated
 human model, and the underlying policy still supplies privileged task
 knowledge. FC and FRS consume one command per 10-step chunk, so a command
@@ -618,60 +628,52 @@ To repeat an F@40 cell, add
 
 ### User study
 
-The study of the MARS user module on LIBERO-Object and LIBERO-Goal
-([design](../../../../docs/superpowers/specs/2026-11-14-mars-libero-user-study-design.md)):
-the VLA is told "do something", the synthetic operator's command says which
-object or goal is meant, and four users corrupt it, one per panel of the
-paper's Fig. 1a.
+The study of the MARS user module on LIBERO-Goal
+([design](../../../../docs/superpowers/specs/2026-11-14-mars-libero-user-study-design.md)),
+round 1 since 2026-11-20: the prompt-dropout checkpoint
+(`outputs/pi05_libero_generic_prompt/checkpoints/006000/pretrained_model`) is
+told "do something", the synthetic operator's command says which goal is meant,
+and four users corrupt it, one per panel of the paper's Fig. 1a.
 
-| Condition file               | User                                                                   |
-| ---------------------------- | ---------------------------------------------------------------------- |
-| `study_object.yaml`          | clean readout (the reference)                                          |
-| `study_object_rotation.yaml` | decoding error: one random 3-D rotation of 60°, drawn from seed 0      |
-| `study_object_lowdof.yaml`   | low-DOF control: the vertical component dropped (`{scale: [1, 1, 0]}`) |
-| `study_object_lag.yaml`      | misperception and delay: a lag-and-turn field (`{curl: 2, tau: 0.5}`)  |
-| `study_object_keypad.yaml`   | discrete input: a six-key pad (`{quantize: axes}`)                     |
+| Condition file             | User                                                                   |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `study_goal.yaml`          | clean readout (the reference)                                          |
+| `study_goal_rotation.yaml` | decoding error: one random 3-D rotation of 60°, drawn from seed 0      |
+| `study_goal_lowdof.yaml`   | low-DOF control: the vertical component dropped (`{scale: [1, 1, 0]}`) |
+| `study_goal_lag.yaml`      | misperception and delay: a lag-and-turn field (`{curl: 2, tau: 0.5}`)  |
+| `study_goal_keypad.yaml`   | discrete input: a six-key pad (`{quantize: axes}`)                     |
 
-`study_goal*.yaml` are the same users on LIBERO-Goal's six tasks a translation
-command can express (1, 4, 5, 6, 7, 8). Every file runs the immediate synthetic
-operator (a new intent at every chunk, consumed at once), 5 trials per task in
-task order: the development split. A test split takes the next states with
-`--set experiment.first_occurrence=5`. Stage 0 found that under the
-SpaceMouse-like timing (a new intent every 20 steps, delivered 4 late) no
-method beats the policy alone on LIBERO-Object even with a clean readout, so
-that profile is a robustness check, not the main condition.
+They run LIBERO-Goal's six tasks a translation command can express (1, 4, 5,
+6, 7, 8; `study_object*.yaml` are the same users on LIBERO-Object). Every file
+runs the immediate synthetic operator (a new intent at every chunk, consumed at
+once), which lets go under a steering arm while the robot heads where it means
+(`policy_operator.let_go_cosine: 0.5`), 5 trials per task in task order: the
+development split. A test split takes the next states with
+`--set experiment.first_occurrence=5`.
 
 ```bash
 U=./examples/pi05/mars/libero/experiments/user_study.sh
-"$U" 0                             # the anchors: floor, ceiling, FC and FRS on the clean readout, both operator timings
-TRANSLATION_NOISE=0.5 "$U" gain             # FC's gain, once: 1.5, 3, 5, 8, 12 at tau 10 and 50 on the clean readout
-TRANSLATION_NOISE=0.5 FC_GAIN=3 "$U" 1      # the baselines under every user (ARMS="frs teleop" for some of them)
-"$U" modules                                # one user module per user, calibrated on the Goal tasks outside Goal-6
-TRANSLATION_NOISE=0.5 "$U" 2                # MARS with those modules: reversal depth x pinned prefix
-CONTROL=1 DEPTHS="6 4 2 1" USERS="clean rotation lowdof lag keypad" TRANSLATION_NOISE=0.5 "$U" 2   # the same loop without a module
-TRANSLATION_NOISE=0.5 "$U" 2 --dry-run      # validate a stage's runs without loading a policy
+P="--set policy.path=$PWD/outputs/pi05_libero_generic_prompt/checkpoints/006000/pretrained_model"
+N="SUITES=goal TRANSLATION_NOISE=0.2 ROTATION_NOISE=0.016 GRIPPER_NOISE=0.4"
+env $N OUT=outputs/pi05_libero_user_study/round1/gain "$U" gain $P      # FC's gain, once: 1.5, 3, 5, 8, 12 at tau 10 and 50, clean readout
+env $N SPLIT=1 ARMS="fc frs teleop floor ceiling" FC_GAIN=3 OUT=outputs/pi05_libero_user_study/round1/stage1 "$U" 1 $P   # the baselines and anchors
+env $N MODULES=outputs/pi05_libero_user_study/round1/modules "$U" modules $P   # one user module per user, calibrated by watching the policy
+env $N "$U" 2 $P --dry-run                  # validate a stage's runs without loading a policy
 ```
 
-`SUITES="goal"` keeps a stage to one suite, `ARMS="frs fc teleop floor ceiling"`
-adds the policy-alone anchors to stage 1, `SPLIT=1` gives every knob value its
-own run, and any extra flag reaches every run, e.g.
-`--set policy.path=<checkpoint>` for another policy (`MODULES` and `OUT` then
-name where that policy's modules and runs go).
+`ARMS` picks the arms of stage 1, `USERS` the users, `SPLIT=1` gives every
+knob value its own run, and any extra flag reaches every run.
 
 Stage 2 trains one user module per user (`modules`: `train_user_module.py` in
 the LIBERO-Goal scene on the four tasks outside Goal-6 (0, 2, 3, 9), five start
-states each, through that user's readout, into
-`outputs/pi05_libero_user_study/user_modules/<user>/`), so a module has seen
-the scene but none of the six evaluation tasks. Calibration takes 20 episodes
-of the task-prompted policy and 20 of the policy under the arm's own prompt
-(their first 120 steps). The second kind is there because a task-prompted
-rollout only visits states where the policy's own plan is already what the
-operator means: modules calibrated on those alone learned to discard the
-command. MARS then runs with the module on the development split over the
-reversal depth (1, 2, 4, 6, 10; `DEPTHS` picks some) and the pinned prefix (5,
-10, 25, 50), as on the cursor grid. `CONTROL=1` runs the same loop without a
-module (FRS at a partial reversal), so a gain at a shallow depth can be told
-from the module's.
+states each, into `MODULES/<user>/`), so a module has seen the scene but none of
+the six evaluation tasks. Its calibration watches the policy under "do
+something" for 20 episodes, unsteered, while the synthetic operator pushes where
+the robot heads wrong and rests where it heads right (the let-go rule), so a
+pushed state is one where the command matters and a rest teaches the module to
+leave the policy alone. The noise, at the study's level, is drawn once per state.
+MARS then runs with the module on the development split over
+the reversal depth and the pinned prefix, as on the cursor grid.
 
 The baselines are their papers' methods, each with its one knob tuned per user
 on the development split, as on the cursor. FRS (Tang et al.) keeps the full
@@ -682,9 +684,8 @@ LIBERO recipe) and tunes `tau` (5 to 50); its gain is chosen once on the clean
 readout, as the cursor's was. Teleop, as on the cursor, is the operator alone
 (`control.mode: teleop`): its translation through the user's readout, its
 rotation and gripper, and no policy. A user's corruption acts on the
-translation; its noise reaches every part of the command, at 0.5 on the
-translation, 0.04 on the rotation and 1.0 on the gripper (the same noise
-relative to how large the operator's commands of each kind are). Every user carries translation noise 0.5. What differs
+translation; its noise reaches every part of the command at every read, at 0.2
+on the translation, 0.016 on the rotation and 0.4 on the gripper. What differs
 from the papers' own LIBERO runs: the checkpoint (lerobot's conversion,
 fine-tuned, with 50-step chunks and mean/std action statistics, against
 openpi's 10-step chunks and quantiles), rotation and gripper handed back to
@@ -692,56 +693,38 @@ the policy in FRS, the command's own length written in FC (theirs is a unit
 direction), and a policy that knows the tasks but is not told which.
 
 The launcher runs several experiments at a time across the GPUs (a worker
-takes the next run as it finishes one). Results go to
-`outputs/pi05_libero_user_study/stage<N>/`; each launch keeps its runs' logs
+takes the next run as it finishes one). Results go to `OUT` (default
+`outputs/pi05_libero_user_study/stage<N>/`); each launch keeps its runs' logs
 and the code state (`HEAD` and the working-tree diff) under `logs/<launch
 time>/`, and a dry run writes nothing there.
 
 ### Training a MARS user module
 
 `train_user_module.py` calibrates a learned user module for one operator readout,
-the cursor project's recipe ported to pi0.5. It rolls out the task-prompted
-policy (the synthetic operator) to collect states at chunk boundaries, labels
-each with the operator's chunk `L` under the real task, the push that chunk
-implies (the `PolicyOperator` rule) through the arm's readout (its corruption or
-curl, then translation noise of std `sigma ~ U(sigma_min, sigma_max)`), the reference
-chunk `a_bci` FRS builds from that served command, and `z_L`, `L` reversed through
-the goal-free field (the arm's prompt). The module `U(x_t, t)` then minimizes the
+the cursor project's recipe ported to pi0.5. It collects states at chunk
+boundaries and labels each with the operator's chunk `L` under the real task,
+the push that chunk implies (the `PolicyOperator` rule) through the arm's
+readout (its corruption or curl, then noise at every read), the reference chunk
+`a_bci` FRS builds from that served command, and `z_L`, `L` reversed through the
+goal-free field (the arm's prompt). The module `U(x_t, t)` then minimizes the
 field regression `U(x_t, t) P(x_t, t) = z_L − a_bci` along `x_t = (1 − t) a_bci +
 t z_L`, so that a full reversal of what the readout delivered lands on the latent
-of what the operator meant. `--generic-episodes N` adds `N` rollouts of the
-policy under the arm's own prompt (`--generic-steps` control steps of each),
-labelled the same way with the scene's task: states where the unsteered policy
-may be heading somewhere else than the operator means.
+of what the operator meant.
 
-`--target command` changes what a reversed command should land on. The latent
-of the operator's whole chunk holds much that a command cannot say (the later
-steps, rotation, the gripper), and a module that sees only the command chunk
-cannot predict it. With `--target command` the label is where steering takes a
-faithful command: the plain reversal, through the same goal-free field, of the
-reference FRS builds from the operator's push itself. The regression runs at
-the reversal's own steps and on the translation dims only (what steering keeps
-of a command; the module's other rows stay the identity), so that the reversal
-of `a_bci` closes its distance to that path over the first `--correct-by`
-steps (default: all of them) and follows it afterwards. A faithful command
-leaves the module the identity, i.e. plain FRS. `--states <file>` reuses the
-states of an earlier run for any arm: rollouts and labels do not depend on the
-user, and the commands are served again through the arm's own readout.
-
-`--cues N` (with `--target command`) trains on a cued calibration session
-instead of the tasks' own pushes, using only what a real session records: the
-cue, and the command the readout delivered for it, noise included. Every state
-gets `N` cues, each the state's push length in a direction drawn evenly on the
-sphere. A cue's direction is held for `--cue-hold` chunks (default 3, so that a
-lagging readout settles) and changes at each new episode. Each cue is served
-through the arm's readout and recorded once with its noise
-(`--cue-noise redrawn` draws the noise anew at every batch, the limit of a long
-session). Its label is the reversal path of the cued push's own reference. A
-task's pushes cluster in a few directions, and a module fitted to noisy
-commands learns that cluster as a prior. Even cues leave it only the readout's
-distortion and the noise to learn, so it tends to shorten a noisy command as
-well as re-aim it. The validation still serves the tasks' own pushes, which a
-cued module never sees.
+The states come from two kinds of rollout. `--episodes N` rolls out the
+task-prompted policy. `--open-episodes N` rolls out the policy under the arm's
+own prompt, unsteered, with the synthetic operator watching it and pushing or
+resting by the arm's let-go rule (`--open-steps` keeps that many control steps
+of each); a state's label is then the chunk the operator planned there and its
+push the one it would deliver, zero where it rests. Task-prompted states alone
+teach a module to discard the command, because there the policy's own plan
+already is the label; with the let-go rule the operator pushes only where the
+robot heads wrong. Commands get noise of std `sigma ~ U(--sigma)` through the
+arm's readout, drawn anew at every batch or once per state with
+`--frozen-noise` (as a recorded session has it). `--states <file>` reuses an
+earlier run's states for any arm: the rollouts and the frozen draws do not
+depend on the user, and the commands are served again through the arm's own
+readout.
 
 The log reports, on held-out states, what the rollouts' steering would execute
 (`FlowReversalSteering`, the executed prefix pinned) at each of `--val-depths`:
@@ -749,11 +732,13 @@ the cosine between the executed steps' mean translation and the operator's
 push, for the policy's own plan from the same noise (`plan`), FRS on the
 user's command (`none`), the same through the module (`user`), FRS on a
 faithful readout's command with the same noise draw (`clean`) and on the push
-itself (`ideal`), where the plan disagrees with the push (`d<depth>_off_*`)
-and where it agrees (`d<depth>_on_*`). A module repairs the command if
-`off_user` moves from `off_none` toward `off_clean`; one that only weakens the
-steering raises `on_user` alone. Few held-out states have a disagreeing plan,
-so this is a monitor; judge a module on all the calibration states.
+itself (`ideal`). It splits the states by whether the plan disagrees with the
+push (`d<depth>_off_*`), agrees (`d<depth>_on_*`) or the operator rests,
+scored there against what it means (`d<depth>_rest_*`), and reports each
+group's mean executed length per step (`d<depth>_<group>_len_*`). A module
+repairs the command if `off_user` moves from `off_none` toward `off_clean`
+without a shorter `len_user`; one that only weakens the steering raises
+`on_user` alone.
 
 ```bash
 python examples/pi05/mars/libero/train_user_module.py \
@@ -767,10 +752,8 @@ from the arm file that names the module it is about to write. `--set KEY=VALUE`
 overrides the file as in `experiment.py`; calibrating on other scenes than the
 arm evaluates on is `--set scene.suite=libero_spatial` (and `scene.task_ids`).
 The episodes cycle through the tasks, each pass from a task's next initial
-state. The log's validation serves each held-out state's command at the
-middle of the `--sigma` range.
-Calibration commands are served by the rollouts' rule: noise only where the
-corrupted command is itself outside the deadband.
+state. Calibration commands are served by the rollouts' rule: noise at every
+read, an idle command included.
 
 **The module's ranks.** Three options set how flexible `U` is; their defaults
 are the module as it was, and a fresh module is the identity under every setting:

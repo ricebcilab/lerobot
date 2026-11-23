@@ -92,9 +92,9 @@ def test_expert_data_serves_the_pushes_cores_and_frozen_noise():
     assert moving.any() and (torch.nn.functional.cosine_similarity(push, goal - obs["pos"], dim=-1)[moving] > 0.999).all()
     assert train.noise is not None and data["val"].noise is None  # validation keeps fresh commands
     sigma, active = torch.ones(len(i)), active_rows(push, DEADBAND)
-    served = train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k))
-    torch.testing.assert_close(served, train_adapter.bci_command(policy, push, core, sigma, train.noise_at(i, k)))  # one draw per step
-    assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, push, core, sigma)[active])
+    served = train_adapter.bci_command(policy, core, sigma, train.noise_at(i, k))
+    torch.testing.assert_close(served, train_adapter.bci_command(policy, core, sigma, train.noise_at(i, k)))  # one draw per step
+    assert active.any() and not torch.allclose(served[active], train_adapter.bci_command(policy, core, sigma)[active])
     # a curl's core is its velocity driven from rest by the pushes in turn (the readout's core), not M @ push
     args = _args("--name", "x", "--corruption", "{curl: 20, tau: 0.1}", "--n-demos", "10", "--val-demos", "4")
     _, curl = corruption_spec(args.corruption)

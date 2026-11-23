@@ -292,8 +292,9 @@ Main parameters (`control:` and `task:` sections):
   5 of 15 there); MARS tunes both, since how far the reversal goes through the user module's field is part of the
   method (the 100-demonstration module fails at the full reversal).
 - `input_noise` and `corruption` act on the command on its way to the controller, as in LeRobot:
-  raw → M·raw (clipped to [-1, 1]) → + Gaussian noise. Both apply only while pushing, so idle input
-  stays idle. Corruption specs (`lerobot.teleoperators.readout.corruption_spec`): `{scale: [sx, sy]}`,
+  raw → M·raw (clipped to [-1, 1]) → + Gaussian noise. The corruption applies only while pushing, the noise
+  at every step, so a resting user's command is the noise itself (since 2026-11-20; the grid, the study and the
+  demonstration-time runs before then had noise only while pushing). Corruption specs (`lerobot.teleoperators.readout.corruption_spec`): `{scale: [sx, sy]}`,
   `{rotation_deg: d}`, `{M: rows}`, or `{curl: b, tau: s}`: a curl field on the command (the dynamics of the
   cursor curl below, acting on what the controller gets instead of on the cursor: the served command is a velocity driven by the push,
   turned clockwise by atan(τb) and slowed by 1/√(1 + (τb)²) at steady state, from rest each trial).

@@ -11,8 +11,13 @@ scene:
   suite: libero_object
   task_ids: null
 operator: policy
+server:
+  headless: true              # nobody watches a study run: no live view, no browser tab (videos are still saved)
 policy_operator:              # the immediate operator: a new intent at every chunk, consumed at once. The
   update_every_steps: null    # SpaceMouse-like profile (20 / 4) left no method above the floor in stage 0;
   delay_steps: 0              # it is a robustness check: --set policy_operator.update_every_steps=20 ...delay_steps=4
+  let_go_cosine: 0.5          # under a steering arm the operator rests (zero command; the readout's noise stays) for the
+                              # next chunk once the robot's executed motion heads with its intent at cosine >= 0.5;
+                              # under teleop it keeps pushing (nothing else moves the robot)
 control:
   corruption: null

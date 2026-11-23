@@ -372,3 +372,40 @@ class LiveView:
                 self.end_headers()
 
         return Handler
+
+
+class _NullStream:
+    """`FrameStream`'s interface for a headless run: frames are neither encoded nor kept, the status is dropped."""
+
+    def publish(self, rgb: np.ndarray) -> None:
+        pass
+
+    def set_status(self, **kwargs) -> None:
+        pass
+
+    def get_status(self) -> dict:
+        return {}
+
+
+class HeadlessView:
+    """`LiveView`'s interface for a run nobody watches (`server.headless`, the synthetic operator): no page, no
+    frame stream, no browser tab. Nothing can wait for a click, so `wait_command` raises."""
+
+    url = None
+
+    def __init__(self):
+        self.stream = _NullStream()
+
+    def start(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def open_in_browser(self) -> None:
+        pass
+
+    def wait_command(self, options: tuple[str, ...]) -> str:
+        raise RuntimeError(
+            "a headless run has no page to wait on: a human operator needs server.headless false"
+        )

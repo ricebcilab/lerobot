@@ -270,6 +270,8 @@ def test_experiment_validation_errors(tmp_path):
         _load(tmp_path, "control: {n_reversal_steps: 0}")
     with pytest.raises(ValueError, match="pinned_steps must"):
         _load(tmp_path, "control: {pinned_steps: 0}")
+    with pytest.raises(ValueError, match="gripper_reference must"):
+        _load(tmp_path, "control: {gripper_reference: 2}")
     for key in ("rotation_noise", "gripper_noise"):
         with pytest.raises(ValueError, match=f"{key} must"):
             _load(tmp_path, f"control: {{{key}: -0.1}}")
@@ -415,3 +417,26 @@ def test_the_study_rotation_is_the_recorded_draw():
     assert goal.session.control.corruption_quantize and goal.session.operator == "policy"
     timing = goal.session.policy_operator  # the immediate operator: every chunk, no delay
     assert timing.update_every_steps is None and timing.delay_steps == 0
+
+
+def test_study_runs_are_headless_and_a_human_cannot_be(tmp_path):
+    """`server.headless`: no page, no frame stream, no browser tab (the study's runs: a synthetic operator); a
+    human operator needs the page, so the pair is refused."""
+    from live_view import HeadlessView
+    from session import build_view
+    from teleop import KeyboardReader
+
+    study = load_experiment_settings(CONFIG_DIR / "experiment" / "study_goal_rotation.yaml", {}).session
+    assert study.headless and not load_interactive_settings(DEFAULT_INTERACTIVE_CONFIG, {}).headless
+    view = build_view(study, KeyboardReader(), dict)
+    assert isinstance(view, HeadlessView) and view.url is None
+    view.start()  # binds nothing
+    view.stream.publish(np.zeros((4, 4, 3), np.uint8))  # encodes nothing
+    view.stream.set_status(state="running")
+    view.open_in_browser()
+    with pytest.raises(RuntimeError, match="headless"):
+        view.wait_command(("start", "skip"))
+    view.close()
+    (tmp_path / "c.yaml").write_text("operator: human\nserver: {headless: true}\n")
+    with pytest.raises(ValueError, match="headless"):
+        load_experiment_settings(tmp_path / "c.yaml", {})

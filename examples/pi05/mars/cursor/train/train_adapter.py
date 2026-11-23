@@ -552,11 +552,10 @@ def mixed_batch(open_data, closed_data, batch, mix):
     return ({k: torch.cat([a[0][k], b[0][k]]) for k in a[0]},) + tuple(torch.cat([x, y]) for x, y in zip(a[1:4], b[1:4]))
 
 
-def bci_command(policy, push, core, sigma, noise=None):
-    """The controller's reference for one served command per sample: noise on the readout core (where the
-    push is active; `noise` the standard normal draws, default fresh), held over the chunk, in the policy's
-    units [B, H, 2]."""
-    served = Readout.serve(core, push, sigma, noise)
+def bci_command(policy, core, sigma, noise=None):
+    """The controller's reference for one served command per sample: noise on the readout core (idle or not;
+    `noise` the standard normal draws, default fresh), held over the chunk, in the policy's units [B, H, 2]."""
+    served = Readout.serve(core, sigma, noise)
     return to_action(served[:, None].expand(-1, policy.horizon, -1), policy)
 
 
@@ -620,7 +619,7 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
     the task module with it (and how often the regenerated chunks collide)."""
     obs, chunk, push, core, _, _ = data.sample(n)
     free, active = hide_goal(obs), active_rows(push, DEADBAND)
-    bci = bci_command(policy, push, core, draw_sigma(args, n, push.device))
+    bci = bci_command(policy, core, draw_sigma(args, n, push.device))
     out = {}
     variants = [("none", None, None), ("user", user, None)] + ([("composed", user, task)] if task is not None else [])
     for name, u, tm in variants:
@@ -755,7 +754,7 @@ def train_task(args, policy, device, rng):
         if args.lambda_field:  # the user's commands, through the frozen user module and this task module
             free = hide_goal(obs)
             latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps, adapted)
-            bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), data["train"].noise_at(i, k))
+            bci = bci_command(policy, core, draw_sigma(args, args.batch, device), data["train"].noise_at(i, k))
             weight = (active_rows(push, DEADBAND) & obs["obstacle_mask"].any(1)).float()  # on the obstacle-free layouts T stays I
             field = field_loss(policy, user, task, free, latent, bci, weight)
             parts["field"].append(field.detach())  # converted at log time (window_mean)
@@ -818,7 +817,7 @@ def train_user(args, policy, model, device, rng):
             obs, chunk, push, core = mixed_batch(data["train"], closed["train"], args.batch, args.closed_loop_mix)
         free = hide_goal(obs)
         latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps)
-        bci = bci_command(policy, push, core, draw_sigma(args, args.batch, device), noise)
+        bci = bci_command(policy, core, draw_sigma(args, args.batch, device), noise)
         return field_loss(policy, user, None, free, latent, bci, active_rows(push, DEADBAND).float())
 
     def validate():

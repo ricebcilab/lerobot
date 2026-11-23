@@ -61,17 +61,12 @@ def test_readout_cores_are_what_the_rollouts_reader_serves_along_an_episode():
     np.testing.assert_allclose(tum.readout_cores(pushes[:1], [0], [0], stick), [[0.6, -0.2, 0.0]])
 
 
-def test_serve_noises_only_an_active_core():
-    rng = np.random.default_rng(0)
-    core = np.array(
-        [[0.5, 0.0, 0.0], [0.02, 0.0, 0.0]]
-    )  # the second: an active push the readout shrank to idle
-    served = tum.serve(core, [0.1, 0.1], rng)
-    assert not np.allclose(served[0], core[0]) and np.all(np.abs(served[0]) <= 1.0)
-    np.testing.assert_array_equal(
-        served[1], core[1]
-    )  # the rollouts' rule: an idle command is served as it is
-    np.testing.assert_allclose(tum.serve(core, 0.0, rng)[0], core[0])
+def test_serve_noises_every_core_an_idle_one_included():
+    core = np.array([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]])  # the second: the operator rests
+    served = tum.serve(core, [0.1, 0.1], np.random.default_rng(0))
+    draws = np.random.default_rng(0).normal(size=core.shape)
+    np.testing.assert_allclose(served, np.clip(core + 0.1 * draws, -1.0, 1.0))  # the rollouts' rule
+    np.testing.assert_allclose(tum.serve(core, 0.0, np.random.default_rng(0)), core)
 
 
 def test_the_session_is_built_without_the_arms_adapter():
@@ -164,9 +159,9 @@ def test_state_cache_round_trips_with_a_safe_load(tmp_path):
         "task_id": 1,
         "label": torch.zeros(CHUNK, 7),
         "latent": torch.ones(CHUNK, MAX_DIM),
-        "path": torch.ones(3, CHUNK, MAX_DIM),
-        "cue_path": torch.ones(2, 3, CHUNK, MAX_DIM),
-        "cue_served": np.zeros((2, 3)),
+        "noise": np.array([0.3, -0.1, 0.0]),  # its frozen draw
+        "pushed": np.zeros(3),
+        "resting": True,
         "raw": np.array([0.2, 0.0, 0.0]),
         "core": np.array([0.1, 0.0, 0.0]),
         "gripper_normalized": -1.0,
@@ -177,8 +172,8 @@ def test_state_cache_round_trips_with_a_safe_load(tmp_path):
     np.testing.assert_array_equal(back["observation"]["img"], state["observation"]["img"])
     assert isinstance(back["raw"], np.ndarray) and isinstance(back["observation"]["state"], np.ndarray)
     assert torch.is_tensor(back["label"]) and torch.is_tensor(back["latent"])
-    assert torch.is_tensor(back["path"]) and back["path"].shape == (3, CHUNK, MAX_DIM)
-    assert torch.is_tensor(back["cue_path"]) and isinstance(back["cue_served"], np.ndarray)
+    np.testing.assert_array_equal(back["noise"], state["noise"])
+    assert isinstance(back["noise"], np.ndarray) and back["resting"] is True
 
 
 def test_cross_step_dims_take_action_dim_names_or_indices():
@@ -216,8 +211,12 @@ def test_states_are_collected_at_the_chunk_boundaries_from_the_first():
     class FakeSession:
         suite, task_id, task_description, vec_env = "s", 0, "t", FakeEnv()
 
+        def __init__(self):
+            self.modes = []
+            self.operator = SimpleNamespace(translation=np.zeros(3), resting=False)
+
         def set_mode(self, mode):
-            pass
+            self.modes.append(mode)
 
         def set_scene(self, suite, task_id):
             self.task_id = task_id
@@ -228,10 +227,18 @@ def test_states_are_collected_at_the_chunk_boundaries_from_the_first():
             for k in range(
                 max_steps or 25
             ):  # as Session.rollout reports: the step count after the step, the observation before it
+                if k % 10 == 0:  # a chunk boundary: the operator's update and the readout's read
+                    self.operator_chunk = np.full((50, 7), k)
+                    self.operator.resting = k == 10
+                    self.operator.translation = np.zeros(3) if k == 10 else np.array([0.3, 0.0, 0.0])
                 recorder(step=k + 1, observation={"k": k})
 
     settings = SimpleNamespace(
-        task_ids=[0], prompt="do something", session=SimpleNamespace(suite="s", n_action_steps=10)
+        task_ids=[0],
+        prompt="do something",
+        session=SimpleNamespace(
+            suite="s", n_action_steps=10, control=SimpleNamespace(mode="shared_flow_reversal_steering")
+        ),
     )
     states = tum.collect_states(FakeSession(), settings, 2, np.random.default_rng(0))
     assert [(s["episode"], s["step"], s["observation"]["k"]) for s in states] == [
@@ -245,71 +252,54 @@ def test_states_are_collected_at_the_chunk_boundaries_from_the_first():
     assert resets == [0, 0, 1, 1]
     assert [s["task_id"] for s in states[::3]] == [3, 7, 3, 7]
 
-    # rollouts under the arm's own prompt follow, from the same start states, kept up to a step, with the scene's task
+    # rollouts under the arm's own prompt follow, the robot unsteered and the operator watching it: each state keeps
+    # the chunk the operator planned, the push it would deliver (zero where it rests) and whether it rests
     resets.clear()
     prompts.clear()
-    states = tum.collect_states(FakeSession(), settings, 2, np.random.default_rng(0), 2, 15)
-    assert prompts == [("t", None), ("t", None), ("do something", 15), ("do something", 15)]
-    assert resets == [0, 0, 0, 0]
-    generic = [s for s in states if s["rollout"] == "generic"]
-    assert [(s["episode"], s["step"], s["task"], s["task_id"]) for s in generic] == [
-        (2, 0, "t", 3), (2, 10, "t", 3), (3, 0, "t", 7), (3, 10, "t", 7)
+    session = FakeSession()
+    states = tum.collect_states(
+        session, settings, 1, np.random.default_rng(0), open_episodes=2, open_steps=15
+    )
+    assert prompts == [("t", None), ("do something", 15), ("do something", 15)]
+    assert session.modes == ["policy"]  # nothing steers: the operator's command does not act
+    assert resets == [0, 0, 0]  # each pass over the tasks from a task's next initial state
+    watched = [s for s in states if s["rollout"] == "open"]
+    assert [(s["episode"], s["step"], s["task"], s["task_id"]) for s in watched] == [
+        (1, 0, "t", 3), (1, 10, "t", 3), (2, 0, "t", 7), (2, 10, "t", 7)
     ]  # fmt: skip
-    assert {s["rollout"] for s in states[:6]} == {"task"}
+    for s in watched:  # what the fake operator had at that chunk boundary
+        k = s["observation"]["k"]
+        np.testing.assert_array_equal(s["label"], np.full((50, 7), k))
+        np.testing.assert_array_equal(s["pushed"], [0.0, 0.0, 0.0] if k == 10 else [0.3, 0.0, 0.0])
+        assert s["resting"] == (k == 10)
+    assert not any(
+        key in states[0] for key in ("label", "pushed", "resting")
+    )  # task-prompted: labelled later
 
 
-def test_command_targets_bring_the_users_reference_onto_the_intended_reversal():
-    n = 10
-    field = lambda x, t: 0.5 * x + 1.0  # noqa: E731  (a field that depends on where the chunk is)
-    intended = torch.randn(2, CHUNK, MAX_DIM)
-    path = tum.reversal_path(Flow(field), intended, n)
-    assert path.shape == (2, n + 1, CHUNK, MAX_DIM)
-    torch.testing.assert_close(path[:, 0], intended)
-    torch.testing.assert_close(path[:, -1], Flow(field).reverse(intended, n), atol=1e-5, rtol=0)
-    served = intended.clone()
-    served[..., :3] += torch.randn(2, CHUNK, 3)  # the user's reference: another translation
-    for correct_by in (n, 4):  # over the whole reversal, or done by its fourth step
-        x = served
-        for k in range(n):
-            at, target = tum.command_target(path, served, torch.full((2,), k), correct_by)
-            # the regression's points are the adapted reversal's own
-            torch.testing.assert_close(at, x, atol=1e-4, rtol=0)
-            x = x + target / n
-            if k + 1 >= correct_by:  # on the intended reversal from there on
-                torch.testing.assert_close(x, path[:, k + 1], atol=1e-4, rtol=0)
-    # a faithful command needs no correction: the plain field's own steps
-    rows, k = torch.arange(2), torch.tensor([3, 7])
-    at, target = tum.command_target(path, intended, k, 4)
-    torch.testing.assert_close(at, path[rows, k])
-    torch.testing.assert_close(target, (path[rows, k + 1] - path[rows, k]) * n)
-    args = tum.parse_args(["--config", "c.yaml", "--out", "o"])
-    assert (args.target, args.correct_by) == ("label", None)  # the cursor's recipe unless asked
-    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--target", "command", "--correct-by", "4"])
-    assert (args.target, args.correct_by) == ("command", 4)
-
-
-def test_translation_loss_trains_the_translation_rows_only():
-    torch.manual_seed(0)
-    user = LearnedUserModule(horizon=CHUNK, n_dims=7, d=16, tdim=8)  # the identity at init
-    x, v = torch.randn(4, CHUNK, MAX_DIM), torch.randn(4, CHUNK, MAX_DIM)
-    t = torch.tensor([0.0, 0.1, 0.5, 0.9])
-    field = lambda x_t, tt: v  # noqa: E731
-    target = v.clone()
-    target[..., :3] = 2 * v[..., :3]
-    target[..., 3:7] = 5.0  # the other dims' targets do not count
-    assert tum.translation_loss(user, field, x, t, v).item() == pytest.approx(0.0, abs=1e-6)
-    start = tum.translation_loss(user, field, x, t, target)
-    assert start.item() == pytest.approx((v[..., :3] ** 2).mean().item(), rel=1e-5)
-    one = tum.translation_loss(user, field, x, t, target, weight=torch.tensor([1.0, 0.0, 0.0, 0.0]))
-    assert one.item() == pytest.approx((v[0, :, :3] ** 2).mean().item(), rel=1e-5)
-    opt = torch.optim.SGD(user.parameters(), lr=0.05)
-    for _ in range(20):
-        opt.zero_grad()
-        tum.translation_loss(user, field, x, t, target).backward()
-        opt.step()
-    assert tum.translation_loss(user, field, x, t, target).item() < 0.9 * start.item()
-    with torch.no_grad():  # rotation and gripper rows stay the identity: their velocity passes unchanged
-        torch.testing.assert_close(user(x, t)[..., 3:, :], torch.eye(7)[3:].expand(4, CHUNK, 4, 7))
+def test_frozen_noise_is_drawn_once_per_state_and_served_through_its_core():
+    states = [{"core": np.array([0.5, 0.0, 0.0])}, {"core": np.zeros(3)}]  # the second: the operator rests
+    tum.freeze_noise(states, (0.2, 0.2), np.random.default_rng(0))
+    draws = np.random.default_rng(0).normal(size=(2, 3))
+    for state, draw in zip(states, draws, strict=True):
+        np.testing.assert_array_equal(state["noise"], draw)
+        assert state["sigma"] == pytest.approx(0.2)
+    kept = [dict(s) for s in states]
+    tum.freeze_noise(
+        states, (0.0, 1.0), np.random.default_rng(1)
+    )  # a state keeps its draw (another arm's run)
+    np.testing.assert_array_equal(states[0]["noise"], kept[0]["noise"])
+    rows = [
+        states[0],
+        states[1],
+        {"core": np.array([0.4, 0.0, 0.0])},
+    ]  # the last: no frozen draw, served afresh
+    served = tum.batch_commands(rows, np.full(3, 0.1), np.random.default_rng(2))
+    np.testing.assert_allclose(
+        served[:2], np.clip(np.stack([s["core"] for s in states]) + 0.2 * draws, -1.0, 1.0)
+    )
+    fresh = np.random.default_rng(2).normal(size=(3, 3))[2]
+    np.testing.assert_allclose(served[2], np.clip(rows[2]["core"] + 0.1 * fresh, -1.0, 1.0))
 
 
 def test_commands_are_relabelled_through_the_arms_readout_and_a_faithful_one():
@@ -338,29 +328,65 @@ def test_executed_summary_splits_by_whether_the_plan_agrees_with_the_intent():
     assert out["off_plan"] == pytest.approx(-1.0) and out["on_plan"] == pytest.approx(1.0)
     assert out["off_none"] == pytest.approx(0.0) and out["on_none"] == pytest.approx(0.5)
     assert out["off_user"] == pytest.approx(1.0) and out["on_user"] == pytest.approx(1.0)
+    assert out["on_len_user"] == pytest.approx(1.0) and out["off_len_plan"] == pytest.approx(1.0)  # |moved|
     empty = tum.executed_summary(intent[:1], plan[:1], {"none": arms["none"][:1]})
-    assert empty["off_n"] == 0 and empty["off_none"] is None
+    assert empty["off_n"] == 0 and empty["off_none"] is None and empty["rest_n"] == 0
+    # a resting operator pushes nothing; its states are scored against what it means
+    meant = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [1.0, 0.0, 0.0]])
+    resting = np.array([False, False, False, True])
+    out = tum.executed_summary(intent, plan, arms, meant=meant, resting=resting)
+    assert (out["off_n"], out["on_n"], out["rest_n"]) == (1, 2, 1)
+    assert out["rest_plan"] == pytest.approx(1.0) and out["rest_none"] == pytest.approx(1.0)
 
 
-def test_cued_pushes_keep_each_length_and_hold_an_evenly_drawn_direction():
-    rng = np.random.default_rng(0)
-    lengths = np.full(6000, 0.5)
-    lengths[:6] = [0.2, 0.4, 0.6, 0.8, 0.5, 0.5]
-    episodes = np.repeat(np.arange(1000), 6)  # six chunk boundaries an episode
-    pushes = tum.cue_pushes(lengths, episodes, rng, hold=3)
-    np.testing.assert_allclose(np.linalg.norm(pushes, axis=1), lengths)  # the state's own push length
-    blocks = (pushes / lengths[:, None]).reshape(-1, 3, 3)  # (cue, chunk of the hold, xyz)
-    np.testing.assert_allclose(blocks[:, 0], blocks[:, 1])
-    np.testing.assert_allclose(blocks[:, 0], blocks[:, 2])  # one direction for the three chunks of a cue
-    assert not np.allclose(blocks[0, 0], blocks[1, 0])  # then another, within the episode
-    assert np.abs(blocks[:, 0].mean(0)).max() < 0.05  # no preferred direction over the session
-    short = tum.cue_pushes(np.ones(4), [0, 0, 1, 1], np.random.default_rng(1), hold=3)
-    assert np.allclose(short[0], short[1]) and not np.allclose(short[1], short[2])  # a new episode, a new cue
-    long = tum.cue_pushes(np.full(50, 1.7), np.zeros(50), rng, hold=1)
-    assert np.abs(long).max() <= 1.0  # clipped as the operator's pushes are
-    args = tum.parse_args(["--config", "c.yaml", "--out", "o"])
-    assert (args.cues, args.cue_hold, args.cue_noise) == (0, 3, "recorded")  # off unless asked
-    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--target", "command", "--cues", "4"])
-    assert args.cues == 4
-    with pytest.raises(SystemExit):  # a cue's label is its own reference: the command target
-        tum.parse_args(["--config", "c.yaml", "--out", "o", "--cues", "4"])
+def test_a_translation_module_corrects_the_translation_alone():
+    from lerobot.policies.steering import AdaptedField
+
+    args = tum.parse_args(
+        ["--config", "c.yaml", "--out", "o", "--dims", "3", "--step-rank", "1", "--d", "64"]
+    )
+    user = tum.build_user_module(args, 50)
+    assert (
+        user.n_dims == 3 and sum(p.numel() for p in user.parameters()) < 30_000
+    )  # the default: about 800 000
+    torch.manual_seed(0)
+    with torch.no_grad():  # away from the identity it starts at
+        for p in user.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+    x, v = torch.randn(2, 50, 32), torch.randn(2, 50, 32)
+    out = AdaptedField(None, user).adapt(x, 0.3, v, backward=True)
+    torch.testing.assert_close(out[..., 3:], v[..., 3:])  # rotation, gripper and padding pass through
+    assert not torch.allclose(out[..., :3], v[..., :3])
+    assert tum.parse_args(["--config", "c.yaml", "--out", "o"]).dims == 7  # every action dim unless asked
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--dims", "3", "--additive"])
+    assert tum.build_user_module(args, 50).additive and not user.additive  # U v + b only when asked
+    with pytest.raises(SystemExit):  # a coupling on a dim the module does not have
+        tum.parse_args(["--config", "c.yaml", "--out", "o", "--dims", "3", "--cross-step-rank", "1",
+                        "--cross-step-dims", "dx,droll"])  # fmt: skip
+
+
+def test_the_depth_loss_counts_the_executed_translation_of_a_partial_reversal():
+    """At depth d the module is fitted along the straight path from the user's reference (t = 0) to the meant chunk
+    reversed d steps (t = d / N), on the pinned steps' translation: what steering keeps of a partial reversal."""
+    torch.manual_seed(0)
+    user = LearnedUserModule(horizon=CHUNK, n_dims=3, d=16, tdim=8)  # the identity at init
+    start, end = torch.randn(4, CHUNK, MAX_DIM), torch.randn(4, CHUNK, MAX_DIM)
+    t_end, t = 0.8, torch.tensor([0.0, 0.2, 0.5, 0.79])
+    exact = lambda x, tt: (end - start) / t_end  # noqa: E731  (a field already on the path)
+    assert tum.depth_loss(user, exact, start, end, t, t_end, steps=2).item() == pytest.approx(0.0, abs=1e-10)
+    off = end.clone()
+    off[:, 2:] += 5.0  # past the pinned steps
+    off[..., 3:] += 5.0  # rotation, gripper, padding
+    moved = lambda x, tt: (off - start) / t_end  # noqa: E731
+    assert tum.depth_loss(user, moved, start, off, t, t_end, steps=2).item() == pytest.approx(0.0, abs=1e-10)
+    wrong = lambda x, tt: torch.zeros_like(x)  # noqa: E731
+    loss = tum.depth_loss(user, wrong, start, end, t, t_end, steps=2)
+    target = ((end - start) / t_end)[:, :2, :3]
+    assert loss.item() == pytest.approx((target**2).mean().item(), rel=1e-5)
+    args = tum.parse_args(["--config", "c.yaml", "--out", "o", "--depth", "8"])
+    assert args.depth == 8 and args.val_depths[0] == 8  # its own depth checked first
+    assert (
+        tum.parse_args(["--config", "c.yaml", "--out", "o"]).depth is None
+    )  # the full reversal unless asked
+    with pytest.raises(SystemExit):
+        tum.parse_args(["--config", "c.yaml", "--out", "o", "--depth", "0"])

@@ -56,6 +56,9 @@ class ControlSettings:
     corruption: dict | list | None = None  # spec as written
     reversal_adapter: dict | None = None  # spec as written
     operator_dims: list[str] = field(default_factory=lambda: ["translation"])  # what the operator commands
+    # FRS: the gripper value the reference holds at every chunk (-1 open, 1 closed; Tang et al. on LIBERO: 0);
+    # None = the model's last executed gripper command
+    gripper_reference: float | None = None
     # Resolved from the specs above, not settings; with a random corruption each trial draws its own matrices.
     corruption_matrix: np.ndarray | None = field(default=None, repr=False)
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
@@ -75,6 +78,7 @@ class SessionSettings:
     suite: str = "libero_spatial"
     task_id: int = 0
     port: int = 8765
+    headless: bool = False  # no live view: no page, no frame stream, no browser tab (experiments of the synthetic operator)
     output_dir: Path = Path("outputs/pi05_libero_interactive")
     operator: str = "human"
     policy_operator: PolicyOperatorSettings = field(default_factory=PolicyOperatorSettings)
@@ -137,7 +141,7 @@ EXPERIMENT_SCHEMA = {
     "policy_operator": _OPERATOR_SCHEMA,
     "policy": _POLICY_SCHEMA,
     "control": _CONTROL_SCHEMA,
-    "server": {"port": "port"},
+    "server": {"port": "port", "headless": "headless"},
 }
 
 
@@ -344,6 +348,14 @@ def build_control(flat: dict, where: str) -> ControlSettings:
             where,
             f"control.operator_dims must be a non-empty list drawn from {', '.join(OPERATOR_DIM_GROUPS)}, got {dims!r}",
         )
+    held = control.gripper_reference
+    if held is not None and (
+        isinstance(held, bool) or not isinstance(held, int | float) or not -1 <= held <= 1
+    ):
+        _fail(
+            where,
+            "control.gripper_reference must be a number in [-1, 1] (the gripper value FRS's reference holds: -1 open, 1 closed) or null (the model's last executed command)",
+        )
     control.corruption_quantize = readout.quantize_spec(control.corruption, f"{where}: control.corruption")
     if not control.corruption_quantize:
         control.corruption_curl = build_curl(control.corruption, f"{where}: control.corruption")
@@ -386,6 +398,10 @@ def _session_from_flat(flat: dict, where: str) -> SessionSettings:
         _fail(where, f"operator must be one of {', '.join(OPERATORS)}, got {session.operator!r}")
     if session.operator != "policy" and session.policy_operator != PolicyOperatorSettings():
         _fail(where, "policy_operator settings require operator=policy")
+    if not isinstance(session.headless, bool):
+        _fail(where, f"server.headless must be true or false, got {session.headless!r}")
+    if session.headless and session.operator != "policy":
+        _fail(where, "server.headless needs operator=policy: a human operator steers from the live view")
     return session
 
 

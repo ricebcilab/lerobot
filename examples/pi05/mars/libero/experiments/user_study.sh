@@ -25,12 +25,14 @@
 #                          alone, as on the cursor: its translation, rotation and gripper, no policy; the
 #                          rotation and the gripper carry ROTATION_NOISE and GRIPPER_NOISE, default 0.04 and
 #                          1.0, the study's levels beside TRANSLATION_NOISE 0.5)
-#   user_study.sh modules  stage 2, first half: one user module per user (rotation, lowdof, lag, keypad), each
+#   TRANSLATION_NOISE=0.2 user_study.sh modules
+#                          stage 2, first half: one user module per user (rotation, lowdof, lag, keypad), each
 #                          calibrated by train_user_module.py in the LIBERO-Goal scene on the four tasks outside
-#                          Goal-6 (0, 2, 3, 9), five start states each: 20 episodes of the task-prompted policy and
-#                          20 of the policy under the arm's prompt (their first 120 steps: states where the
-#                          unsteered policy may head for another task); 3000 steps, through that user's readout,
-#                          into MODULES/<user>/ (default outputs/pi05_libero_user_study/user_modules). Extra flags
+#                          Goal-6 (0, 2, 3, 9): 20 episodes of the policy under "do something", unsteered, the
+#                          synthetic operator watching and pushing or resting by the let-go rule, five start states
+#                          per task; that user's readout, noise TRANSLATION_NOISE drawn once per state; 3000 steps,
+#                          a fifth of the states held out, into
+#                          MODULES/<user>/ (default outputs/pi05_libero_user_study/user_modules). Extra flags
 #                          reach the trainer (e.g. --steps 2000); it has no --dry-run
 #   TRANSLATION_NOISE=0.5 user_study.sh 2
 #                          stage 2, second half: MARS with each user's module on the development split, over the
@@ -147,8 +149,9 @@ case "${STAGE}" in
         done
         ;;
     modules)
+        : "${TRANSLATION_NOISE:?the modules stage needs TRANSLATION_NOISE, the noise of the readout they calibrate on}"
         for user in ${USERS:-rotation lowdof lag keypad}; do
-            JOBS+=("module_${user} --config ${HERE}/../configs/experiment/study_goal_${user}.yaml --set scene.task_ids=[0,2,3,9] --out ${MODULES}/${user} --episodes 20 --generic-episodes 20 --generic-steps 120 --steps 3000")
+            JOBS+=("module_${user} --config ${HERE}/../configs/experiment/study_goal_${user}.yaml --set scene.task_ids=[0,2,3,9] --out ${MODULES}/${user} --episodes 0 --open-episodes 20 --sigma ${TRANSLATION_NOISE} ${TRANSLATION_NOISE} --frozen-noise --steps 3000 --val-frac 0.2 --log-every 300")
         done
         ;;
     2)

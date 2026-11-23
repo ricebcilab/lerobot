@@ -98,6 +98,9 @@ class LearnedUserModule(nn.Module):
       term. Only with ``cross_step_rank`` > 0. Names (e.g. LIBERO's ``ACTION_DIMS``) are mapped to
       indices where configs are parsed.
 
+    - ``additive`` (default False): the correction gains its own term, U(x_t, t) v + b(x_t, t), b (H, n) from
+      (x_t, t) through an extra head (``shift``) on the hidden layer, so the module can supply motion the policy's
+      velocity lacks. b starts at zero.
     The cross head has 2 * H * n_c * q outputs (n_c the coupled dims), so (d + 1) * 2 * H * n_c * q
     parameters: for LIBERO's H = 50 and n = 7, 700 * q outputs (179 900 * q parameters at d = 256).
 
@@ -117,6 +120,7 @@ class LearnedUserModule(nn.Module):
         cross_step_rank: int = 0,
         cross_step_dims: list[int] | None = None,
         cross_step_prefix: int | None = None,
+        additive: bool = False,
     ):
         super().__init__()
         if time_embedding not in ("mars", "pi05"):
@@ -155,6 +159,9 @@ class LearnedUserModule(nn.Module):
             self.config["cross_step_prefix"] = cross_step_prefix
         if cross_step_dims is not None:
             self.config["cross_step_dims"] = list(cross_step_dims)
+        if additive:
+            self.config["additive"] = True
+        self.additive = bool(additive)
         self.horizon, self.n_dims, self.tdim, self.time_embedding = horizon, n_dims, tdim, time_embedding
         self.step_rank, self.cross_step_rank, self.cross_step_dims = (
             step_rank,
@@ -177,6 +184,10 @@ class LearnedUserModule(nn.Module):
             self.cross = nn.Linear(d, 2 * n_u)  # U then V
             nn.init.zeros_(self.cross.weight[:n_u])
             nn.init.zeros_(self.cross.bias[:n_u])
+        if self.additive:
+            self.shift = nn.Linear(d, horizon * n)  # b, per step and dim
+            nn.init.zeros_(self.shift.weight)
+            nn.init.zeros_(self.shift.bias)
 
     def _hidden(self, x_t: torch.Tensor, t) -> torch.Tensor:
         b, h, n = x_t.shape[0], self.horizon, self.n_dims
@@ -206,7 +217,8 @@ class LearnedUserModule(nn.Module):
 
     def velocity(self, x_t: torch.Tensor, t, v: torch.Tensor) -> torch.Tensor:
         """The corrected velocity: x_t (B, H, >= n_dims), t a float or (B,), v (B, H, n) -> (B, H, n) in
-        v's dtype; the per-step matrices, plus the cross-step coupling when ``cross_step_rank`` > 0."""
+        v's dtype; the per-step matrices, plus the cross-step coupling when ``cross_step_rank`` > 0 and the
+        module's own term b when ``additive``."""
         hidden = self._hidden(x_t, t)
         out = torch.einsum("bhij,bhj->bhi", self._matrices(hidden).to(v.dtype), v)
         if self.cross_step_rank:
@@ -223,6 +235,8 @@ class LearnedUserModule(nn.Module):
                 out = out + term
             else:
                 out = out.index_add(-1, torch.as_tensor(dims, device=out.device), term)
+        if self.additive:
+            out = out + self.shift(hidden).view(hidden.shape[0], self.horizon, self.n_dims).to(v.dtype)
         return out
 
     @staticmethod
@@ -1479,6 +1493,11 @@ class FlowReversalSteering(_ChunkSteering):
     Tang et al. (App. D.1) pin fewer steps than they execute: a 5-step reference (`action_repeats`) in a 15-step
     chunk with 10 executed, so the policy fills in half of what runs. The default here pins every executed step;
     for the paper's setting, pin half of n_action_steps.
+
+    `gripper_reference` fixes the gripper value every reference holds, in environment units, in place of the
+    model's last executed command. Tang et al.'s LIBERO runs (App. D.2) keep rotation and gripper in the reference,
+    rotation at 0 and the gripper halfway between open and closed: `operator_dims` with all three groups and
+    `gripper_reference=0`.
     """
 
     def __init__(
@@ -1494,10 +1513,12 @@ class FlowReversalSteering(_ChunkSteering):
         gripper_open: float = GRIPPER_OPEN,
         reference_fn: Callable | None = None,
         reference_step: float | None = None,
+        gripper_reference: float | None = None,
     ):
         super().__init__(policy, source, deadband)
         self._adapter = adapter
         self.gripper_open = gripper_open
+        self.gripper_reference = gripper_reference
         self._reference_fn = reference_fn
         self._reference_step = reference_step
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
@@ -1510,10 +1531,15 @@ class FlowReversalSteering(_ChunkSteering):
             mean, std = self.action_mean_std(postprocessor)
             self._mean, self._std = mean[:N_ACTION_DIMS], std[:N_ACTION_DIMS]
             if self._has_gripper:
-                self._gripper_ref = self._normalize_gripper(gripper_open)
+                self._gripper_ref = self._normalize_gripper(self._gripper_start)
         elif reference_fn is None:
             raise ValueError(
                 "a FlowReversalSteering needs the postprocessor's action statistics or a reference_fn"
+            )
+        if gripper_reference is not None and not self._has_gripper:
+            raise ValueError(
+                "gripper_reference is the 7-D operator space's (its reference holds a gripper value); this action "
+                "space has no gripper dim"
             )
         self._pending_reference: torch.Tensor | None = None
         self._last_reference: torch.Tensor | None = None
@@ -1587,10 +1613,16 @@ class FlowReversalSteering(_ChunkSteering):
     def _normalize_gripper(self, gripper: float) -> float:
         return float((gripper - self._mean[GRIPPER_DIM]) / self._std[GRIPPER_DIM])
 
+    @property
+    def _gripper_start(self) -> float:
+        """The gripper value (environment units) the reference holds when a rollout starts: ``gripper_reference``
+        when set (it then holds at every chunk), else ``gripper_open``."""
+        return self.gripper_open if self.gripper_reference is None else self.gripper_reference
+
     def reset(self) -> None:
         super().reset()
         if self._has_gripper:
-            self._gripper_ref = self._normalize_gripper(self.gripper_open)
+            self._gripper_ref = self._normalize_gripper(self._gripper_start)
         self._last_reference = None
         self.steered_chunks = 0
         self.reconstruction_errors = []
@@ -1721,7 +1753,7 @@ class FlowReversalSteering(_ChunkSteering):
         chunk, plain = self.steered_chunk(batch, commands, field=field)
         self._last_reference = self._pending_reference  # None when no row steered
         executed = chunk[:, : self._policy.config.n_action_steps].float().cpu()  # one device sync per chunk
-        if self._has_gripper:
+        if self._has_gripper and self.gripper_reference is None:
             last = executed[:, -1, GRIPPER_DIM]
             self._gripper_ref = float(last[0]) if len(last) == 1 else last.double().numpy()
         if self._last_reference is not None:
@@ -1985,6 +2017,7 @@ class SteeringPolicy(PreTrainedPolicy):
                     pinned_steps=cfg.pinned_steps,
                     deadband=cfg.deadband,
                     reference_step=step,
+                    gripper_reference=cfg.gripper_reference,
                 )
         return self._core
 

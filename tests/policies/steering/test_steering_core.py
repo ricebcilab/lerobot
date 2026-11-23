@@ -443,3 +443,26 @@ def test_frs_pinned_steps_in_paint_the_later_steps():
     for bad in (0, 17):
         with pytest.raises(ValueError, match="pinned_steps"):
             _frs(sampler, ref, pinned_steps=bad)
+
+
+def test_an_additive_user_module_starts_at_the_identity_and_adds_its_own_velocity(tmp_path):
+    """`additive`: U(x_t, t) v + b(x_t, t), so the module can supply motion the policy's velocity lacks. Off by
+    default, where the module (its config and its weights' names) is what it always was."""
+    x, t, v = _inputs()
+    plain = LearnedUserModule(6, 3, d=32, tdim=8)
+    assert "additive" not in plain.config and not any(k.startswith("shift") for k in plain.state_dict())
+    user = LearnedUserModule(6, 3, d=32, tdim=8, additive=True)
+    assert user.config["additive"] is True
+    with torch.no_grad():
+        assert torch.equal(user.velocity(x, t, v), v)  # a fresh module is still plain FRS
+        user.shift.bias.fill_(0.5)
+        torch.testing.assert_close(user.velocity(x, t, v), v + 0.5)  # the matrices at the identity, plus b
+        torch.testing.assert_close(user.velocity(x, t, torch.zeros_like(v)), torch.full_like(v, 0.5))
+    loaded, kind, _ = AdapterModules.load_module(
+        AdapterModules.save_module(user, tmp_path / "u.pt", kind="user")
+    )
+    assert kind == "user" and loaded.config == user.config
+    assert torch.equal(loaded.velocity(x, t, v), user.velocity(x, t, v))
+    target, fresh = torch.randn(3, 6, 3), LearnedUserModule(6, 3, d=32, tdim=8, additive=True)
+    ((fresh.velocity(x, t, v) - target) ** 2).mean().backward()
+    assert fresh.shift.weight.grad.abs().sum() > 0  # the additive head trains from the identity

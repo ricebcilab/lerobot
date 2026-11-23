@@ -165,6 +165,7 @@ class TrialRecorder:
                     operator.translation if operator is not None else np.full(3, np.nan)
                 ),
                 "operator_command_age_steps": operator.command_age_steps if operator is not None else -1,
+                "operator_resting": bool(operator.resting) if operator is not None else False,
                 "operator_query_count": operator.refreshes if operator is not None else 0,
                 "eef_pos": _first(eef.get("pos"), 3),
                 "eef_quat": _first(eef.get("quat"), 4),
@@ -354,6 +355,7 @@ def _provenance(
         "zeroed_dims": list(control.zeroed_dims),
         "n_reversal_steps": control.n_reversal_steps,
         "pinned_steps": control.pinned_steps,
+        "gripper_reference": control.gripper_reference,
         "reversal_adapter_modules": {
             "user": control.reversal_adapter_user_path,
             "task": control.reversal_adapter_task_path,
@@ -389,7 +391,8 @@ def _describe_block(settings: ExperimentSettings) -> str:
         + ("  (the scene's own instruction)" if settings.prompt == PROMPT_FROM_TASK else ""),
         f"mode: {control.mode}   tau: {control.tau}   lambda: {control.lam}   ic_gain: {control.ic_gain}   zeroed_dims: {control.zeroed_dims}   "
         f"n_reversal_steps: {control.n_reversal_steps}   pinned_steps: {control.pinned_steps}",
-        f"operator: {settings.session.operator}   operator commands: {', '.join(control.operator_dims)}",
+        f"operator: {settings.session.operator}   operator commands: {', '.join(control.operator_dims)}"
+        + ("" if control.gripper_reference is None else f"   gripper_reference: {control.gripper_reference}"),
     ]
     if settings.session.operator == "policy":
         lines.append(f"operator timing (environment steps): {asdict(settings.session.policy_operator)}")

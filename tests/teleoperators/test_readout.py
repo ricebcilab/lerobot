@@ -54,13 +54,6 @@ def old_cursor_readout(raw, matrix, sigma, rng):
     return np.where((np.abs(raw).max(-1) >= DEADBAND)[..., None], out, raw)
 
 
-def old_robot_noisy(clean, std, rng):
-    """libero/teleop.py NoisyReader before the shared core."""
-    if std == 0.0 or np.max(np.abs(clean)) < DEADBAND:
-        return clean
-    return np.clip(clean + rng.normal(0.0, std, size=3), -1.0, 1.0)
-
-
 # ---------------------------------------------------------------- the checks
 
 
@@ -84,30 +77,15 @@ def test_curl_is_both_examples_curl(tau, curl):
     np.testing.assert_allclose(v, readout.curl_steady_state(tau, curl, 3) @ u, atol=1e-9)
 
 
-def test_matrix_corruption_and_noise_are_the_cursor_readout():
+def test_matrix_corruption_and_noise_are_the_cursor_readout_on_active_pushes():
+    """The frozen copy noised active pushes only; on those the shared core is it (idle ones: the next section)."""
     rng_a, rng_b = np.random.default_rng(0), np.random.default_rng(0)
     raw = np.random.default_rng(1).uniform(-1, 1, (5, 2))
-    raw[2] = 0.01  # idle: served as is
     m = np.array([[1.0, 0.0], [0.0, 0.25]])
     sigma = np.array([0.0, 0.5, 1.0, 1.5, 2.0])[:, None]
     old = old_cursor_readout(raw, m, sigma, rng_a)
-    new = readout.add_noise(readout.corrupt(raw, m), raw, sigma[:, 0], rng_b.normal(size=raw.shape))
+    new = readout.add_noise(readout.corrupt(raw, m), sigma[:, 0], rng_b.normal(size=raw.shape))
     np.testing.assert_array_equal(new, old)
-    np.testing.assert_array_equal(new[2], raw[2])
-
-
-def test_the_command_gate_is_the_robot_noisy_reader():
-    """The robot's rule (``noise_gate="command"``, 3-D, one unbatched trial): the corrupted command is noised only
-    when it is itself outside the deadband, and only then is anything drawn."""
-    scale = np.diag([0.25, 1.0, 1.0])  # the second push is active, its corrupted command idle
-    for raw in (np.array([0.4, -0.2, 0.9]), np.array([0.1, 0.0, -0.02]), np.array([0.01, 0.0, -0.02])):
-        rng_a, rng_b = np.random.default_rng(3), np.random.default_rng(3)
-        old = old_robot_noisy(readout.corrupt(raw, scale), 0.6, rng_a)
-        new = readout.Readout(scale, 0.6, rng_b, n_dims=3, noise_gate="command")(raw)
-        np.testing.assert_array_equal(new, old)
-        assert rng_a.random() == rng_b.random()  # the same draws spent
-    with pytest.raises(ValueError, match="noise_gate"):
-        readout.Readout(noise_gate="always")
 
 
 def test_a_3d_curl_readout_steps_and_reads_apart():
@@ -158,14 +136,13 @@ class _Draws:
 def test_readout_with_a_matrix_is_corrupt_then_noise():
     g = np.random.default_rng(2)
     raw = g.uniform(-1, 1, (5, 2))
-    raw[3] = 0.01  # idle: served as is
+    raw[3] = 0.01  # idle: left as is by the corruption, then noised
     m, sigma = np.array([[0.0, 1.0], [-1.0, 0.0]]) * 1.5, g.uniform(0, 1, 5)
     rng_a, rng_b = np.random.default_rng(7), np.random.default_rng(7)
     served = readout.Readout(m, sigma, rng_a)(raw)
     np.testing.assert_array_equal(
-        served, readout.add_noise(readout.corrupt(raw, m), raw, sigma, rng_b.normal(size=(5, 2)))
+        served, readout.add_noise(readout.corrupt(raw, m), sigma, rng_b.normal(size=(5, 2)))
     )
-    np.testing.assert_array_equal(served[3], raw[3])
     per_trial = np.stack([np.eye(2), 0.5 * np.eye(2)])
     chunk = g.uniform(-1, 1, (2, 4, 2))
     np.testing.assert_array_equal(
@@ -213,6 +190,22 @@ def test_core_is_the_readout_before_noise_from_rest(kind):
         readout.Readout(np.stack([np.eye(2)] * 3)).core(pushes)
 
 
+def test_noise_applies_at_every_read_an_idle_push_included():
+    """A decoder's noise does not know the operator rests: an idle push, and a push the corruption shrank to idle,
+    are served as noise, from the same draws an active push gets (numpy and torch alike); with no noise an idle
+    push stays idle."""
+    raw = np.array([[0.4, -0.2, 0.9], [0.1, 0.0, -0.02], [0.0, 0.0, 0.0]])  # active, shrunk to idle, idle
+    scale = np.diag([0.25, 1.0, 1.0])
+    draws = np.random.default_rng(3).normal(size=raw.shape)
+    served = readout.Readout(scale, 0.6, _Draws(draws), n_dims=3)(raw)
+    np.testing.assert_allclose(served, np.clip(readout.corrupt(raw, scale) + 0.6 * draws, -1.0, 1.0))
+    core = torch.tensor(readout.corrupt(raw, scale))
+    np.testing.assert_allclose(
+        readout.Readout.serve(core, torch.full((3,), 0.6), torch.tensor(draws)).numpy(), served, atol=1e-12
+    )
+    np.testing.assert_array_equal(readout.Readout(scale, 0.0, n_dims=3)(raw)[2], 0.0)
+
+
 def test_serve_is_the_numpy_last_stage_for_the_same_draws():
     g = np.random.default_rng(5)
     raw = g.uniform(-1, 1, (6, 2))
@@ -220,13 +213,12 @@ def test_serve_is_the_numpy_last_stage_for_the_same_draws():
     m, sigma, noise = np.diag([1.0, 0.25]), g.uniform(0, 2, 6), g.normal(size=(6, 2))
     served = readout.Readout(m, sigma, _Draws(noise))(raw)
     core = readout.Readout(m).core(raw[:, None])[:, 0]
-    out = readout.Readout.serve(
-        torch.tensor(core), torch.tensor(raw), torch.tensor(sigma), torch.tensor(noise)
-    )
+    out = readout.Readout.serve(torch.tensor(core), torch.tensor(sigma), torch.tensor(noise))
     np.testing.assert_allclose(out.numpy(), served, atol=1e-12)
-    fresh = readout.Readout.serve(torch.tensor(core), torch.tensor(raw), torch.zeros(6))  # no noise: the core
-    np.testing.assert_allclose(fresh.numpy()[[0, 2, 3, 4, 5]], core[[0, 2, 3, 4, 5]], atol=1e-12)
-    np.testing.assert_array_equal(fresh.numpy()[1], raw[1])
+    fresh = readout.Readout.serve(
+        torch.tensor(core), torch.zeros(6)
+    )  # no noise: the core, the idle row's too
+    np.testing.assert_allclose(fresh.numpy(), core, atol=1e-12)
 
 
 @pytest.mark.parametrize("matrix", [None, "tensor"])
@@ -242,8 +234,7 @@ def test_chunk_is_the_readout_on_a_chunk_for_the_same_draws(matrix):
     torch.manual_seed(11)
     draws = torch.randn(4, 5, 2, dtype=torch.float64).numpy()
     served = readout.Readout(None if matrix is None else m, sigma, _Draws(draws))(chunk)
-    np.testing.assert_allclose(out.numpy(), served, atol=1e-12)
-    np.testing.assert_array_equal(out.numpy()[2, 3], chunk[2, 3])
+    np.testing.assert_allclose(out.numpy(), served, atol=1e-12)  # the idle step noised alike
     with pytest.raises(ValueError, match="curl"):
         readout.Readout(curl={"curl": 20.0, "tau": 0.1}).chunk(torch.tensor(chunk), torch.tensor(sigma))
 
@@ -312,7 +303,7 @@ def test_quantize_snaps_an_active_push_to_its_largest_axis_at_its_own_length():
         readout.quantize_spec({"quantize": "octants"})
     with pytest.raises(ValueError, match="quantize"):
         corruption_spec({"quantize": "axes"}, n_dims=3)
-    arm = readout.Readout(quantize=True, n_dims=3, noise_gate="command")
+    arm = readout.Readout(quantize=True, n_dims=3)
     np.testing.assert_allclose(arm(raw[0]), [0.0, -np.sqrt(0.62), 0.0])
     np.testing.assert_array_equal(arm.core(raw[None]), readout.quantize(raw)[None])
     with pytest.raises(ValueError, match="not both"):

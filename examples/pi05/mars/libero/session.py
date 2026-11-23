@@ -18,7 +18,7 @@ from functools import cache
 import numpy as np
 import torch
 from config import MODES, ControlSettings, SessionSettings, gain_that_cannot_clip, matrix_list, spec_label
-from live_view import LiveView
+from live_view import HeadlessView, LiveView
 from reproducibility import TrialSpec
 from teleop import KeyboardReader, PolicyOperator, TeleopChain
 
@@ -53,6 +53,7 @@ RATE_HZ = 20  # LIBERO control rate; caps the loop so teleop feels real-time
 TELEOP_MAX_STEPS = 900
 # The shared modes are lerobot's steering policy's (`SteeringPolicy`, the cursor example's too) over pi0.5
 STEERING_MODES = {"shared_flow_control": "flow_control", "shared_flow_reversal_steering": "frs"}
+DIRECT_MODES = ("teleop", "shared_override")  # the operator's command moves the robot by itself
 
 
 @dataclass
@@ -75,6 +76,14 @@ class _ZeroPolicy:
 
 def _identity(x):
     return x
+
+
+def build_view(settings, keyboard, status_extra: Callable[[], dict]):
+    """The session's view, not yet started: the live page on `settings.port`, or with `settings.headless` a view
+    that serves nothing (no page, no frame encoding, no browser tab)."""
+    if settings.headless:
+        return HeadlessView()
+    return LiveView(settings.port, keyboard, status_extra)
 
 
 def _frame(observation) -> np.ndarray:
@@ -112,13 +121,15 @@ class Session:
         self.chain = TeleopChain(self.keyboard, translation_noise=control.translation_noise)
         # A synthetic operator (the task-prompted policy) replaces the SpaceMouse/keyboard.
         self.operator: PolicyOperator | None = None
+        self.operator_chunk: np.ndarray | None = None  # the operator's latest planned chunk, normalized
         if settings.operator == "policy":
             self.operator = PolicyOperator(settings.n_action_steps, settings.policy_operator)
             self.chain.attach_operator(self.operator)
         self.adapter = AdapterModules(n_dims=None)  # the 7-D holder: each module on its own dims
-        self.view = LiveView(settings.port, self.keyboard, self._status_extra)
+        self.view = build_view(settings, self.keyboard, self._status_extra)
         self.view.start()
-        print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
+        if self.view.url is not None:
+            print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
 
         logging.info(f"Loading policy {settings.policy_path} ...")
         self.policy_cfg = PreTrainedConfig.from_pretrained(settings.policy_path)
@@ -359,6 +370,7 @@ class Session:
         self.n_reversal_steps = control.n_reversal_steps  # None = full reversal, so set it explicitly
         self.pinned_steps = control.pinned_steps  # None = the executed prefix; the steering core checks it
         self.operator_dims = tuple(control.operator_dims)
+        self.gripper_reference = control.gripper_reference  # None = the model's last executed gripper command
         self.set_mode(control.mode)
 
     def refresh_translation_gain(self) -> str:
@@ -480,6 +492,7 @@ class Session:
                 n_reversal_steps=self.n_reversal_steps,
                 pinned_steps=cfg.n_action_steps if self.pinned_steps is None else self.pinned_steps,
                 operator_dims=list(self.operator_dims),
+                gripper_reference=self.gripper_reference,
             )
         if self._steering is None or fields != self._steering_fields:
             steering = SteeringPolicy(
@@ -602,6 +615,8 @@ class Session:
             )
             if action_hook is not None:
                 action_numpy = action_hook(action_numpy)
+            if self.operator is not None:
+                self.operator.observe(action_numpy[0])  # what the operator sees the robot do
 
             previous_observation = observation
             # Scene state *before* the step: the vector env auto-resets on termination, so the
@@ -664,10 +679,15 @@ class Session:
         return np.stack([a.to("cpu").numpy()[0] for a in steps])
 
     def _refresh_operator(self, observation, step: int = 0) -> None:
-        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator."""
+        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator. It may
+        let go unless it drives the robot alone (teleop, override): under a steering arm, or watching the policy
+        alone, the robot moves without it."""
         chunk = self.policy_chunk(observation, self.task_description)
         chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
-        self.operator.refresh(chunk * self.operator_std + self.operator_mean, step=step)  # env units
+        self.operator_chunk = chunk  # normalized: what the operator means, a calibration's label
+        self.operator.refresh(  # env units
+            chunk * self.operator_std + self.operator_mean, step=step, may_rest=self.mode not in DIRECT_MODES
+        )
 
     def close(self) -> None:
         close_envs(self.envs_dict)

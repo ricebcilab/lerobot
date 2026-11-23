@@ -197,6 +197,9 @@ class PolicyOperatorSettings:
 
     update_every_steps: int | None = None  # None = the executing policy's chunk interval
     delay_steps: int = 0
+    # The operator lets go (zero translation and rotation) until its next update when the robot's mean executed
+    # translation since its last update heads with its new intent at this cosine or more; None = always pushes.
+    let_go_cosine: float | None = None
 
     def __post_init__(self):
         if self.update_every_steps is not None and (
@@ -205,6 +208,10 @@ class PolicyOperatorSettings:
             raise ValueError("policy_operator.update_every_steps must be a positive integer or null")
         if type(self.delay_steps) is not int or self.delay_steps < 0:
             raise ValueError("policy_operator.delay_steps must be a non-negative integer")
+        if self.let_go_cosine is not None and not -1.0 <= float(self.let_go_cosine) <= 1.0:
+            raise ValueError(
+                f"policy_operator.let_go_cosine must be in [-1, 1] or null, got {self.let_go_cosine}"
+            )
 
 
 class PolicyOperator:
@@ -215,6 +222,12 @@ class PolicyOperator:
     command (close iff the mean is > 0), held until the next delivery. Update period and delay are in environment steps;
     the defaults are the immediate once-per-chunk oracle. It sits in front of the human sources
     (`TeleopChain.attach_operator`), so corruption, noise and recorders treat it like a person.
+
+    `observe(action)` shows it each executed action. With `let_go_cosine` set, an update whose new intent the
+    robot's mean executed translation since the last update already heads with at that cosine or more delivers a
+    rest instead (zero translation and rotation, the intent's gripper; `resting` True), unless the caller says it
+    may not rest (`refresh(..., may_rest=False)`: under teleop nothing else moves the robot). The readout still
+    serves its noise on a rest. `oracle_translation` stays the intent either way.
     """
 
     def __init__(self, n_action_steps: int, settings: PolicyOperatorSettings | None = None):
@@ -231,6 +244,9 @@ class PolicyOperator:
         self._rotation = np.zeros(3)
         self._gripper = GRIPPER_OPEN
         self.oracle_translation = np.zeros(3)
+        self.resting = False
+        self._executed = np.zeros(3)  # the executed translation summed since the last update
+        self._executed_steps = 0
         self._pending: deque = deque()
         self._generated_at: int | None = None
         self._step = 0
@@ -239,14 +255,32 @@ class PolicyOperator:
     def should_refresh(self, step: int) -> bool:
         return step % self.update_every_steps == 0
 
-    def refresh(self, chunk, step: int = 0) -> None:
-        """Compute intent from the observation at `step`; deliver it after the configured delay."""
+    def observe(self, action) -> None:
+        """One executed env action (its translation the first three dims): what the operator sees the robot do."""
+        self._executed += np.asarray(action, dtype=np.float64)[:3]
+        self._executed_steps += 1
+
+    def _on_course(self, intent: np.ndarray) -> bool:
+        """Whether the mean executed translation since the last update heads with `intent` at `let_go_cosine`."""
+        threshold = self.settings.let_go_cosine
+        if threshold is None or not self._executed_steps:
+            return False
+        moved = self._executed / self._executed_steps
+        norms = np.linalg.norm(moved) * np.linalg.norm(intent)
+        return bool(norms > 0 and moved @ intent / norms >= threshold)
+
+    def refresh(self, chunk, step: int = 0, may_rest: bool = True) -> None:
+        """Compute intent from the observation at `step`; deliver it, or a rest, after the configured delay."""
         chunk = np.asarray(chunk, dtype=np.float64)[: self.n_action_steps]
         translation = np.clip(chunk[:, :3].mean(axis=0), -1.0, 1.0)
         rotation = np.clip(chunk[:, 3:6].mean(axis=0), -1.0, 1.0)
         gripper = GRIPPER_CLOSE if chunk[:, GRIPPER_DIM].mean() > 0 else GRIPPER_OPEN
         self.oracle_translation = translation.copy()
-        self._pending.append((step + self.settings.delay_steps, step, translation, rotation, gripper))
+        rest = may_rest and self._on_course(translation)
+        self._executed, self._executed_steps = np.zeros(3), 0
+        if rest:
+            translation, rotation = np.zeros(3), np.zeros(3)
+        self._pending.append((step + self.settings.delay_steps, step, translation, rotation, gripper, rest))
         self.refreshes += 1
         self.advance(step)
 
@@ -254,7 +288,9 @@ class PolicyOperator:
         """Deliver the commands due by `step` and hold the latest; idle until the first one arrives."""
         self._step = step
         while self._pending and self._pending[0][0] <= step:
-            _, self._generated_at, self._translation, self._rotation, self._gripper = self._pending.popleft()
+            _, self._generated_at, self._translation, self._rotation, self._gripper, self.resting = (
+                self._pending.popleft()
+            )
 
     @property
     def command_age_steps(self) -> int:
@@ -338,10 +374,10 @@ class ReadoutReader:
     command plus N(0, `gripper_noise`^2) (the simulator reads only that sign); 0, the default, is off.
     Only teleop mode reads those two parts.
 
-    The matrix and the noise can change at any time and apply only while the source commands beyond
-    DEADBAND, so an idle source stays idle (noise is drawn only for a corrupted command that is itself
-    beyond it: the readout's `noise_gate="command"`). With a curl the field keeps evolving while the
-    push is idle (the cursor readout's rule), but an idle push is still served as is. The curl's clock
+    The matrix and the noise can change at any time. The matrix applies only while the source commands
+    beyond DEADBAND; the noise at every read, an idle source included (a decoder's noise does not know the
+    operator rests). With a curl the field keeps evolving while the push is idle (the cursor readout's
+    rule), and an idle push is served as is before the noise. The curl's clock
     is `advance(step)`, called once per environment step by the rollout; a read integrates the steps
     elapsed since the last read with the push held, so once-per-chunk reads (FC, FRS) and
     once-per-step reads (teleop) see the same dynamics. `reset()` starts the field from rest. `rng` is
@@ -362,7 +398,7 @@ class ReadoutReader:
         gripper_noise: float = 0.0,
     ):
         self.source = source
-        self._readout = readout.Readout(rng=rng, n_dims=3, noise_gate="command")
+        self._readout = readout.Readout(rng=rng, n_dims=3)
         self._clock = 0
         self._integrated = 0
         self._curl: Curl | None = None
@@ -385,7 +421,6 @@ class ReadoutReader:
             old.rng,
             curl=field,
             n_dims=3,
-            noise_gate="command",
             quantize=self._quantize,
         )
         self._curl = curl

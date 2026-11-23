@@ -80,6 +80,9 @@ class SteeringConfig(PreTrainedConfig):
             chunk.
         operator_dims: The action dim groups the operator commands (names of ``OPERATOR_DIM_GROUPS``; None: every
             dim, as on the cursor).
+        gripper_reference: FRS: the gripper value every reference holds, in environment units (Tang et al. on
+            LIBERO, App. D.2: 0, halfway between open and closed), or None: the model's last executed gripper
+            command. Only in the 7-D operator space (pi0.5's).
         adapter_matrix: The MARS adapter's fixed user matrix F (rows, ``n_dims`` x ``n_dims``; 7 x 7 in a LIBERO
             spec), or None. In the operator's (environment) units, normalized at use by the base's postprocessor's
             action statistics (``AdapterModules.normalized_matrix``; the cursor's uniform std leaves it as it is).
@@ -118,6 +121,7 @@ class SteeringConfig(PreTrainedConfig):
     pinned_steps: int | None = None
     deadband: float = readout.DEADBAND
     operator_dims: list[str] | None = None
+    gripper_reference: float | None = None
     adapter_matrix: list[list[float]] | None = None
     adapter_user: str | None = None
     adapter_task: str | None = None

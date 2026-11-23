@@ -7,6 +7,8 @@ from teleop import (
     GRIPPER_OPEN,
     CombinedReader,
     KeyboardReader,
+    PolicyOperator,
+    PolicyOperatorSettings,
     ReadoutReader,
     RecordingReader,
     TeleopChain,
@@ -90,16 +92,53 @@ def test_build_corruption_and_read_matrix_spec(tmp_path):
         build_corruption(read_matrix_spec(path))
 
 
-def test_noisy_reader_is_seeded_and_idle_stays_idle():
+def test_noisy_reader_is_seeded_and_noises_an_idle_push_too():
     source = Source((0.5, 0.5, 0.5))
     a = ReadoutReader(source, translation_noise=0.1, rng=np.random.default_rng(1)).translation
     b = ReadoutReader(source, translation_noise=0.1, rng=np.random.default_rng(1)).translation
     np.testing.assert_array_equal(a, b)
     assert not np.array_equal(a, source.translation)
-    source.translation = np.zeros(3)
-    np.testing.assert_array_equal(ReadoutReader(source, translation_noise=0.1).translation, 0)
+    source.translation = np.zeros(3)  # the operator rests: the readout still serves its noise
+    rest = ReadoutReader(source, translation_noise=0.1, rng=np.random.default_rng(1)).translation
+    np.testing.assert_allclose(rest, np.clip(0.1 * np.random.default_rng(1).normal(size=3), -1.0, 1.0))
     with pytest.raises(ValueError):
         ReadoutReader(source, translation_noise=-1)
+
+
+def test_the_operator_lets_go_while_the_robot_heads_where_it_means():
+    """With `let_go_cosine` the operator watches what the robot executed since its last update: heading with its
+    new intent at that cosine or more, it rests (zero translation and rotation) until the next update; off course
+    it pushes again; `may_rest=False` (teleop: nothing else moves the robot) and the default always push."""
+    op = PolicyOperator(10, PolicyOperatorSettings(let_go_cosine=0.5))
+    chunk = np.zeros((10, 7))
+    chunk[:, 0], chunk[:, 3] = 0.6, 0.1  # the intent: +x, with a little rotation
+    op.refresh(chunk, step=0)  # nothing executed yet: it pushes
+    np.testing.assert_allclose(op.translation, [0.6, 0.0, 0.0])
+    assert not op.resting
+
+    def execute(direction):
+        for _ in range(10):
+            op.observe(np.array([*direction, 0.0, 0.0, 0.0, -1.0]))
+
+    execute([0.5, 0.2, 0.0])  # on course (cosine 0.93)
+    op.refresh(chunk, step=10)
+    np.testing.assert_array_equal(op.translation, 0.0)
+    np.testing.assert_array_equal(op.rotation, 0.0)
+    np.testing.assert_allclose(op.oracle_translation, [0.6, 0.0, 0.0])  # the intent is still what it means
+    assert op.resting
+    execute([0.1, 0.5, 0.0])  # off course (cosine 0.20)
+    op.refresh(chunk, step=20)
+    np.testing.assert_allclose(op.translation, [0.6, 0.0, 0.0])
+    assert not op.resting
+    execute([0.5, 0.0, 0.0])
+    op.refresh(chunk, step=30, may_rest=False)
+    np.testing.assert_allclose(op.translation, [0.6, 0.0, 0.0])
+    default = PolicyOperator(10)
+    default.observe(np.array([0.5, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]))
+    default.refresh(chunk, step=10)
+    np.testing.assert_allclose(default.translation, [0.6, 0.0, 0.0])
+    with pytest.raises(ValueError, match="let_go_cosine"):
+        PolicyOperatorSettings(let_go_cosine=1.5)
 
 
 def test_recording_reader_counts_reads():

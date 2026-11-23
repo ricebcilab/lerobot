@@ -24,7 +24,7 @@ control:
   speed_gain: 0.5             # scales the cursor's speed in every mode (1 = the demos' speed)
   gain_mode: step             # how: step scales every executed step (the study); time plays each planned step over
                               #   1/gain control steps, the motion the policy was trained on (the obstacle grid)
-  input_noise: 0.0            # std of Gaussian noise added to the x/y command while pushing
+  input_noise: 0.0            # std of Gaussian noise added to the x/y command at every step, the user resting or not
   corruption: null            # what the controller gets = M @ what was pushed, e.g. {scale: [1.0, 0.5]}
   reversal_adapter: null      # mars: the reversal follows F @ v, e.g. {translation: corruption} or {learned: <name>}
 

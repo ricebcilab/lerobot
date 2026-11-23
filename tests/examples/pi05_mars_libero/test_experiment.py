@@ -213,6 +213,61 @@ def test_rollout_keeps_preview_state_and_separates_operator_policy_randomness(
     assert not np.array_equal(a[0], a[chunk_steps])  # consecutive chunks receive different draws
 
 
+@pytest.mark.parametrize(
+    "mode,rests", [("shared_flow_reversal_steering", True), ("policy", True), ("teleop", False)]
+)
+def test_the_operator_lets_go_unless_it_drives_the_robot_alone(monkeypatch, mode, rests):
+    """The rollout shows the let-go operator every executed action: under a steering arm, or watching the policy
+    alone (a calibration), it rests for the next chunk once the robot heads where it means; under teleop nothing
+    else moves the robot, so it keeps pushing."""
+    import session as session_module
+    from config import SessionSettings
+
+    preview = {"pixels": {"image": np.zeros((1, 2, 2, 3), dtype=np.uint8)}}
+    monkeypatch.setattr(session_module, "preprocess_observation", lambda obs: dict(obs))
+    session = Session.__new__(Session)
+    session.settings = SessionSettings(n_action_steps=2, operator="policy")
+    session.mode = mode
+    session.operator = PolicyOperator(2, PolicyOperatorSettings(let_go_cosine=0.5))
+    session.chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
+    session.view = SimpleNamespace(
+        stream=SimpleNamespace(publish=lambda frame: None, set_status=lambda **kwargs: None)
+    )
+    session.vec_env = SimpleNamespace(
+        step=lambda action: (preview, np.array([0.0]), np.array([False]), np.array([False]), {})
+    )
+    plan = torch.zeros(1, 2, 7)
+    plan[..., 0] = 0.6  # the operator means +x
+    monkeypatch.setattr(Session, "task_description", property(lambda self: "the task"))
+    session.operator_mean, session.operator_std = np.zeros(7), np.ones(7)
+    session.policy_chunk = lambda observation, prompt: plan
+    session.chunk_command = lambda: None
+    session.mode_label = lambda: "test"
+    session.metrics = lambda: {}
+    session.autocast_ctx = session_module.nullcontext()
+    delivered = []
+
+    def select_action(obs):
+        delivered.append(session.operator.translation)
+        return torch.tensor([[0.5, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]])  # the robot heads +x
+
+    identity = lambda value: value  # noqa: E731
+    session._rollout_kwargs = lambda: {
+        "policy": SimpleNamespace(reset=lambda: None, select_action=select_action),
+        "action_hook": None,
+        "preprocessor": identity,
+        "postprocessor": identity,
+        "env_preprocessor": identity,
+        "env_postprocessor": identity,
+    }
+    session.rollout("do something", initial_observation=preview, max_steps=4)
+    np.testing.assert_allclose(delivered[:2], [[0.6, 0.0, 0.0]] * 2)  # nothing executed yet: it pushes
+    np.testing.assert_allclose(delivered[2:], [[0.0 if rests else 0.6, 0.0, 0.0]] * 2)
+    np.testing.assert_allclose(
+        session.operator_chunk, plan[0].numpy()
+    )  # the chunk it meant, kept for calibration
+
+
 def test_prompt_for():
     assert prompt_for("do something", "pick up the bowl") == "do something"
     assert prompt_for("task", "pick up the bowl") == "pick up the bowl"
@@ -387,6 +442,11 @@ def test_the_shared_modes_run_lerobots_steering_policy(tmp_path):
     assert (core.n_reversal_steps, core.pinned_steps) == (None, 25)
     session.apply_control(control)
     assert session.steering_policy().config.pinned_steps == 10
+    # the gripper value FRS's reference holds (default: the model's last executed command)
+    halfway = _settings(tmp_path, "mode: shared_flow_reversal_steering, gripper_reference: 0").session.control
+    session.apply_control(halfway)
+    assert session.steering_policy().core.gripper_reference == 0 and frs.core.gripper_reference is None
+    session.apply_control(control)
 
     keyboard.update({"ArrowRight"}, toggles=0)
     reads = session.chain.served.reads

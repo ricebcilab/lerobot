@@ -17,7 +17,8 @@
 controller, shared by the robot (pi0.5 / LIBERO) and the cursor shared-autonomy examples.
 
 A command is a deflection in [-1, 1] per axis; inside ``DEADBAND`` (max |component|) the operator counts as idle,
-and idle input stays exactly idle at every stage. The stages, in order:
+and the corruption stages leave idle input idle. The noise does not: a decoder's noise does not know the operator
+rests, so it is added at every read, an idle push included. The stages, in order:
 
 - a matrix corruption: ``clip(M @ raw)``;
 - or a curl field on the command: the served command is a velocity v driven by the push u through
@@ -25,15 +26,13 @@ and idle input stays exactly idle at every stage. The stages, in order:
   lag), stepped exactly over each control step (``curl_discretization``, ``curl_step``), then clipped;
 - or a discrete input (``quantize``): the command snapped to the axis of its largest component at its own length,
   so only its direction is lost: the nearest of the 2n key directions;
-- Gaussian noise of std sigma per axis, clipped (``add_noise``).
+- Gaussian noise of std sigma per axis, clipped (``add_noise``), at every read.
 
 The functions are numpy and batched over leading axes: a command is (..., n), a matrix (n, n) or one per row
 (..., n, n), sigma a scalar or one per row. ``Readout`` is the stateful readout both examples run, built on them
 (numpy, closed loop, a curl velocity per trial; ``n_dims`` 2 on the cursor, 3 for the robot's translation), with the
 same rule over a whole sequence from rest (``Readout.core``) and its torch forms for training (``Readout.chunk``,
-``Readout.serve``). The examples differ in one rule, when the noise applies (``noise_gate``): the cursor's while
-the operator pushes, with a draw on every step; the robot's while the corrupted command is itself outside the
-deadband, with a draw only then.
+``Readout.serve``). Both examples share the noise rule: a draw per read and axis while the noise is on.
 
 The specs that configure a readout are parsed here too, for any number of dims: ``matrix_spec`` builds every matrix
 of a config (a corruption M, and the fixed adapter F's blocks that ``SteeringConfig.build_adapter`` reads),
@@ -123,17 +122,14 @@ def quantize(raw, deadband: float = DEADBAND) -> np.ndarray:
     return np.where(is_active(raw, deadband)[..., None], snapped, raw)
 
 
-def add_noise(core, raw, sigma, noise, deadband: float = DEADBAND) -> np.ndarray:
-    """The readout's last stage: ``core`` (..., n) (the corrupted command) plus ``sigma`` times the standard normal
-    draws ``noise`` (..., n) per axis, clipped, where the raw push is active; the raw push elsewhere. ``sigma`` a
-    scalar or one per row (...,). The caller draws ``noise``, so each keeps its own random stream (the robot draws
-    only while the operator pushes, the cursor on every step)."""
-    core, raw = np.asarray(core, dtype=np.float64), np.asarray(raw, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-    noisy = np.clip(
+def add_noise(core, sigma, noise) -> np.ndarray:
+    """The readout's last stage: ``core`` (..., n) (the corrupted command, idle or not) plus ``sigma`` times the
+    standard normal draws ``noise`` (..., n) per axis, clipped. ``sigma`` a scalar or one per row (...,). The caller
+    draws ``noise``, so each keeps its own random stream."""
+    core, sigma = np.asarray(core, dtype=np.float64), np.asarray(sigma, dtype=np.float64)
+    return np.clip(
         core + np.asarray(noise, dtype=np.float64) * (sigma[..., None] if sigma.ndim else sigma), -1.0, 1.0
     )
-    return np.where(is_active(raw, deadband)[..., None], noisy, raw)
 
 
 # ---------------------------------------------------------------- the specs: matrices and corruptions
@@ -220,14 +216,12 @@ def quantize_spec(spec: Any, where: str = "control.corruption") -> bool:
     return True
 
 
-NOISE_GATES = ("push", "command")  # when a readout's noise applies; see ``Readout``
-
-
 class Readout:
     """What happens to a command between the operator and the controller:
     raw -> M @ raw (corruption, clipped to [-1, 1]) -> + N(0, input_noise^2) per
-    axis (clipped again). Both apply only while the operator is commanding
-    (outside DEADBAND), so idle input stays exactly idle.
+    axis (clipped again). The corruption applies only while the operator is
+    commanding (outside DEADBAND); the noise at every read, so a resting
+    operator's command is the noise itself.
 
     With `curl` ({curl, tau[, dt]}) the corruption is a curl field instead of M: the
     readout keeps a velocity per trial, driven by every raw push (idle ones too)
@@ -247,13 +241,8 @@ class Readout:
 
     A call is `step(raw)` (the curl's velocity advances one control step) then
     `read(raw)` (what is served for that push); a controller that reads less often
-    than it steps (the robot's, once per chunk) calls them apart.
-
-    `noise_gate` says when the noise applies. "push" (the cursor's): wherever the
-    raw push is outside the deadband, with a draw for every step and axis while
-    the noise is on, active or not. "command" (the robot's): wherever the
-    corrupted command is itself outside the deadband, and nothing is drawn in a
-    read where no row's is.
+    than it steps (the robot's, once per chunk) calls them apart. A read draws
+    one normal per row and axis while the noise is on.
     """
 
     def __init__(
@@ -264,7 +253,6 @@ class Readout:
         curl=None,
         dt=0.02,
         n_dims=2,
-        noise_gate="push",
         quantize=False,
     ):
         self.corruption, self.input_noise = corruption, np.asarray(input_noise, dtype=float)
@@ -275,9 +263,6 @@ class Readout:
         self.curl, self.vel = curl, None
         self.dt = dt if curl is None else curl.get("dt", dt)
         self.n_dims = n_dims
-        if noise_gate not in NOISE_GATES:
-            raise ValueError(f"noise_gate must be one of {NOISE_GATES}, got {noise_gate!r}")
-        self.noise_gate = noise_gate
         if curl is not None:
             if corruption is not None:
                 raise ValueError("a readout has a matrix corruption or a curl, not both")
@@ -316,18 +301,12 @@ class Readout:
             out = raw.copy()
         if not np.any(self.input_noise):
             return out
-        if self.noise_gate == "command":  # the robot's: only a command that is itself active is noised
-            if not np.any(is_active(out)):
-                return out
-            gate = out
-        else:  # the cursor's: a draw per step and axis while the noise is on, active or not
-            gate = raw
         sigma = (
             self.input_noise.reshape(self.input_noise.shape + extra)
             if self.input_noise.ndim
             else self.input_noise
         )
-        return add_noise(out, gate, sigma, self.rng.normal(size=out.shape))
+        return add_noise(out, sigma, self.rng.normal(size=out.shape))
 
     def __call__(self, raw):
         self.step(raw)
@@ -359,26 +338,23 @@ class Readout:
     def chunk(self, command, sigma):
         """The readout in torch, for training: deflection chunks `command` [B, H, n] and a noise std per trial
         `sigma` [B]; the corruption (one n x n matrix or None) as a tensor on the command's device. The same rule,
-        step by step: M @ raw, clip, + noise, clip, only where the step is active. A curl keeps a velocity over
-        steps, so it takes no chunks."""
+        step by step: M @ raw where the step is active, clip, + noise at every step, clip. A curl keeps a velocity
+        over steps, so it takes no chunks."""
         if self.curl is not None:
             raise ValueError("a curl readout takes one command per trial and step, not a chunk")
         if self.quantize:
             raise ValueError("a quantize readout has no torch form: serve its numpy core")
-        if self.corruption is None:
-            out = command
-        else:
+        out = command
+        if self.corruption is not None:
             m = torch.as_tensor(self.corruption, dtype=command.dtype, device=command.device)
-            out = torch.clamp(command @ m.T, -1.0, 1.0)
-        out = torch.clamp(out + sigma[:, None, None] * torch.randn_like(out), -1.0, 1.0)
-        active = command.abs().amax(-1, keepdim=True) >= DEADBAND
-        return torch.where(active, out, command)
+            active = command.abs().amax(-1, keepdim=True) >= DEADBAND
+            out = torch.where(active, torch.clamp(command @ m.T, -1.0, 1.0), command)
+        return torch.clamp(out + sigma[:, None, None] * torch.randn_like(out), -1.0, 1.0)
 
     @staticmethod
-    def serve(core, raw, sigma, noise=None):
+    def serve(core, sigma, noise=None):
         """The readout's last stage in torch, for training: `core` [B, n] (M @ raw clipped, or a curl's
-        velocity) plus noise of std `sigma` [B], clipped, only where the raw push [B, n] is active.
-        `noise` [B, n]: the standard normal draws to scale by sigma (default: fresh ones)."""
+        velocity; idle or not) plus noise of std `sigma` [B], clipped. `noise` [B, n]: the standard normal draws
+        to scale by sigma (default: fresh ones)."""
         noise = torch.randn_like(core) if noise is None else noise
-        out = torch.clamp(core + sigma[:, None] * noise, -1.0, 1.0)
-        return torch.where(raw.abs().amax(-1, keepdim=True) >= DEADBAND, out, raw)
+        return torch.clamp(core + sigma[:, None] * noise, -1.0, 1.0)
