@@ -43,7 +43,7 @@ import numpy as np
 import yaml
 from actions import clamp_joint_velocity, command_from_qdot, ticks_per_action
 from arms import _with_fixed_adapter
-from batches import CameraMap, camera_map, observation_batch, unnormalized
+from batches import CameraMap, camera_map, observation_batch, to_action
 from config import MODE_MAP, ExperimentConfig
 from interfaces import (
     ACTION_DIMS,
@@ -426,11 +426,9 @@ def run_trial(
                 with torch.inference_mode():
                     action = wired.policy.select_action(batch)
                     proposed = wired.policy.last_policy_action
-                action8 = clamp_action(unnormalized(wired.postprocessor, action), q, arm, dt)
+                action8 = clamp_action(to_action(wired.postprocessor, action), q, arm, dt)
                 plan = (
-                    np.full(3, np.nan)
-                    if proposed is None
-                    else unnormalized(wired.postprocessor, proposed)[:3]
+                    np.full(3, np.nan) if proposed is None else to_action(wired.postprocessor, proposed)[:3]
                 )
             reads = 1
             served_from_chunk += 1

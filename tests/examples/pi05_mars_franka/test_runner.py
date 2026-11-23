@@ -514,3 +514,22 @@ def test_a_gated_tokenizer_becomes_two_lines_and_a_real_error_does_not():
     other = ValueError("normalizer stats do not match the action width")
     text = str(explain_pipeline_failure(other, "lerobot/pi05_droid").code)
     assert "could not be built" in text and "hf auth login" not in text
+
+
+class _OffsetPostprocessor:
+    """A postprocessor that returns whatever width its stats imply: 32 for the DROID checkpoint."""
+
+    def __init__(self, width):
+        self.width = width
+
+    def __call__(self, value):
+        return np.full((1, self.width), 0.25, dtype=np.float32)
+
+
+def test_the_policy_action_is_cut_to_the_arms_width():
+    """The checkpoint's action is 32 wide; the arm executes eight. Its padding unnormalizes to zero."""
+    from batches import to_action
+
+    assert to_action(_OffsetPostprocessor(32), np.zeros((1, 32))).shape == (8,)
+    with pytest.raises(ValueError, match="fewer than the 8"):
+        to_action(_OffsetPostprocessor(7), np.zeros((1, 7)))

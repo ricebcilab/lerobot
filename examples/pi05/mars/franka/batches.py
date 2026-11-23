@@ -24,12 +24,13 @@ from typing import Any
 
 import numpy as np
 from config import ExperimentConfig
-from interfaces import StationManifest
+from interfaces import ACTION_DIMS, StationManifest
 from station import IMAGE_SIZE, resize_with_pad, state_from_obs
 
 __all__ = [
     "CameraMap",
     "camera_map",
+    "to_action",
     "observation_batch",
     "pad_state",
     "suggested_cameras",
@@ -174,6 +175,21 @@ def observation_batch(
         batch[key] = image
     batch["task"] = prompt
     return batch
+
+
+def to_action(postprocessor, value, *, dims: int = ACTION_DIMS) -> np.ndarray:
+    """A policy action as the ``(dims,)`` the arm can execute: unnormalized, then the checkpoint's padding cut.
+
+    The DROID checkpoint's action feature is 32 wide (its statistics are too), while the arm has eight numbers'
+    worth of action. The padding dims' statistics are zero, so unnormalizing them yields zero and dropping them
+    loses nothing; keeping them would be a 32-long "action" that the clamps refuse.
+    """
+    action = unnormalized(postprocessor, value)
+    if action.shape[0] < dims:
+        raise ValueError(
+            f"the checkpoint produced {action.shape[0]} action dims, fewer than the {dims} this arm executes"
+        )
+    return action[:dims]
 
 
 def unnormalized(postprocessor, value) -> np.ndarray:
