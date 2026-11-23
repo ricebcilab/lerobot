@@ -134,11 +134,16 @@ def _action_stats(config):
     return _safetensors_stats(folder)
 
 
-def format_checkpoint(config) -> str:
-    """A DECISION.md block for a loaded policy config: the action and the observation keys, no weights."""
+def format_checkpoint(config, stats_path: Path | None = None) -> str:
+    """A DECISION.md block for a loaded policy config: the action and the observation keys, no weights.
+
+    The widths come from the checkpoint's own postprocessor, which for the published DROID port is absent: the
+    file the runner installs instead is `stats_path`, so its presence and the action width it describes are
+    reported on their own line rather than as a bare "unavailable".
+    """
     stats = _action_stats(config)
     shape = _action_shape(config)
-    widths = "unavailable: no action mean/std" if stats is None else f"{stats[0]} / {stats[1]}"
+    widths = "unavailable: the checkpoint ships none" if stats is None else f"{stats[0]} / {stats[1]}"
     lines = [
         "checkpoint:",
         f"  path: {_display(getattr(config, 'pretrained_path', None))}",
@@ -152,7 +157,25 @@ def format_checkpoint(config) -> str:
         f"  action shape: {shape or 'unavailable'}",
         f"  action mean/std widths: {widths}",
     ]
+    if stats_path is not None:
+        lines.append(f"  statistics: {_format_stats_file(stats_path)}")
     return "\n".join(lines)
+
+
+def _format_stats_file(path: Path) -> str:
+    """What `--stats` names: present with the width it describes, or why it is missing."""
+    if not path.exists():
+        return (
+            f"[--stats {path} absent: download it from "
+            "https://storage.googleapis.com/openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json]"
+        )
+    try:
+        import stats as checkpoint_stats
+
+        found = checkpoint_stats.read_openpi_stats(path)
+    except Exception as error:  # the probe reports, it does not die on the other half's input
+        return f"[--stats {path} unreadable: {error}]"
+    return f"[--stats {path}: action width {checkpoint_stats.real_width(found)}]"
 
 
 def format_manifest(manifest: StationManifest) -> str:
@@ -198,10 +221,10 @@ def _load_config(policy: Path):
     return config
 
 
-def _checkpoint_block(policy: Path) -> str:
+def _checkpoint_block(policy: Path, stats_path: Path) -> str:
     """The checkpoint half, reporting a failure as its own line rather than ending the probe."""
     try:
-        return format_checkpoint(_load_config(policy))
+        return format_checkpoint(_load_config(policy), stats_path)
     except Exception as e:
         return f"checkpoint: unavailable: {e}"
 
@@ -242,7 +265,13 @@ def _station_block(host: str, port: int) -> str:
     robot = None
     try:
         robot = Robot(host=host, port=port)
-        lines = [f"station: ws://{host}:{port}", format_manifest(_manifest(robot)), _read_only_step(robot)]
+        manifest = _manifest(robot)
+        lines = [
+            f"station: ws://{host}:{port}",
+            format_manifest(manifest),
+            f"suggested cameras: {_suggested_cameras(manifest)}",
+            _read_only_step(robot),
+        ]
         return "\n".join(lines)
     except Exception as e:
         return f"station: unavailable: {e}"
@@ -250,6 +279,17 @@ def _station_block(host: str, port: int) -> str:
         if robot is not None:
             with contextlib.suppress(Exception):
                 robot.close()
+
+
+def _suggested_cameras(manifest: StationManifest) -> str:
+    """The `cameras:` line a condition file should carry, from the feeds' names, or why it cannot be guessed."""
+    try:
+        import batches
+
+        roles = batches.suggested_cameras(manifest)
+    except Exception as error:
+        return f"unavailable: {error}"
+    return f"{{exterior: {roles['exterior']}, wrist: {roles['wrist']}}}"
 
 
 def _spacemouse_block() -> str:
@@ -266,14 +306,19 @@ def main(argv=None) -> int:
     """Print the one block; nothing else, so the output can be pasted into DECISION.md."""
     args = _parse_args(argv)
     worktree = _use_worktree(args.worktree)
+    stats_path = Path(args.stats) if args.stats is not None else DEFAULT_STATS
     blocks = [
         f"worktree: {worktree}",
-        _checkpoint_block(args.policy),
+        _checkpoint_block(args.policy, stats_path),
         _station_block(args.station, args.port),
         _spacemouse_block(),
     ]
     print("\n".join(blocks))
     return 0
+
+
+DEFAULT_STATS = Path(__file__).resolve().parent / "assets" / "droid" / "norm_stats.json"
+"""Where the runner looks for the statistics the checkpoint does not ship (see `assets/README.md`)."""
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -283,6 +328,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--policy", required=True, type=Path, help="checkpoint folder (weights are not read)")
     parser.add_argument("--station", default="10.42.0.1", help="c3po station host")
     parser.add_argument("--port", default=9090, type=int, help="c3po WebSocket port")
+    parser.add_argument(
+        "--stats", default=None, help=f"openpi's norm_stats.json (default: {DEFAULT_STATS})"
+    )
     default_worktree = Path(__file__).resolve().parents[4]
     parser.add_argument(
         "--worktree",
