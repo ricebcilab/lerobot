@@ -378,7 +378,9 @@ def run_trial(
     success = False
     aborted = False
     served_from_chunk = 0
-    chunk_done = False  # the next action would compute a chunk: brake first (see below)
+    chunk_done = False
+    have_chunk = False  # whether the policy still holds queued actions for this chunk
+    stale: dict = {}  # the next action would compute a chunk: brake first (see below)
 
     for tick in range(max_steps):
         chain.advance()
@@ -419,12 +421,16 @@ def run_trial(
                 )
                 plan = np.full(3, np.nan)
             else:
-                batch = wired.preprocessor(
-                    observation_batch(obs, arm_name, wired.cameras, prompt, wired.state_dim)
-                )
-                batch["command"] = torch.as_tensor(command, dtype=torch.float32)
+                # The preprocessor is the expensive part of a tick (two images to the device, a tokenizer);
+                # `select_action` only reads its batch when its queue is empty, so a mid-chunk tick reuses it.
+                if not have_chunk:
+                    stale = wired.preprocessor(
+                        observation_batch(obs, arm_name, wired.cameras, prompt, wired.state_dim)
+                    )
+                    stale["command"] = torch.as_tensor(command, dtype=torch.float32)
+                    have_chunk = True
                 with torch.inference_mode():
-                    action = wired.policy.select_action(batch)
+                    action = wired.policy.select_action(stale)
                     proposed = wired.policy.last_policy_action
                 action8 = clamp_action(to_action(wired.postprocessor, action), q, arm, dt)
                 plan = (
@@ -434,6 +440,7 @@ def run_trial(
             served_from_chunk += 1
             if wired.policy is not None and served_from_chunk >= n_actions:
                 chunk_done = True
+                have_chunk = False  # the queue is empty: the next action computes a chunk
         else:
             reads = 0
 

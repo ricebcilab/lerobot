@@ -533,3 +533,33 @@ def test_the_policy_action_is_cut_to_the_arms_width():
     assert to_action(_OffsetPostprocessor(32), np.zeros((1, 32))).shape == (8,)
     with pytest.raises(ValueError, match="fewer than the 8"):
         to_action(_OffsetPostprocessor(7), np.zeros((1, 7)))
+
+
+def test_the_preprocessor_runs_once_per_chunk_not_once_per_tick(tmp_path):
+    """The tokenizer and two image copies are the expensive part of a tick; mid-chunk ticks reuse the batch."""
+    calls = {"n": 0}
+
+    def counting_preprocessor(batch):
+        calls["n"] += 1
+        return batch
+
+    config = ExperimentConfig(
+        steering=SteeringSettings(mode="frs"),
+        policy=PolicySettings(n_action_steps=2),
+        trial=TrialSettings(trials=1, max_steps=8),
+    )
+    station = FakeStation([observation(DROID_RESET_Q)], control_rate=15.0)
+    policy = FakePolicy()
+    jacobian = LinearJacobian(np.eye(6, 7))
+    wired = build(
+        config,
+        stats_path=None,
+        station_factory=lambda cfg: station,
+        policy_factory=lambda cfg, path, names: PolicyBundle(
+            policy, counting_preprocessor, FakePostprocessor()
+        ),
+        jacobian_factory=lambda: jacobian,
+        now=NOW,
+    )
+    _run(wired, tmp_path, max_steps=8)
+    assert calls["n"] == 3  # chunks at ticks 0, 3 and 6; the ticks between reuse the batch
