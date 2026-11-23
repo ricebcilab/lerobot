@@ -6,6 +6,7 @@ idle, and the gripper toggles once per press.
 """
 
 import json
+import struct
 from types import SimpleNamespace
 
 import numpy as np
@@ -215,3 +216,21 @@ def test_the_node_can_be_pinned_for_a_device_with_several_interfaces(monkeypatch
     chain = readout_chain.build_chain({"corruption": None, "input_noise": 0.0}, headless=False)
     assert chain.describe() == f"SpaceMouse {node}"
     assert SpaceMouseReader is not None  # the real class is what the fake replaces
+
+
+def test_the_live_stick_read_decodes_a_translation_report(tmp_path, monkeypatch, capsys):
+    """A node that speaks must reach the printed line: the import that decodes it is as load-bearing as the read."""
+    import lerobot.teleoperators.spacemouse as spacemouse_package
+    import lerobot.teleoperators.spacemouse.teleop_spacemouse as spacemouse_module
+    import probe
+
+    node = tmp_path / "hidraw7"
+    node.write_bytes(b"\x01" + struct.pack("<hhh", 120, -60, 0))
+    # the probe imports the finder from the package and the scale from the module, so both are patched
+    monkeypatch.setattr(spacemouse_package, "find_spacemice", lambda: [str(node)])
+    monkeypatch.setattr(spacemouse_module, "env_full_scale", lambda: 350.0)
+
+    summary = probe._stick_block(0.6)
+    printed = capsys.readouterr().out
+    assert "raw (+120, -60, +0)" in printed
+    assert "raw (+120, -60, +0)" in summary

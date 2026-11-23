@@ -306,7 +306,7 @@ def _stick_block(seconds: float) -> str:
     import struct
 
     from lerobot.teleoperators.spacemouse import find_spacemice
-    from lerobot.teleoperators.spacemouse.teleop_spacemouse import env_full_scale
+    from lerobot.teleoperators.spacemouse.teleop_spacemouse import REPORT_TRANSLATION, env_full_scale
 
     nodes = find_spacemice()
     if not nodes:
