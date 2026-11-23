@@ -86,8 +86,14 @@ runner reads the stick once per action, holds that action for `ceil(control_rate
 records every station tick.
 
 An action is the policy's own chunk step: seven joint velocities and a gripper position. The station
-integrates the velocities, so the runner sends one action per action and holds it, rather than sending
-position targets. The gripper is the policy's; the operator's button only drives `teleop`.
+integrates the velocities, so the runner sends one action per action and repeats it for
+`ceil(control_rate / 15)` station ticks, rather than sending position targets. The gripper is the policy's; the
+operator's button only drives `teleop`.
+
+A station that runs at the checkpoint's own rate (15 Hz) runs one action per tick, and the station keeps
+applying the last velocity while the policy computes the next chunk. A 300 ms pause at 0.5 rad/s would drift
+the arm 0.15 rad, so the runner sends one tick of zero velocity before every replan: the arm holds its
+position through the pause instead of continuing. It costs one tick per chunk.
 
 Success is labelled on the keyboard (`n`) at the moment it happens; `q` abandons a trial. Both are recorded, so
 a session can be re-read without trusting a video.

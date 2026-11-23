@@ -65,7 +65,7 @@ ACTION_RATE = 15.0
 RESET_TOLERANCE_RAD = 0.05
 """How far a reset may sit from the configured start pose before a trial refuses to begin."""
 
-FAKE_CONTROL_RATE = 10.0
+FAKE_CONTROL_RATE = ACTION_RATE
 """The fake station's tick rate: ten actions a second, so a dry run's first ten lines are ten actions."""
 
 
@@ -274,6 +274,7 @@ def run_trial(
     seed: int = 0,
     run_dir: Path | None = None,
     stop_reader: Any = None,
+    brake: bool = True,
 ) -> TrialResult:
     """One trial: reset, check the pose, then one action held over the station's ticks.
 
@@ -298,6 +299,7 @@ def run_trial(
         wired.policy.reset()
     chain.reset()
     ticks = ticks_per_action(wired.manifest.control_rate, ACTION_RATE)
+    n_actions = int(config.policy.n_action_steps or 15)
     dt = 1.0 / wired.manifest.control_rate
     recorder = TrialRecorder()
     served = raw = np.zeros(3)
@@ -306,6 +308,8 @@ def run_trial(
     gripper = 0.0
     success = False
     aborted = False
+    served_from_chunk = 0
+    chunk_done = False  # the next action would compute a chunk: brake first (see below)
 
     for tick in range(max_steps):
         chain.advance()
@@ -319,6 +323,22 @@ def run_trial(
                 break
 
         if action8 is None or tick % ticks == 0:
+            if brake and chunk_done:
+                # The station holds the last velocity while the policy computes, so at 15 Hz a 300 ms chunk
+                # pause drifts the arm 0.15 rad. One tick of zero velocity before each replan turns that
+                # drift into a hold; it costs one tick per chunk and nothing else.
+                chunk_done = False
+                served_from_chunk = 0  # the next compute starts a new chunk
+                served = np.asarray(chain.translation, dtype=np.float64).reshape(-1)
+                brake_action = clamp_action(
+                    np.concatenate([np.zeros(ARM_DIMS), [gripper]]), q, arm, dt
+                )
+                recorder.add(
+                    q=q, action=brake_action, plan=plan, served=served, raw=raw, gripper=gripper, reads=0
+                )
+                obs = station.step(action_dict(brake_action, arm_name))
+                q = np.asarray(obs[f"{arm_name}/joint_position"], dtype=np.float64)
+                continue
             served = np.asarray(chain.translation, dtype=np.float64).reshape(-1)
             raw = np.asarray(getattr(chain, "_raw", served), dtype=np.float64).reshape(-1)
             gripper = chain.grip()
@@ -344,6 +364,9 @@ def run_trial(
                     else unnormalized(wired.postprocessor, proposed)[:3]
                 )
             reads = 1
+            served_from_chunk += 1
+            if wired.policy is not None and served_from_chunk >= n_actions:
+                chunk_done = True
         else:
             reads = 0
 
