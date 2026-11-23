@@ -184,6 +184,35 @@ def build(
     )
 
 
+PALIGEMMA_TOKENIZER = "google/paligemma-3b-pt-224"
+"""The tokenizer a pi05 preprocessor instantiates, and a gated Google repository.
+
+The checkpoint ships no tokenizer: `policy_preprocessor.json` names this one and `TokenizerProcessorStep` loads
+it. Without an accepted licence and a token on the machine, the load fails with a `GatedRepoError` wrapped in a
+hundred lines of transformers traceback, so it is turned into two lines here.
+"""
+
+
+def explain_pipeline_failure(error: Exception, policy_path: str) -> SystemExit:
+    """The runner's exit for a pipeline that could not be built, naming the one thing to fix when it is access.
+
+    Only the gated case is special: everything else keeps its own message, so a real bug is not hidden behind a
+    licence hint.
+    """
+    text = f"{type(error).__name__}: {error}"
+    if "gated" not in text.lower():
+        return SystemExit(f"the policy's processors could not be built from {policy_path}: {text}")
+    return SystemExit(
+        f"the pi0.5 preprocessor needs the gated tokenizer {PALIGEMMA_TOKENIZER}, "
+        "which this machine cannot read.\n"
+        f"  1. accept the licence at https://huggingface.co/{PALIGEMMA_TOKENIZER} "
+        "with the account this machine uses\n"
+        "  2. log that machine in: `hf auth login` (or export HF_TOKEN=...), then run the same command again\n"
+        "  offline instead: copy ~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224 from a machine "
+        "that has it, and set HF_HOME to the cache's parent"
+    )
+
+
 def build_policy(
     config: ExperimentConfig, stats_path: str | Path | None, rename_map: dict[str, str]
 ) -> PolicyBundle:
@@ -212,12 +241,15 @@ def build_policy(
             "(seven joint velocities and a gripper position); it is not this checkpoint's statistics"
         )
     pre_overrides, post_overrides = checkpoint_stats.overrides(statistics, rename_map)
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=base.config,
-        pretrained_path=config.policy.path,
-        preprocessor_overrides=pre_overrides,
-        postprocessor_overrides=post_overrides,
-    )
+    try:
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=base.config,
+            pretrained_path=config.policy.path,
+            preprocessor_overrides=pre_overrides,
+            postprocessor_overrides=post_overrides,
+        )
+    except Exception as error:  # the pipelines need assets the checkpoint does not carry
+        raise explain_pipeline_failure(error, config.policy.path) from error
     policy = SteeringPolicy(
         SteeringConfig(**config.steering_config()),
         base_policy=base,

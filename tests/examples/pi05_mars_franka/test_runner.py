@@ -500,3 +500,17 @@ def test_the_state_is_padded_to_the_checkpoints_width():
     np.testing.assert_allclose(pad_state(np.ones(8)), np.r_[np.ones(8), np.zeros(24)])
     with pytest.raises(ValueError, match="more than the checkpoint's 32"):
         pad_state(np.ones(33))
+
+
+def test_a_gated_tokenizer_becomes_two_lines_and_a_real_error_does_not():
+    """The pi0.5 processor loads a gated Google tokenizer; a hundred lines of traceback hides the one fix."""
+    from runner import explain_pipeline_failure
+
+    gated = OSError("You are trying to access a gated repo. 403 Client Error. (Request ID: x)")
+    exit_ = explain_pipeline_failure(gated, "lerobot/pi05_droid")
+    text = str(exit_.code)
+    assert "hf auth login" in text and "google/paligemma-3b-pt-224" in text
+
+    other = ValueError("normalizer stats do not match the action width")
+    text = str(explain_pipeline_failure(other, "lerobot/pi05_droid").code)
+    assert "could not be built" in text and "hf auth login" not in text
