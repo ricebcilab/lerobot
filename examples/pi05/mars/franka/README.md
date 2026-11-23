@@ -157,7 +157,11 @@ need more ([`DESIGN.md`](DESIGN.md)).
 
 - **`ModuleNotFoundError: c3po`** — install it from its source tree; it is not on PyPI.
 - **"No SpaceMouse ... found"** — the udev rule, or plug it in; the runner still runs with a null source, which
-  steers nothing.
+  steers nothing. Every run prints `operator: <node>` or `operator: none (<why>)` before its first trial, and
+  each trial prints `operator pushed on N/M ticks`, so a silent stick is visible without opening a file.
+- **The stick is found but nothing moves** — a 3Dconnexion device has several hidraw interfaces and only one
+  carries the translations. `run.sh probe … --stick 5` reads each candidate for five seconds: the node with
+  `id 1` reports and a peak near 1.00 is the one. Pin it with `SPACEMOUSE_HIDRAW=/dev/hidrawN`.
 - **`--stats: ... does not exist`** — copy OpenPI's `norm_stats.json` into `assets/droid/`; see above.
 - **401 at the tokenizer** — `hf auth login`; the checkpoint's tokenizer is gated.
 - **The arm stutters once per chunk** — the policy's pause is the denoising pass, and a `trial_XXX.npz`'s `t`

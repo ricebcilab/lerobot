@@ -116,6 +116,7 @@ def build(
     policy_factory: Callable[[ExperimentConfig, str | Path | None, dict[str, str]], PolicyBundle],
     now: Callable[[], dt.datetime],
     headless: bool = False,
+    headless_operator: bool | None = None,
     start_pose: np.ndarray | None = None,
     jacobian_factory: Callable[[], JacobianPort] | None = None,
 ) -> Wired:
@@ -144,7 +145,7 @@ def build(
         policy, preprocessor, postprocessor = policy_factory(config, stats_path, cameras.rename_map())
     chain = readout_chain.build_chain(
         {"corruption": config.readout.corruption, "input_noise": config.readout.input_noise},
-        headless=headless,
+        headless=headless if headless_operator is None else headless_operator,
     )
     return Wired(
         config=config,
@@ -260,6 +261,18 @@ def require_start_pose(q: np.ndarray, start_pose: np.ndarray | None, tolerance_r
 
 
 # ---------------------------------------------------------------- one trial
+
+
+def operator_activity(rows: list[dict], deadband: float = 0.05) -> tuple[int, float]:
+    """How often the operator actually pushed, and how hard.
+
+    A silent run and a working run look the same in a success rate: both say "no success". This is the number
+    that tells them apart, so it is printed with every trial and a zero is a broken stick, not a hard task.
+    """
+    if not rows:
+        return 0, 0.0
+    pushes = [float(np.abs(np.asarray(row["user_translation"])).max()) for row in rows]
+    return sum(1 for push in pushes if push >= deadband), max(pushes, default=0.0)
 
 
 def run_trial(
@@ -466,10 +479,12 @@ def run(
         )
         record = result.record
         records.append(record)
+        pushed, peak = operator_activity(result.rows)
         print(
             f"trial {trial + 1}/{wired.config.trial.trials}: "
             f"{'SUCCESS' if record['success'] else 'no success'} after {record['steps']} steps "
-            f"({record['duration_s']:.1f}s)"
+            f"({record['duration_s']:.1f}s), operator pushed on {pushed}/{len(result.rows)} ticks "
+            f"(peak {peak:.2f})"
             + ("  [aborted]" if record["aborted"] else "")
         )
         if record["aborted"]:
@@ -655,8 +670,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         policy_factory=build_policy,
         now=dt.datetime.now,
         headless=fake,
+        headless_operator=False,  # a dry run is a real stick test: only the station is fake
         start_pose=start_pose,
     )
+    print(f"operator: {wired.chain.describe()}")
     reader = KeypressReader() if args.stop_on == "keypress" else NullReader()
     try:
         if args.dry_run:

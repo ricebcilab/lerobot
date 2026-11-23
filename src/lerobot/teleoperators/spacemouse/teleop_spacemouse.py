@@ -69,20 +69,35 @@ def _is_3dconnexion(uevent: str) -> bool:
     return False
 
 
-def find_spacemouse(hid_id: str | None = None, sysfs: Path = Path("/sys/class/hidraw")) -> str:
-    """The /dev/hidraw node of a SpaceMouse.
+def find_spacemice(hid_id: str | None = None, sysfs: Path = Path("/sys/class/hidraw")) -> list[str]:
+    """Every /dev/hidraw node of a SpaceMouse, sorted.
 
-    With `hid_id` (e.g. "0000046D:0000C62B") the first node whose uevent contains it; with None
-    the first node whose HID_ID has a 3Dconnexion vendor. Raises FileNotFoundError naming the ids
-    searched.
+    With `hid_id` (e.g. "0000046D:0000C62B") the nodes whose uevent contains it; with None every
+    node whose HID_ID has a 3Dconnexion vendor. Empty when there is none. A 3Dconnexion device
+    usually exposes more than one interface, and only one of them carries the translation reports,
+    so the list matters to a caller that did not get what it expected.
     """
-    for sysdir in sorted(Path(sysfs).glob("hidraw*")):
+    nodes = []
+    for sysdir in sorted(Path(sysfs).glob("hidraw*"), key=lambda path: path.name):
         try:
             uevent = (sysdir / "device" / "uevent").read_text()
         except OSError:
             continue
         if (hid_id in uevent) if hid_id is not None else _is_3dconnexion(uevent):
-            return f"/dev/{sysdir.name}"
+            nodes.append(f"/dev/{sysdir.name}")
+    return nodes
+
+
+def find_spacemouse(hid_id: str | None = None, sysfs: Path = Path("/sys/class/hidraw")) -> str:
+    """The first /dev/hidraw node of a SpaceMouse (`find_spacemice`'s order).
+
+    Raises FileNotFoundError naming the ids searched; a device with several interfaces resolves to
+    whichever node the kernel lists first, which is why `find_spacemice` exists for a caller that
+    needs to try them all.
+    """
+    nodes = find_spacemice(hid_id, sysfs)
+    if nodes:
+        return nodes[0]
     wanted = (
         f"HID id {hid_id}" if hid_id is not None else f"3Dconnexion vendor {' or '.join(SPACEMOUSE_VENDORS)}"
     )

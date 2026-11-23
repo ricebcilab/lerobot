@@ -23,6 +23,9 @@ open, so the rest of the example never branches on whether a SpaceMouse exists.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 
 from lerobot.teleoperators import readout
@@ -31,6 +34,14 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import env_full_scale
 
 GRIPPER_CLOSE = 1.0
 GRIPPER_OPEN = -1.0
+
+SPACEMOUSE_NODE_ENV = "SPACEMOUSE_HIDRAW"
+"""Pin the exact `/dev/hidrawN` the stick is read from.
+
+A 3Dconnexion device exposes several hidraw interfaces and only one carries the translation reports, so the
+node the kernel lists first is a guess. `probe.py --stick` prints which node actually speaks; setting this
+variable to that node removes the guess, since a device's `HID_ID` (the lab's `SPACEMOUSE_HID_ID`) is the same
+across its interfaces and cannot pick one. Unset, the first node is used as before."""
 
 # The SpaceMouse's device axes (x: right +, y: toward you +, z: down +; already scaled to [-1, 1] by
 # SpaceMouseReader.axes) mapped onto the station's base frame (x forward, y left, z up). Unverified until
@@ -86,6 +97,10 @@ class SpaceMouseChain:
             self._closed = not self._closed
         return GRIPPER_CLOSE if self._closed else GRIPPER_OPEN
 
+    def describe(self) -> str:
+        """Where the command comes from, for the runner's first line: the device node, or why it is absent."""
+        return f"SpaceMouse {self.reader.path}"
+
     def reset(self, n_trials: int = 1) -> None:
         """A new trial: the curl's velocity starts from rest and the gripper opens.
 
@@ -106,6 +121,10 @@ class NullChain:
 
     def __init__(self, why: str = "headless"):
         self.why = why
+
+    def describe(self) -> str:
+        """Why the operator is idle: the run records this, so a silent stick is visible afterwards."""
+        return f"none ({self.why})"
 
     @property
     def translation(self) -> np.ndarray:
@@ -153,8 +172,9 @@ def build_chain(settings, *, headless: bool) -> SpaceMouseChain | NullChain:
     served = _build_readout(settings)
     if headless:
         return NullChain("headless")
+    node = os.environ.get(SPACEMOUSE_NODE_ENV) or None
     try:
-        reader = SpaceMouseReader(find_spacemouse(), full_scale=env_full_scale())
+        reader = SpaceMouseReader(node or find_spacemouse(), full_scale=env_full_scale())
     except OSError as e:  # FileNotFoundError, PermissionError: no device, or no access to it
         return NullChain(f"no SpaceMouse: {e}")
     return SpaceMouseChain(reader, served)

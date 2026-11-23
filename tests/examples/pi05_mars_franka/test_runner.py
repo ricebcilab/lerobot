@@ -394,3 +394,59 @@ def test_a_zero_velocity_brake_precedes_each_replan(tmp_path):
     assert np.allclose(sent[2], 0.0), "the replan must be preceded by a zero-velocity tick"
     assert not np.allclose(sent[3], 0.0)
     assert np.allclose(sent[5], 0.0), "the next chunk's boundary brakes too"
+
+
+def test_the_operator_is_read_unless_the_run_asks_for_a_null_one(tmp_path, monkeypatch):
+    """A dry run keeps the real stick: only the station is fake, which is what makes it a stick test."""
+    import readout_chain
+
+    seen = {}
+
+    def fake_build(settings, *, headless):
+        seen["headless"] = headless
+        return readout_chain.NullChain("test")
+
+    monkeypatch.setattr(readout_chain, "build_chain", fake_build)
+    config = _arm_config()
+    station = FakeStation([observation(DROID_RESET_Q)], control_rate=15.0)
+    build(
+        config,
+        stats_path=None,
+        station_factory=lambda cfg: station,
+        policy_factory=lambda cfg, path, names: PolicyBundle(None, None, None),
+        now=NOW,
+    )
+    assert seen["headless"] is False  # `headless` defaults to the station's, and the station is real here
+    build(
+        config,
+        stats_path=None,
+        station_factory=lambda cfg: station,
+        policy_factory=lambda cfg, path, names: PolicyBundle(None, None, None),
+        now=NOW,
+        headless=True,
+    )
+    assert seen["headless"] is True
+    build(
+        config,
+        stats_path=None,
+        station_factory=lambda cfg: station,
+        policy_factory=lambda cfg, path, names: PolicyBundle(None, None, None),
+        now=NOW,
+        headless=True,
+        headless_operator=False,
+    )
+    assert seen["headless"] is False
+
+
+def test_operator_activity_separates_a_silent_stick_from_a_hard_task():
+    from runner import operator_activity
+
+    rows = [
+        {"user_translation": np.zeros(3)},
+        {"user_translation": np.array([0.0, 0.3, 0.0])},
+        {"user_translation": np.array([0.9, 0.0, 0.0])},
+    ]
+    pushed, peak = operator_activity(rows)
+    assert (pushed, peak) == (2, 0.9)
+    assert operator_activity([{"user_translation": np.zeros(3)}]) == (0, 0.0)
+    assert operator_activity([]) == (0, 0.0)

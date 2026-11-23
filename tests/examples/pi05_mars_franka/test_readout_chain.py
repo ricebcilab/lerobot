@@ -195,3 +195,23 @@ def test_format_spacemouse_names_the_node_and_scale():
     assert "350" in text
 
     assert "unavailable" in probe.format_spacemouse(None, None)
+
+
+def test_the_node_can_be_pinned_for_a_device_with_several_interfaces(monkeypatch, tmp_path):
+    """`SPACEMOUSE_HIDRAW` wins over discovery, because a device's HID id names all of its interfaces."""
+    import readout_chain
+    from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseReader
+
+    node = tmp_path / "hidraw7"
+    node.write_bytes(b"")
+
+    def fake_reader(path, full_scale=350.0):
+        reader = type("R", (), {})()
+        reader.path, reader.axes, reader.take_press = str(path), (0.0, 0.0, 0.0), lambda: False
+        return reader
+
+    monkeypatch.setattr(readout_chain, "SpaceMouseReader", fake_reader)
+    monkeypatch.setenv("SPACEMOUSE_HIDRAW", str(node))
+    chain = readout_chain.build_chain({"corruption": None, "input_noise": 0.0}, headless=False)
+    assert chain.describe() == f"SpaceMouse {node}"
+    assert SpaceMouseReader is not None  # the real class is what the fake replaces

@@ -292,6 +292,52 @@ def _suggested_cameras(manifest: StationManifest) -> str:
     return f"{{exterior: {roles['exterior']}, wrist: {roles['wrist']}}}"
 
 
+def _stick_block(seconds: float) -> str:
+    """Every candidate hidraw node, read live: which nodes emit reports, and what the tallest push reads.
+
+    "Found a device" is not "the device speaks". A 3Dconnexion device exposes several hidraw interfaces and
+    only one carries the translation reports, so a node that opens and stays silent looks exactly like a
+    working one until a person pushes the stick. This reads each candidate for `seconds`, counts its report
+    ids and reports the largest push each node saw.
+    """
+    import select
+
+    from lerobot.teleoperators.spacemouse import find_spacemice
+    from lerobot.teleoperators.spacemouse.teleop_spacemouse import REPORT_TRANSLATION, env_full_scale, parse_report
+
+    nodes = find_spacemice()
+    if not nodes:
+        return "stick: unavailable: no 3Dconnexion hidraw node found"
+    scale = env_full_scale()
+    lines = [f"stick: {seconds:g}s per node, full scale {scale:g} counts (push the stick now)"]
+    for node in nodes:
+        try:
+            handle = open(node, "rb", buffering=0)  # noqa: SIM115 - closed below
+        except OSError as error:
+            lines.append(f"  {node}: unavailable: {error}")
+            continue
+        counts: dict[int, int] = {}
+        peak = 0.0
+        try:
+            while True:
+                ready, _, _ = select.select([handle], [], [], seconds)
+                if not ready:
+                    break
+                data = handle.read(64)
+                if not data:
+                    break
+                kind, payload = parse_report(data)
+                counts[data[0]] = counts.get(data[0], 0) + 1
+                if kind == "translation":
+                    peak = max(peak, max(abs(value) for value in payload) / scale)
+        finally:
+            handle.close()
+        ids = ", ".join(f"id {key}: {count}" for key, count in sorted(counts.items())) or "no reports"
+        mark = " <- translation" if counts.get(REPORT_TRANSLATION) else ""
+        lines.append(f"  {node}: {ids}; peak push {peak:.2f}{mark}")
+    return "\n".join(lines)
+
+
 def _spacemouse_block() -> str:
     """The operator's device, found the same way the chain finds it for a run."""
     try:
@@ -313,6 +359,8 @@ def main(argv=None) -> int:
         _station_block(args.station, args.port),
         _spacemouse_block(),
     ]
+    if args.stick is not None:
+        blocks.append(_stick_block(args.stick))
     print("\n".join(blocks))
     return 0
 
@@ -330,6 +378,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--port", default=9090, type=int, help="c3po WebSocket port")
     parser.add_argument(
         "--stats", default=None, help=f"openpi's norm_stats.json (default: {DEFAULT_STATS})"
+    )
+    parser.add_argument(
+        "--stick",
+        nargs="?",
+        const=5.0,
+        default=None,
+        type=float,
+        metavar="SECONDS",
+        help="also read every SpaceMouse interface live for this long (default 5), then exit",
     )
     default_worktree = Path(__file__).resolve().parents[4]
     parser.add_argument(

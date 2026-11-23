@@ -27,6 +27,7 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SPACEMOUSE_VENDORS,
     SpaceMouseAxes,
     SpaceMouseReader,
+    find_spacemice,
     find_spacemouse,
     parse_report,
 )
@@ -196,3 +197,14 @@ def test_teleop_get_action(tmp_path, monkeypatch):
         teleop.get_action()
     teleop.disconnect()
     assert teleop.reader is None
+
+
+def test_every_interface_of_a_device_is_listed(tmp_path):
+    """A 3Dconnexion device exposes several hidraw nodes and only one carries the translations."""
+    sysfs = fake_sysfs(
+        tmp_path,
+        {"hidraw3": "0003:0000256F:0000C635", "hidraw4": "0003:0000256F:0000C635", "hidraw7": "0003:0000046D:0000C62B"},
+    )
+    assert find_spacemice(sysfs=sysfs) == ["/dev/hidraw3", "/dev/hidraw4", "/dev/hidraw7"]
+    assert find_spacemice(sysfs=tmp_path / "empty") == []
+    assert find_spacemouse(sysfs=sysfs) == "/dev/hidraw3"
