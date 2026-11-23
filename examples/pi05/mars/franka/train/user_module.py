@@ -64,6 +64,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # franka/, the example's own modules
 
+from batches import pad_state  # noqa: E402
 from config import CommandSettings  # noqa: E402
 from interfaces import ACTION_DIMS, ARM_DIMS  # noqa: E402
 from jacobian import PandaJacobian  # noqa: E402
@@ -280,12 +281,15 @@ class _LoadedModel:
     chunk_size: int
     max_action_dim: int
     n_action_steps: int
+    state_dim: int
     device: torch.device
     use_amp: bool
 
     def batch(self, observation, prompt: str):
         """One stored observation under `prompt`, preprocessed into the batch the policy takes."""
-        batch = {"observation.state": torch.as_tensor(observation["state"], dtype=torch.float32)}
+        # the checkpoint reads a 32-dim state (its statistics and its state token string are that wide)
+        state = pad_state(np.asarray(observation["state"]), self.state_dim)
+        batch = {"observation.state": torch.as_tensor(state, dtype=torch.float32)}
         for key, image in observation["images"].items():
             batch[key] = image.to(torch.float32) / 255.0
         batch["task"] = prompt  # the batcher wraps the string, the tokenizer reads it
@@ -385,6 +389,7 @@ def _load_model(args, dataset) -> _LoadedModel:
         chunk_size=chunk_size,
         max_action_dim=max_action_dim,
         n_action_steps=n_action_steps,
+        state_dim=int(getattr(config, "max_state_dim", 32)),
         device=next(policy.parameters()).device,
         use_amp=bool(getattr(config, "use_amp", False)),
     )
