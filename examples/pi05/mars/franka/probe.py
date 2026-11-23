@@ -32,6 +32,7 @@ import argparse
 import contextlib
 import json
 import sys
+import time
 from pathlib import Path
 
 from interfaces import StationManifest
@@ -293,49 +294,57 @@ def _suggested_cameras(manifest: StationManifest) -> str:
 
 
 def _stick_block(seconds: float) -> str:
-    """Every candidate hidraw node, read live: which nodes emit reports, and what the tallest push reads.
+    """Read every candidate hidraw node live, printing each report as it arrives.
 
-    "Found a device" is not "the device speaks". A 3Dconnexion device exposes several hidraw interfaces and
-    only one carries the translation reports, so a node that opens and stays silent looks exactly like a
-    working one until a person pushes the stick. This reads each candidate for `seconds`, counts its report
-    ids and reports the largest push each node saw.
+    "Found a device" is not "the device speaks": a 3Dconnexion device exposes several hidraw interfaces and only
+    one carries the translation reports, so a node that opens and stays silent looks exactly like a working one
+    until a person pushes the stick. Each node is opened non-blocking and polled, and every line is flushed, so a
+    run that sees nothing says so within a second instead of holding the terminal until the budget runs out.
     """
+    import os
     import select
+    import struct
 
     from lerobot.teleoperators.spacemouse import find_spacemice
-    from lerobot.teleoperators.spacemouse.teleop_spacemouse import REPORT_TRANSLATION, env_full_scale, parse_report
+    from lerobot.teleoperators.spacemouse.teleop_spacemouse import env_full_scale
 
     nodes = find_spacemice()
     if not nodes:
         return "stick: unavailable: no 3Dconnexion hidraw node found"
     scale = env_full_scale()
-    lines = [f"stick: {seconds:g}s per node, full scale {scale:g} counts (push the stick now)"]
+    print(f"stick: {seconds:g} s, full scale {scale:g} counts - push the stick now", flush=True)
+    opened: dict[int, str] = {}
     for node in nodes:
         try:
-            handle = open(node, "rb", buffering=0)  # noqa: SIM115 - closed below
+            opened[os.open(node, os.O_RDONLY | os.O_NONBLOCK)] = node
         except OSError as error:
-            lines.append(f"  {node}: unavailable: {error}")
-            continue
-        counts: dict[int, int] = {}
-        peak = 0.0
-        try:
-            while True:
-                ready, _, _ = select.select([handle], [], [], seconds)
-                if not ready:
-                    break
-                data = handle.read(64)
+            print(f"  {node}: unavailable: {error}", flush=True)
+    seen: dict[str, int] = {}
+    last = "none"
+    deadline = time.time() + seconds
+    try:
+        while opened and time.time() < deadline:
+            ready, _, _ = select.select(list(opened), [], [], 0.25)
+            for fd in ready:
+                try:
+                    data = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
                 if not data:
-                    break
-                kind, payload = parse_report(data)
-                counts[data[0]] = counts.get(data[0], 0) + 1
-                if kind == "translation":
-                    peak = max(peak, max(abs(value) for value in payload) / scale)
-        finally:
-            handle.close()
-        ids = ", ".join(f"id {key}: {count}" for key, count in sorted(counts.items())) or "no reports"
-        mark = " <- translation" if counts.get(REPORT_TRANSLATION) else ""
-        lines.append(f"  {node}: {ids}; peak push {peak:.2f}{mark}")
-    return "\n".join(lines)
+                    continue
+                node = opened[fd]
+                seen[node] = seen.get(node, 0) + 1
+                if data[0] == REPORT_TRANSLATION and len(data) >= 7:
+                    x, y, z = struct.unpack_from("<hhh", data, 1)
+                    last = f"{node} raw ({x:+d}, {y:+d}, {z:+d}) -> ({x / scale:+.2f}, {y / scale:+.2f}, {z / scale:+.2f})"
+                    print(f"  {last}", flush=True)
+                else:
+                    print(f"  {node} report id {data[0]}, {len(data)} bytes: {data[:10].hex()}", flush=True)
+    finally:
+        for fd in opened:
+            os.close(fd)
+    summary = ", ".join(f"{node}: {count}" for node, count in sorted(seen.items())) or "no reports"
+    return f"stick: reports per node: {summary}; last translation: {last}"
 
 
 def _spacemouse_block() -> str:
