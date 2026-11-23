@@ -478,3 +478,25 @@ def test_a_pair_is_keyed_by_the_pose_not_by_the_pixels(monkeypatch):
 
     moved = observation(np.asarray(DROID_RESET_Q) + 0.01)
     assert initial_state_hash(moved, ARM, ("exterior",)) != initial_state_hash(first, ARM, ("exterior",))
+
+
+def test_the_state_is_padded_to_the_checkpoints_width():
+    """The DROID statistics and the state token string are 32 wide; eight real dims alone fail both."""
+    from batches import STATE_DIM, camera_map as make_cameras, observation_batch, pad_state
+    from interfaces import StationManifest
+
+    manifest = StationManifest(
+        arms=(ARM,),
+        cameras=("exterior", "wrist"),
+        action_keys=(f"{ARM}/joint_velocity", f"{ARM}/gripper_position"),
+        control_rate=15.0,
+    )
+    batch = observation_batch(observation(DROID_RESET_Q), ARM, make_cameras(_arm_config(), manifest), "t")
+    state = batch["observation.state"].numpy()
+    assert state.shape == (STATE_DIM,) and STATE_DIM == 32
+    np.testing.assert_allclose(state[:7], DROID_RESET_Q, rtol=0, atol=1e-6)
+    assert np.all(state[8:] == 0)
+
+    np.testing.assert_allclose(pad_state(np.ones(8)), np.r_[np.ones(8), np.zeros(24)])
+    with pytest.raises(ValueError, match="more than the checkpoint's 32"):
+        pad_state(np.ones(33))

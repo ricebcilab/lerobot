@@ -27,7 +27,23 @@ from config import ExperimentConfig
 from interfaces import StationManifest
 from station import IMAGE_SIZE, resize_with_pad, state_from_obs
 
-__all__ = ["CameraMap", "camera_map", "observation_batch", "suggested_cameras", "unnormalized"]
+__all__ = [
+    "CameraMap",
+    "camera_map",
+    "observation_batch",
+    "pad_state",
+    "suggested_cameras",
+    "unnormalized",
+]
+
+STATE_DIM = 32
+"""The checkpoint's `max_state_dim`, and so the width of the state it was trained to read.
+
+DROID's statistics are 32 wide and the state is written into the prompt as one number per dim, so a batch that
+sends the arm's eight real dims alone fails twice: the normalizer's `(x - mean) / std` cannot broadcast 8
+against 32, and the state token string would be 24 numbers shorter than the checkpoint's. Zero padding is what
+the checkpoint's own client sends, and the padding dims' statistics are zero, so they normalize to zero.
+"""
 
 DROID_IMAGE_KEYS = (
     "observation.images.base_0_rgb",
@@ -125,8 +141,16 @@ def camera_map(config: ExperimentConfig, manifest: StationManifest) -> CameraMap
     return CameraMap({DROID_IMAGE_KEYS[0]: exterior, DROID_IMAGE_KEYS[1]: wrist, DROID_IMAGE_KEYS[2]: None})
 
 
+def pad_state(state: np.ndarray, state_dim: int = STATE_DIM) -> np.ndarray:
+    """The arm's state, zero-padded to the checkpoint's width (a no-op when it is already that wide)."""
+    state = np.asarray(state, dtype=np.float32).reshape(-1)
+    if state.shape[0] > state_dim:
+        raise ValueError(f"the state has {state.shape[0]} dims, more than the checkpoint's {state_dim}")
+    return np.concatenate([state, np.zeros(state_dim - state.shape[0], dtype=np.float32)])
+
+
 def observation_batch(
-    obs: Mapping[str, np.ndarray], arm: str, cameras: CameraMap, prompt: str
+    obs: Mapping[str, np.ndarray], arm: str, cameras: CameraMap, prompt: str, state_dim: int = STATE_DIM
 ) -> dict[str, Any]:
     """One station observation as the preprocessor's input batch: state, three images, and the task.
 
@@ -137,7 +161,7 @@ def observation_batch(
     """
     import torch
 
-    state = state_from_obs(obs, arm).astype(np.float32)
+    state = pad_state(state_from_obs(obs, arm), state_dim)
     batch: dict[str, Any] = {"observation.state": torch.from_numpy(state)}
     for name, source in cameras.sources.items():
         if source is None:

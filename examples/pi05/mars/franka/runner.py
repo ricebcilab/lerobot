@@ -38,6 +38,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import batches
 import numpy as np
 import yaml
 from actions import clamp_joint_velocity, command_from_qdot, ticks_per_action
@@ -94,6 +95,7 @@ class PolicyBundle(NamedTuple):
     policy: Any
     preprocessor: Any
     postprocessor: Any
+    state_dim: int = batches.STATE_DIM
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ class Wired:
     manifest: StationManifest
     cameras: CameraMap
     now: Callable[[], dt.datetime]
+    state_dim: int = batches.STATE_DIM
 
 
 @dataclass
@@ -155,10 +158,12 @@ def build(
         config = _with_fixed_adapter(config, jacobian, start)
     config.check_adapters()
     cameras = camera_map(config, manifest)
+    state_dim = batches.STATE_DIM
     if config.steering.mode == "teleop":
         policy = preprocessor = postprocessor = None
     else:
-        policy, preprocessor, postprocessor = policy_factory(config, stats_path, cameras.rename_map())
+        bundle = policy_factory(config, stats_path, cameras.rename_map())
+        policy, preprocessor, postprocessor, state_dim = bundle
     chain = readout_chain.build_chain(
         {"corruption": config.readout.corruption, "input_noise": config.readout.input_noise},
         headless=headless if headless_operator is None else headless_operator,
@@ -175,6 +180,7 @@ def build(
         manifest=manifest,
         cameras=cameras,
         now=now,
+        state_dim=state_dim,
     )
 
 
@@ -217,7 +223,7 @@ def build_policy(
         base_policy=base,
         postprocessor=postprocessor,
     )
-    return PolicyBundle(policy, preprocessor, postprocessor)
+    return PolicyBundle(policy, preprocessor, postprocessor, int(base.config.max_state_dim))
 
 
 # ---------------------------------------------------------------- the action and the reset
@@ -381,7 +387,9 @@ def run_trial(
                 )
                 plan = np.full(3, np.nan)
             else:
-                batch = wired.preprocessor(observation_batch(obs, arm_name, wired.cameras, prompt))
+                batch = wired.preprocessor(
+                    observation_batch(obs, arm_name, wired.cameras, prompt, wired.state_dim)
+                )
                 batch["command"] = torch.as_tensor(command, dtype=torch.float32)
                 with torch.inference_mode():
                     action = wired.policy.select_action(batch)
