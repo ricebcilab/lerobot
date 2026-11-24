@@ -199,15 +199,24 @@ class C3poStation:
     ``RobotPort`` describes and re-implementing them here would only add somewhere to disagree.
     """
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, rate: float | None = None) -> None:
         import c3po
 
-        self.robot = c3po.Robot(host=host, port=port)
+        # c3po asks r2d2 for a control rate at connect time and its default is 50 Hz, while a Franka station's
+        # native rate is often lower; the rate the station runs at is the rate the actions are executed at.
+        self.robot = (
+            c3po.Robot(host=host, port=port) if rate is None else c3po.Robot(host=host, port=port, rate=rate)
+        )
         self._manifest = manifest_from_robot(self.robot)
 
     @property
     def manifest(self) -> StationManifest:
         return self._manifest
+
+    @property
+    def configured_rate(self) -> float:
+        """The rate c3po asked the station for, which is not necessarily the manifest's native rate."""
+        return float(self.robot.rate)
 
     def reset(self) -> dict[str, np.ndarray]:
         """Start a new episode and return the observation after the reset."""

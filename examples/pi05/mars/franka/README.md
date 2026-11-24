@@ -87,7 +87,14 @@ records every station tick.
 
 An action is the policy's own chunk step: seven joint velocities and a gripper position. The station
 integrates the velocities, so the runner sends one action per action and repeats it for
-`ceil(control_rate / 15)` station ticks, rather than sending position targets. The gripper is the policy's; the
+`ceil(control_rate / 15)` station ticks, rather than sending position targets.
+
+The station's clock is `station.rate`, the rate c3po asks r2d2 for at connect time, and its default is 50 Hz
+while a Franka station's native rate is often 15. `step()` blocks until the station's next observation, so the
+station's configured rate *is* the loop's rate: at 50 an action planned to run for 1 s is executed in 0.3 s and
+the arm gets a third of the time the policy intended. Set `station.rate` to the rate the probe prints
+(`control rate: 15 Hz`); the runner reports a mismatch before the first trial rather than letting you infer it
+from a stopwatch. The gripper is the policy's; the
 operator's button only drives `teleop`.
 
 A station that runs at the checkpoint's own rate (15 Hz) runs one action per tick, and the station keeps

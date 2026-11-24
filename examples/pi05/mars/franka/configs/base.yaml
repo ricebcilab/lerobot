@@ -6,6 +6,9 @@ station:
   host: "10.42.0.1"
   port: 9090
   arm: null                     # null = the manifest's only arm
+  rate: null                    # Hz c3po asks r2d2 for; null = c3po's default 50. Set it to the station's
+                                # native rate (the probe prints it) so the station cycles at the rate the
+                                # actions were planned for.
 cameras:
   exterior: null                # the probe fills these in; null = the manifest's first two feeds
   wrist: null

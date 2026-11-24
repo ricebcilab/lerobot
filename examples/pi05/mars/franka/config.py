@@ -161,10 +161,13 @@ class StationSettings:
     host: str = "10.42.0.1"
     port: int = 9090
     arm: str | None = None
+    rate: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", _text(self.host, "station.host"))
         object.__setattr__(self, "port", _count(self.port, "station.port"))
+        if self.rate is not None:
+            object.__setattr__(self, "rate", _positive(self.rate, "station.rate"))
         if self.arm is not None:
             object.__setattr__(self, "arm", _text(self.arm, "station.arm"))
 

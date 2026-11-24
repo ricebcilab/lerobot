@@ -479,9 +479,9 @@ def run_trial(
         obs = station.step(action_dict(action8, arm_name))
         q = np.asarray(obs[f"{arm_name}/joint_position"], dtype=np.float64)
         if pace:
-            # The station hands back observations without necessarily blocking for its own cycle, so the loop
-            # keeps the clock: a tick that finishes early waits out the rest of the period, and one that
-            # overruns (a chunk being computed) is counted rather than hidden.
+            # `step()` blocks until the station's next observation, so this is a guard rather than the clock:
+            # it only bites when the station is configured faster than the manifest's native rate (c3po asks
+            # for 50 Hz unless told otherwise) and it counts the ticks our own work overran.
             leftover = period - (time.perf_counter() - tick_started)
             if leftover > 0:
                 time.sleep(leftover)
@@ -781,7 +781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             control_rate=FAKE_CONTROL_RATE,
         )
     else:
-        station_factory = lambda cfg: C3poStation(cfg.station.host, cfg.station.port)  # noqa: E731
+        station_factory = lambda cfg: C3poStation(cfg.station.host, cfg.station.port, cfg.station.rate)  # noqa: E731
 
     wired = build(
         config,
@@ -798,6 +798,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parameter = next(base.parameters())
         total = sum(p.numel() for p in base.parameters())
         print(f"policy: {parameter.device} {parameter.dtype}, {total / 1e9:.1f}B params")
+    configured = getattr(wired.station, "configured_rate", None)
+    native = wired.manifest.control_rate
+    if configured is not None and abs(configured - native) > 1e-6:
+        print(
+            f"station: {native:g} Hz native, c3po configured {configured:g} Hz "
+            f"(set station.rate: {native:g} to make the station run at its own rate)"
+        )
     print(f"operator: {wired.chain.describe()}")
     reader = KeypressReader() if args.stop_on == "keypress" else NullReader()
     try:

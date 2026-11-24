@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from station import (
+    C3poStation,
     FakeStation,
     action_dict,
     build_arm_spec,
@@ -160,3 +161,28 @@ def test_resize_with_pad_letterboxes_a_landscape_frame_without_stretching():
     # The content box keeps the source's 4:3 aspect: no pixel was stretched into the padding.
     width, height = right - left + 1, bottom - top + 1
     assert np.isclose(width / height, 640 / 480, atol=0.01)
+
+
+def test_the_station_is_configured_at_the_rate_it_is_given(monkeypatch):
+    """c3po asks r2d2 for 50 Hz unless told otherwise; the station's own rate is what the actions assume."""
+    import sys
+    import types
+
+    calls = {}
+
+    class FakeRobot:
+        rate = 50.0
+
+        def __init__(self, *, host, port, rate=None):
+            calls.update(host=host, port=port, rate=rate)
+            self.rate = 50.0 if rate is None else rate
+            self.arms, self.cameras, self.action_keys = ("follower",), ("exterior", "wrist"), ()
+            self.control_rate = 15.0
+            self.joint_names = {"follower": [f"panda_joint{i}" for i in range(1, 8)]}
+
+    monkeypatch.setitem(sys.modules, "c3po", types.SimpleNamespace(Robot=FakeRobot))
+    default = C3poStation("10.0.0.1", 9090)
+    assert calls["rate"] is None and default.configured_rate == 50.0  # c3po's own default
+
+    asked = C3poStation("10.0.0.1", 9090, 15.0)
+    assert calls["rate"] == 15.0 and asked.configured_rate == 15.0
