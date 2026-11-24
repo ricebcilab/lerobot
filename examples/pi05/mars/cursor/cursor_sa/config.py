@@ -3,7 +3,7 @@
 An **arm** is one control condition (configs/<arm>.yaml): the policy, the control
 mode and its depth, the readout (corruption, noise) and the task. An arm
 file says `extends: base.yaml` (or another arm) and overrides only what it
-changes. A **protocol** (configs/study_short.yaml, study_long_<user>.yaml) names what a
+changes. A **protocol** (configs/study_short_<user>.yaml, study_long_<user>.yaml) names what a
 participant plays, as cells of a sweep's grid, and how: trials and practice per
 block, block order, trial timing. Unknown or
 missing keys are errors, so a typo cannot silently do nothing. Spec values
@@ -54,6 +54,9 @@ PROTOCOL_DEFAULTS = {
     "trial": {"ready_hold_s": 0.3, "feedback_s": 0.6},
     "expert": {"lag": 0, "slow_radius": 0.15, "clearance": 0.05, "margin": 0.03},
     "display": {"blind": True, "cues": True},  # cues: the served command, the planned path and the STEERING label
+    # --calibrate: the reaches the cursor plays by itself before the visit, and the steps the participant's own user
+    # module is trained on them (the shared modules' recipe: 100 reaches, 500 steps)
+    "calibration": {"reaches": 100, "practice": 5, "steps": 500},
 }
 CELLS_KEYS = ("methods", "grid", "settings")  # a protocol's cells must give, beside the rest of a sweep and task_order
 
@@ -170,14 +173,16 @@ def adapter_names(arm):
 
 
 def load_protocol(path):
-    """A protocol {name, study, cells, blocks, trial, expert, display}. `study` is the folder under results/ its runs
+    """A protocol {name, study, cells, blocks, trial, expert, display, calibration}. `study` is the folder under results/ its runs
     go to (results/<study>/<participant>/<name>_s<visit>_<task>/; by default the name), so protocols of one study
-    (study_long_U1 ... U4) share it. `cells` says what a participant plays: a sweep of its
+    (study_long_U1 ... U4, study_short_U1 ... U4) share it. `cells` says what a participant plays: a sweep of its
     own in a sweep config's form (run_sweep.py), its users x tasks grid one user x the tasks played, each task a
     section of the visit (`run_experiment.protocol_sections`), the methods in the order given; beside it settings,
     the tuned setting per cell and method ('<user>x<task>|<noise>' -> method -> {knob: value}, as run_sweep.py's
     settings.yaml for this protocol gives them), and task_order, latin_square (the first task first, the others
-    counterbalanced) or listed. The sweep's keys are checked where it is built (run_sweep.load_sweep)."""
+    counterbalanced) or listed. The sweep's keys are checked where it is built (run_sweep.load_sweep). `calibration`
+    sizes a visit's own user module (run_experiment.py --calibrate): the reaches the cursor plays by itself, the
+    practice ones before them, and the training steps."""
     path = resolve(path)
     data = yaml.safe_load(path.read_text()) or {}
     unknown = set(data) - {"name", "study", "cells"} - set(PROTOCOL_DEFAULTS)

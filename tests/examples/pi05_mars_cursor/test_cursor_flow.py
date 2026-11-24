@@ -316,7 +316,7 @@ def test_arm_task_parameters_reach_the_env_and_the_records():
 
 
 def test_config_files_fill_defaults_and_reject_unknown_keys(tmp_path):
-    protocol = config.load_protocol("study_short.yaml")
+    protocol = config.load_protocol("study_short_U1.yaml")
     assert list(protocol["cells"]["methods"]) == ["teleop", "flow_control", "frs", "mars"] and protocol["cells"]["task_order"] == "latin_square"
     assert protocol["blocks"]["trials"] == 40 and protocol["display"] == {"blind": True, "cues": False}
     cells = ("cells: {methods: {teleop: {mode: teleop}}, grid: {users: {U1: {corruption: null}}, tasks: {T1: {obstacle: null}}, "

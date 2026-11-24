@@ -4,7 +4,7 @@
 # another arm) and overrides only what it changes; a sweep's method and cell
 # override it again (configs/sweeps/). Unknown or missing keys are errors. Who
 # plays (a person, the expert) and how many trials are the protocol's business
-# (configs/study_short.yaml, study_long_<user>.yaml).
+# (configs/study_short_<user>.yaml, study_long_<user>.yaml).
 
 policy:
   model: flow_goaldrop        # policy under checkpoints/policies/ (trained with goal dropout; never told the goal)

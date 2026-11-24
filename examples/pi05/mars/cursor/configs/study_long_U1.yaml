@@ -7,9 +7,10 @@
 # with U4). About 1 h 30 to 1 h 45 min; 2 h 40 min if every trial ran out. study_long_U1.yaml to study_long_U4.yaml
 # differ only in their user and its settings.
 #
-#   python run_experiment.py --protocol study_long_U1.yaml --participant p1 --prepare   # the visit's scene tokens, ahead
-#   python run_experiment.py --protocol study_long_U1.yaml --participant p1
-#   python run_experiment.py --protocol study_long_U1.yaml --participant p1 --resume    # continue after a stop
+#   python run_experiment.py --protocol study_long --user U1 --participant p1 --prepare   # the visit's scene tokens, ahead
+#   python run_experiment.py --protocol study_long --user U1 --participant p1
+#   python run_experiment.py --protocol study_long --user U1 --participant p1 --resume    # continue after a stop
+#   python run_experiment.py --protocol study_long --user U1 --participant p1 --calibrate # MARS on the person's own module
 #   python run_sweep.py --sweep study_long_U1                                         # tune the arms with the expert
 #
 # `cells` is the sweep that builds the arms and tunes them with the simulated expert (the baselines as their papers

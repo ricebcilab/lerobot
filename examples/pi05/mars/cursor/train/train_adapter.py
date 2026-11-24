@@ -34,6 +34,10 @@ initial modules pool their trials (DAgger-style rounds: the first module's state
     python train/train_adapter.py --kind user --corruption '{scale: [1.0, 0.25]}' --name refit/user_gain025y_refit \
         --closed-loop grid_20000demos/user_gain025y_expert --closed-loop-depth 6
 
+A SESSION'S CALIBRATION (`run_experiment.py --calibrate`, `train_calibrated_user`): the open-loop recipe on a
+recording. The cursor played the demonstrations by itself while the participant pushed, and the command at every
+demonstration step is the one their readout served there, as recorded (one per step, as --frozen-noise draws it).
+
 TASK MODULE: the policy is frozen and never saw obstacles. On demonstrations that go around the task's
 obstacles (along the expert's path), the task module T = (A, b) is trained by flow matching through the
 adapted field, on the policy's own interpolation x_t = (1 - t) z + t a,
@@ -555,11 +559,31 @@ def mixed_batch(open_data, closed_data, batch, mix):
     return ({k: torch.cat([a[0][k], b[0][k]]) for k in a[0]},) + tuple(torch.cat([x, y]) for x, y in zip(a[1:4], b[1:4]))
 
 
+class CalibrationData:
+    """A recorded calibration (a session's --calibrate): the demonstrations the cursor played (a DemoSampler) and, at
+    every one of their steps, the command the participant's readout served there (`served` [B, L, 2], its noise in
+    it: a recording has one command per step)."""
+
+    def __init__(self, layouts, actions, lengths, served, policy, device):
+        self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
+        self.served = torch.as_tensor(np.asarray(served), dtype=torch.float32, device=device)
+
+    def sample(self, n):
+        """(obs, chunk, served): demo samples and the command served there."""
+        obs, chunk, i, k = self.sampler.sample(n, indexed=True)
+        return obs, chunk, self.served[i, k]
+
+
+def held_command(policy, served):
+    """The controller's reference for one served command per sample [B, 2]: held over the chunk, in the policy's
+    units [B, H, 2]."""
+    return to_action(served[:, None].expand(-1, policy.horizon, -1), policy)
+
+
 def bci_command(policy, core, sigma, noise=None):
     """The controller's reference for one served command per sample: noise on the readout core (idle or not;
     `noise` the standard normal draws, default fresh), held over the chunk, in the policy's units [B, H, 2]."""
-    served = Readout.serve(core, sigma, noise)
-    return to_action(served[:, None].expand(-1, policy.horizon, -1), policy)
+    return held_command(policy, Readout.serve(core, sigma, noise))
 
 
 def draw_sigma(args, n, device):
@@ -615,6 +639,12 @@ def chunk_collision(policy, adapter, obs, steps):
     return collides(obs, forward_flow(policy, obs, z, 0.0, 1.0, steps, adapter) * policy.action_scale).float().mean().item()
 
 
+def regenerated(policy, free, bci, steps, adapter=None):
+    """The chunk a command gives at full reversal through the (adapted) flow, in screen units."""
+    return Flow(lambda x, t_: policy(free, x, t_), None if adapter is None else adapter.field(free), noise_time=0.0,
+                batch_time=True).regenerate(bci, steps) * policy.action_scale
+
+
 @torch.no_grad()
 def expert_check(policy, data, args, user=None, task=None, n=2048):
     """Open loop on held-out demo states, at full reversal: how well the regenerated chunk heads where the
@@ -627,8 +657,7 @@ def expert_check(policy, data, args, user=None, task=None, n=2048):
     variants = [("none", None, None), ("user", user, None)] + ([("composed", user, task)] if task is not None else [])
     for name, u, tm in variants:
         adapter = AdapterModules(user=u, task=tm) if u is not None or tm is not None else None
-        regen = Flow(lambda x, t_: policy(free, x, t_), None if adapter is None else adapter.field(free), noise_time=0.0,
-                     batch_time=True).regenerate(bci, args.flow_steps) * policy.action_scale
+        regen = regenerated(policy, free, bci, args.flow_steps, adapter)
         out[f"heading_cos_{name}"] = float(Flow.heading_cosine(regen, chunk, n_dims=2)[active].mean())
         if obs["obstacle_mask"].any():
             rows = active & obs["obstacle_mask"].any(1)
@@ -830,6 +859,39 @@ def train_user(args, policy, model, device, rng):
         return val
 
     save(args, "user", user, _train_module(user, args.steps, args.lr, batch_loss, validate, args.log_every))
+
+
+def train_calibrated_user(policy, layouts, actions, lengths, served, device, steps=500, batch=512, lr=1e-3, flow_steps=10,
+                          check=2048, tick=None):
+    """A user module from a recorded calibration (`CalibrationData`: demonstrations the cursor played and what a
+    participant's readout served at every step of them): `train_user`'s open-loop recipe with the recorded command
+    in the place of the expert's push through a simulated readout, every read counted alike. `policy` is the frozen
+    FlowPolicy the module will steer (its weights stop asking for gradients); `tick()` is called at every step (a
+    window's event pump). Returns the module in eval mode and the log, whose one entry checks, on `check` of the
+    calibration's own steps (those where the demonstration moves), how well the regenerated chunk heads where the
+    demonstration does with no module and with this one."""
+    policy.requires_grad_(False)
+    data = CalibrationData(layouts, actions, lengths, served, policy, device)
+    user = LearnedUserModule(policy.horizon, n_dims=2).to(device)
+
+    def batch_loss(step):
+        if tick is not None:
+            tick()
+        obs, chunk, command = data.sample(batch)
+        free = hide_goal(obs)
+        latent = reverse_flow(policy, free, chunk / policy.action_scale, flow_steps, flow_steps)
+        return field_loss(policy, user, None, free, latent, held_command(policy, command))
+
+    @torch.no_grad()
+    def validate():
+        obs, chunk, command = data.sample(check)
+        free, bci, moving = hide_goal(obs), held_command(policy, command), chunk.sum(1).norm(dim=-1) > 1e-3
+        return {f"heading_cos_{name}": float(Flow.heading_cosine(regenerated(policy, free, bci, flow_steps, adapter), chunk,
+                                                                n_dims=2)[moving].mean())
+                for name, adapter in (("none", None), ("user", AdapterModules(user=user)))}
+
+    log = _train_module(user, steps, lr, batch_loss, validate, log_every=steps)
+    return user.eval(), log
 
 
 # ---------------------------------------------------------------- main

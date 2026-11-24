@@ -77,6 +77,18 @@ class Renderer:
             draw()
             self.clock.tick(self.fps)
 
+    def page(self, title, lines):
+        """A title and the lines under it, on an empty screen (not yet shown)."""
+        self.screen.fill(BG)
+        self.text(title, (FIELD // 2, HUD + 200), big=True, center=True)
+        for i, line in enumerate(lines):
+            self.text(line, (FIELD // 2, HUD + 250 + 26 * i), center=True, color=INK_2)
+
+    def wait_screen(self, title, lines):
+        """A screen that asks for nothing, shown once: a pause the session fills itself (a module being trained)."""
+        self.page(title, lines)
+        pygame.display.flip()
+
     def screen_message(self, title, lines, agent):
         """Show a screen until the person continues; redrawn so the device status stays current."""
         tic = time.monotonic()
@@ -84,10 +96,7 @@ class Renderer:
         def draw():
             if hasattr(agent, "poll"):
                 agent.poll()
-            self.screen.fill(BG)
-            self.text(title, (FIELD // 2, HUD + 200), big=True, center=True)
-            for i, line in enumerate(lines):
-                self.text(line, (FIELD // 2, HUD + 250 + 26 * i), center=True, color=INK_2)
+            self.page(title, lines)
             if hasattr(agent, "status"):
                 self.text(f"SpaceMouse: {agent.status}", (12, 100), color=INK_2)
             pygame.display.flip()
@@ -101,12 +110,19 @@ class Renderer:
 
     def block_screen(self, info, agent):
         arm = "" if self.blind else f"  ({info['arm']})"
-        lines = [f"{info['n_practice']} practice trials, then {info['n_trials']} trials.",
-                 "Push the stick to move the cursor onto the gold target and hold it there."]
+        if info.get("calibration"):  # the cursor plays the reaches by itself (`session.Calibration`)
+            title = "Calibration"
+            lines = [f"{info['n_practice']} practice reaches, then {info['n_trials']} reaches.",
+                     "The cursor moves to the gold target by itself.",
+                     "Push the stick toward the gold target while it moves, as if you were steering it."]
+        else:
+            title = f"Block {info['block']} of {info['n_blocks']}{arm}"
+            lines = [f"{info['n_practice']} practice trials, then {info['n_trials']} trials.",
+                     "Push the stick to move the cursor onto the gold target and hold it there."]
         if info.get("resumed"):
             lines.append(f"Resuming after {info['resumed']} completed trials.")
         lines.append("Press a SpaceMouse button or Enter to start.")
-        self.screen_message(f"Block {info['block']} of {info['n_blocks']}{arm}", lines, agent)
+        self.screen_message(title, lines, agent)
 
     def section_screen(self, info, agent):
         """Before a task section of a visit over several tasks."""
@@ -170,11 +186,11 @@ class Renderer:
     def draw(self, ctx, banner=None, banner_color=INK, done=False):
         env, ctl, layouts, task, hud = ctx["env"], ctx["ctl"], ctx["layouts"], ctx["task"], ctx["hud"]
         self.screen.fill(BG)
-        which = "practice" if hud.get("practice") else "trial"
+        which = "practice" if hud.get("practice") else "reach" if hud.get("calibration") else "trial"
         arm = "" if self.blind or not hud.get("arm") else f"   ({hud['arm']})"
-        self.text(f"Block {hud.get('block', 1)} of {hud.get('n_blocks', 1)}   {which} {hud.get('trial', 1)} "
-                  f"of {hud.get('n_trials', 1)}{arm}", (12, 8), big=True)
-        if self.cues and not done and is_active(ctx["served"][0]) and ctl.mode not in ("policy", "teleop"):
+        block = "Calibration" if hud.get("calibration") else f"Block {hud.get('block', 1)} of {hud.get('n_blocks', 1)}"
+        self.text(f"{block}   {which} {hud.get('trial', 1)} of {hud.get('n_trials', 1)}{arm}", (12, 8), big=True)
+        if self.cues and not done and is_active(ctx["served"][0]) and ctl.mode not in ("policy", "teleop", "playback"):
             self.text("STEERING", (FIELD - 100, 10), big=True, color=COMMAND)
         pygame.draw.line(self.screen, TARGET_EDGE, (0, HUD - 1), (FIELD, HUD - 1))
 

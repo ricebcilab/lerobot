@@ -21,7 +21,7 @@ from the repo root. Day one, on a fresh clone:
 ```bash
 uv sync --extra mars        # or: pip install -e ".[mars]"
 uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py download
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1
 uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --study study_short --participants p1
 ```
 
@@ -37,16 +37,17 @@ More:
 ```bash
 uv run --extra mars --extra test pytest tests/examples/pi05_mars_cursor -q   # ~5 min
 
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1          # a person on the SpaceMouse
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1 --resume # continue an interrupted visit
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1 --session 2   # a second visit, new layouts
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant sim         # the expert agent, headless (20 s)
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant sim --watch # the expert, rendered
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1             # a person on the SpaceMouse
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1 --resume    # continue an interrupted visit
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U3 --participant p1 --session 2 # a second visit, new layouts, another user
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant sim            # the expert agent, headless (20 s)
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant sim --watch    # the expert, rendered
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1 --calibrate # MARS on the person's own user module (calibration first, +3.5 min)
 uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long                            # tables and figures for every run of a study
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1          # the October study's report for p1 (PDF)
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1 p2 p3 p4 # its group report
 uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --device cpu                          # the paper's figures (examples/pi05/mars/figures/*.pdf, *.png, stats.json)
-uv run --extra mars python examples/pi05/mars/cursor/run_sweep.py --sweep study_short              # tune the short study's arms with the expert, test (~2 min)
+uv run --extra mars python examples/pi05/mars/cursor/run_sweep.py --sweep study_short_U1           # tune the short study's arms for one user with the expert, test (~2 min)
 uv run --extra mars python examples/pi05/mars/cursor/run_sweep.py --sweep grid --cells U1xT1 --out grid_part_U1xT1   # a part of the grid (see Sweeps)
 ```
 
@@ -88,10 +89,11 @@ reports/              report_grid_image.py (the image task modules' gate verdict
                       grid over its five training seeds); stats.json holds the numbers the captions quote. MARS
                       (Modular Adapters for Reversal Steering) is mars's display name: MARS = user + task modules,
                       MARS-U = the user module alone, MARS-T = the task module alone; the code's tokens are unchanged
-configs/              base.yaml and condition_*.yaml (arms), study_short.yaml and study_long_U1-U4.yaml (the protocols,
-                      each its own sweep), sweeps/*.yaml (sweep definitions)
+configs/              base.yaml and condition_*.yaml (arms), study_short_U1-U4.yaml and study_long_U1-U4.yaml (the
+                      protocols, one per study and user, each its own sweep), sweeps/*.yaml (sweep definitions)
 ../checkpoints/       IGNORED  (examples/pi05/mars/checkpoints/) policies/<name>/, adapters/<name>/ (weights +
-                      training logs; none tracked; hub.py download fetches the study's and the grid's)
+                      training logs; none tracked; hub.py download fetches the study's and the grid's);
+                      adapters/participants/ holds the user modules of calibrated visits (never uploaded)
 ../results/           IGNORED  (examples/pi05/mars/results/) study_short/ and study_long/ (a study's runs, by
                       participant: p<N>/, sim/), sim/sweeps/<name>/ (run_sweep.py), analysis/, old/ (superseded
                       results, by date; old/2026-11-23/ the October study: p1-p7, sim/study_s1, analysis/)
@@ -113,7 +115,8 @@ such as `checkpoints/` and `results/` are under `examples/pi05/mars/`.
 - **Arm.** One control condition, a config under `configs/` (policy, mode and its settings, readout, task).
   A sweep builds one per method for every cell of its grid (`run_sweep.method_arm`: a base arm such as
   `condition_study.yaml` with the cell's user, task, policy and modules), and a study plays those.
-- **Protocol** (`configs/study_short.yaml`, `configs/study_long_<user>.yaml`): the cells a participant plays
+- **Protocol** (`configs/study_short_<user>.yaml`, `configs/study_long_<user>.yaml`; `--protocol study_short --user U3`
+  plays `study_short_U3.yaml`): the cells a participant plays
   (one user x the tasks, as a sweep of their own, with every cell's tuned settings), trials and practice trials
   per block, the block order rule, trial timing. One task section per task and, in it, one block per arm.
 - **Blocks.** The order is a row of a balanced Latin square chosen by the participant number and
@@ -151,9 +154,9 @@ noise 1.0, applied only while pushing. That protocol, its arm files and its tuni
 and a window that shows the cursor, the targets and the obstacles and nothing of the command or the plan
 (`display.cues: false`):
 
-| | `study_short.yaml` | `study_long_<user>.yaml` |
+| | `study_short_<user>.yaml` | `study_long_<user>.yaml` |
 | --- | --- | --- |
-| User | U1 | one per file: U1, U2, U3 or U4 |
+| User | one per file: U1, U2, U3 or U4 | one per file: U1, U2, U3 or U4 |
 | Tasks | T1, the open field | T1, then T2 to T5 |
 | Arms | teleop, flow control, FRS, MARS with the user module | the same on T1; on T2 to T5 flow control and FRS on the task's fine-tuned policy, MARS with the user and the task module |
 | Condition | the recorded study's (`step` gain mode, 5 s) | the grid's (`time` gain mode, 5 s on T1, 8 s on T2 to T5) |
@@ -161,16 +164,24 @@ and a window that shows the cursor, the targets and the obstacles and nothing of
 | Session | about 14 min (20 at most) | about 1 h 30 to 1 h 45 min (2 h 40 at most) |
 
 ```bash
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1
-HF_HUB_OFFLINE=1 uv run --extra mars --extra pi python examples/pi05/mars/cursor/run_experiment.py --protocol study_long_U1.yaml --participant p1 --prepare
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_long_U1.yaml --participant p1
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1
+HF_HUB_OFFLINE=1 uv run --extra mars --extra pi python examples/pi05/mars/cursor/run_experiment.py --protocol study_long --user U1 --participant p1 --prepare
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_long --user U1 --participant p1
 ```
+
+- **Participant and user on the command line.** `--participant p<N>` names the person (the folder under
+  `results/<study>/`, and with `--session` the rows of the block and task orders and the layouts); `--user U<k>`
+  names the user profile, the readout the person plays through (U1 vertical gain 0.25, U2 horizontal gain 0.25, U3
+  a 60 degree rotation, U4 a curl field), and picks the study's protocol file for it (`study_short_U3.yaml`; a file
+  named whole with `--protocol` needs no `--user`). A study named without its user is an error that lists them. The
+  run folder carries the protocol's name, so one person's visits under several users sit side by side; give each
+  its own `--session`, since the layouts follow the participant and the session.
 
 - **A protocol is its own sweep.** A protocol's `cells:` is a sweep config (its base arm, the four methods with
   their modules and tuning grids, one user x the tasks played, the noise, the seed), with `settings`, what
   `run_sweep.py --sweep <protocol>` tuned for each cell (its `settings.yaml`), and `task_order` beside it. Every
   arm is the one that sweep builds for the user's cell, at its tuned setting and the sweep's noise, so a
-  participant plays exactly what the expert was tuned on. The four long protocols differ only in their user and
+  participant plays exactly what the expert was tuned on. A study's four protocols differ only in their user and
   its settings (a test checks it). A protocol's `study` names its folder under `results/`: the short study's runs go
   to `results/study_short/<participant>/`, every long protocol's to `results/study_long/<participant>/`.
 - **Task sections.** A task is a section with its own layouts, block order and run folder
@@ -180,12 +191,27 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
   block and `--resume`; finished sections are left as they are.
 - **Modules.** The user modules are `study/user_<tag>_expert_n100_s0`: the grid's recipe (100 simulated expert
   reaches, 500 steps, frozen noise) at noise 0.5, with the loss over every read, a rest's noise included. Every
-  participant shares them; nothing is trained in a session. The task modules are the grid's vision modules.
+  participant shares them unless the visit is calibrated (next). The task modules are the grid's vision modules.
+- **Calibration (`--calibrate`, either study).** The user module is trained in the session, on the participant's
+  own commands. Before the first block the cursor plays demonstration reaches by itself on the open field (the
+  protocol's `calibration`: 100 reaches after 5 practice ones) while the participant pushes as if steering it,
+  through the user's readout. That is the shared modules' recipe with the person in the simulated expert's place:
+  every step keeps what the readout served, and a user module is trained on those commands
+  (`train_adapter.train_calibrated_user`, 500 steps, about 15 s on a GPU, a waiting screen meanwhile). It takes the
+  shared module's place in MARS for the whole visit; in the long study the task modules compose with it as with
+  any user's. MARS keeps the depth and prefix tuned with the shared module. About 3.5 minutes in all (89 s of
+  reaches, the gates between them, the training). The reaches are a run of their own,
+  `<protocol>_s<session>_calibration/` (mode `playback`), and the module is
+  `checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>/`, named in every manifest and
+  record of the visit; its meta holds the calibration and a closing check (how well a regenerated chunk heads
+  where the demonstration did, with no module and with it, on the calibration's own steps). `--resume` continues
+  an interrupted calibration and keeps a finished one, and a visit begun with `--calibrate` is resumed with it.
+  `--participant sim --calibrate` plays the same block with the expert, the shared modules' recipe on new draws.
 - **Scene tokens.** A vision task module reads pi0.5's tokens of a picture of the scene. `--prepare` makes them
   for the visit's layouts (which depend only on the participant, the visit and the task) and caches them under
   `checkpoints/scene/<protocol>/`, so the session itself never loads pi0.5; without it they are made when the
   session starts (about a minute).
-- **Tuning.** `run_sweep.py --sweep study_short` (2 min) and `--sweep study_long_<user>` (about 40 min a user on
+- **Tuning.** `run_sweep.py --sweep study_short_<user>` (2 min) and `--sweep study_long_<user>` (about 40 min a user on
   two GPUs, in parts by `--cells`, then `--merge`) tune each arm with the simulated expert, as the grid does.
 - **Analysis.** `analyze_results.py --study <study>` writes `results/analysis/<study>/`: `trials.csv`, `summary.csv`,
   `summary.md` (per participant × arm, and the mean over people), `success_by_arm.png`,
@@ -237,7 +263,7 @@ on a task, e.g. a task-module arm where the task has none, are named below it) a
 
 | Sweep | Agent | Grid | Takes |
 |---|---|---|---|
-| `study_short` (the protocol, `configs/study_short.yaml`) | expert | the short study's cell (U1 on T1 under `condition_study.yaml`, noise 0.5): flow control over tau (lambda 1), FRS over pinned_steps (the full reversal), MARS over n_reverse_steps × pinned_steps; its `settings.yaml` goes into the protocol's `cells.settings` | ~2 min |
+| `study_short_<user>` (the protocols `configs/study_short_U1.yaml` to `U4`) | expert | the short study's cell for one user (T1 under `condition_study.yaml`, noise 0.5): flow control over tau (lambda 1), FRS over pinned_steps (the full reversal), MARS over n_reverse_steps × pinned_steps; its `settings.yaml` goes into the protocol's `cells.settings` | ~2 min |
 | `study_long_<user>` (the protocols `configs/study_long_U1.yaml` to `U4`) | expert | the long study's cells for one user (T1 to T5 under `condition_grid.yaml`, noise 0.5; flow control and FRS on the fine-tuned policies, MARS with the vision task modules), tuned the same way | ~40 min a user on two GPUs |
 | `grid_expert_check` | expert | the expert alone (teleop, clean readout) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
 | `grid_task_check` | expert_chunk | the goal-given policy's own chunks executed, with and without each task module, and each task's retrained policy alone (T2–T5) | 2 min on a free GPU |
@@ -303,7 +329,7 @@ every arm from it, with its method's mode and settings and its cell's user and t
 
 | Condition | Used by | What it sets |
 |---|---|---|
-| `condition_study.yaml` | the short study (`study_short.yaml`) | 4 targets, reach 0.35–0.5, 5 s per trial, speed gain by step |
+| `condition_study.yaml` | the short study (`study_short_<user>.yaml`) | 4 targets, reach 0.35–0.5, 5 s per trial, speed gain by step |
 | `condition_grid.yaml` | the grid, the long study and the other grid sweeps | noise 1.0 (a sweep's noise replaces it), 4 targets, reach 0.35–0.5, 8 s per trial (T1: 5 s, set by the sweep), speed gain by time |
 
 Main parameters (`control:` and `task:` sections):
@@ -491,7 +517,7 @@ pinned prefix, and the study's MARS arm moved to the grid's 100-demonstration us
 
 ## Next steps
 
-1. **Run participants** with `study_short.yaml` and `study_long_<user>.yaml`, after a pilot of each for the session length and the frame times.
+1. **Run participants** with `study_short_<user>.yaml` and `study_long_<user>.yaml`, after a pilot of each for the session length and the frame times.
 2. **Changes of course** are outside the deployed task (one goal per trial), and the user modules
    are calibrated without them; calibrating on demonstrations that switch target mid-reach did not fix
    that (Oct 23). Also classifier-free guidance between the goal-given and goal-hidden outputs.

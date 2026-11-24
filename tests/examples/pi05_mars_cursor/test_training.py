@@ -13,7 +13,7 @@ import torch
 
 from cursor_sa import config
 from lerobot.teleoperators.readout import Readout, corruption_spec
-from lerobot.envs.cursor import TaskConfig, obstacle_spec
+from lerobot.envs.cursor import TaskConfig, obstacle_spec, sample_layouts
 from cursor_sa.demos import demo_positions, make_demos
 from cursor_sa.policy import FlowPolicy, load_policy
 from lerobot.teleoperators.readout import DEADBAND
@@ -193,6 +193,27 @@ def test_the_user_modules_loss_counts_every_read(trained, monkeypatch):
     monkeypatch.setattr(train_adapter, "field_loss", lambda *a: weights.append(a[6] if len(a) > 6 else None) or real(*a))
     train_adapter.train(_args("--kind", "user", *ROT, "--name", "u_reads", *COMMON))
     assert len(weights) == 4 and all(w is None for w in weights)
+
+
+def test_a_recorded_calibration_trains_on_the_commands_it_served(monkeypatch):
+    """`train_calibrated_user` (a session's --calibrate): the user module's open-loop recipe on a recording. At every
+    step of the demonstrations the cursor played, the command is the one the readout served there, held over the
+    chunk as the controller holds it; nothing is drawn anew, as a recording has one command per step."""
+    policy, task, rng = _base_policy(), TaskConfig(min_reach=0.35, max_reach=0.5), np.random.default_rng(0)
+    layouts = sample_layouts(rng, 8, (4, 4), task)
+    actions, lengths = make_demos(rng, layouts, task)
+    served = np.clip(rng.normal(0, 0.5, actions.shape), -1, 1)  # any recording, one command per step
+    seen, real = [], train_adapter.field_loss
+    monkeypatch.setattr(train_adapter, "field_loss", lambda *a: seen.append(a[5]) or real(*a))
+    user, log = train_adapter.train_calibrated_user(
+        policy, layouts, actions, lengths, served, "cpu", steps=3, batch=16, check=64
+    )
+    assert isinstance(user, LearnedUserModule) and not user.training
+    assert len(seen) == 3 and {"heading_cos_none", "heading_cos_user"} <= set(log[-1])
+    recorded = train_adapter.to_action(torch.as_tensor(served, dtype=torch.float32), policy).reshape(-1, 2)
+    for bci in seen:
+        assert bci.shape == (16, policy.horizon, 2) and (bci == bci[:, :1]).all()  # one command, held over the chunk
+        assert (bci[:, 0, None] == recorded[None]).all(-1).any(1).all()  # and it is a recorded one
 
 
 def test_a_disc_task_module_trains_with_the_user_module_in_the_loop(trained):

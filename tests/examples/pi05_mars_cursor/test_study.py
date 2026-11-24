@@ -1,15 +1,19 @@
 """The user study built from a protocol's cells: each task section's tuned arms (run_experiment.protocol_sections), the
-scene an image task module reads in a study run, the shipped protocols, and what a window without cues draws."""
+scene an image task module reads in a study run, the shipped protocols, a visit calibrated on the participant's own
+commands (--calibrate), and what a window without cues draws."""
 
+import functools
 import os
 
 import numpy as np
 import pytest
 import run_experiment
+import torch
 import yaml
 from cursor_sa import config, session
 from cursor_sa.agents import ExpertAgent
 from cursor_sa.policy import FlowPolicy
+from cursor_sa.records import load_run
 from cursor_sa.session import Visit
 from cursor_sa.steering import SharedController, to_action
 
@@ -44,7 +48,27 @@ PROTOCOL = {
     "trial": {"ready_hold_s": 0.0, "feedback_s": 0.0},
     "expert": {"lag": 0, "slow_radius": 0.15},
 }
-LONG_USERS = ("U1", "U2", "U3", "U4")
+USERS = ("U1", "U2", "U3", "U4")
+CALIBRATED = """
+name: tiny
+cells:
+  arm: condition_study.yaml
+  methods:
+    teleop: {mode: teleop}
+    mars: {mode: frs, reversal_adapter: {user: cell}, tune: {n_reverse_steps: [2], pinned_steps: [4]}}
+  grid:
+    users:
+      U3: {corruption: {rotation_deg: 60}, adapter: shared_module}
+    tasks:
+      T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+    noises: [0.5]
+  settings:
+    U3xT1|0.5:
+      mars: {n_reverse_steps: 2, pinned_steps: 4}
+blocks: {trials: 2, practice: 1}
+trial: {ready_hold_s: 0.0, feedback_s: 0.0}
+calibration: {reaches: 6, practice: 1, steps: 3}
+"""
 
 
 def test_protocol_cells_give_each_task_its_tuned_arms(tmp_path):
@@ -117,51 +141,125 @@ def test_protocol_cells_give_each_task_its_tuned_arms(tmp_path):
 
 
 def test_shipped_study_protocols_resolve():
-    """study_short.yaml (U1 on T1) and study_long_<user>.yaml (each grid user on T1-T5): the arms of every task
-    section at their tuned settings, noise 0.5, the condition hidden and no cues; the long ones' obstacle tasks play
-    the fine-tuned policy and MARS's task module, and the four differ only in their user and its settings."""
+    """study_short_<user>.yaml (each grid user on T1) and study_long_<user>.yaml (each on T1-T5): the arms of every
+    task section at their tuned settings, noise 0.5, the condition hidden and no cues; the long ones' obstacle tasks
+    play the fine-tuned policy and MARS's task module, and a study's four differ only in their user and its settings."""
     import run_sweep
 
-    shipped = [("study_short.yaml", "U1", ["T1"])] + [
-        (f"study_long_{u}.yaml", u, ["T1", "T2", "T3", "T4", "T5"]) for u in LONG_USERS
-    ]
-    for name, expected, tasks in shipped:
-        protocol = config.load_protocol(name)
-        assert protocol["name"] == name.removesuffix(".yaml") and protocol["display"] == {
-            "blind": True,
-            "cues": False,
-        }
-        assert protocol["study"] == (
-            "study_short" if expected == "U1" and tasks == ["T1"] else "study_long"
-        )  # results/<study>/
-        assert run_sweep.load_sweep(protocol["name"])["grid"]["users"] == [
-            expected
-        ]  # run_sweep.py --sweep <protocol>
-        sections, user = run_experiment.protocol_sections(protocol)
-        assert user == expected and list(sections) == tasks, name
-        for task, arms in sections.items():
-            assert list(arms) == ["teleop", "flow_control", "frs", "mars"]
-            assert {arm["input_noise"] for arm in arms.values()} == {0.5}
+    studies = {"study_short": ["T1"], "study_long": ["T1", "T2", "T3", "T4", "T5"]}
+    for study, tasks in studies.items():
+        for expected in USERS:
+            protocol = config.load_protocol(f"{study}_{expected}.yaml")
             assert (
-                arms["flow_control"]["lambda"] == 1 and arms["frs"]["n_reverse_steps"] is None
-            )  # as their papers define them
-            assert (arms["mars"]["learned_adapter"]["task"] is None) == (task == "T1")
-            assert (arms["frs"]["model"] == "flow_goaldrop") == (task == "T1") and arms["mars"][
-                "model"
-            ] == "flow_goaldrop"
-            policy = session.load_checkpoints({"a": arms["teleop"]}, "cpu")[0][
-                "flow_goaldrop"
-            ]  # a full push, in action units
-            assert arms["flow_control"]["ic_gain"] == pytest.approx(float(to_action(1.0, policy)), abs=1e-4)
+                protocol["name"] == f"{study}_{expected}" and protocol["study"] == study
+            )  # results/<study>/
+            assert protocol["display"] == {"blind": True, "cues": False}
+            assert run_sweep.load_sweep(protocol["name"])["grid"]["users"] == [
+                expected
+            ]  # run_sweep.py --sweep <protocol>
+            sections, user = run_experiment.protocol_sections(protocol)
+            assert user == expected and list(sections) == tasks, protocol["name"]
+            for task, arms in sections.items():
+                assert list(arms) == ["teleop", "flow_control", "frs", "mars"]
+                assert {arm["input_noise"] for arm in arms.values()} == {0.5}
+                assert (
+                    arms["flow_control"]["lambda"] == 1 and arms["frs"]["n_reverse_steps"] is None
+                )  # as their papers define them
+                assert (arms["mars"]["learned_adapter"]["task"] is None) == (task == "T1")
+                assert (arms["frs"]["model"] == "flow_goaldrop") == (task == "T1") and arms["mars"][
+                    "model"
+                ] == "flow_goaldrop"
+                policy = session.load_checkpoints({"a": arms["teleop"]}, "cpu")[0][
+                    "flow_goaldrop"
+                ]  # a full push, in action units
+                assert arms["flow_control"]["ic_gain"] == pytest.approx(
+                    float(to_action(1.0, policy)), abs=1e-4
+                )
     assert sections["T2"]["teleop"]["gain_mode"] == "time"
-    longs = [yaml.safe_load((config.CONFIG_DIR / f"study_long_{u}.yaml").read_text()) for u in LONG_USERS]
 
-    def study(p):  # all of a long protocol but its name, its user and that user's settings
+    def shared(p):  # all of a protocol but its name, its user and that user's settings
         cells = {k: v for k, v in p["cells"].items() if k != "settings"}
         return {**p, "name": None, "cells": {**cells, "grid": {**cells["grid"], "users": None}}}
 
-    assert all(study(p) == study(longs[0]) for p in longs)
-    assert [list(p["cells"]["grid"]["users"]) for p in longs] == [[u] for u in LONG_USERS]
+    for study in studies:
+        files = [yaml.safe_load((config.CONFIG_DIR / f"{study}_{u}.yaml").read_text()) for u in USERS]
+        assert all(shared(p) == shared(files[0]) for p in files), study
+        assert [list(p["cells"]["grid"]["users"]) for p in files] == [[u] for u in USERS]
+    users = [
+        yaml.safe_load((config.CONFIG_DIR / f"{study}_{u}.yaml").read_text())["cells"]["grid"]["users"]
+        for study in studies
+        for u in USERS
+    ]
+    assert users[:4] == users[4:]  # a user is the same readout and module in both studies
+
+
+def test_a_user_on_the_command_line_picks_the_studys_protocol():
+    """--user names the user profile on the command line: the protocol played is the study's file for that user
+    (study_short and U3 -> study_short_U3.yaml). A protocol file named whole needs no --user, and a study named
+    without its user, or with one it has no file for, is an error that lists the users it has."""
+    args = run_experiment.parse_args(["--protocol", "study_short", "--participant", "p2", "--user", "U3"])
+    assert (args.protocol, args.participant) == ("study_short_U3.yaml", "p2")
+    assert run_experiment.protocol_sections(config.load_protocol(args.protocol))[1] == "U3"
+    assert run_experiment.protocol_file("study_long.yaml", "U2") == "study_long_U2.yaml"
+    assert run_experiment.protocol_file("study_long_U4.yaml") == "study_long_U4.yaml"
+    for user in (None, "U9"):
+        with pytest.raises(ValueError, match="--user U1, U2, U3 or U4"):
+            run_experiment.protocol_file("study_short", user)
+
+
+def test_a_calibrated_visit_plays_mars_with_the_participants_own_module(tmp_path, monkeypatch):
+    """--calibrate: before the first section the cursor plays demonstration reaches by itself while the participant
+    pushes through the user's readout; a user module trained on what the readout served takes the shared module's
+    place in MARS, by name in every manifest and record, and the shared module is never loaded. A resumed visit keeps
+    the module it calibrated."""
+    from train import train_adapter
+
+    monkeypatch.setattr(session, "adapter_path", lambda name: tmp_path / "adapters" / name / "adapter.pt")
+    small = functools.partial(
+        train_adapter.train_calibrated_user, batch=16, check=64
+    )  # a tiny run of the trainer
+    monkeypatch.setattr(train_adapter, "train_calibrated_user", small)
+    (tmp_path / "tiny.yaml").write_text(CALIBRATED)
+    assert config.load_protocol("study_short_U1.yaml")["calibration"] == {
+        "reaches": 100,
+        "practice": 5,
+        "steps": 500,
+    }
+    argv = ["--protocol", str(tmp_path / "tiny.yaml"), "--participant", "sim", "--cpu", "--calibrate"]
+    argv += ["--results", str(tmp_path / "results")]
+    run_experiment.main(argv)
+    runs = tmp_path / "results" / "tiny" / "sim"
+    manifest, reaches = load_run(runs / "tiny_s1_calibration")
+    assert (
+        manifest["block_order"] == ["calibration"] and manifest["arms"]["calibration"]["mode"] == "playback"
+    )
+    assert [r["practice"] for r in reaches] == [True] + [False] * 6
+    for r in reaches:  # the demonstration lands on the goal; the readout is the user's, read at every step
+        assert (r["outcome"], r["user"], r["task"]) == ("hit", "U3", "calibration")
+        assert (r["corruption"], r["input_noise"], r["obstacle"]) == ({"rotation_deg": 60}, 0.5, None)
+        assert len(r["served_commands"]) == len(r["path"]) - 1 == round(r["duration_s"] / 0.02)
+    name = "participants/tiny/sim/tiny_s1"
+    path = tmp_path / "adapters" / name / "adapter.pt"
+    assert AdapterModules.load(path).kind == "user"
+    meta = torch.load(path)["meta"]["calibration"]
+    assert (meta["participant"], meta["user"], meta["reaches"], meta["steps"]) == ("sim", "U3", 6, 3)
+    assert {"heading_cos_none", "heading_cos_user"} <= set(meta["log"][-1])
+    played, records = load_run(runs / "tiny_s1_T1")
+    assert played["arms"]["mars"]["reversal_adapter"] == {"user": name, "task": None}
+    assert (
+        f"adapters/{name}" in played["checkpoints"] and "adapters/shared_module" not in played["checkpoints"]
+    )
+    assert {r["arm"] for r in records} == {"teleop", "mars"} and len(records) == 6
+    assert {r["reversal_adapter"]["user"] for r in records if r["arm"] == "mars"} == {name}
+    trained, real = [], run_experiment.train_user_module
+    monkeypatch.setattr(
+        run_experiment, "train_user_module", lambda *a, **k: trained.append(1) or real(*a, **k)
+    )
+    run_experiment.main([*argv, "--resume"])  # nothing left to play, nothing trained again
+    path.unlink()  # a visit stopped while its module was trained: the reaches stand, the training runs again
+    run_experiment.main([*argv, "--resume"])
+    assert trained == [1] and AdapterModules.load(path).kind == "user"
+    assert len(load_run(runs / "tiny_s1_calibration")[1]) == 7
 
 
 def test_a_study_run_attaches_and_caches_an_image_task_modules_scene(tmp_path, monkeypatch):

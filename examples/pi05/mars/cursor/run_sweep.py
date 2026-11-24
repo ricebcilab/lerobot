@@ -1,7 +1,7 @@
 """Tune-then-test sweeps of the steering methods with a simulated agent, on the portal's mechanism.
 
-    python run_sweep.py --sweep study_short                            # a study protocol's cells (configs/study_short.yaml)
-    python run_sweep.py --sweep study_short --tune-trials 50 --test-trials 50   # a quick look
+    python run_sweep.py --sweep study_short_U1                         # a study protocol's cells (configs/study_short_U1.yaml)
+    python run_sweep.py --sweep study_short_U1 --tune-trials 50 --test-trials 50   # a quick look
     python run_sweep.py --sweep grid --resume                          # continue an interrupted sweep
     python run_sweep.py --sweep grid --cells U1xT3 U2xT4 --out grid_part1   # some cells, in a process of their own
     python run_sweep.py --sweep grid --merge grid_part1 grid_part2 --out grid_s0   # combine the parts

@@ -1,7 +1,7 @@
 # The short user study's condition: the task of the study recorded in October 2026 (4 targets per trial and a reach of
 # 0.35-0.5 from the start to the goal, chosen then by a task parameter search as where the methods differ most) under
-# the default controller (gain_mode step, 5 s per trial). sweeps/study_short.yaml builds every arm of the short study
-# on it, setting each cell's user (the corruption and the user's module) and the noise.
+# the default controller (gain_mode step, 5 s per trial). study_short_<user>.yaml builds every arm of the short study
+# on it, setting its cell's user (the corruption and the user's module) and the noise.
 extends: base.yaml
 task:
   targets: [4, 4]

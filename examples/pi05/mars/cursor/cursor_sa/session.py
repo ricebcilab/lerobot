@@ -7,6 +7,9 @@
               and a manifest
     visit     a participant's visit over several tasks: one run per task
               section, in a counterbalanced task order
+    calibration  the reaches a participant's own user module is trained on,
+              before a visit: the cursor plays demonstrations by itself
+              while the person pushes
     trial     agent -> readout -> controller -> env, stepped at 50 Hz, logged
 
 `run_trials` steps a batch of trials in lockstep. A person runs one trial at a
@@ -24,6 +27,7 @@ import numpy as np
 from . import config
 from lerobot.teleoperators.readout import Readout
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, sample_layouts
+from .demos import make_demos
 from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import load_policy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
@@ -149,7 +153,30 @@ def readout_for(arm, rng=None, input_noise=None, off=False):
     return Readout(arm["corruption_matrix"], noise, rng, curl=arm["corruption_curl"])
 
 
-def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None, scene_encoder=None):
+class Playback:
+    """The controller of a calibration reach: the cursor moves by the recorded steps `actions` [B, L, 2] on its own
+    and holds after they end, whatever the command. What `run_trials` and the window ask of a controller."""
+
+    mode, chunks = "playback", 0
+
+    def __init__(self, actions):
+        self.actions, self.t = np.asarray(actions, dtype=float), 0
+        self.steered_chunks = np.zeros(len(self.actions), dtype=int)
+
+    def act(self, command, reference=None):
+        step = self.actions[:, self.t] if self.t < self.actions.shape[1] else np.zeros_like(self.actions[:, 0])
+        self.t += 1
+        return step
+
+    def record(self, displacement):
+        pass
+
+    def planned(self):
+        return [()] * len(self.actions)
+
+
+def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None, scene_encoder=None,
+               playback=None):
     """Step len(layouts) trials in lockstep until all are done; return one record per trial.
 
     `policy` (a `CursorFlowPolicy`, `load_checkpoints`', or a bare `FlowPolicy`) goes to the controller
@@ -159,6 +186,9 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
     person quits. When the arm's task module reads vlm_views, `scene_encoder` (an
     encoder, or a zero-argument factory of one, called once) is required: the
     running trials' two views are encoded at every observation (`view_scene_fn`).
+    With `playback` (steps [B, L, 2], a calibration's demonstrations) the cursor plays those
+    steps by itself instead of a controller's (`Playback`): the commands are read and
+    logged as in any trial, nothing steers, and no feedback follows.
     """
     task = arm_task(arm)
     B = len(layouts)
@@ -173,10 +203,10 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
                              "scene_encoder (an encoder, or a factory of one)")
         scene_fn = view_scene_fn(module, scene_encoder if hasattr(scene_encoder, "encode") else scene_encoder())
     env = CursorEnv(layouts, task)
-    ctl = SharedController(policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"],
-                           arm["execute"], task.dt, speed_gain=arm["speed_gain"], adapter=adapter,
-                           device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"], lam=arm["lambda"],
-                           pinned_steps=arm["pinned_steps"], scene_fn=scene_fn)
+    ctl = Playback(playback) if playback is not None else SharedController(
+        policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"], arm["execute"], task.dt,
+        speed_gain=arm["speed_gain"], adapter=adapter, device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"],
+        lam=arm["lambda"], pinned_steps=arm["pinned_steps"], scene_fn=scene_fn)
     readout.reset(B)
     agent.reset(B, readout)
     ctx = dict(env=env, ctl=ctl, layouts=layouts, task=task, agent=agent, served=np.zeros((B, 2)), hud=hud or {})
@@ -205,7 +235,7 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
     except Aborted:
         aborted = True
     t_end = now_iso()
-    if renderer is not None and not aborted:
+    if renderer is not None and not aborted and playback is None:
         renderer.feedback_phase(ctx)
 
     path, raw_log, served_log = np.stack(path, 1), np.stack(raw_log, 1), np.stack(served_log, 1)
@@ -238,6 +268,8 @@ class Run:
     names its task (in the run's folder, its layout seed and every record), takes the block order's next
     row per section (`index`), and counts the blocks over the visit; `labels` go into its records and
     manifest too."""
+
+    calibration = False  # a `Calibration`'s trials are reaches the cursor plays by itself
 
     def __init__(self, protocol, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
                  run_name=None, *, arms, section=None, labels=None):
@@ -272,10 +304,14 @@ class Run:
                     agent=dict(name=self.agent.name, **self.agent.params()), checkpoints=checkpoints,
                     git_commit=git_commit(ROOT), environment=environment(), started=now_iso(), finished=None)
 
-    def start(self):
+    def check(self):
+        """A run that has trials is continued only on --resume."""
         if self.dir.exists() and any(self.dir.glob("block*.jsonl")) and not self.resume:
             raise FileExistsError(f"{self.dir} already has trials; pass --resume to continue it, "
                                   f"or --session {self.session + 1} for a new visit")
+
+    def start(self):
+        self.check()
         self.dir.mkdir(parents=True, exist_ok=True)
         if self.resume and (self.dir / "manifest.json").exists():
             old = read_manifest(self.dir)
@@ -304,6 +340,10 @@ class Run:
         plan += [(False, i + 1, self.layouts[[j]], int(j)) for i, j in enumerate(block_permutation(self.seed, block, n_t))]
         return plan
 
+    def playback(self, rows):
+        """The steps the cursor plays by itself in these trials of a block's plan, or None: a run's trials are steered."""
+        return None
+
     def run(self, renderer=None):
         """Play every block; returns the number of trials played.
 
@@ -321,7 +361,8 @@ class Run:
                 log = self.dir / block_filename(block, arm_name)
                 readout = readout_for(arm, np.random.default_rng([self.seed, block]))
                 before, n_blocks = (self.section["first_block"], self.section["n_blocks"]) if self.section else (0, len(self.order))
-                hud = dict(block=before + block, n_blocks=n_blocks, arm=arm_name)  # counted over the visit
+                hud = dict(block=before + block, n_blocks=n_blocks, arm=arm_name,  # counted over the visit
+                           calibration=self.calibration)
                 if renderer is not None:
                     renderer.block_screen(dict(**hud, n_practice=len(self.practice), n_trials=len(self.layouts),
                                                resumed=len(done)), self.agent)
@@ -333,13 +374,14 @@ class Run:
                                      practice=practice)
                     try:
                         recs = run_trials(arm, Layouts.concat([r[2] for r in rows]), self.agent, readout,
-                                          self.policies[arm["model"]], self.adapters, self.device, renderer, trial_hud)
+                                          self.policies[arm["model"]], self.adapters, self.device, renderer, trial_hud,
+                                          playback=self.playback(rows))
                     except Aborted as e:
                         self.append(log, block, arm_name, rows, e.args[0])
                         raise
                     self.append(log, block, arm_name, rows, recs)
                     played += len(rows)
-                if renderer is not None:
+                if renderer is not None and not self.calibration:  # a calibration ends in its module's training
                     end = block == len(self.order)  # of this run; the visit ends with its last section
                     last = end and (self.section is None or self.section["last"])
                     renderer.break_screen(dict(**hud, last=last, section_end=end and not last), self.agent)
@@ -354,6 +396,83 @@ class Run:
             append_record(log, trial_record(rec, self.arms[arm_name], self.participant, self.run_name,
                                             self.protocol["name"], block, arm_name, trial, practice, layout_id,
                                             self.agent.name, self.labels))
+
+
+class Calibration(Run):
+    """The reaches a participant's own user module is trained on (--calibrate), before a visit's first section: on
+    the open field, under the user's readout, the cursor plays one demonstration per layout by itself (`make_demos`)
+    while the participant pushes as if steering it, and every step keeps what the readout served. A run of one
+    block in <protocol>_s<session>_calibration/ (`protocol.calibration`: its reaches and practice reaches), resumed
+    as any run is.
+
+    `sections` are the visit's ({task: {arm name: arm}}): the readout and the layouts' task are their first arm's,
+    the policy the one their user module steers. `module` names the module trained on the calibration
+    (checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>), `with_module` puts it in the
+    shared module's place and `data` is what its trainer reads."""
+
+    calibration = True
+
+    def __init__(self, protocol, sections, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
+                 labels=None):
+        arms = [arm for section in sections.values() for arm in section.values()]
+        models = {arm["model"] for arm in arms if self.user_module(arm)}
+        if len(models) != 1:
+            raise ValueError(f"protocol {protocol['name']}: a calibration trains the user module of one policy; its arms "
+                             f"play a user module on {sorted(models) or 'none'}")
+        arm = {**arms[0], "mode": "playback", "method": "calibration", "model": models.pop(), "obstacle": None,
+               "reversal_adapter": None, "learned_adapter": None, "adapter_matrix": None}
+        plan = protocol["calibration"]
+        blocks = {"trials": plan["reaches"], "practice": plan["practice"], "order": "listed"}
+        section = dict(task="calibration", index=0, first_block=0, n_blocks=1, last=False)
+        super().__init__({**protocol, "blocks": blocks}, participant, session, agent, device, results_dir, resume,
+                         arms={"calibration": arm}, section=section, labels=labels)
+        self.module = f"participants/{protocol['study']}/{participant}/{protocol['name']}_s{session}"
+        rng, task = np.random.default_rng([self.seed, 2]), arm_task(arm)
+        self.demos = {practice: make_demos(rng, layouts, task)  # (steps [B, L, 2], lengths [B]) per layout set
+                      for practice, layouts in ((False, self.layouts), (True, self.practice))}
+
+    @staticmethod
+    def user_module(arm):
+        """The user module an arm plays by name, or None."""
+        names = arm["learned_adapter"]
+        return names.get("user") if isinstance(names, dict) else None
+
+    @property
+    def module_path(self):
+        return adapter_path(self.module)
+
+    @property
+    def ready(self):
+        """Whether the visit has its module: every reach played and the module trained on them saved."""
+        return self.module_path.exists() and (self.dir / "manifest.json").exists() and not self.remaining()
+
+    def playback(self, rows):
+        return self.demos[rows[0][0]][0][[row[3] for row in rows]]
+
+    def with_module(self, sections):
+        """`sections` with the participant's module in the shared user module's place, in every arm that plays one."""
+        def swap(arm):
+            if not self.user_module(arm):
+                return arm
+            return {**arm, "reversal_adapter": {**arm["reversal_adapter"], "user": self.module},
+                    "learned_adapter": {**arm["learned_adapter"], "user": self.module}}
+
+        return {task: {name: swap(arm) for name, arm in arms.items()} for task, arms in sections.items()}
+
+    def data(self):
+        """The played calibration as its trainer reads it: (layouts, steps [B, L, 2], lengths [B], served [B, L, 2]),
+        one row per finished reach: its layout, the demonstration the cursor played on it, and what the readout
+        served at every one of its steps."""
+        records = [r for r in self.done_trials(1, "calibration") if not r["practice"] and r["outcome"] == "hit"]
+        ids = [r["layout_id"] for r in records]
+        actions, lengths = self.demos[False]
+        served = np.zeros((len(ids), actions.shape[1], 2))
+        for row, (record, i) in enumerate(zip(records, ids)):
+            if len(record["served_commands"]) != lengths[i]:
+                raise ValueError(f"{self.dir}: reach {record['trial']} has {len(record['served_commands'])} commands for a "
+                                 f"demonstration of {lengths[i]} steps (was the code changed since it was played?)")
+            served[row, :lengths[i]] = record["served_commands"]
+        return self.layouts[ids], actions[ids], lengths[ids], served
 
 
 class Visit:
@@ -375,6 +494,11 @@ class Visit:
             self.runs.append(Run(protocol, participant, session, agent, device, results_dir, resume,
                                  arms=sections[task], section=section, labels=labels))
             first += len(sections[task])
+
+    def check(self):
+        """Every section's folder before anything is played (a calibration, which comes before `start`)."""
+        for run in self.runs:
+            run.check()
 
     def start(self):
         """Every section's manifest and checkpoints before the first screen, so an existing folder or a
