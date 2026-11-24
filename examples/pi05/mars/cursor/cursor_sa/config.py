@@ -3,8 +3,9 @@
 An **arm** is one control condition (configs/<arm>.yaml): the policy, the control
 mode and its depth, the readout (corruption, noise) and the task. An arm
 file says `extends: base.yaml` (or another arm) and overrides only what it
-changes. A **protocol** (configs/study.yaml) names the arms a participant plays
-and how: trials and practice per block, block order, trial timing. Unknown or
+changes. A **protocol** (configs/study_short.yaml, study_long_<user>.yaml) names what a
+participant plays, as cells of a sweep's grid, and how: trials and practice per
+block, block order, trial timing. Unknown or
 missing keys are errors, so a typo cannot silently do nothing. Spec values
 (corruption, reversal_adapter) are replaced whole, never merged.
 """
@@ -52,8 +53,9 @@ PROTOCOL_DEFAULTS = {
     "blocks": {"trials": 40, "practice": 5, "order": "latin_square"},
     "trial": {"ready_hold_s": 0.3, "feedback_s": 0.6},
     "expert": {"lag": 0, "slow_radius": 0.15, "clearance": 0.05, "margin": 0.03},
-    "display": {"blind": True},
+    "display": {"blind": True, "cues": True},  # cues: the served command, the planned path and the STEERING label
 }
+CELLS_KEYS = ("methods", "grid", "settings")  # a protocol's cells must give, beside the rest of a sweep and task_order
 
 
 def resolve(path):
@@ -83,7 +85,7 @@ def _nested(path):
 def load_arm(path, overrides=None):
     """An arm's parameters {name: value}, validated, with the derived fields
     corruption_matrix, corruption_curl, adapter_matrix, learned_adapter and method. `overrides`
-    (parameter name -> value) win over the file, as command-line flags do."""
+    (parameter name -> value, e.g. a sweep's method and cell) win over the file."""
     path = resolve(path)
     params = {}
     for section, values in _nested(path).items():
@@ -168,18 +170,32 @@ def adapter_names(arm):
 
 
 def load_protocol(path):
-    """A protocol {name, arms, blocks, trial, expert, display}; arms maps arm name -> config file."""
+    """A protocol {name, study, cells, blocks, trial, expert, display}. `study` is the folder under results/ its runs
+    go to (results/<study>/<participant>/<name>_s<visit>_<task>/; by default the name), so protocols of one study
+    (study_long_U1 ... U4) share it. `cells` says what a participant plays: a sweep of its
+    own in a sweep config's form (run_sweep.py), its users x tasks grid one user x the tasks played, each task a
+    section of the visit (`run_experiment.protocol_sections`), the methods in the order given; beside it settings,
+    the tuned setting per cell and method ('<user>x<task>|<noise>' -> method -> {knob: value}, as run_sweep.py's
+    settings.yaml for this protocol gives them), and task_order, latin_square (the first task first, the others
+    counterbalanced) or listed. The sweep's keys are checked where it is built (run_sweep.load_sweep)."""
     path = resolve(path)
     data = yaml.safe_load(path.read_text()) or {}
-    unknown = set(data) - {"name", "arms"} - set(PROTOCOL_DEFAULTS)
+    unknown = set(data) - {"name", "study", "cells"} - set(PROTOCOL_DEFAULTS)
     if unknown:
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
-    arms = data.get("arms")
-    if not isinstance(arms, dict) or not arms:
-        raise ValueError(f"{path}: arms must map arm names to config files")
-    for name, file in arms.items():
-        resolve(file)
-    protocol = dict(name=data.get("name", path.stem), arms=dict(arms))
+    study = str(data.get("study") or data.get("name", path.stem))
+    if not study or "/" in study or study.startswith("."):
+        raise ValueError(f"{path}: study names the folder under results/ its runs go to, one name; got {study!r}")
+    cells = data.get("cells")
+    if not isinstance(cells, dict) or set(CELLS_KEYS) - set(cells) or not isinstance(cells.get("methods"), dict):
+        raise ValueError(f"{path}: cells takes a sweep's methods and grid (and its arm, tune, trials, seed), settings and "
+                         f"task_order, got {cells!r}")
+    if not isinstance(cells["settings"], dict):
+        raise ValueError(f"{path}: cells.settings maps '<user>x<task>|<noise>' to each method's tuned setting")
+    cells = {"task_order": "latin_square", **cells}
+    if cells["task_order"] not in ("latin_square", "listed"):
+        raise ValueError(f"{path}: cells.task_order must be latin_square or listed")
+    protocol = dict(name=data.get("name", path.stem), study=study, cells=cells)
     for section, defaults in PROTOCOL_DEFAULTS.items():
         given = data.get(section) or {}
         bad = set(given) - set(defaults)

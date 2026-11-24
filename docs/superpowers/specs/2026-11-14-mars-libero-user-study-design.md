@@ -271,6 +271,41 @@ commands. Runs and reports are in `outputs/pi05_libero_user_study/round2/` (`eva
 Stage 1's run folders were deleted on the author's word after every trial was exported to
 `outputs/pi05_libero_user_study/round1/baseline_trials.csv`, which the paired comparisons use.
 
+- **Control of what FRS does with rotation and gripper (2026-11-23; `round2/control.sh`, `control_report.txt`).**
+  Tang et al.'s LIBERO recipe (App. D.2) keeps rotation, at 0, and the gripper, halfway between open and closed, in
+  the reference; the study's FRS redraws their noise after the reversal. On the clean readout at noise 0.2, the
+  redirect fine-tune's checkpoint and the same resets, successes of 30 at prefix 5 / 10 / 25 / 50: redrawn 7 / 10 /
+  12 / 11 (33.3%), rotation reversed 7 / 11 / 10 / 11 (32.5%; -0.8 points, p 1), rotation and gripper reversed
+  (`control.gripper_reference=0`) 5 / 7 / 9 / 11 (26.7%; -6.7, p 0.13). The right first reach is 43.3 / 46.7 / 44.2%
+  (p 0.34 and 1) and success after it 75 / 64 / 58%. The gripper closes in at least 95% of trials in every arm. So
+  the difference kept from the paper does not cost FRS, the three are equal at prefix 50 (the paper's own case),
+  and holding rotation and gripper to a filler does not move the first choice.
+- **Checks for a completion module (2026-11-23 evening; `round2/oracle_completion.py`, `oracle_report.txt`,
+  `decode_check.txt`).** The proposal was a scene-conditioned module that writes the latent FRS hands back to the
+  policy (rotation, gripper, the steps past the prefix: 320 of 350 numbers at prefix 10). Two checks, before
+  building it, on the clean readout at noise 0.2 and round 2's resets:
+  - An oracle that fills the handed-back latent from the meant chunk's (the task-prompted policy's chunk reversed
+    through the same field; it knows the task, so it bounds any such module): successes of 30 at prefix 5 / 10 /
+    25 / 50, 15 / 12 / 11 / 8 (38.3% pooled; FRS 33.3%, McNemar p 0.33; prefix 5 50.0 against 23.3%, p 0.02);
+    right first reach 52.5 against 43.3% (p 0.043). Level with FC under the four users (pooled 26.7-39.4%, best
+    cells 40.0-53.3%), not above it.
+  - The same oracle filling every element (the policy regenerates the meant chunk under "do something"): 19 of 30
+    (63.3%; the ceiling 100%), right first reach 70%; "push the plate" and "turn on the stove" stay mostly out of
+    reach. So the "do something" prior caps FRS-based methods on this checkpoint at about 63% even with perfect
+    intent.
+  - Whether the meant first object can be read from what a module would see (a softmax regression on the
+    commands so far and the scene, each task's reset held out; the majority class, the bowl, is 50%): 63% at the
+    first chunk, 50-55% at chunks 1 to 7. Without the readout's noise 59-73%, from the operator's intent at every
+    chunk 63-91%; an operator that never rests (estimated on the same trajectories) 57-69%. The scene features
+    add nothing over the commands.
+  - Conclusion: in this setting (a policy told "do something" on tasks it masters) no FRS-based method was found
+    that would beat FC; the prior and the operator's signal both limit it. The author chose to move LIBERO to the
+    FRS paper's own regime: a policy told the task in words, on tasks it was not trained on (the paper's Goal base
+    is a pi0.5 trained only on LIBERO-90), with the released Goal checkpoint, told the task, as the synthetic
+    operator. LIBERO then tests correcting a corrupted command for an instructed policy, the cursor tests goal
+    inference, and the paper claims no intent inference from LIBERO. Step 0 (the agent's base rates) started
+    21:57 in `outputs/pi05_libero_user_study/instructed/`.
+
 ## Before round 1
 
 What the earlier iterations (2026-11-14 to 2026-11-20) established, all under the old user (always pushing, noise

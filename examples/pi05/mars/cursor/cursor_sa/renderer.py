@@ -17,35 +17,28 @@ TARGET, TARGET_EDGE, GOAL = (236, 235, 230), (201, 200, 193), (251, 227, 161)
 CURSOR, PLAN, COMMAND = (42, 120, 214), (150, 190, 236), (235, 104, 52)
 GOOD, BAD = (27, 150, 100), (210, 60, 60)
 OBSTACLE, OBSTACLE_EDGE = (205, 204, 198), (150, 149, 144)
+MAX_BEHIND = 2  # frame periods a trial frame may run behind its deadline before the grid starts again (a stall)
 # The keys a human agent's keyboard is told about, by the names its reader knows (`devices.KEY_PUSHES`, and shift).
 HELD_KEYS = {"left": (pygame.K_LEFT,), "right": (pygame.K_RIGHT,), "up": (pygame.K_UP,), "down": (pygame.K_DOWN,),
              "shift": (pygame.K_LSHIFT, pygame.K_RSHIFT)}
-FREE_PLAY_KEYS = {pygame.K_1: ("mode", "policy"), pygame.K_2: ("mode", "teleop"), pygame.K_3: ("mode", "flow_control"),
-                  pygame.K_4: ("mode", "frs"), pygame.K_LEFTBRACKET: ("depth", -1), pygame.K_RIGHTBRACKET: ("depth", +1),
-                  pygame.K_MINUS: ("speed_gain", -0.1), pygame.K_EQUALS: ("speed_gain", +0.1),
-                  pygame.K_KP_MINUS: ("speed_gain", -0.1), pygame.K_KP_PLUS: ("speed_gain", +0.1),
-                  pygame.K_SPACE: ("skip", None)}
 
 
 def to_px(p):
     return int(round(p[0] * FIELD)), int(round(HUD + (1 - p[1]) * FIELD))
 
 
-class Skipped(Exception):
-    """The trial was skipped (free play, space)."""
-
-
 class Renderer:
-    """blind=True hides the condition (for participants); free_play=True enables the
-    setting keys and reports them through `requests`."""
+    """blind=True hides the condition (for participants); unblinded, the arm's name
+    shows beside the block and trial count. cues=False leaves out what tells the arms
+    apart on screen: the served command's line, the planned path and the STEERING label
+    (a blinded study shows the cursor, the targets and the obstacles)."""
 
-    def __init__(self, title="Cursor shared autonomy", blind=True, free_play=False, ready_hold_s=0.3,
-                 feedback_s=0.6, fps=50, auto_continue_s=None):
-        self.blind, self.free_play = blind, free_play
+    def __init__(self, title="Cursor shared autonomy", blind=True, ready_hold_s=0.3,
+                 feedback_s=0.6, fps=50, auto_continue_s=None, cues=True):
+        self.blind, self.cues = blind, cues
         self.ready_hold_s, self.feedback_s, self.fps = ready_hold_s, feedback_s, fps
         self.auto_continue_s = auto_continue_s  # screens continue by themselves (watching the expert)
-        self.requests = []       # free-play setting changes, (what, value)
-        self.status_line = ""
+        self.deadline = None  # when the current trial frame is due to end (`frame`)
         pygame.init()
         self.screen = pygame.display.set_mode((FIELD, HUD + FIELD))
         pygame.display.set_caption(title)
@@ -64,8 +57,6 @@ class Renderer:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     raise Aborted()
                 pressed.append(event.key)
-                if self.free_play and event.key in FREE_PLAY_KEYS:
-                    self.requests.append(FREE_PLAY_KEYS[event.key])
         if agent is not None and hasattr(agent, "keyboard"):
             held = pygame.key.get_pressed()
             agent.keyboard.hold(name for name, keys in HELD_KEYS.items() if any(held[k] for k in keys))
@@ -117,9 +108,20 @@ class Renderer:
         lines.append("Press a SpaceMouse button or Enter to start.")
         self.screen_message(f"Block {info['block']} of {info['n_blocks']}{arm}", lines, agent)
 
+    def section_screen(self, info, agent):
+        """Before a task section of a visit over several tasks."""
+        lines = ["This task has obstacles: steer around them. Touching one ends the trial." if info.get("obstacles")
+                 else "This task has no obstacles.",
+                 "Press a SpaceMouse button or Enter to continue."]
+        self.screen_message(f"Task {info['position']} of {info['of']}", lines, agent)
+
     def break_screen(self, info, agent):
         if info["last"]:
             self.screen_message("Done. Thank you!", ["Press a SpaceMouse button or Enter to finish."], agent)
+        elif info.get("section_end"):
+            self.screen_message(f"End of block {info['block']} of {info['n_blocks']}",
+                                ["That was the last block of this task. Take a longer break if you like.",
+                                 "Press a SpaceMouse button or Enter to continue."], agent)
         else:
             self.screen_message(f"End of block {info['block']} of {info['n_blocks']}",
                                 ["Take a break if you like.", "Press a SpaceMouse button or Enter to continue."], agent)
@@ -136,14 +138,25 @@ class Renderer:
 
         self.frames(agent, lambda: self.draw(ctx, banner="Get ready" if idle_since[0] is not None else "Release the stick",
                                              banner_color=INK_2), done)
+        self.begin_trial()
+
+    def begin_trial(self):
+        """The trial starts now: its frame k is due to end k frame periods from here (`frame`)."""
+        self.deadline = time.monotonic()
 
     def frame(self, ctx):
+        """One frame of a trial, paced by deadline: it waits until its own end on the trial's grid of frame periods,
+        so a frame that ran late (a chunk computed in it) is followed by a shorter one and the trial keeps the task's
+        rate on average, in wall-clock time as in steps. More than MAX_BEHIND periods late (a stall) starts the grid
+        again from now, rather than a burst of short frames."""
         self.pump(ctx["agent"])
-        if self.free_play and ("skip", None) in self.requests:
-            self.requests.remove(("skip", None))
-            raise Skipped()
         self.draw(ctx)
-        self.clock.tick(self.fps)
+        period, now = 1.0 / self.fps, time.monotonic()
+        self.deadline = (now if self.deadline is None else self.deadline) + period
+        if now - self.deadline > MAX_BEHIND * period:
+            self.deadline = now
+        elif now < self.deadline:
+            time.sleep(self.deadline - now)
 
     def feedback_phase(self, ctx):
         env = ctx["env"]
@@ -157,17 +170,11 @@ class Renderer:
     def draw(self, ctx, banner=None, banner_color=INK, done=False):
         env, ctl, layouts, task, hud = ctx["env"], ctx["ctl"], ctx["layouts"], ctx["task"], ctx["hud"]
         self.screen.fill(BG)
-        if self.blind:
-            which = "practice" if hud.get("practice") else "trial"
-            self.text(f"Block {hud.get('block', 1)} of {hud.get('n_blocks', 1)}   {which} {hud.get('trial', 1)} "
-                      f"of {hud.get('n_trials', 1)}", (12, 8), big=True)
-        else:
-            self.text(hud.get("title", ""), (12, 8), big=True)
-            self.text(hud.get("line2", ""), (12, 36), color=INK_2)
-            self.text(hud.get("line3", ""), (12, 56), color=INK_2)
-            self.text(hud.get("line4", ""), (12, 78))
-        self.text(self.status_line, (12, 100), color=INK_2)
-        if not done and is_active(ctx["served"][0]) and ctl.mode not in ("policy", "teleop"):
+        which = "practice" if hud.get("practice") else "trial"
+        arm = "" if self.blind or not hud.get("arm") else f"   ({hud['arm']})"
+        self.text(f"Block {hud.get('block', 1)} of {hud.get('n_blocks', 1)}   {which} {hud.get('trial', 1)} "
+                  f"of {hud.get('n_trials', 1)}{arm}", (12, 8), big=True)
+        if self.cues and not done and is_active(ctx["served"][0]) and ctl.mode not in ("policy", "teleop"):
             self.text("STEERING", (FIELD - 100, 10), big=True, color=COMMAND)
         pygame.draw.line(self.screen, TARGET_EDGE, (0, HUD - 1), (FIELD, HUD - 1))
 
@@ -187,11 +194,11 @@ class Renderer:
                 fill = int(radius * min(1.0, env.dwell[0] / task.dwell_steps))
                 if fill > 0:
                     pygame.draw.circle(self.screen, PLAN, center, fill)
-        plan = ctl.planned()[0]
+        plan = ctl.planned()[0] if self.cues else ()
         if len(plan) and not done:
             pygame.draw.lines(self.screen, PLAN, False, [to_px(env.pos[0])] + [to_px(p) for p in plan], 3)
         cursor = to_px(env.pos[0])
-        if not done and is_active(ctx["served"][0]):
+        if self.cues and not done and is_active(ctx["served"][0]):
             pygame.draw.line(self.screen, COMMAND, cursor, to_px(env.pos[0] + 0.12 * ctx["served"][0]), 3)
         pygame.draw.circle(self.screen, CURSOR, cursor, 8)
         if banner:

@@ -1,13 +1,13 @@
 """Tune-then-test sweeps of the steering methods with a simulated agent, on the portal's mechanism.
 
-    python run_sweep.py --sweep study_tuning                           # configs/sweeps/study_tuning.yaml
-    python run_sweep.py --sweep study_tuning --tune-trials 50 --test-trials 50   # a quick look
+    python run_sweep.py --sweep study_short                            # a study protocol's cells (configs/study_short.yaml)
+    python run_sweep.py --sweep study_short --tune-trials 50 --test-trials 50   # a quick look
     python run_sweep.py --sweep grid --resume                          # continue an interrupted sweep
     python run_sweep.py --sweep grid --cells U1xT3 U2xT4 --out grid_part1   # some cells, in a process of their own
     python run_sweep.py --sweep grid --merge grid_part1 grid_part2 --out grid_s0   # combine the parts
     python run_sweep.py --sweep grid --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_s0/settings.yaml --out grid_s1
 
-A sweep config (configs/sweeps/<name>.yaml) names the agent, the base arm, the
+A sweep config (configs/sweeps/<name>.yaml, or a study protocol's `cells`, configs/<name>.yaml) names the agent, the base arm, the
 methods (overrides of the arm), the settings to tune per mode (`tune`: for
 flow_control tau (chunk steps of 16), lambda (Euler steps the command is written
 at) and ic_gain, for frs n_reverse_steps (Euler steps of flow_steps) and
@@ -132,11 +132,38 @@ def _valid_tune(mode, knobs):
             and all(isinstance(v, list) and v for v in knobs.values()))
 
 
+PROTOCOL_ONLY = ("settings", "task_order")  # a study protocol's cells beside the sweep they are
+
+
+def protocol_cells(protocol):
+    """A study protocol's cells as a sweep config of their own: its grid, methods, base arm and tuning, named after
+    the protocol (`config.load_protocol`)."""
+    name = {"name": protocol["name"]} if protocol.get("name") else {}
+    return {**name, **{k: v for k, v in protocol["cells"].items() if k not in PROTOCOL_ONLY}}
+
+
 def load_sweep(path, module_seed=None):
+    """A sweep config (a bare name is configs/sweeps/<name>.yaml), or a study protocol (configs/<name>.yaml), whose
+    cells are the sweep that tunes it."""
     path = Path(path)
     if not path.exists():
-        path = config.CONFIG_DIR / "sweeps" / (path.name if path.suffix else path.name + ".yaml")
+        name = path.name if path.suffix else path.name + ".yaml"
+        path = config.CONFIG_DIR / "sweeps" / name
+        if not path.exists() and (config.CONFIG_DIR / name).exists():
+            path = config.CONFIG_DIR / name
     data = yaml.safe_load(path.read_text())
+    if "cells" in data:
+        data = protocol_cells({"name": path.stem, **data})
+    return sweep_from(data, path, module_seed)
+
+
+def protocol_sweep(protocol):
+    """The sweep a loaded study protocol's cells are (`config.load_protocol`)."""
+    return sweep_from(protocol_cells(protocol), Path(protocol["name"]))
+
+
+def sweep_from(data, path, module_seed=None):
+    """A sweep from a sweep config's data; `path` names it in errors and is its default name."""
     if module_seed is not None:  # the same sweep with the modules of another training seed
         data = with_module_seed(data, module_seed)
         data["name"] = f"{data.get('name', path.stem)}_s{module_seed}"

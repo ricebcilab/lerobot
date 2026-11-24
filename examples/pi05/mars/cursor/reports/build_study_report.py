@@ -3,7 +3,8 @@
     python reports/build_study_report.py --participants p1
     python reports/build_study_report.py --participants p1 p2 p3 p4
 
-Reads every session of each participant under results/<participant>/<protocol>_s<k>/ and, when
+The study recorded in October 2026 (protocol `study`): reads every session of each participant under
+results/old/2026-11-23/<participant>/<protocol>_s<k>/ (--results) and, when
 present, the expert agent's test result for the same condition from
 results/sim/sweeps/study_tuning/test.json. One participant gives reports/study_<participant>.pdf;
 several give reports/study_group.pdf, where the unit of analysis is the participant (each one's
@@ -605,7 +606,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--participants", nargs="+", required=True, help="p<N> ...; one gives that participant's report, several the group's")
     p.add_argument("--protocol", default="study", help="protocol name as in the manifests")
-    p.add_argument("--results", default=str(RESULTS))
+    p.add_argument("--results", default=str(RESULTS / "old" / "2026-11-23"), help="the recorded study's folder")
     p.add_argument("--out", help="PDF path (default reports/study_<participant>.pdf or reports/study_group.pdf)")
     args = p.parse_args(argv)
     if len(args.participants) == 1:

@@ -50,11 +50,11 @@ def arm_fields(arm):
     return out
 
 
-def trial_record(outcome, arm, participant, run, protocol, block, arm_name, trial, practice, layout_id, agent):
+def trial_record(outcome, arm, participant, run, protocol, block, arm_name, trial, practice, layout_id, agent, labels=None):
     """A full trial record: the run context, the trial's outcome fields (from
-    session.run_trials) and the arm's settings."""
+    session.run_trials) and the arm's settings; `labels` (a task section's task and user) with them."""
     return dict(participant=participant, run=run, protocol=protocol, block=block, arm=arm_name, trial=trial,
-                practice=practice, layout_id=layout_id, agent=agent, **outcome, **arm_fields(arm))
+                practice=practice, layout_id=layout_id, agent=agent, **(labels or {}), **outcome, **arm_fields(arm))
 
 
 def summarize(records):

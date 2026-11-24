@@ -1,7 +1,0 @@
-# Study arm: Flow Reversal Steering as Tang et al. define it (the full reversal), at the pinned prefix
-# sweeps/study_tuning.yaml tuned (57.6% of 500 test trials). The recorded sessions steered the whole chunk.
-extends: condition_study.yaml
-control:
-  mode: frs
-  n_reverse_steps: null
-  pinned_steps: 8

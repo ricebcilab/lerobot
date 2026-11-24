@@ -13,7 +13,8 @@ module alone, MARS-T the task module alone.
 
 Reads (results/ is git-ignored, so these are local):
     fig1  nothing (its reaches come from the readout's rule, its densities are made up)
-    fig2  results/p*/study_s*/ (the recorded sessions) and results/sim/study_s1 (the expert's reference)
+    fig2  the study recorded in October 2026, moved to results/old/2026-11-23/: p*/study_s*/ (the sessions) and
+          sim/study_s1 (the expert's reference)
     fig3  the vision grid's five training seeds: results/sim/sweeps/grid_vision_s<k>/test.json (seed 0 tuned, seeds 1-4
           tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
           module alone and with the user module) joined trial for trial by the fine-tuned arm from
@@ -514,6 +515,9 @@ def build_fig1(out):
 
 
 # ================================================================ Figure 2: the human study
+
+
+RECORDED_STUDY = Path("old") / "2026-11-23"  # under results/: the October 2026 study's p1-p7 and sim/study_s1
 
 
 def study_trials(results):
@@ -1102,7 +1106,7 @@ def main(argv=None):
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args(argv)
     out, results = Path(args.out), Path(args.results)
-    builders = {"fig1": lambda: build_fig1(out), "fig2": lambda: build_fig2(out, results),
+    builders = {"fig1": lambda: build_fig1(out), "fig2": lambda: build_fig2(out, results / RECORDED_STUDY),
                 "fig3": lambda: build_fig3(out, results, args.device)}
     for name in args.only:
         print(f"{name} -> {builders[name]()}", flush=True)

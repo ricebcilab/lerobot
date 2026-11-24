@@ -7,7 +7,9 @@ the grid use, listed in hub_manifest.yaml.
     uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py upload                    # maintainers: create the repo, upload
 
 The manifest is rebuilt from the configs, never edited by hand:
-- study: configs/study.yaml's arms (their policy and adapters);
+- study: every method of the study protocols (configs/study_short.yaml, study_long_<user>.yaml) in every cell: the
+  policies (frozen and fine-tuned per task), the four users' modules and the vision task modules, so the protocols
+  play and tune after a download;
 - grid: every method of configs/sweeps/grid.yaml in every cell (the frozen policy, the retrained policies, the
   seed-0 user and task modules, and the user modules calibrated on the retrained policies);
 - grid_seeds: the grid's training seeds 1-4, derived from each seed-0 module of the grid group by putting _s<k> in
@@ -35,7 +37,7 @@ import yaml
 from huggingface_hub import HfApi, snapshot_download
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cursor_sa (otherwise imported lazily) sits one folder up
-from cursor_sa.paths import CHECKPOINTS, ROOT  # noqa: E402
+from cursor_sa.paths import CHECKPOINTS, CONFIGS, ROOT  # noqa: E402
 
 MANIFEST = ROOT / "hub_manifest.yaml"
 REPO = "ricebcilab/mars-cursor"
@@ -53,7 +55,7 @@ POLICY_REQUIRED = ("config.json", "model.safetensors", *POLICY_PIPELINE_FILES)
 ADAPTER_REQUIRED = ("adapter.pt",)
 HEADER = """\
 # The checkpoint folders (under examples/pi05/mars/checkpoints/) that the study and the grid use, on the Hub at
-# `repo`. Written by `hub.py manifest` from configs/study.yaml, configs/sweeps/grid.yaml and the grid's seeds 1-4;
+# `repo`. Written by `hub.py manifest` from the study protocols, configs/sweeps/grid.yaml and the grid's seeds 1-4;
 # do not edit by hand (`hub.py manifest --check` fails when this file and the configs disagree).
 """
 
@@ -78,11 +80,13 @@ def seed_name(name, k):
 def manifest_folders():
     """{group: sorted folders} rebuilt from the configs."""
     import run_sweep
-    from cursor_sa import config
-    protocol = config.load_protocol("study.yaml")
-    study = arm_folders(config.load_arm(f) for f in protocol["arms"].values())
-    sweep = run_sweep.load_sweep("grid")
-    grid = arm_folders(run_sweep.method_arm(sweep, m, level) for m in sweep["methods"] for level in sweep["grid"]["levels"])
+
+    def sweep_folders(path):
+        sweep = run_sweep.load_sweep(path)
+        return arm_folders(run_sweep.method_arm(sweep, m, level) for m in sweep["methods"] for level in sweep["grid"]["levels"])
+
+    study = set().union(*(sweep_folders(p) for p in sorted(CONFIGS.glob("study_*.yaml"))))  # a protocol's cells are a sweep
+    grid = sweep_folders("grid")
     seeds = {f"adapters/{seed_name(f.split('/', 1)[1], k)}" for f in grid if f.startswith("adapters/") for k in SEEDS}
     return {"study": sorted(study), "grid": sorted(grid), "grid_seeds": sorted(seeds)}
 

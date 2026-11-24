@@ -1,0 +1,86 @@
+# The long user study (2026-11-23) for U1 (vertical gain 0.25): the five tasks (T1 the open field, T2-T5 the obstacle tasks)
+# under the grid's condition (condition_grid.yaml: gain_mode time, a replan every 80 ms, 8 s per trial, T1 5 s) at
+# input noise 0.5, which the readout serves at every read. Four arms per task, under the same four names on every task:
+# teleop; flow control and FRS (the frozen policy on T1, the task's fine-tuned policy on T2-T5, grid_vision.yaml's ft
+# arms); MARS (the user's module, study/user_<tag>_expert_n100_s0: the grid's recipe at noise 0.5 with the loss over
+# every read, and on T2-T5 the grid's vision task module: T2 trained with U1 in the loop, T3 with U2, T4 with U3, T5
+# with U4). About 1 h 30 to 1 h 45 min; 2 h 40 min if every trial ran out. study_long_U1.yaml to study_long_U4.yaml
+# differ only in their user and its settings.
+#
+#   python run_experiment.py --protocol study_long_U1.yaml --participant p1 --prepare   # the visit's scene tokens, ahead
+#   python run_experiment.py --protocol study_long_U1.yaml --participant p1
+#   python run_experiment.py --protocol study_long_U1.yaml --participant p1 --resume    # continue after a stop
+#   python run_sweep.py --sweep study_long_U1                                         # tune the arms with the expert
+#
+# `cells` is the sweep that builds the arms and tunes them with the simulated expert (the baselines as their papers
+# define them, each with its one knob tuned; MARS the reversal depth x the pinned prefix); run_sweep.py writes the
+# tuned values to results/sim/sweeps/study_long_U1/settings.yaml, and they go into cells.settings. A task section per
+# task, T1 first and T2-T5 in a balanced Latin square row by participant number and visit; within a section every arm
+# sees the same 40 layouts and the block order is the next row of the arms' square. The condition is hidden, and the
+# window shows the cursor, the targets and the obstacles and nothing of the command or the plan (display.cues: false).
+# Each section's records go to results/study_long/<participant>/study_long_U1_s<visit>_<task>/.
+name: study_long_U1
+study: study_long
+cells:
+  arm: condition_grid.yaml
+  methods:
+    teleop: {mode: teleop}
+    flow_control:
+      mode: flow_control
+      ic_gain: 2.084264602519949
+      model: &ft {T1: flow_goaldrop, T2: flow_goaldrop_disc_large_ft_n300_s0, T3: flow_goaldrop_wall_gap_ft_n300_s0,
+                  T4: flow_goaldrop_ring_goal_ft_n300_s0, T5: flow_goaldrop_ring_start_ft_n300_s0}
+    frs:
+      mode: frs
+      model: *ft
+    mars:
+      mode: frs
+      tune: {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}
+      reversal_adapter:
+        user: cell
+        task: {T1: null,
+               T2: image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256,
+               T3: image/task_wall_gap_n300_s0_with_gain025x_vlm_image_rel_rigid_r256,
+               T4: image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256,
+               T5: image/task_ring_start_n300_s0_with_curl20_vlm_image_rel_rigid_r256}
+  tune:
+    flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}
+    frs: {pinned_steps: [2, 4, 8, 16]}
+  grid:
+    users:
+      U1: {corruption: {scale: [1.0, 0.25]}, adapter: study/user_gain025y_expert_n100_s0}
+    tasks:
+      T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+      T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
+      T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
+      T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
+      T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
+    noises: [0.5]
+  trials: {tune: 200, test: 500}
+  seed: 800
+  task_order: latin_square
+  settings:
+    U1xT1|0.5:
+      flow_control: {tau: 16}
+      frs: {pinned_steps: 8}
+      mars: {n_reverse_steps: 3, pinned_steps: 8}
+    U1xT2|0.5:
+      flow_control: {tau: 10}
+      frs: {pinned_steps: 16}
+      mars: {n_reverse_steps: 4, pinned_steps: 16}
+    U1xT3|0.5:
+      flow_control: {tau: 16}
+      frs: {pinned_steps: 16}
+      mars: {n_reverse_steps: 8, pinned_steps: 8}
+    U1xT4|0.5:
+      flow_control: {tau: 16}
+      frs: {pinned_steps: 8}
+      mars: {n_reverse_steps: 9, pinned_steps: 16}
+    U1xT5|0.5:
+      flow_control: {tau: 14}
+      frs: {pinned_steps: 16}
+      mars: {n_reverse_steps: 7, pinned_steps: 8}
+blocks: {trials: 40, practice: 5, order: latin_square}
+trial: {ready_hold_s: 0.3, feedback_s: 0.6}
+expert: {lag: 0, slow_radius: 0.15}
+display: {blind: true, cues: false}

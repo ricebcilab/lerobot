@@ -1,11 +1,22 @@
 # The checkpoint folders (under examples/pi05/mars/checkpoints/) that the study and the grid use, on the Hub at
-# `repo`. Written by `hub.py manifest` from configs/study.yaml, configs/sweeps/grid.yaml and the grid's seeds 1-4;
+# `repo`. Written by `hub.py manifest` from the study protocols, configs/sweeps/grid.yaml and the grid's seeds 1-4;
 # do not edit by hand (`hub.py manifest --check` fails when this file and the configs disagree).
 repo: ricebcilab/mars-cursor
 folders:
   study:
-  - adapters/user_gain025y_expert_n100_s0
+  - adapters/image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256
+  - adapters/image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256
+  - adapters/image/task_ring_start_n300_s0_with_curl20_vlm_image_rel_rigid_r256
+  - adapters/image/task_wall_gap_n300_s0_with_gain025x_vlm_image_rel_rigid_r256
+  - adapters/study/user_curl20_expert_n100_s0
+  - adapters/study/user_gain025x_expert_n100_s0
+  - adapters/study/user_gain025y_expert_n100_s0
+  - adapters/study/user_rot60_expert_n100_s0
   - policies/flow_goaldrop
+  - policies/flow_goaldrop_disc_large_ft_n300_s0
+  - policies/flow_goaldrop_ring_goal_ft_n300_s0
+  - policies/flow_goaldrop_ring_start_ft_n300_s0
+  - policies/flow_goaldrop_wall_gap_ft_n300_s0
   grid:
   - adapters/task_disc_large_n300_s0_with_gain025y
   - adapters/task_ring_goal_n300_s0_with_rot60

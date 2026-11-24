@@ -5,6 +5,8 @@
     run       one participant under one protocol: blocks in a counterbalanced
               order, the same target layouts in every arm, one jsonl per block
               and a manifest
+    visit     a participant's visit over several tasks: one run per task
+              section, in a counterbalanced task order
     trial     agent -> readout -> controller -> env, stepped at 50 Hz, logged
 
 `run_trials` steps a batch of trials in lockstep. A person runs one trial at a
@@ -12,6 +14,7 @@ time in real time with a renderer; the expert runs a whole block at once,
 headless. Everything else is the same code and the same records.
 """
 
+import json
 import time
 import zlib
 from pathlib import Path
@@ -59,22 +62,31 @@ def balanced_latin_square(n):
     return rows
 
 
-def block_order(arm_names, participant, order="latin_square", session=1):
+def block_order(arm_names, participant, order="latin_square", session=1, shift=0):
     """The arms in the order a visit plays them: a row of the balanced Latin square chosen by the
     participant number and advanced by one row per visit, so the same person's visits are
-    counterbalanced too (p1 -> row 1, then 2, ...; sim -> row 0)."""
+    counterbalanced too (p1 -> row 1, then 2, ...; sim -> row 0). `shift` advances it further: each
+    task section of a visit takes the next row."""
     if order == "listed":
         return list(arm_names)
     if order == "latin_square":
         rows = balanced_latin_square(len(arm_names))
-        row = rows[(participant_index(participant) + session - 1) % len(rows)]
+        row = rows[(participant_index(participant) + session - 1 + shift) % len(rows)]
         return [arm_names[i] for i in row]
     raise ValueError(f"unknown block order {order!r}; expected latin_square or listed")
 
 
-def layout_seed(participant, session):
-    """One seed per visit: the same layouts in every arm of the visit, new ones next visit."""
-    return zlib.crc32(f"{participant}:{session}".encode())
+def task_order(tasks, participant, order="latin_square", session=1):
+    """The tasks in the order a visit plays them: the first as listed (the open field, where every visit
+    starts), the others in a row of their own balanced Latin square, chosen as the block order's row is."""
+    tasks = list(tasks)
+    return tasks[:1] + block_order(tasks[1:], participant, order, session) if len(tasks) > 2 else tasks
+
+
+def layout_seed(participant, session, section=None):
+    """One seed per visit: the same layouts in every arm of the visit, new ones next visit. A task section of
+    a visit (`section`, its task's name) takes its own."""
+    return zlib.crc32((f"{participant}:{session}" + ("" if section is None else f":{section}")).encode())
 
 
 def make_layout_sets(seed, n_trials, n_practice, targets, task):
@@ -219,18 +231,26 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
 
 
 class Run:
-    """One participant's visit under a protocol. `start()` writes the manifest and
-    finds where to resume; `run()` plays the blocks."""
+    """One participant's run of one task under a protocol: `arms` ({arm name: arm}) on the same layouts, a
+    block each. `start()` writes the manifest and finds where to resume; `run()` plays the blocks.
+
+    `section` makes the run one task section of a `Visit`: {task, index, first_block, n_blocks, last, ...}
+    names its task (in the run's folder, its layout seed and every record), takes the block order's next
+    row per section (`index`), and counts the blocks over the visit; `labels` go into its records and
+    manifest too."""
 
     def __init__(self, protocol, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
-                 run_name=None):
+                 run_name=None, *, arms, section=None, labels=None):
         self.protocol, self.participant, self.session, self.agent = protocol, participant, session, agent
-        self.device, self.resume = device, resume
-        self.arms = {name: config.load_arm(file) for name, file in protocol["arms"].items()}
-        self.order = block_order(list(self.arms), participant, protocol["blocks"]["order"], session)
-        self.run_name = run_name or f"{protocol['name']}_s{session}"
+        self.device, self.resume, self.section = device, resume, section
+        task = section["task"] if section else None
+        self.labels = {"task": task, **(labels or {})} if section else {}
+        self.arms = arms
+        self.order = block_order(list(self.arms), participant, protocol["blocks"]["order"], session,
+                                 section["index"] if section else 0)
+        self.run_name = run_name or f"{protocol['name']}_s{session}" + (f"_{task}" if section else "")
         self.dir = Path(results_dir) / participant / self.run_name
-        self.seed = layout_seed(participant, session)
+        self.seed = layout_seed(participant, session, task)
         blocks = protocol["blocks"]
         first = next(iter(self.arms.values()))
         for name, arm in self.arms.items():  # every arm plays the same layouts, so they must agree on them
@@ -245,7 +265,8 @@ class Run:
         models = dict.fromkeys(a["model"] for a in self.arms.values())  # each policy hashed once
         checkpoints = {f"policies/{m}": file_sha256(policy_weights(m)) for m in models}
         checkpoints.update(adapter_checkpoints(self.arms))
-        return dict(participant=self.participant, session=self.session, run=self.run_name,
+        section = {} if self.section is None else {"section": {**self.section, **self.labels}}
+        return dict(participant=self.participant, session=self.session, run=self.run_name, **section,
                     protocol=self.protocol, arms={k: arm_fields(v) for k, v in self.arms.items()},
                     block_order=self.order, layout_seed=self.seed,
                     agent=dict(name=self.agent.name, **self.agent.params()), checkpoints=checkpoints,
@@ -260,12 +281,20 @@ class Run:
             old = read_manifest(self.dir)
             if old["block_order"] != self.order or old["layout_seed"] != self.seed:
                 raise ValueError(f"{self.dir}: the existing run has a different order or layout seed")
+            if old["arms"] != json.loads(json.dumps(self.manifest()["arms"])):
+                raise ValueError(f"{self.dir}: the existing run has different arms (their settings changed since it began)")
+            if old.get("finished") and not self.remaining():
+                return  # a complete run keeps its manifest; nothing is left to play
         write_manifest(self.dir, self.manifest())
         self.policies, self.adapters = load_checkpoints(self.arms, self.device)
 
     def done_trials(self, block, arm):
         path = self.dir / block_filename(block, arm)
         return [r for r in read_records(path)] if path.exists() else []
+
+    def remaining(self):
+        """The trials still to play, over every block."""
+        return sum(len(self.block_plan(block)) - len(self.done_trials(block, arm)) for block, arm in enumerate(self.order, 1))
 
     def block_plan(self, block):
         """(practice flag, trial index, layout, layout id) for every trial of a block, in order."""
@@ -291,7 +320,8 @@ class Run:
                     continue
                 log = self.dir / block_filename(block, arm_name)
                 readout = readout_for(arm, np.random.default_rng([self.seed, block]))
-                hud = dict(block=block, n_blocks=len(self.order), arm=arm_name)
+                before, n_blocks = (self.section["first_block"], self.section["n_blocks"]) if self.section else (0, len(self.order))
+                hud = dict(block=before + block, n_blocks=n_blocks, arm=arm_name)  # counted over the visit
                 if renderer is not None:
                     renderer.block_screen(dict(**hud, n_practice=len(self.practice), n_trials=len(self.layouts),
                                                resumed=len(done)), self.agent)
@@ -310,7 +340,9 @@ class Run:
                     self.append(log, block, arm_name, rows, recs)
                     played += len(rows)
                 if renderer is not None:
-                    renderer.break_screen(dict(**hud, last=block == len(self.order)), self.agent)
+                    end = block == len(self.order)  # of this run; the visit ends with its last section
+                    last = end and (self.section is None or self.section["last"])
+                    renderer.break_screen(dict(**hud, last=last, section_end=end and not last), self.agent)
         finally:
             m = read_manifest(self.dir)
             m["finished"] = now_iso()
@@ -321,4 +353,42 @@ class Run:
         for (practice, trial, _, layout_id), rec in zip(rows, recs):
             append_record(log, trial_record(rec, self.arms[arm_name], self.participant, self.run_name,
                                             self.protocol["name"], block, arm_name, trial, practice, layout_id,
-                                            self.agent.name))
+                                            self.agent.name, self.labels))
+
+
+class Visit:
+    """One participant's visit over several task sections: a `Run` per section, in the visit's task order
+    (`task_order`), each with its own layouts, run folder and block order (the next row per section).
+
+    `sections` maps a task's name to its arms {arm name: arm}, in the protocol's order; `order` is the task
+    order rule (latin_square | listed); `labels` (e.g. the user) go into every record and manifest."""
+
+    def __init__(self, protocol, sections, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
+                 order="latin_square", labels=None):
+        names = list(sections)
+        self.tasks = task_order(names, participant, order, session)
+        n_blocks, first, self.runs = sum(len(arms) for arms in sections.values()), 0, []
+        for k, task in enumerate(self.tasks):
+            section = dict(task=task, index=names.index(task), position=k + 1, of=len(names), first_block=first,
+                           n_blocks=n_blocks, last=k == len(names) - 1, task_order=self.tasks,
+                           obstacles=any(arm["obstacle"] is not None for arm in sections[task].values()))
+            self.runs.append(Run(protocol, participant, session, agent, device, results_dir, resume,
+                                 arms=sections[task], section=section, labels=labels))
+            first += len(sections[task])
+
+    def start(self):
+        """Every section's manifest and checkpoints before the first screen, so an existing folder or a
+        missing checkpoint stops the visit before it begins."""
+        for run in self.runs:
+            run.start()
+
+    def run(self, renderer=None):
+        """Play every section with trials left; returns the number of trials played."""
+        played = 0
+        for run in self.runs:
+            if not run.remaining():
+                continue  # a section a resumed visit had finished
+            if renderer is not None and len(self.runs) > 1:  # a one-task visit needs no task screen
+                renderer.section_screen({**run.section, **run.labels}, run.agent)
+            played += run.run(renderer)
+        return played

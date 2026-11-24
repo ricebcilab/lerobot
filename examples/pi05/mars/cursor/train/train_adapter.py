@@ -14,7 +14,10 @@ through the policy's flow), along the straight path from z_L to a_bci:
 
     U(x_t, t) P(x_t, t) = a_bci - z_L,   x_t = (1 - t) z_L + t a_bci
 
-so a full reversal of a_bci lands on z_L, which regenerates L. Two knobs set the module's flexibility (LearnedUserModule):
+so a full reversal of a_bci lands on z_L, which regenerates L. Every sample counts alike, the ones where the expert
+rests included (the readout serves noise at every read, so a_bci is then the noise alone and a calibration cannot
+tell a rest from a push; the modules trained before 2026-11-23 weighted the loss by the expert's own push, which only
+a simulation knows). Two knobs set the module's flexibility (LearnedUserModule):
 `--step-rank r` builds every step's matrix from r matrices shared by the chunk, and `--cross-step-rank q` adds a
 rank-q coupling between the chunk's steps (`--cross-step-dims 0` or `0,1` picks the dims it couples; default both);
 the defaults (every step's matrix free, no coupling) are the grid's. They are saved in the module's config.
@@ -818,7 +821,7 @@ def train_user(args, policy, model, device, rng):
         free = hide_goal(obs)
         latent = reverse_flow(policy, free, chunk / policy.action_scale, args.flow_steps, args.flow_steps)
         bci = bci_command(policy, core, draw_sigma(args, args.batch, device), noise)
-        return field_loss(policy, user, None, free, latent, bci, active_rows(push, DEADBAND).float())
+        return field_loss(policy, user, None, free, latent, bci)  # every read, a rest's noise included (see USER MODULE)
 
     def validate():
         val = expert_check(policy, data["val"], args, user)

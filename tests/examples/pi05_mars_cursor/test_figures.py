@@ -81,7 +81,8 @@ def test_schematic_draws_three_density_panels_and_its_flows(spec):
     bf.plt.close(fig)
 
 
-@pytest.mark.skipif(not any((RESULTS / f"p{i}").exists() for i in range(1, 10)), reason="no recorded study sessions")
+@pytest.mark.skipif(not any((RESULTS / bf.RECORDED_STUDY / f"p{i}").exists() for i in range(1, 10)),
+                    reason="no recorded study sessions")
 def test_fig2_builds_from_the_recorded_sessions(tmp_path):
     bf.main(["--only", "fig2", "--out", str(tmp_path)])
     stats = json.loads((tmp_path / "stats.json").read_text())["fig2"]

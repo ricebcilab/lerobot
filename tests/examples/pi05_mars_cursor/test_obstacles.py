@@ -188,7 +188,7 @@ def test_obstacle_demos_avoid_the_obstacles_and_end_on_the_goal(spec):
 
 
 def test_the_expert_solves_every_obstacle_task_without_touching_anything():
-    arm = config.load_arm("teleop.yaml", {"targets": [4, 4], "reach": [0.35, 0.5], "time_limit_s": 8.0})
+    arm = config.load_arm("base.yaml", {"mode": "teleop", "targets": [4, 4], "reach": [0.35, 0.5], "time_limit_s": 8.0})
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     for spec in (GRID_DISC, GRID_WALL, RING_GOAL, RING_START):
         arm["obstacle"] = obstacle_spec(spec)
@@ -219,9 +219,8 @@ def test_the_expert_solves_every_obstacle_task_without_touching_anything():
 
 
 def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records():
-    from run_experiment import parse_args
-    arm = config.load_arm("teleop.yaml", {"obstacle": {"kind": "disc", "radius": 0.04, "along": 0.5}, "targets": [4, 4],
-                                          "reach": [0.35, 0.5]})
+    arm = config.load_arm("base.yaml", {"mode": "teleop", "obstacle": {"kind": "disc", "radius": 0.04, "along": 0.5},
+                                        "targets": [4, 4], "reach": [0.35, 0.5]})
     assert arm["obstacle"] == {"kind": "disc", "radius": 0.04, "along": 0.5, "offset": 0.0, "side": "random",
                                "decoy": False}
     assert arm_task(arm).obstacle == arm["obstacle"] and arm_task(config.load_arm("base.yaml")).obstacle is None
@@ -233,9 +232,6 @@ def test_obstacle_arm_parameter_reaches_the_env_the_layouts_and_the_records():
     recs = run_trials(arm, layouts, ExpertAgent(), Readout(None, 0.0), policies[arm["model"]], adapters, "cpu")
     assert len(recs[0]["obstacles"]) == 1 and len(recs[0]["obstacles"][0]) == 3
     np.testing.assert_allclose(recs[0]["obstacles"], layouts.real_obstacles(0), atol=1e-4)
-    # free play takes the spec on the command line
-    args = parse_args(["--arm", "teleop.yaml", "--obstacle", "{kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14}"])
-    assert args.overrides["obstacle"]["kind"] == "wall"
 
 
 def test_decoy_any_places_the_obstacle_about_a_target_drawn_uniformly_the_goal_among_them():

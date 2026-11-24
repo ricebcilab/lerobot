@@ -186,6 +186,15 @@ def test_a_user_module_trains_and_recalibrates_closed_loop(trained):
     assert {"heading_cos_user", "closed_heading_cos_none", "closed_heading_cos_user"} <= set(_log(trained, "u_cl")[-1])
 
 
+def test_the_user_modules_loss_counts_every_read(trained, monkeypatch):
+    """The readout serves noise at every read, so a calibration cannot tell a rest from a push: the user module's
+    field loss takes every sample alike, with no weight from the expert's true push (which only a simulation knows)."""
+    weights, real = [], train_adapter.field_loss
+    monkeypatch.setattr(train_adapter, "field_loss", lambda *a: weights.append(a[6] if len(a) > 6 else None) or real(*a))
+    train_adapter.train(_args("--kind", "user", *ROT, "--name", "u_reads", *COMMON))
+    assert len(weights) == 4 and all(w is None for w in weights)
+
+
 def test_a_disc_task_module_trains_with_the_user_module_in_the_loop(trained):
     final = torch.load(trained / "t" / "adapter.pt")
     meta = final["meta"]

@@ -1,19 +1,20 @@
-"""The portal: run an experiment protocol for a participant, or play one arm freely.
+"""The portal: run an experiment protocol for a participant.
 
-    python run_experiment.py --protocol study.yaml --participant p1              # a person on the SpaceMouse
-    python run_experiment.py --protocol study.yaml --participant p1 --resume     # continue an interrupted visit
-    python run_experiment.py --protocol study.yaml --participant sim             # the expert agent, headless
-    python run_experiment.py --protocol study.yaml --participant sim --watch     # the expert, rendered
-    python run_experiment.py --arm study_mars.yaml                                  # free play, one arm
+    python run_experiment.py --protocol study_short.yaml --participant p1              # a person on the SpaceMouse
+    python run_experiment.py --protocol study_short.yaml --participant p1 --resume     # continue an interrupted visit
+    python run_experiment.py --protocol study_short.yaml --participant sim             # the expert agent, headless
+    python run_experiment.py --protocol study_short.yaml --participant sim --watch     # the expert, rendered
+    python run_experiment.py --protocol study_long_U1.yaml --participant p1 --prepare  # a visit's scene tokens, ahead
+    python run_experiment.py --protocol study_long_U3.yaml --participant p1            # the long study with another user
 
 A participant is p<N> (a person) or sim (the expert agent). Both run the same
 protocol through the same mechanism (cursor_sa/session.py) and write the same
-records to results/<participant>/<protocol>_s<session>/. Free play (no
-protocol) logs to results/<participant>/free/<timestamp>.jsonl, shows the
-condition, and enables the setting keys:
-
-    1-4   mode: policy, teleop, flow_control, frs        [ ]  depth (tau / n_reverse_steps)
-    - =   speed gain                                     space  skip the trial        esc  quit
+records. A protocol (study_short.yaml, study_long_<user>.yaml) gives its cells,
+one user x the tasks played, as a sweep of its own (run_sweep.py tunes it): one
+task section per task, each a run of its own in
+results/<study>/<participant>/<protocol>_s<session>_<task>/ (study_short, or
+study_long for every long protocol), with the arms for the user's cell at their
+tuned settings.
 
 If a window cannot open (e.g. over SSH), set DISPLAY=:1 first.
 """
@@ -24,55 +25,31 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 from cursor_sa import config
 from cursor_sa.agents import make_agent
-from lerobot.envs.cursor import sample_layouts
-from cursor_sa.paths import RESULTS
-from cursor_sa.records import append_record, load_run, summarize, trial_record
-from cursor_sa.session import Aborted, Run, arm_task, readout_for, load_checkpoints, run_trials
-
-ARM_FLAGS = {  # free-play overrides of arm parameters
-    "--model": ("model", str), "--flow-steps": ("flow_steps", int), "--execute": ("execute", int),
-    "--mode": ("mode", str), "--tau": ("tau", int), "--lambda": ("lambda", int), "--ic-gain": ("ic_gain", float),
-    "--n-reverse-steps": ("n_reverse_steps", yaml.safe_load),
-    "--speed-gain": ("speed_gain", float), "--gain-mode": ("gain_mode", str), "--input-noise": ("input_noise", float),
-    "--corruption": ("corruption", yaml.safe_load), "--reversal-adapter": ("reversal_adapter", yaml.safe_load),
-    "--velocity-tau": ("velocity_tau", float), "--curl": ("curl", float), "--targets": ("targets", None),
-    "--target-radius": ("target_radius", float), "--min-target-sep": ("min_target_sep", float),
-    "--reach": ("reach", yaml.safe_load), "--dwell-s": ("dwell_s", float), "--time-limit-s": ("time_limit_s", float),
-    "--obstacle": ("obstacle", yaml.safe_load),
-}
+from cursor_sa.paths import CHECKPOINTS, RESULTS
+from cursor_sa.records import load_run, summarize
+from cursor_sa.session import Aborted, Visit, load_checkpoints
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--protocol", help="protocol config, e.g. study.yaml (bare names are looked up in configs/)")
-    p.add_argument("--arm", help="free play with this arm config instead of a protocol")
-    p.add_argument("--participant", help="p<N> for a person (default p0 in free play), sim for the expert agent")
+    p.add_argument("--protocol", required=True, help="protocol config, e.g. study_short.yaml (bare names are looked up in configs/)")
+    p.add_argument("--participant", required=True, help="p<N> for a person, sim for the expert agent")
     p.add_argument("--session", type=int, default=1, help="visit number; a new one gets new layouts")
     p.add_argument("--resume", action="store_true", help="continue an interrupted visit from its next trial")
     p.add_argument("--watch", action="store_true", help="render a sim run in real time")
     p.add_argument("--no-blind", action="store_true", help="show the condition to the participant")
     p.add_argument("--allow-keyboard", action="store_true", help="arrow keys may drive the cursor (study runs)")
-    p.add_argument("--results", default=str(RESULTS), help="results folder")
+    p.add_argument("--prepare", action="store_true", help="make and cache the visit's scene tokens (the task modules that "
+                   "read a picture of the scene), print its order, write nothing under results and exit")
+    p.add_argument("--scene-cache", help="where a visit's scene tokens are kept (default checkpoints/scene/<protocol>)")
+    p.add_argument("--results", default=str(RESULTS), help="results folder; a run goes to <results>/<study>/<participant>/")
     p.add_argument("--cpu", action="store_true", help="run the policy on the CPU")
-    over = p.add_argument_group("free-play overrides of the arm", "each wins over the arm config")
-    for flag, (name, typ) in ARM_FLAGS.items():
-        if typ is None:
-            over.add_argument(flag, dest=name, type=int, nargs=2, default=argparse.SUPPRESS, metavar=("MIN", "MAX"))
-        else:
-            over.add_argument(flag, dest=name, type=typ, default=argparse.SUPPRESS)
     args = p.parse_args(argv)
-    if bool(args.protocol) == bool(args.arm):
-        p.error("give exactly one of --protocol or --arm")
-    if args.protocol and not args.participant:
-        p.error("--participant is required with a protocol (p<N> or sim)")
-    args.participant = args.participant or "p0"
     if args.participant != "sim" and not (args.participant.startswith("p") and args.participant[1:].isdigit()):
         p.error("--participant must be p<N> (a person) or sim (the expert agent)")
-    args.overrides = {name: getattr(args, name) for _, (name, _) in ARM_FLAGS.items() if hasattr(args, name)}
     return args
 
 
@@ -88,23 +65,101 @@ def make_renderer(**kw):
 # ---------------------------------------------------------------- a protocol run
 
 
+def protocol_sections(protocol):
+    """A protocol's task sections, {task: {method: arm}} in the order of its tasks, and the user played. The protocol's
+    cells are a sweep of their own (`run_sweep.protocol_sweep`: one user x the tasks played, at one noise level), and
+    every arm is the one that sweep builds for the user's cell on that task (`run_sweep.method_arm`: the user's
+    corruption and module, the task's obstacle, time limit, policy and task module), at the cell's tuned setting from
+    `cells.settings` ('<cell>|<noise>' -> method -> setting, run_sweep.py's settings.yaml for the protocol) and at the
+    sweep's noise, which a sweep sets per trial and an arm of its own does not carry."""
+    from run_sweep import cell_key, is_tuned, method_arm, protocol_sweep, with_setting  # run_sweep imports the session
+    sweep = protocol_sweep(protocol)
+    grid = sweep["grid"]
+    if grid["family"] != "grid" or len(grid["noises"]) != 1:
+        raise ValueError(f"protocol {protocol['name']}: its cells must be a users x tasks grid at one noise level")
+    if len(grid["users"]) != 1:
+        raise ValueError(f"protocol {protocol['name']}: a protocol plays one user, got {grid['users']} (one protocol "
+                         f"per user: study_long_<user>.yaml)")
+    user, noise, settings = grid["users"][0], grid["noises"][0], protocol["cells"]["settings"]
+    sections = {}
+    for task in grid["tasks"]:
+        level = f"{user}x{task}"
+        tuned, arms = settings.get(cell_key(level, noise)) or {}, {}
+        for method in sweep["methods"]:
+            arm = method_arm(sweep, method, level)
+            if is_tuned(arm):
+                if tuned.get(method) is None:
+                    raise ValueError(f"protocol {protocol['name']}: cells.settings has no tuned setting for "
+                                     f"{cell_key(level, noise)}, {method}")
+                arm = with_setting(arm, tuned[method])
+            arms[method] = {**arm, "input_noise": noise}
+        sections[task] = arms
+    return sections, user
+
+
+def attach_scenes(runs, cache_dir, encoder_factory=None):
+    """Give every run's layouts (its trials and its practice trials) the scene arrays its task modules read
+    (`run_sweep.scene_sources`: a picture of the scene or its vision tokens), from the cache or made and cached
+    (`run_sweep.attach_scene`, keyed by participant, visit and task). The runs' checkpoints must be loaded;
+    `encoder_factory()` makes the pi0.5 scene encoder, called only for vision tokens the cache lacks."""
+    from run_sweep import attach_scene, scene_sources
+    for run in runs:
+        sources = scene_sources(run.adapters)
+        task = run.section["task"] if run.section else "run"
+        for layouts, split in ((run.layouts, "trials"), (run.practice, "practice")):
+            attach_scene(layouts, sources, cache_dir, f"{run.participant}_s{run.session}_{task}_{split}", encoder_factory)
+
+
+def scene_encoders(device):
+    """A factory of the one pi0.5 scene encoder (made at its first call) and the list it lands in, to close."""
+    made = []
+
+    def factory():
+        if not made:
+            from lerobot.policies.steering import SceneEncoder
+            from run_sweep import SCENE_VLM_PATH
+            made.append(SceneEncoder(SCENE_VLM_PATH, device=device))
+        return made[0]
+
+    return factory, made
+
+
 def run_protocol(args):
     protocol = config.load_protocol(args.protocol)
     sim = args.participant == "sim"
     agent = make_agent("expert", **protocol["expert"]) if sim else make_agent("human", allow_keyboard=args.allow_keyboard)
-    run = Run(protocol, args.participant, args.session, agent, device_for(args), args.results, args.resume)
-    run.start()
-    print(f"{args.participant}, {run.run_name}: blocks {run.order}, {len(run.layouts)} trials + "
-          f"{len(run.practice)} practice each, layout seed {run.seed} -> {run.dir}", flush=True)
+    results = Path(args.results) / protocol["study"]  # results/study_short/p1/, results/study_long/p1/
+    device, common = device_for(args), (args.participant, args.session, agent, device_for(args), results, args.resume)
+    sections, user = protocol_sections(protocol)  # a task section per task, its arms at their tuned settings
+    visit = Visit(protocol, sections, *common, order=protocol["cells"]["task_order"], labels={"user": user})
+    runs = visit.runs
+    for run in runs:
+        print(f"{args.participant}, {run.run_name}: blocks {run.order}, {len(run.layouts)} trials + "
+              f"{len(run.practice)} practice each, layout seed {run.seed} -> {run.dir}", flush=True)
+    cache = Path(args.scene_cache) if args.scene_cache else CHECKPOINTS / "scene" / protocol["name"]
+    factory, encoders = scene_encoders(device)
+    try:
+        if args.prepare:  # the scene tokens alone: checkpoints loaded, nothing written under results
+            for run in runs:
+                run.policies, run.adapters = load_checkpoints(run.arms, device)
+        else:
+            visit.start()
+        attach_scenes([run for run in runs if run.adapters is not None], cache, factory)
+    finally:
+        for encoder in encoders:  # pi0.5 leaves the GPU before the first trial
+            encoder.close()
+    if args.prepare:
+        print(f"scene tokens ready in {cache}")
+        return
     renderer = None
     if not sim or args.watch:
         renderer = make_renderer(title=f"{protocol['name']}: {args.participant}",
-                                 blind=protocol["display"]["blind"] and not args.no_blind,
+                                 blind=protocol["display"]["blind"] and not args.no_blind, cues=protocol["display"]["cues"],
                                  ready_hold_s=protocol["trial"]["ready_hold_s"],
                                  feedback_s=protocol["trial"]["feedback_s"], auto_continue_s=1.0 if sim else None)
     tic = time.time()
     try:
-        played = run.run(renderer)
+        played = visit.run(renderer)
         print(f"{played} trials in {time.time() - tic:.0f}s")
     except Aborted:
         print("aborted by the participant; re-run with --resume to continue")
@@ -113,7 +168,9 @@ def run_protocol(args):
             renderer.close()
         if hasattr(agent, "close"):
             agent.close()
-    print_summary(run.dir)
+    for run in runs:
+        if (run.dir / "manifest.json").exists():
+            print_summary(run.dir)
 
 
 def print_summary(run_dir):
@@ -124,97 +181,16 @@ def print_summary(run_dir):
         rows = [r for r in trials if r["arm"] == arm]
         if rows:
             s = summarize(rows)
+            frames = [dt for r in rows for dt in r["frame_dt_ms"] or []]  # a rendered run: how long its frames took
+            pace = (f"  frames {np.mean(frames):.1f} ms mean, {np.median(frames):.1f} ms median, "
+                    f"{np.percentile(frames, 95):.1f} ms at the 95th percentile" if frames else "")
             print(f"  {arm:16s} {s['hits']:3d}/{s['n']:<3d} hits ({100 * s['success']:5.1f}%)  "
-                  f"median {s['time_s'] if s['time_s'] is not None else float('nan'):.2f} s")
-
-
-# ---------------------------------------------------------------- free play
-
-
-def setting_text(arm):
-    depth = (f"tau {arm['tau']}/{config.CHUNK_STEPS}, gain {arm['ic_gain']:g}, lambda {arm['lambda']}" if arm["mode"] == "flow_control" else
-             f"n_reverse_steps {arm['n_reverse_steps'] or arm['flow_steps']}/{arm['flow_steps']}" if arm["mode"] == "frs"
-             else "")
-    names = arm["learned_adapter"]
-    parts = ([] if arm["mode"] != "frs" else ["learned user adapter"] if isinstance(names, str) else
-             (["learned user adapter"] if isinstance(names, dict) and names["user"] else
-              ["fixed user adapter"] if arm["adapter_matrix"] is not None else []))
-    if isinstance(names, dict) and names["task"]:
-        parts.append("task adapter")
-    adapter = "".join(f"   {p}" for p in parts)
-    return f"{arm['method']}   {depth}{adapter}   speed gain {arm['speed_gain']:.1f}" + (" by time" if arm["gain_mode"] == "time" else "")
-
-
-def apply_request(arm, what, value):
-    """A free-play key: change the arm in place and re-derive it."""
-    if what == "mode":
-        arm["mode"] = value
-    elif what == "depth":
-        if arm["mode"] == "flow_control":
-            arm["tau"] = int(np.clip(arm["tau"] + value, 0, config.CHUNK_STEPS))
-        elif arm["mode"] == "frs":
-            n = int(np.clip((arm["n_reverse_steps"] or arm["flow_steps"]) + value, 1, arm["flow_steps"]))
-            arm["n_reverse_steps"] = None if n == arm["flow_steps"] else n
-    elif what == "speed_gain":
-        arm["speed_gain"] = round(float(np.clip(arm["speed_gain"] + value, 0.1, 2.0)), 1)
-    config.derive(arm)
-
-
-def free_play(args):
-    from cursor_sa.renderer import Skipped
-    arm = config.load_arm(args.arm, args.overrides)
-    sim = args.participant == "sim"
-    agent = make_agent("expert") if sim else make_agent("human", allow_keyboard=True)
-    device = device_for(args)
-    policies, adapters = load_checkpoints({arm["name"]: arm}, device)
-    policy = policies[arm["model"]]
-    renderer = make_renderer(title=f"free play: {arm['name']}", blind=False, free_play=True,
-                             auto_continue_s=1.0 if sim else None)
-    log_dir = Path(args.results) / args.participant / "free"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log = log_dir / f"{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
-    rng = np.random.default_rng()
-    readout = readout_for(arm, np.random.default_rng())
-    tally, n = {}, 0
-    try:
-        while True:
-            layouts = sample_layouts(rng, 1, tuple(arm["targets"]), arm_task(arm))
-            hits, played = tally.get(arm["method"], (0, 0))
-            hud = dict(title=setting_text(arm), line4=f"{arm['method']}: {hits}/{played} hits    trials {n}",
-                       line3=f"corruption {arm['corruption'] or 'off'}    input noise {arm['input_noise']}    "
-                             f"{'curl %g/s   ' % arm['curl'] if arm['curl'] else ''}"
-                             f"{'obstacle %s   ' % arm['obstacle']['kind'] if arm['obstacle'] else ''}config {arm['name']}",
-                       line2=("expert agent" if sim else f"SpaceMouse: {agent.status}   (arrow keys work too)"))
-            renderer.status_line = "1-4 mode   [ ] depth   - = speed gain   space skip   esc quit"
-            try:
-                rec = run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer, hud)[0]
-            except Skipped:
-                continue
-            n += 1
-            tally[arm["method"]] = (hits + (rec["outcome"] == "hit"), played + 1)
-            append_record(log, trial_record(rec, arm, args.participant, "free", None, 0, arm["name"], n, False, None,
-                                            agent.name))
-            while renderer.requests:
-                what, value = renderer.requests.pop(0)
-                if what != "skip":
-                    apply_request(arm, what, value)
-                    if any(n not in adapters for n in config.adapter_names(arm)):
-                        adapters.update(load_checkpoints({arm["name"]: arm}, device)[1])
-            readout = readout_for(arm, readout.rng)
-    except Aborted:
-        pass
-    finally:
-        renderer.close()
-        if hasattr(agent, "close"):
-            agent.close()
-    print(f"{n} trials logged to {log}" if n else "no finished trials")
-    for method, (hits, played) in tally.items():
-        print(f"  {method}: {hits}/{played} hits")
+                  f"median {s['time_s'] if s['time_s'] is not None else float('nan'):.2f} s{pace}")
 
 
 def main(argv=None):
     args = parse_args(argv)
-    run_protocol(args) if args.protocol else free_play(args)
+    run_protocol(args)
 
 
 if __name__ == "__main__":

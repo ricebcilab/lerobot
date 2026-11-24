@@ -23,8 +23,8 @@ Run from the repo root.
 ```bash
 uv sync --extra mars        # or: pip install -e ".[mars]"
 uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py download
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study.yaml --participant p1
-uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --participants p1
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short.yaml --participant p1
+uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --study study_short --participants p1
 ```
 
 `hub.py download` fetches the trained checkpoints (the folders in
@@ -33,7 +33,8 @@ uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --
 session for participant `p1` (SpaceMouse and a display; use `--participant sim`
 for the expert agent, headless, which needs neither), and `analyze_results.py`
 prints the per-arm table and writes that participant's tables and figures.
-Results go to `examples/pi05/mars/results/`, checkpoints to
+Results go to `examples/pi05/mars/results/` (a study's runs to `results/study_short/p1/` and
+`results/study_long/p1/`), checkpoints to
 `examples/pi05/mars/checkpoints/` (both gitignored).
 
 The cursor trainers write lerobot's formats (a `cursor_flow` policy folder, `adapter.pt` in the

@@ -48,13 +48,13 @@ def test_constant_reference_equals_the_command(mode):
 
 
 def test_the_expert_chunk_agent_plans_goal_given_chunks_and_holds_each_planned_step():
-    arm = config.load_arm("teleop.yaml")
+    arm = config.load_arm("base.yaml", {"mode": "teleop"})
     policies, adapters = load_checkpoints({arm["name"]: arm}, "cpu")
     policy = policies[arm["model"]]
     layouts = sample_layouts(np.random.default_rng(3), 6, (2, 4), TaskConfig())
     recs = run_trials(arm, layouts, ExpertChunkAgent(), Readout(None, 0.0), policy, adapters, "cpu")  # the oracle
     assert all(r["outcome"] == "hit" and np.isfinite(r["raw_commands"]).all() and abs(np.array(r["raw_commands"])).max() < 4 for r in recs)
-    recs = run_trials(config.load_arm("frs.yaml"), layouts, ExpertChunkAgent(), Readout(None, 0.0), policy, adapters, "cpu")
+    recs = run_trials(config.load_arm("base.yaml", {"mode": "frs"}), layouts, ExpertChunkAgent(), Readout(None, 0.0), policy, adapters, "cpu")
     assert all(r["outcome"] in ("hit", "wrong_target", "timeout") and r["steered_chunks"] > 0 for r in recs)
     # gain 0.5 by time: each planned step pushed for two control steps, the reference given only when a chunk starts,
     # the controller's history receiving the planned steps whole
@@ -206,7 +206,8 @@ def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path):
     assert cell_key(0.25, 1.0, groups[1][1]) == "0.25|1.0|targets=2-2|dwell_s=0.5" and cell_key(5, 0.0) == "5|0.0"
     arm = method_arm(sweep, "frs", 0.25, groups[3][1])
     assert arm["targets"] == [4, 4] and arm["dwell_s"] == 0.5 and arm["corruption"] == {"scale": [1.0, 0.25]}
-    assert load_sweep("study_tuning.yaml")["grid"]["axes"] == {}
+    (tmp_path / "plain.yaml").write_text("name: plain\nmethods:\n  teleop: {mode: teleop}\ngrid:\n  family: gain\n  levels: [0.25]\n  noises: [1.0]\n")
+    assert load_sweep(tmp_path / "plain.yaml")["grid"]["axes"] == {}  # a sweep without task axes
     (tmp_path / "named.yaml").write_text(  # named values: an axis of obstacles
         "name: named\nmethods:\n  teleop: {mode: teleop}\n  frs: {mode: frs}\ngrid:\n  family: none\n  noises: [0.5]\n"
         "  axes: {obstacle: {T0: null, T1: {kind: disc, radius: 0.04, along: 0.5}}, targets: [[4, 4]]}\n")

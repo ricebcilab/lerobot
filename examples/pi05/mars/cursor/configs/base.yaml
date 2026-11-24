@@ -1,10 +1,10 @@
-# The default arm: one control condition for run_experiment.py.
+# The default arm: one control condition.
 #
 # Every arm parameter lives here. An arm file says `extends: base.yaml` (or
-# another arm) and overrides only what it changes; a command-line flag of
-# run_experiment.py still wins over both (free play), e.g. --speed-gain 0.3.
-# Unknown or missing keys are errors. Who plays (a person, the expert) and how
-# many trials are the protocol's business (configs/study.yaml).
+# another arm) and overrides only what it changes; a sweep's method and cell
+# override it again (configs/sweeps/). Unknown or missing keys are errors. Who
+# plays (a person, the expert) and how many trials are the protocol's business
+# (configs/study_short.yaml, study_long_<user>.yaml).
 
 policy:
   model: flow_goaldrop        # policy under checkpoints/policies/ (trained with goal dropout; never told the goal)

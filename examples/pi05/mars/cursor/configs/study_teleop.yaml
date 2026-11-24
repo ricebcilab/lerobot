@@ -1,4 +1,0 @@
-# Study arm: teleop.
-extends: condition_study.yaml
-control:
-  mode: teleop

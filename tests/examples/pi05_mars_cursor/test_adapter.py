@@ -113,7 +113,7 @@ def test_adapter_specs_accept_single_and_composite_forms(tmp_path, monkeypatch):
     assert config.adapter_names(both) == ["tiny_user", "tiny_task"]
     task_only = config.load_arm("base.yaml", {"mode": "teleop", "reversal_adapter": {"task": "tiny_task"}})
     assert task_only["learned_adapter"] == {"user": None, "task": "tiny_task"} and task_only["method"] == "teleop"
-    assert config.adapter_names(config.load_arm("teleop.yaml")) == []
+    assert config.adapter_names(config.load_arm("base.yaml", {"mode": "teleop"})) == []
     with pytest.raises(ValueError, match="reversal_adapter"):
         config.load_arm("base.yaml", {"reversal_adapter": {"bogus": 1}})
 
@@ -130,11 +130,11 @@ def test_adapter_specs_accept_single_and_composite_forms(tmp_path, monkeypatch):
     assert with_fixed.kind == "user" and with_fixed.user is None and with_fixed.matrix is not None
     assert session.arm_adapter(task_only, adapters).kind == "task"  # served in every mode
     assert set(session.adapter_checkpoints({"a": both})) == {"adapters/tiny_user", "adapters/tiny_task"}
-    assert session.adapter_checkpoints({"t": config.load_arm("teleop.yaml")}) == {}
+    assert session.adapter_checkpoints({"t": config.load_arm("base.yaml", {"mode": "teleop"})}) == {}
 
 
 def test_expert_chunk_plans_through_the_adapted_field():
-    arm = config.load_arm("teleop.yaml")
+    arm = config.load_arm("base.yaml", {"mode": "teleop"})
     policies, _ = session.load_checkpoints({arm["name"]: arm}, "cpu")
     policy = policies[arm["model"]]
     layouts = sample_layouts(np.random.default_rng(2), 3, 4, TaskConfig())

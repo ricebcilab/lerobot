@@ -12,7 +12,6 @@ from cursor_sa.demos import DemoSampler, make_demos, replay
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, _layout, sample_layouts
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy, load_policy
 from cursor_sa.records import summarize
-from cursor_sa.session import load_checkpoints
 from cursor_sa.steering import (MAX_SPEED, as_adapter, SharedController, hide_goal, observation, to_action,
                                 to_deflection)
 
@@ -270,36 +269,29 @@ def test_gain_scales_the_cursor_by_step_or_by_time():
     np.testing.assert_allclose([s for _, s in odd.steps_of(3)], [0.1, 0.2])  # a control step across two planned steps
 
 
-def test_shipped_configs_load_and_flags_override_them():
-    arms = {p.name: config.load_arm(p) for p in config.CONFIG_DIR.glob("*.yaml") if p.name != "study.yaml"}
-    assert {"base.yaml", "teleop.yaml", "flow_control.yaml", "frs.yaml", "condition_study.yaml", "condition_grid.yaml",
-            "study_teleop.yaml", "study_flow_control.yaml", "study_frs.yaml", "study_mars.yaml"} == set(arms)
-    assert {arms[f"study_{m}.yaml"]["mode"] for m in ("teleop", "flow_control", "frs", "mars")} == {"teleop", "flow_control", "frs"}
-    assert all(arms[f"study_{m}.yaml"]["corruption"] == {"scale": [1.0, 0.25]} for m in ("teleop", "flow_control", "frs", "mars"))
-    assert arms["frs.yaml"]["corruption"] is None
-    cfg = config.load_arm("frs.yaml", {"speed_gain": 0.3, "corruption": {"scale": [1.0, 0.5]},
-                                       "reversal_adapter": {"translation": "corruption"}})  # MARS with F = M
+def test_shipped_configs_load_and_overrides_win():
+    arms = {p.name: config.load_arm(p) for p in config.CONFIG_DIR.glob("*.yaml")
+            if not p.name.startswith("study_")}  # the other files of configs/ are protocols
+    assert {"base.yaml", "condition_study.yaml", "condition_grid.yaml"} == set(arms)  # the default arm and the sweeps' two bases
+    study = arms["condition_study.yaml"]  # the short study's task alone: its sweep sets the user and the noise
+    assert (study["targets"], study["reach"], study["corruption"], study["input_noise"]) == ([4, 4], [0.35, 0.5], None, 0.0)
+    cfg = config.load_arm("base.yaml", {"mode": "frs", "speed_gain": 0.3, "corruption": {"scale": [1.0, 0.5]},
+                                        "reversal_adapter": {"translation": "corruption"}})  # MARS with F = M
     assert cfg["speed_gain"] == 0.3 and cfg["mode"] == "frs" and cfg["method"] == "mars"
     np.testing.assert_allclose(cfg["adapter_matrix"], cfg["corruption_matrix"])
-    assert config.load_arm("study_flow_control.yaml", {"corruption": None})["corruption_matrix"] is None
-    study_mars = config.load_arm("study_mars.yaml")
-    assert (study_mars["learned_adapter"], study_mars["n_reverse_steps"], study_mars["pinned_steps"]) == ("user_gain025y_expert_n100_s0", 5, 8)
-    assert config.load_arm("teleop.yaml")["method"] == "teleop" and config.load_arm("frs.yaml")["method"] == "frs"
-    study_fc = config.load_arm("study_flow_control.yaml")  # the command in action units, at the tuned tau and lambda
-    assert study_fc["mode"] == "flow_control" and (study_fc["tau"], study_fc["lambda"]) == (14, 1)
-    policy = load_checkpoints({"a": study_fc}, "cpu")[0][study_fc["model"]]
-    assert study_fc["ic_gain"] == pytest.approx(float(to_action(1.0, policy)), abs=1e-4)  # a full push's
-    base_fc = config.load_arm("flow_control.yaml")
-    assert (base_fc["tau"], base_fc["ic_gain"], base_fc["lambda"]) == (8, 2.0, 1)
-    assert config.load_arm("flow_control.yaml", {"mode": "shared_flow_control"})["mode"] == "flow_control"
-    assert config.load_arm("flow_control.yaml", {"tau": 16})["tau"] == 16
+    assert study["corruption_matrix"] is None
+    assert config.load_arm("base.yaml", {"mode": "teleop"})["method"] == "teleop" and config.load_arm("base.yaml", {"mode": "frs"})["method"] == "frs"
+    base_fc = config.load_arm("base.yaml")
+    assert (base_fc["mode"], base_fc["tau"], base_fc["ic_gain"], base_fc["lambda"]) == ("flow_control", 8, 2.0, 1)
+    assert config.load_arm("base.yaml", {"mode": "shared_flow_control"})["mode"] == "flow_control"
+    assert config.load_arm("base.yaml", {"tau": 16})["tau"] == 16
     for bad in ({"tau": 17}, {"lambda": 11}, {"ic_gain": 0.0}):
         with pytest.raises(ValueError, match="control"):
-            config.load_arm("flow_control.yaml", bad)
+            config.load_arm("base.yaml", bad)
     from cursor_sa.records import arm_fields
-    assert config.load_arm("base.yaml")["gain_mode"] == "step" and arm_fields(config.load_arm("condition_grid.yaml"))["gain_mode"] == "time"
+    assert base_fc["gain_mode"] == "step" and arm_fields(config.load_arm("condition_grid.yaml"))["gain_mode"] == "time"
     with pytest.raises(ValueError, match="gain_mode"):
-        config.load_arm("teleop.yaml", {"gain_mode": "slow"})
+        config.load_arm("base.yaml", {"gain_mode": "slow"})
 
 
 def test_arm_task_parameters_reach_the_env_and_the_records():
@@ -321,21 +313,30 @@ def test_arm_task_parameters_reach_the_env_and_the_records():
         config.load_arm("base.yaml", {"reach": 0.3})
     with pytest.raises(ValueError, match="task.time_limit_s"):
         config.load_arm("base.yaml", {"time_limit_s": 0})
-    from run_experiment import parse_args
-    args = parse_args(["--arm", "teleop.yaml", "--reach", "[0.3, 0.6]", "--dwell-s", "0.5", "--min-target-sep", "0.2"])
-    assert args.overrides == {"reach": [0.3, 0.6], "dwell_s": 0.5, "min_target_sep": 0.2}  # the free-play flags
-    assert config.load_arm("teleop.yaml", args.overrides)["dwell_s"] == 0.5
 
 
 def test_config_files_fill_defaults_and_reject_unknown_keys(tmp_path):
-    protocol = config.load_protocol("study.yaml")
-    assert list(protocol["arms"]) == ["teleop", "flow_control", "frs", "mars"]
-    assert protocol["blocks"]["trials"] == 40 and protocol["display"]["blind"] is True
-    (tmp_path / "p.yaml").write_text("arms: {a: teleop.yaml}\nblocks: {trial: 3}\n")
+    protocol = config.load_protocol("study_short.yaml")
+    assert list(protocol["cells"]["methods"]) == ["teleop", "flow_control", "frs", "mars"] and protocol["cells"]["task_order"] == "latin_square"
+    assert protocol["blocks"]["trials"] == 40 and protocol["display"] == {"blind": True, "cues": False}
+    cells = ("cells: {methods: {teleop: {mode: teleop}}, grid: {users: {U1: {corruption: null}}, tasks: {T1: {obstacle: null}}, "
+             "noises: [0.5]}, settings: {}}\n")
+    (tmp_path / "p.yaml").write_text(cells + "blocks: {trial: 3}\n")
     with pytest.raises(ValueError, match="unknown keys in blocks"):
         config.load_protocol(tmp_path / "p.yaml")
-    (tmp_path / "q.yaml").write_text("arms: {a: teleop.yaml}\n")
-    assert config.load_protocol(tmp_path / "q.yaml")["blocks"]["practice"] == 5
+    (tmp_path / "q.yaml").write_text(cells)
+    plain = config.load_protocol(tmp_path / "q.yaml")
+    assert (plain["study"], protocol["study"]) == ("q", "study_short")  # results/<study>/<participant>/, by default the name
+    (tmp_path / "deep.yaml").write_text(cells + "study: a/b\n")
+    with pytest.raises(ValueError, match="study"):
+        config.load_protocol(tmp_path / "deep.yaml")
+    assert plain["blocks"]["practice"] == 5 and plain["display"] == {"blind": True, "cues": True}  # by default the window draws the command
+    (tmp_path / "short.yaml").write_text("cells: {sweep: grid, user: U1, settings: {}}\n")  # a sweep named, not given
+    with pytest.raises(ValueError, match="cells takes"):
+        config.load_protocol(tmp_path / "short.yaml")
+    (tmp_path / "file.yaml").write_text(cells.replace("settings: {}", "settings: tuned.yaml"))
+    with pytest.raises(ValueError, match="cells.settings maps"):
+        config.load_protocol(tmp_path / "file.yaml")
     (tmp_path / "bad.yaml").write_text("extends: %s\ncontrol:\n  tua: 3\n" % (config.CONFIG_DIR / "base.yaml"))
     with pytest.raises(ValueError, match="unknown key control.tua"):
         config.load_arm(tmp_path / "bad.yaml")

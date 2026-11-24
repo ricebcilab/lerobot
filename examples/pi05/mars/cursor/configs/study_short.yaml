@@ -1,0 +1,47 @@
+# The short user study (2026-11-23): U1 (vertical gain 0.25) on the open field (T1) across teleop, flow control, FRS
+# and MARS with the user's module, under the recorded study's task and controller (condition_study.yaml: gain_mode
+# step, a replan every 40 ms, 5 s per trial) at input noise 0.5, which the readout serves at every read. About 14
+# minutes.
+#
+#   python run_experiment.py --protocol study_short.yaml --participant p1
+#   python run_experiment.py --protocol study_short.yaml --participant sim      # the expert agent, same protocol
+#   python run_sweep.py --sweep study_short                                     # tune the arms with the expert (~2 min)
+#
+# `cells` is the sweep that builds the arms and tunes them with the simulated expert: the baselines as their papers
+# define them, each with its one knob tuned (flow control over tau at lambda 1, its gain the command in action units;
+# FRS over the pinned prefix at the full reversal); MARS, with the user's module (study/user_<tag>_expert_n100_s0: the
+# grid's recipe at noise 0.5 with the loss over every read), tunes the reversal depth x the pinned prefix.
+# run_sweep.py writes the tuned values to results/sim/sweeps/study_short/settings.yaml; they go into cells.settings.
+# Every arm sees the same 40 layouts, in a different order per block; the block order is a balanced Latin square row
+# by participant number and visit. The condition is hidden, and the window shows the cursor and the targets and
+# nothing of the command or the plan (display.cues: false). The records go to
+# results/study_short/<participant>/study_short_s<visit>_T1/.
+name: study_short
+study: study_short
+cells:
+  arm: condition_study.yaml
+  methods:
+    teleop: {mode: teleop}
+    flow_control: {mode: flow_control, ic_gain: 2.084264602519949}
+    frs: {mode: frs}
+    mars: {mode: frs, reversal_adapter: {user: cell}, tune: {n_reverse_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pinned_steps: [2, 4, 8, 16]}}
+  tune:
+    flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}
+    frs: {pinned_steps: [2, 4, 8, 16]}
+  grid:
+    users:
+      U1: {corruption: {scale: [1.0, 0.25]}, adapter: study/user_gain025y_expert_n100_s0}
+    tasks:
+      T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
+    noises: [0.5]
+  trials: {tune: 200, test: 500}
+  seed: 1000
+  settings:
+    U1xT1|0.5:
+      flow_control: {tau: 16}
+      frs: {pinned_steps: 4}
+      mars: {n_reverse_steps: 4, pinned_steps: 8}
+blocks: {trials: 40, practice: 5, order: latin_square}
+trial: {ready_hold_s: 0.3, feedback_s: 0.6}
+expert: {lag: 0, slow_radius: 0.15}
+display: {blind: true, cues: false}

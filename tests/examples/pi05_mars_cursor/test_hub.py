@@ -26,7 +26,16 @@ def test_manifest_matches_configs(tmp_path, monkeypatch, capsys):
 def test_manifest_covers_study_grid_and_seeds():
     folders = hub.manifest_folders()
     assert folders == hub.read_manifest()
-    assert {"policies/flow_goaldrop", "adapters/user_gain025y_expert_n100_s0"} <= set(folders["study"])
+    study = {
+        "policies/flow_goaldrop",
+        "policies/flow_goaldrop_ring_goal_ft_n300_s0",
+        "adapters/study/user_gain025y_expert_n100_s0",
+        "adapters/study/user_curl20_expert_n100_s0",
+        "adapters/image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256",
+    }
+    assert (
+        study <= set(folders["study"]) and len(folders["study"]) == 5 + 4 + 4
+    )  # policies, user modules, task modules
     grid = {"policies/flow_goaldrop_ring_start", "adapters/user_rot60_expert_n100_s0_on_wall_gap"}
     assert grid | {"adapters/task_ring_goal_n300_s0_with_rot60"} <= set(folders["grid"])
     seeds = folders["grid_seeds"]

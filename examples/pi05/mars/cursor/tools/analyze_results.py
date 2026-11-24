@@ -1,10 +1,13 @@
 """Analyze experiment runs: per participant and pooled, human or simulated.
 
-    python examples/pi05/mars/cursor/tools/analyze_results.py                               # every run under results/p*/ and results/sim/
-    python examples/pi05/mars/cursor/tools/analyze_results.py --participants p1 p2 sim      # some participants
-    python examples/pi05/mars/cursor/tools/analyze_results.py --protocol study --out study  # one protocol, named output folder
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_short                    # every run of a study
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long --participants p1 sim
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long --protocol study_long_U2 --out long_U2
+    python examples/pi05/mars/cursor/tools/analyze_results.py --results ../results/old/2026-11-23 --protocol study  # the October study
 
-Practice and aborted trials are excluded. Writes to results/analysis/<out>/:
+A study's runs are under results/<study>/<participant>/ (run_experiment.py); without --study the participants'
+folders are read from --results itself. Practice and aborted trials are excluded. Writes to
+results/analysis/<out>/ (by default the study's name, or all):
 
     trials.csv            one row per trial (participant, run, block, arm, trial, outcome, duration, ...)
     summary.csv           per participant x run x arm: n, success, wrong-target and timeout rates, median time of the hits
@@ -187,18 +190,19 @@ def fig_paths(trials, arms, participant, out):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--results", default=str(RESULTS))
+    p.add_argument("--study", help="the study's folder under --results (study_short, study_long), whose participants are read")
     p.add_argument("--participants", nargs="+", help="p1 p2 ... sim (default: all)")
     p.add_argument("--protocol", help="only runs of this protocol name")
-    p.add_argument("--out", default="all", help="folder name under results/analysis/")
+    p.add_argument("--out", help="folder name under results/analysis/ (default: the study, or all)")
     args = p.parse_args()
 
-    runs = find_runs(args.results, args.participants, args.protocol)
+    runs = find_runs(Path(args.results) / (args.study or ""), args.participants, args.protocol)
     if not runs:
         raise SystemExit("no runs found")
     trials, arms = load_trials(runs)
     rows = by_arm(trials)
     pool = pooled(rows, arms)
-    out = Path(args.results) / "analysis" / args.out
+    out = Path(args.results) / "analysis" / (args.out or args.study or "all")
     out.mkdir(parents=True, exist_ok=True)
     keep = ("participant", "run", "protocol", "block", "arm", "method", "trial", "layout_id", "outcome", "duration_s",
             "selected", "goal", "n_targets", "chunks", "steered_chunks", "t_start", "t_end")
