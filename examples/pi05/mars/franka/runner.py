@@ -33,6 +33,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -184,6 +185,21 @@ def build(
     )
 
 
+def resolve_device(requested: str | None) -> str:
+    """The device the policy and its batches go to: the config's, or cuda when this machine has it.
+
+    The checkpoint's own `config.json` says `"device": "cpu"`, because that is what its exporter ran on, and
+    nothing in `from_pretrained` overrides it. Left alone, the whole model runs on the CPU: the loop then takes
+    half a second per station tick, a chunk takes seconds, and `nvidia-smi` shows an idle GPU while every core
+    is busy. This is the one place that decides.
+    """
+    if requested is not None:
+        return requested
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 PALIGEMMA_TOKENIZER = "google/paligemma-3b-pt-224"
 """The tokenizer a pi05 preprocessor instantiates, and a gated Google repository.
 
@@ -232,7 +248,10 @@ def build_policy(
         raise FileNotFoundError(
             f"the checkpoint's statistics are missing: {stats_path} (pass --stats <openpi norm_stats.json>)"
         )
-    base = PI05Policy.from_pretrained(config.policy.path)
+    device = resolve_device(config.policy.device)
+    base = PI05Policy.from_pretrained(config.policy.path).to(device).eval()
+    # the folder's config.json says "cpu" (it is what the exporter ran on), and nothing moves the model for it
+    base.config.device = device
     statistics = checkpoint_stats.read_openpi_stats(stats_path)
     width = checkpoint_stats.real_width(statistics)
     if width != ACTION_DIMS:
@@ -241,6 +260,8 @@ def build_policy(
             "(seven joint velocities and a gripper position); it is not this checkpoint's statistics"
         )
     pre_overrides, post_overrides = checkpoint_stats.overrides(statistics, rename_map)
+    # the pipeline's device step comes from that same "cpu" config; the batch has to reach the model's device
+    pre_overrides["device_processor"] = {"device": device}
     try:
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=base.config,
@@ -251,7 +272,7 @@ def build_policy(
     except Exception as error:  # the pipelines need assets the checkpoint does not carry
         raise explain_pipeline_failure(error, config.policy.path) from error
     policy = SteeringPolicy(
-        SteeringConfig(**config.steering_config()),
+        SteeringConfig(**config.steering_config(), device=device),
         base_policy=base,
         postprocessor=postprocessor,
     )
@@ -380,7 +401,8 @@ def run_trial(
     served_from_chunk = 0
     chunk_done = False
     have_chunk = False  # whether the policy still holds queued actions for this chunk
-    stale: dict = {}  # the next action would compute a chunk: brake first (see below)
+    stale: dict = {}
+    chunk_seconds: list[float] = []  # wall time of each call that computed a chunk
 
     for tick in range(max_steps):
         chain.advance()
@@ -423,15 +445,20 @@ def run_trial(
             else:
                 # The preprocessor is the expensive part of a tick (two images to the device, a tokenizer);
                 # `select_action` only reads its batch when its queue is empty, so a mid-chunk tick reuses it.
-                if not have_chunk:
+                computes_chunk = not have_chunk
+                if computes_chunk:
                     stale = wired.preprocessor(
                         observation_batch(obs, arm_name, wired.cameras, prompt, wired.state_dim)
                     )
                     stale["command"] = torch.as_tensor(command, dtype=torch.float32)
                     have_chunk = True
+                started = time.perf_counter()
                 with torch.inference_mode():
                     action = wired.policy.select_action(stale)
                     proposed = wired.policy.last_policy_action
+                if computes_chunk:
+                    # the number that says whether the policy runs on the GPU: a chunk is 10 Euler steps
+                    chunk_seconds.append(time.perf_counter() - started)
                 action8 = clamp_action(to_action(wired.postprocessor, action), q, arm, dt)
                 plan = (
                     np.full(3, np.nan) if proposed is None else to_action(wired.postprocessor, proposed)[:3]
@@ -470,6 +497,8 @@ def run_trial(
         "steps": len(recorder.rows),
         "duration_s": round(duration, 2),
         "user_reads": recorder.total_reads,
+        "chunks": len(chunk_seconds),
+        "chunk_s_median": round(float(np.median(chunk_seconds)), 3) if chunk_seconds else None,
         "steps_file": steps_file,
         "finished_at": wired.now().isoformat(timespec="seconds"),
     }
@@ -741,6 +770,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless_operator=False,  # a dry run is a real stick test: only the station is fake
         start_pose=start_pose,
     )
+    if wired.policy is not None:
+        base = wired.policy.base_policy
+        parameter = next(base.parameters())
+        total = sum(p.numel() for p in base.parameters())
+        print(f"policy: {parameter.device} {parameter.dtype}, {total / 1e9:.1f}B params")
     print(f"operator: {wired.chain.describe()}")
     reader = KeypressReader() if args.stop_on == "keypress" else NullReader()
     try:

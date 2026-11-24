@@ -13,6 +13,7 @@ policy:
   path: "lerobot/pi05_droid"
   prompt_generic: "do something"  # the floor arm's prompt
   n_action_steps: 15              # the checkpoint's chunk; the executed prefix pins it whole
+  device: null                    # null = cuda when available; the checkpoint's own config says "cpu"
 command:
   qdot_full: 0.5                # rad/s at a full stick deflection
   twist_full: 0.11              # m/s at a full stick deflection, before the Jacobian

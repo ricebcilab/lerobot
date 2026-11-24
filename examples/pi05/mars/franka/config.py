@@ -189,9 +189,12 @@ class PolicySettings:
     path: str = "lerobot/pi05_droid"
     prompt_generic: str = "do something"
     n_action_steps: int | None = None
+    device: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _text(self.path, "policy.path"))
+        if self.device is not None:
+            object.__setattr__(self, "device", _text(self.device, "policy.device"))
         object.__setattr__(self, "prompt_generic", _text(self.prompt_generic, "policy.prompt_generic"))
         if self.n_action_steps is not None:
             object.__setattr__(self, "n_action_steps", _count(self.n_action_steps, "policy.n_action_steps"))

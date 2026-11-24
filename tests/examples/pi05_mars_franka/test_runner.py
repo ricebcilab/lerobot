@@ -563,3 +563,21 @@ def test_the_preprocessor_runs_once_per_chunk_not_once_per_tick(tmp_path):
     )
     _run(wired, tmp_path, max_steps=8)
     assert calls["n"] == 3  # chunks at ticks 0, 3 and 6; the ticks between reuse the batch
+
+
+def test_the_record_reports_how_long_a_chunk_took(tmp_path):
+    """This is the number that says whether the policy runs on the GPU: a chunk is ten Euler steps."""
+    wired, _, _, _ = _wired(_arm_config())
+    result = _run(wired, tmp_path)
+    assert result.record["chunks"] >= 1
+    assert result.record["chunk_s_median"] is not None and result.record["chunk_s_median"] >= 0.0
+
+
+def test_the_device_defaults_to_cuda_when_there_is_one(monkeypatch):
+    from runner import resolve_device
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    assert resolve_device(None) == "cuda"
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    assert resolve_device(None) == "cpu"
+    assert resolve_device("cuda:1") == "cuda:1"  # an explicit choice is never second-guessed
