@@ -127,6 +127,7 @@ def _run(wired, tmp_path, **kwargs):
         "max_steps": 4,
         "run_dir": tmp_path,
         "seed": 0,
+        "pace": False,  # the tests are not a real-time loop
     }
     options.update(kwargs)
     return run_trial(wired, **options)
@@ -581,3 +582,16 @@ def test_the_device_defaults_to_cuda_when_there_is_one(monkeypatch):
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
     assert resolve_device(None) == "cpu"
     assert resolve_device("cuda:1") == "cuda:1"  # an explicit choice is never second-guessed
+
+
+def test_the_loop_keeps_the_stations_clock(tmp_path):
+    """The station hands observations back without blocking, so an unpaced loop outruns it at 55 Hz."""
+    config = ExperimentConfig(
+        steering=SteeringSettings(mode="frs"),
+        policy=PolicySettings(n_action_steps=2),
+        trial=TrialSettings(trials=1, max_steps=6),
+    )
+    wired, _, _, _ = _wired(config, control_rate=50.0)  # a 20 ms tick
+    result = _run(wired, tmp_path, max_steps=6, pace=True)
+    assert result.record["rate_hz"] == pytest.approx(50.0, rel=0.25)
+    assert result.record["late_ticks"] == 0

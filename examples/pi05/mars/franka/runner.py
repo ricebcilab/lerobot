@@ -364,6 +364,7 @@ def run_trial(
     run_dir: Path | None = None,
     stop_reader: Any = None,
     brake: bool = True,
+    pace: bool = True,
 ) -> TrialResult:
     """One trial: reset, check the pose, then one action held over the station's ticks.
 
@@ -389,6 +390,8 @@ def run_trial(
         wired.policy.reset()
     chain.reset()
     ticks = ticks_per_action(wired.manifest.control_rate, ACTION_RATE)
+    period = 1.0 / wired.manifest.control_rate  # one station tick, the loop's clock
+    paced_late = 0  # ticks where our own work overran the period
     n_actions = int(config.policy.n_action_steps or 15)
     dt = 1.0 / wired.manifest.control_rate
     recorder = TrialRecorder()
@@ -405,6 +408,7 @@ def run_trial(
     chunk_seconds: list[float] = []  # wall time of each call that computed a chunk
 
     for tick in range(max_steps):
+        tick_started = time.perf_counter()
         chain.advance()
         if stop_reader is not None:
             pressed = stop_reader.poll(tick)
@@ -474,6 +478,15 @@ def run_trial(
         recorder.add(q=q, action=action8, plan=plan, served=served, raw=raw, gripper=gripper, reads=reads)
         obs = station.step(action_dict(action8, arm_name))
         q = np.asarray(obs[f"{arm_name}/joint_position"], dtype=np.float64)
+        if pace:
+            # The station hands back observations without necessarily blocking for its own cycle, so the loop
+            # keeps the clock: a tick that finishes early waits out the rest of the period, and one that
+            # overruns (a chunk being computed) is counted rather than hidden.
+            leftover = period - (time.perf_counter() - tick_started)
+            if leftover > 0:
+                time.sleep(leftover)
+            else:
+                paced_late += 1
 
     duration = recorder.elapsed
     settings = flat_settings(
@@ -497,6 +510,8 @@ def run_trial(
         "steps": len(recorder.rows),
         "duration_s": round(duration, 2),
         "user_reads": recorder.total_reads,
+        "rate_hz": round(len(recorder.rows) / duration, 2) if duration > 0 else None,
+        "late_ticks": paced_late,
         "chunks": len(chunk_seconds),
         "chunk_s_median": round(float(np.median(chunk_seconds)), 3) if chunk_seconds else None,
         "steps_file": steps_file,
@@ -572,11 +587,19 @@ def run(
         record = result.record
         records.append(record)
         pushed, peak = operator_activity(result.rows)
+        chunk = record["chunk_s_median"]
+        compute = (
+            f", {record['chunks']} chunks" + (f" at {chunk:.2f}s" if chunk is not None else "")
+            if record["chunks"]
+            else ""
+        )
+        late = f", {record['late_ticks']} late" if record["late_ticks"] else ""
         print(
             f"trial {trial + 1}/{wired.config.trial.trials}: "
             f"{'SUCCESS' if record['success'] else 'no success'} after {record['steps']} steps "
-            f"({record['duration_s']:.1f}s), operator pushed on {pushed}/{len(result.rows)} ticks "
-            f"(peak {peak:.2f})" + ("  [aborted]" if record["aborted"] else "")
+            f"({record['duration_s']:.1f}s, {record['rate_hz'] or 0:.1f} Hz{late}){compute}, "
+            f"operator pushed on {pushed}/{len(result.rows)} ticks (peak {peak:.2f})"
+            + ("  [aborted]" if record["aborted"] else "")
         )
         if record["aborted"]:
             break
