@@ -22,7 +22,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lerobot.teleoperators.spacemouse import SpaceMouseConfig, SpaceMouseTeleop, teleop_spacemouse
+from lerobot.teleoperators.spacemouse import (
+    SpaceMouseConfig,
+    SpaceMouseTeleop,
+    SpaceMouseTwist,
+    teleop_spacemouse,
+)
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SPACEMOUSE_VENDORS,
     SpaceMouseAxes,
@@ -38,6 +43,10 @@ def motion(x: int, y: int, z: int) -> bytes:
     return b"\x01" + struct.pack("<hhh", x, y, z)
 
 
+def rotation(rx: int, ry: int, rz: int) -> bytes:
+    return b"\x02" + struct.pack("<hhh", rx, ry, rz)
+
+
 def buttons(mask: int) -> bytes:
     return b"\x03" + mask.to_bytes(4, "little")
 
@@ -48,6 +57,12 @@ def fake_sysfs(root: Path, nodes: dict[str, str]) -> Path:
         (root / name / "device").mkdir(parents=True)
         (root / name / "device" / "uevent").write_text(f"DRIVER=hid-generic\nHID_ID={hid_id}\nHID_NAME=x\n")
     return root
+
+
+def clear_scale_env(monkeypatch) -> None:
+    """No scale environment variables: the defaults the reader tests below assume."""
+    monkeypatch.delenv("SPACEMOUSE_FULL_SCALE", raising=False)
+    monkeypatch.delenv("SPACEMOUSE_ROTATION_FULL_SCALE", raising=False)
 
 
 def wait_for(condition, timeout: float = 5.0) -> None:
@@ -82,6 +97,12 @@ def test_parse_report():
     assert parse_report(b"\x03\x01\x00\x00\x00") == ("buttons", 1)
     assert parse_report(b"\x09") == ("other", None)
     assert parse_report(b"\x01\x00") == ("other", None)  # too short for a translation
+
+
+def test_parse_report_rotation():
+    assert parse_report(rotation(350, -175, 0)) == ("rotation", (350, -175, 0))
+    assert parse_report(motion(1, -2, 3)) == ("translation", (1, -2, 3))  # id 1 is unchanged
+    assert parse_report(b"\x02\x00") == ("other", None)  # too short for a rotation
 
 
 def test_find_by_vendor(tmp_path):
@@ -126,6 +147,49 @@ def test_axes_clip_and_default_scale():
     assert reader.axes == (1.0, -1.0, 0.1)
 
 
+def test_rotation_scales_and_clips():
+    reader = pipe_reader([rotation(700, -350, 35)], rotation_full_scale=700)
+    assert reader.rotation == (1.0, -0.5, 0.05)
+
+
+def test_rotation_defaults_to_the_full_scale_and_clips(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([rotation(700, -350, 35)])
+    assert reader.rotation == (1.0, -1.0, 0.1)
+
+
+def test_rotation_full_scale_from_the_env(monkeypatch):
+    clear_scale_env(monkeypatch)
+    monkeypatch.setenv("SPACEMOUSE_FULL_SCALE", "700")
+    monkeypatch.setenv("SPACEMOUSE_ROTATION_FULL_SCALE", "1400")  # the explicit rotation scale wins
+    reader = pipe_reader([rotation(700, -350, 0)])
+    assert reader.rotation == (0.5, -0.25, 0.0)
+
+
+def test_rotation_full_scale_falls_back_to_the_translation_env(monkeypatch):
+    clear_scale_env(monkeypatch)
+    monkeypatch.setenv("SPACEMOUSE_FULL_SCALE", "700")
+    reader = pipe_reader([rotation(350, -175, 0)])
+    assert reader.rotation == (0.5, -0.25, 0.0)
+
+
+def test_a_rotation_report_leaves_the_translation_state_alone(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([motion(350, -175, 70), rotation(700, -700, 700)])
+    assert reader.axes == (1.0, -0.5, 0.2)
+    assert reader.motion_reports == 1
+    assert reader.rotation == (1.0, -1.0, 1.0)
+    assert reader.reports_handled == 2
+
+
+def test_a_rotation_report_alone_keeps_the_translation_axes_at_rest(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([rotation(350, -350, 350)])
+    assert reader.axes == (0.0, 0.0, 0.0)
+    assert reader.motion_reports == 0
+    assert reader.rotation == (1.0, -1.0, 1.0)
+
+
 def test_buttons_and_presses():
     reader = pipe_reader([buttons(1), buttons(3), buttons(2), buttons(0), b"\x09", buttons(4)])
     assert reader.buttons == 4
@@ -166,6 +230,84 @@ def test_axes_map_the_device_channels_with_the_env_defaults(monkeypatch, env, hi
     wait_for(lambda: not axes.connected)
     assert axes.translation.any()
     axes.close()
+
+
+def test_twist_maps_six_channels_and_reads_them_from_the_device(monkeypatch):
+    clear_scale_env(monkeypatch)
+    r, w = os.pipe()
+    try:
+        twist = SpaceMouseTwist(
+            source=[1, 0, 2, 4, 3, 5],  # the device's x, y, z then rx, ry, rz, reordered and signed
+            sign=[1.0, -1.0, -1.0, -1.0, 1.0, 1.0],
+            path=f"/dev/fd/{r}",
+            full_scale=700,
+        )
+    finally:
+        os.close(r)
+    # (x, y, z, rx, ry, rz) as the reader would scale them: translations by full_scale, rotations by
+    # the rotation full scale (the default here).
+    reading = [0.5, -0.25, 0.1, 1.0, -0.5, 0.2]
+    np.testing.assert_array_equal(twist.map(reading), [-0.25, -0.5, -0.1, 0.5, 1.0, 0.2])
+
+    os.write(w, motion(350, -175, 70))
+    wait_for(lambda: twist.reader.motion_reports == 1)
+    os.write(w, rotation(350, -175, 70))
+    wait_for(lambda: twist.reader.reports_handled == 2)
+    np.testing.assert_array_equal(twist.twist, [-0.25, -0.5, -0.1, 0.5, 1.0, 0.2])  # translations first
+    assert twist.connected
+
+    os.close(w)  # unplugged: the last value stays
+    wait_for(lambda: not twist.connected)
+    np.testing.assert_array_equal(twist.twist, [-0.25, -0.5, -0.1, 0.5, 1.0, 0.2])
+    twist.close()
+
+
+def test_twist_takes_both_full_scales(monkeypatch):
+    clear_scale_env(monkeypatch)
+    monkeypatch.setenv("SPACEMOUSE_FULL_SCALE", "350")  # overridden by the arguments
+    monkeypatch.setenv("SPACEMOUSE_ROTATION_FULL_SCALE", "350")
+    r, w = os.pipe()
+    try:
+        twist = SpaceMouseTwist(
+            source=[0, 1, 2, 3, 4, 5],
+            sign=[1.0] * 6,
+            path=f"/dev/fd/{r}",
+            full_scale=700,
+            rotation_full_scale=1400,
+        )
+    finally:
+        os.close(r)
+    os.write(w, motion(350, -175, 70))
+    wait_for(lambda: twist.reader.motion_reports == 1)
+    os.write(w, rotation(700, -350, 350))
+    wait_for(lambda: twist.reader.reports_handled == 2)
+    np.testing.assert_array_equal(twist.twist, [0.5, -0.25, 0.1, 0.5, -0.25, 0.25])
+    os.close(w)
+    wait_for(lambda: not twist.connected)
+    twist.close()
+
+
+def test_twist_resolves_both_scales_from_the_env(monkeypatch):
+    clear_scale_env(monkeypatch)
+    monkeypatch.setenv("SPACEMOUSE_FULL_SCALE", "700")  # the rotation scale falls back to it
+    r, w = os.pipe()
+    try:
+        twist = SpaceMouseTwist(source=[0, 1, 2, 3, 4, 5], sign=[1.0] * 6, path=f"/dev/fd/{r}")
+    finally:
+        os.close(r)
+    assert (twist.reader.full_scale, twist.reader.rotation_full_scale) == (700.0, 700.0)
+    os.close(w)
+    wait_for(lambda: not twist.connected)
+    twist.close()
+
+
+def test_twist_rejects_a_bad_channel_map():
+    with pytest.raises(ValueError, match="one length"):
+        SpaceMouseTwist(source=[0, 1, 2, 3, 4, 5], sign=[1.0] * 5)  # one list is short
+    with pytest.raises(ValueError, match="device channels"):
+        SpaceMouseTwist(source=[0, 1, 2], sign=[1.0, 1.0, 1.0])  # not all six
+    with pytest.raises(ValueError, match="device channels"):
+        SpaceMouseTwist(source=[0, 1, 2, 3, 4, 6], sign=[1.0] * 6)  # 6 is not a device channel
 
 
 def test_teleop_get_action(tmp_path, monkeypatch):

@@ -19,6 +19,7 @@ from .teleop_spacemouse import (
     SpaceMouseAxes,
     SpaceMouseReader,
     SpaceMouseTeleop,
+    SpaceMouseTwist,
     find_spacemouse,
     parse_report,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "SpaceMouseConfig",
     "SpaceMouseReader",
     "SpaceMouseTeleop",
+    "SpaceMouseTwist",
     "find_spacemouse",
     "parse_report",
 ]
