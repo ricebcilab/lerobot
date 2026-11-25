@@ -1976,10 +1976,12 @@ class SteeringPolicy(PreTrainedPolicy):
 
     @property
     def core(self) -> "FlowControlSteering | FlowReversalSteering":
-        """The mode's steering core over the base policy, built on first use. FRS's reference is the core's own, from
-        the postprocessor's action statistics: ``Flow.uniform_reference`` in the 7-D operator space (pi0.5's), the
-        command held at ``max_speed * dt`` per control step (``reference_step``) in an action space without its
-        gripper dim (the cursor's), the rule that space has (``FlowReversalSteering.reference_chunk``)."""
+        """The mode's steering core over the base policy, built on first use. Flow control writes the command into
+        the first ``n_dims`` action dims, or the operator's one named group. FRS's reference is the core's own,
+        from the postprocessor's action statistics: the command held at the config's ``reference_step`` per control
+        step when that is set, else the action space's rule -- ``Flow.uniform_reference`` in the 7-D operator space
+        (pi0.5's), ``max_speed * dt`` in an action space without its gripper dim (the cursor's)
+        (``FlowReversalSteering.reference_chunk``)."""
         cfg = self.config
         if cfg.mode == "none":
             raise ValueError("mode 'none' has no steering core")
@@ -1991,7 +1993,7 @@ class SteeringPolicy(PreTrainedPolicy):
                     raise ValueError(
                         f"flow control writes one group of action dims, got operator_dims {dims}"
                     )
-                written = slice(None) if dims is None else OPERATOR_DIM_GROUPS[dims[0]]
+                written = slice(0, cfg.n_dims) if dims is None else OPERATOR_DIM_GROUPS[dims[0]]
                 self._core = FlowControlSteering(
                     base,
                     None,
@@ -2007,7 +2009,11 @@ class SteeringPolicy(PreTrainedPolicy):
                 stats = self._action_stats()
                 if stats is None:
                     raise self._no_stats("frs builds its reference")
-                step = None if FlowReversalSteering.has_gripper_dim(stats[0]) else cfg.max_speed * cfg.dt
+                step = (
+                    cfg.reference_step
+                    if cfg.reference_step is not None
+                    else (None if FlowReversalSteering.has_gripper_dim(stats[0]) else cfg.max_speed * cfg.dt)
+                )
                 self._core = FlowReversalSteering(
                     base,
                     None,
