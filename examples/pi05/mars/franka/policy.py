@@ -269,7 +269,8 @@ def make_steering(bundle: Bundle, steering: SteeringConfig) -> SteeringPolicy:
     action statistics: without them the cores cannot build, so a bundle without ``mean``/``std`` gets
     a ``ValueError`` naming the missing file, and ``mode = "none"`` (the base policy's own chunk) does
     not need them. A named ``adapter_user``/``adapter_task`` checkpoint that is not on disk is refused
-    here too, before anything is loaded: ``train-user`` writes the user module, and the message says so.
+    here too, before anything is loaded: ``train-user`` writes the user module and ``train-task`` the
+    task module, and the message names the one that does.
     """
     from lerobot.policies.steering import SteeringConfig as PolicySteeringConfig, SteeringPolicy
 
@@ -284,9 +285,10 @@ def make_steering(bundle: Bundle, steering: SteeringConfig) -> SteeringPolicy:
     for kind in ("user", "task"):
         path = getattr(steering, f"adapter_{kind}", None)
         if path is not None and not Path(path).is_file():
+            phase, tool = ("B", "train-user") if kind == "user" else ("C", "train-task")
             raise ValueError(
-                f"adapter_{kind}: {path} is not a file. Train the {kind} module first (Phase B's "
-                f"`mars-franka train-user` for the user module) or point the mode table at a checkpoint"
+                f"adapter_{kind}: {path} is not a file. Train the {kind} module first (Phase {phase}'s "
+                f"`mars-franka {tool}`) or point the mode table at a checkpoint"
             )
 
     base_config = getattr(bundle.policy, "config", None)

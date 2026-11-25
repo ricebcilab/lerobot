@@ -22,18 +22,22 @@ import pytest
 import torch
 from config import load_config
 from policy import Bundle
+from scene import TASK_SOURCE, Scene, from_checkpoint
 from source import FakeSource
 from statefiles import Recorder, load
 from station import FakeStation as RealFakeStation
 from stats import CHECKPOINT_WIDTH
 
-from lerobot.policies.steering import AdapterModules, LearnedUserModule
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
 SHIPPED = EXAMPLE_DIR / "configs" / "franka.toml"
 
 MODE_COMMANDS = ("autonomous", "fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
-SHIPPED_COMMANDS = ("autonomous", "teleop", "fc", "frs", "mars-f", "mars-u")
+SHIPPED_COMMANDS = ("autonomous", "teleop", "fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
+
+TASK_SIZE = 128
+"""The fake task checkpoints' scene render size: small, so saving one is instant (the VLM resizes to 224)."""
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -200,6 +204,36 @@ def _trained_bundle() -> Bundle:
     )
 
 
+def _task_checkpoint(path: Path) -> Path:
+    """A MARS task module checkpoint built with no training: its config is the scene ``load_bundle`` reads.
+
+    ``n_dims`` is the station's 8 (the task module learns the gripper too) and its horizon the checkpoint's
+    chunk, as ``train-task`` builds it; the scene is this phase's ``vlm_image``. No weights are trained.
+    """
+    module = LearnedTaskModule(
+        horizon=_SamplerConfig.chunk_size,
+        n_dims=8,
+        d=16,
+        tdim=8,
+        heads=2,
+        layers=1,
+        **LearnedTaskModule.spec(TASK_SOURCE, TASK_SIZE),
+    )
+    return AdapterModules.save_module(module, path, kind="task", meta={"prompt": "pick"})
+
+
+def _user_checkpoint(path: Path) -> Path:
+    """A MARS user module checkpoint, for the composed ``mars`` arm that names both."""
+    module = LearnedUserModule(_SamplerConfig.chunk_size, 7, d=16, tdim=8)
+    return AdapterModules.save_module(module, path, kind="user", meta={"prompt": "pick"})
+
+
+def _task_arm_config(config_dir: Path, command: str, *, task: Path, user: Path) -> Path:
+    """A config whose ``[modes.<command>]`` names the saved (fake) task checkpoint, and the user too for ``mars``."""
+    adapter_user = f'adapter_user = "{user}"\n' if command == "mars" else ""
+    return _write(config_dir, f'[modes.{command}]\nmode = "frs"\n{adapter_user}adapter_task = "{task}"\n')
+
+
 @pytest.fixture
 def fake_hardware(monkeypatch):
     """The real loop over a fake station and a fake source: no c3po, no mouse, no faked loop."""
@@ -274,12 +308,17 @@ def test_the_shipped_config_is_the_study_config():
     )
     assert config.command.translation_gain == 0.11 and config.command.gain == "auto"
     assert config.readout.corruption == {"rotation_z_deg": 20} and config.readout.noise == 0.35
-    # mars-u names Phase B's user module (its checkpoint is the one [user] checkpoint points at);
-    # mars-t and mars need a task module, which Phase C does not ship yet.
-    assert set(config.modes) == {"fc", "frs", "mars-f", "mars-u"}
+    # The six method arms the config ships: Phase B's user module and Phase C's task module name
+    # gitignored checkpoints, so the shipped tables are the ones their trainers write to.
+    assert set(config.modes) == {"fc", "frs", "mars-f", "mars-u", "mars-t", "mars"}
     assert config.modes["fc"].ic_gain == 15.0 and config.modes["mars-f"].adapter_matrix == "corruption"
     assert config.modes["mars-u"].mode == "frs"
     assert config.modes["mars-u"].adapter_user == config.user.checkpoint
+    assert config.modes["mars-t"].mode == "frs"
+    assert config.modes["mars-t"].adapter_task == config.task.checkpoint
+    assert config.modes["mars"].mode == "frs"
+    assert config.modes["mars"].adapter_user == config.user.checkpoint
+    assert config.modes["mars"].adapter_task == config.task.checkpoint
     assert (config.steering.n_reversal_steps, config.steering.pinned_steps) == (10, 8)
     assert config.spacemouse.source == (0, 1, 2, 3, 4, 5)
     assert config.recording.dir == EXAMPLE_DIR / "outputs" / "mars_franka"
@@ -480,11 +519,105 @@ def test_mars_u_composes_the_real_steering_policy_from_a_saved_user_module(
 
 
 @pytest.mark.parametrize("command", ["mars-t", "mars"])
-def test_a_missing_mode_table_names_it_and_how_to_add_one(command, capsys):
-    assert cli.main([command, "--prompt", "pick", "--config", str(SHIPPED), "--dry-run"]) == 2
+def test_a_missing_mode_table_names_it_and_how_to_add_one(command, tmp_path, capsys):
+    """A variant config without the arm's table is told how to add it (the shipped config ships both)."""
+    path = _write(tmp_path, '[modes.frs]\nmode = "frs"\n')
+    assert cli.main([command, "--prompt", "pick", "--config", str(path), "--dry-run", "--steps", "1"]) == 2
     error = capsys.readouterr().err
     assert f"[modes.{command}]" in error
     assert "add one" in error
+
+
+@pytest.mark.parametrize("command", ["autonomous", "fc", "frs", "mars-f"])
+def test_a_mode_without_a_task_adapter_calls_load_bundle_exactly_as_before(
+    command, real_components, monkeypatch
+):
+    """No ``adapter_task`` anywhere in the mode's table: ``load_bundle(config)``, with no ``task=`` keyword
+    at all -- the fake loader does not accept one, so an extra argument would fail the run."""
+    seen = {}
+
+    def fake_load(config):
+        seen["config"] = config
+        return _trained_bundle()
+
+    monkeypatch.setattr(cli, "load_bundle", fake_load)
+    assert cli.main([command, "--prompt", "pick", "--config", str(SHIPPED), "--steps", "1"]) == 0
+    assert seen["config"].policy.path == load_config(SHIPPED).policy.path
+    assert real_components.instances[-1].kwargs["bundle"].scene is None
+
+
+@pytest.mark.parametrize("command", ["mars-t", "mars"])
+def test_a_dry_run_of_the_task_arms_loads_no_checkpoint(command, dry_station, monkeypatch, capsys):
+    """The shipped task arms name the checkpoints ``train-task`` writes (gitignored, absent on a fresh
+    checkout); a dry run composes them from the fakes and reads no checkpoint, as ``mars-u`` does."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a dry run loaded a checkpoint")
+
+    monkeypatch.setattr(cli, "load_bundle", forbidden)
+    assert cli.main([command, "--config", str(SHIPPED), "--dry-run", "--steps", "2", "--prompt", "pick"]) == 0
+    assert len(dry_station.instances[-1].actions) == 2
+    assert capsys.readouterr().out.count("act[") == 2
+
+
+@pytest.mark.parametrize("command", ["mars-t", "mars"])
+def test_the_task_arms_load_their_checkpoint_into_the_bundles_scene(
+    command, tmp_path, real_components, monkeypatch
+):
+    """Once a mode table names ``adapter_task``, that checkpoint reaches ``load_bundle(task=...)``: the
+    bundle the loop gets carries the checkpoint's recorded scene, so ``prepare`` encodes the scene camera
+    and the task module reads its tokens; the same file is the steering policy's adapter."""
+    task = _task_checkpoint(tmp_path / "task" / "task.pt")
+    user = _user_checkpoint(tmp_path / "user" / "user.pt")
+    path = _task_arm_config(tmp_path, command, task=task, user=user)
+    calls = {}
+
+    def fake_load(config, task=None):
+        calls["config"] = config
+        calls["task"] = task
+        return replace(_trained_bundle(), scene=None if task is None else from_checkpoint(task))
+
+    monkeypatch.setattr(cli, "load_bundle", fake_load)
+    assert cli.main([command, "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 0
+
+    configured = load_config(path)
+    checkpoint = configured.modes[command].adapter_task
+    loop = real_components.instances[-1]
+    assert calls["config"] == configured
+    assert calls["task"] == checkpoint
+    bundle = loop.kwargs["bundle"]
+    assert bundle.scene == Scene(TASK_SOURCE, TASK_SIZE)
+    assert loop.kwargs["mode"] == "steered"
+    assert loop.kwargs["steering"].config.adapter_task == str(checkpoint)
+    if command == "mars":
+        assert loop.kwargs["steering"].config.adapter_user == str(configured.modes[command].adapter_user)
+    else:
+        assert loop.kwargs["steering"].config.adapter_user is None
+    assert loop.kwargs["station"].closed and loop.kwargs["source"].closed
+
+
+@pytest.mark.parametrize("command", ["mars-t", "mars"])
+def test_a_task_arm_names_its_missing_checkpoint_in_one_line(
+    command, tmp_path, real_components, monkeypatch, capsys
+):
+    """``train-task`` has not run: the run names the file and the command that writes it, no traceback."""
+    missing = tmp_path / "task" / "task.pt"  # never written
+    path = _task_arm_config(tmp_path, command, task=missing, user=tmp_path / "user" / "user.pt")
+    monkeypatch.setattr(cli, "load_bundle", lambda config: pytest.fail("loaded a checkpoint first"))
+    assert cli.main([command, "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 2
+    error = capsys.readouterr().err
+    assert str(missing) in error and "train-task" in error
+    assert "Traceback" not in error
+    assert len(error.strip().splitlines()) == 1  # one line, the CLI's own
+
+
+def test_a_relative_task_checkpoint_resolves_beside_the_example(tmp_path, real_components, capsys):
+    """A config's relative path is the config layer's: beside the example directory, not the caller's cwd."""
+    path = _write(tmp_path, '[modes.mars-t]\nmode = "frs"\nadapter_task = "assets/task/absent/task.pt"\n')
+    assert cli.main(["mars-t", "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 2
+    expected = EXAMPLE_DIR / "assets" / "task" / "absent" / "task.pt"
+    error = capsys.readouterr().err
+    assert str(expected) in error and "train-task" in error
 
 
 def test_mars_u_names_a_missing_user_checkpoint(tmp_path, real_components, monkeypatch, capsys):
