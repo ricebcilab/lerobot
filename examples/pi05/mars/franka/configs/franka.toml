@@ -23,10 +23,10 @@ n_action_steps = 8
 dtype = "bfloat16"
 
 [command]
-translation_gain = 0.11 # m/s at full deflection: flow-steering App. E's ~11 cm/s
-rotation_gain = 0.5 # rad/s at full deflection (ours: a mapping choice; the sign needs a jog)
-twist_length = 0.2 # m, the mixed-unit scale of the IK's 6-row solve
-deadband = 0.02 # action units below which the operator counts as idle
+translation_gain = 0.6 #0.11 # m/s at full deflection: flow-steering App. E's ~11 cm/s
+rotation_gain = 1 #0.5 # rad/s at full deflection (ours: a mapping choice; the sign needs a jog)
+twist_length = 1 #0.2 # m, the mixed-unit scale of the IK's 6-row solve
+deadband = 0 #0.02 # action units below which the operator counts as idle
 gain = "auto" # 1 / ||F||_2 with the corruption on, else 1.0, so the corrupted command cannot clip
 # The session's measured reset pose (the probe's "reset pose q"), pinned so the corruption lift F7,
 # the `mars-f` adapter matrix and the trainer's replay are the same 7x7 and noise sequence across
@@ -85,12 +85,12 @@ adapter_task = "assets/task/pilot/task.pt"
 # both full scales are 350 and the receiver's other nodes are silent. "" = search: the source opens the
 # candidate nodes and takes the one that delivers motion. What no probe can measure is the sign map:
 # the first jog sets it. The probe prints the node the source picks and the rest six-vector.
-path = "" # "" = search for the device (SPACEMOUSE_HID_ID, when set, pins it instead)
+path = "/dev/hidraw8" # "" = search for the device (SPACEMOUSE_HID_ID, when set, pins it instead)
 hid_id = "" # "" = search; otherwise a HID id such as 0000046D:0000C62B
 full_scale = 350.0
 rotation_full_scale = 350.0 # measured 2026-11-25: the rotation triple peaked at 350 raw counts
-source = [0, 1, 2, 3, 4, 5] # device channels in the twist's [x, y, z, rx, ry, rz] order
-sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+source = [1, 0, 2, 4, 3, 5] # device channels in the twist's [x, y, z, rx, ry, rz] order
+sign = [1.0, 1.0, -1.0, 1.0, 1.0, -1.5]
 # Subtract the rest six-vector once at start (captured after reports arrive and the stick settles),
 # so a released stick is a zero command: one session read x = +0.154 at rest, a later one exactly 0,
 # so the offset moves with the device's state. The probe prints the captured offset each session.
