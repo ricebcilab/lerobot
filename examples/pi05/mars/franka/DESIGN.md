@@ -478,8 +478,9 @@ the `cnn`/`discs`/`vlm_prefix`/`vlm_views` sources are out of scope). The infere
 `observation.scene_images` — the scene camera (ZED2), letterboxed to `render_size`, uint8 channel-first — which
 `SteeringSceneTokensProcessorStep` encodes into `observation.scene_tokens` before the base pre-processor's
 normalizer. That step needs `lerobot/pi05_base` (about 14 GB) for its `SceneEncoder`: a **second VLM resident
-in the process** at train and at inference time. `load_bundle(config, task=<checkpoint>)` builds it from the
-task checkpoint's own recorded config; the loop includes the scene image iff the bundle has a scene step.
+in the process** at train and at inference time. `scene.from_checkpoint(<checkpoint>)` reads it from the task checkpoint's own recorded
+config and `load_bundle(config, task=<checkpoint>)` carries it; the loop includes the scene image iff the
+bundle has a scene step. The command surface passes the selected mode's `adapter_task` (and nothing else does).
 `SceneEncoder` is injectable, which is how the offline tests exercise the step without the weights.
 
 **Training.** Batches are the prepared observation (with the scene step) plus `kind="task"`, the normalized
@@ -489,9 +490,11 @@ size, the demos and the output; `[training]` is shared with the user module.
 
 **Arms and S2.** `mars-t` = FRS + the task module; `mars` = FRS + both modules (the composed method). Both are
 policy-level adaptations, so a study block holds the task module constant across its arms and compares it
-against the same arms without it (`autonomous+task`, `frs+task`, `mars-t`, `mars`); S2's verdict is task
-success on the robot — there is no simulation-free proxy for it. The offline gate is the held-out flow-matching
-loss and the same heading table `validate-user` prints, with the task module in the field.
+against the same arms without it: `frs` (no task) vs `mars-t` (task), and `mars-u` (user) vs `mars` (user and
+task). S2's verdict is task success on the robot — there is no simulation-free proxy for it; the offline
+number is the trainer's held-out flow-matching loss alone. A "policy + task module, no steering" anchor needs
+its own `[modes.<name>]` table with `mode = "none"` and a command to run it; that composition is deferred to
+the S2 build with the block protocol and the success entry, which neither study has yet.
 
 **Config additions.**
 ```toml
@@ -504,7 +507,11 @@ loss and the same heading table `validate-user` prints, with the task module in 
 [modes.mars]   mode = "frs" ; adapter_user = "assets/user/<name>/user.pt" ; adapter_task = "assets/task/<name>/task.pt"
 ```
 
-**Slices.** C1 the demonstration loader (pure mapping + a lazy `LeRobotDataset` open); C2 the scene step and
-the bundle's task wiring; C3 the task trainer; C4 `mars-t`/`mars`, the S2 plan in the runbook, and the final
-gate. Hardware-only throughout: the real dataset schema, the real `pi05_base` tokens, a real training run, and
-every S2 number.
+**Slices.** C1 the demonstration loader (pure mapping + a lazy `LeRobotDataset` open, accepting both a single
+8-wide `action` feature and namespace-separated action keys, since r2d2's schema is unverified); C2 the scene
+step and the bundle's task wiring (`scene.py`); C3 the task trainer (`train_task.py`, sharing `training.py`'s
+loop with the user trainer); C3b a default-preserving steering fix (a module narrower than the base's action
+width: the loss slices the field to the module's dims, `forward` pads the normalized chunk to the base's
+`max_action_dim`, and `AdaptedField` prefers a module's own `n_dims`); C4 `mars-t`/`mars`, the S2 plan in the
+runbook, and the final gate. Hardware-only throughout: the real dataset schema, the real `pi05_base` tokens, a
+real training run, and every S2 number.
