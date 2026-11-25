@@ -196,17 +196,23 @@ def _stats_file(path: Path) -> Path:
     return path
 
 
-def _observations(count: int = 3, joint: np.ndarray | None = None) -> list[dict]:
-    """A fake station's canned observations: two camera feeds and the arm state at ``joint``."""
-    joint = JOINT if joint is None else np.asarray(joint)
+def _observations(
+    count: int = 3, joint: np.ndarray | None = None, joints: list[np.ndarray] | None = None
+) -> list[dict]:
+    """A fake station's canned observations: two camera feeds and the arm state.
+
+    ``joints`` gives each canned observation its own pose (the chunk test changes ``q`` mid-chunk);
+    otherwise every observation is at ``joint`` (the default: the DROID-like ``JOINT``).
+    """
+    poses = [JOINT if joint is None else np.asarray(joint)] * count if joints is None else joints
     return [
         {
-            "follower/joint_position": joint.copy(),
+            "follower/joint_position": np.asarray(pose, dtype=np.float64).copy(),
             "follower/gripper_position": np.zeros(1),
             "scene_zed": np.full((8, 8, 3), 10 * index, dtype=np.uint8),
             "wrist_zed": np.full((8, 8, 3), 20 * index, dtype=np.uint8),
         }
-        for index in range(count)
+        for index, pose in enumerate(poses)
     ]
 
 
@@ -303,6 +309,119 @@ def test_steered_prepares_once_per_chunk_and_holds_the_boundary_command():
         np.testing.assert_allclose(command, _expected_served(DEFLECTION, JOINT))
     for command in bundle.commands[4:]:
         np.testing.assert_allclose(command, _expected_served(changed, JOINT))
+
+
+def test_steered_holds_one_served_command_for_the_chunk_when_q_and_the_stick_move():
+    """The whole served command is the chunk boundary's, not each tick's: moving the stick *and* the
+    arm pose mid-chunk changes neither what ``act`` receives nor the trace's ``cmd[...]``."""
+    station = _Station(_observations(joints=[JOINT, JOINT + 0.1, JOINT + 0.2]))
+    source = FakeSource(deflection=DEFLECTION)
+    bundle = _CountingBundle()
+    changed = np.array([-0.3, 0.2, 0.0, 0.0, 0.0, 0.0])
+
+    def change_mid_chunk(fake: _Station) -> None:
+        if fake.steps == 1:  # after the first tick, two ticks before the next boundary
+            source.deflection_vector = changed
+
+    station.on_step = change_mid_chunk
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="steered",
+        source=source,
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick the cube", max_steps=8, trace=True)
+
+    assert len(bundle.commands) == 8
+    first, second = bundle.commands[0], bundle.commands[4]
+    for command in bundle.commands[:4]:
+        np.testing.assert_array_equal(command, first)  # identical, not merely close
+    for command in bundle.commands[4:]:
+        np.testing.assert_array_equal(command, second)
+    np.testing.assert_allclose(first, _expected_served(DEFLECTION, JOINT))  # tick 0's observation
+    np.testing.assert_allclose(second, _expected_served(changed, JOINT + 0.1))  # tick 4's observation
+    assert not np.allclose(first, second)
+    assert source.reads == 2  # the stick is read at the two chunk boundaries only
+
+
+def test_the_trace_prints_the_held_command_and_no_operator_gripper(capsys):
+    """The trace's ``cmd[...]`` is the command in force, i.e. the held per-chunk one, and the gripper
+    column is ``-`` in the shared modes: that button is not what moves the gripper there."""
+    station = _Station(_observations())
+    source = FakeSource(deflection=DEFLECTION, gripper=True)
+    loop = Loop(
+        config=_config(n_action_steps=2),
+        station=station,
+        mode="steered",
+        source=source,
+        bundle=_CountingBundle(),
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=4, trace=True)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if " cmd[" in line]
+    assert len(lines) == 4
+    held = " ".join(f"{value:+.3f}" for value in _expected_served(DEFLECTION, JOINT))
+    for line in lines:
+        assert f"cmd[{held}]" in line
+        assert line.endswith("grip -")
+
+
+def test_the_trace_prints_the_operators_gripper_in_teleop(capsys):
+    station = _Station(_observations())
+    source = FakeSource(deflection=DEFLECTION)
+
+    def close_after_first_step(fake: _Station) -> None:
+        if fake.steps >= 1:
+            source.gripper_closed = True
+
+    station.on_step = close_after_first_step
+    loop = Loop(config=_config(), station=station, mode="teleop", source=source)
+
+    loop.run(prompt="pick", max_steps=2, trace=True)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if " cmd[" in line]
+    assert [line.rsplit("grip ", 1)[1] for line in lines] == ["0", "1"]
+
+
+def test_the_noise_is_drawn_once_per_chunk_not_once_per_tick(monkeypatch):
+    """The chunk boundary draws the noise: the same seed's commands are the same for 2 chunks whether
+    the chunk is 2 or 4 ticks (and the readout is drawn twice in both), so a seeded run's noise does
+    not depend on ``n_action_steps``."""
+    draws = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        draws.append(1)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+
+    def chunk_commands(n_action_steps: int) -> tuple[list[np.ndarray], int]:
+        draws.clear()
+        bundle = _CountingBundle()
+        loop = Loop(
+            config=_config(n_action_steps=n_action_steps, readout=ReadoutConfig(noise=0.3, seed=7)),
+            station=_Station(_observations()),
+            mode="steered",
+            source=FakeSource(deflection=DEFLECTION),
+            bundle=bundle,
+            steering=_steering(),
+        )
+        loop.run(prompt="pick", max_steps=2 * n_action_steps)  # two chunks either way
+        return [bundle.commands[0], bundle.commands[n_action_steps]], len(draws)
+
+    short, short_draws = chunk_commands(2)
+    long, long_draws = chunk_commands(4)
+
+    assert short_draws == 2 and long_draws == 2  # one readout per chunk
+    for first, second in zip(short, long, strict=True):
+        np.testing.assert_array_equal(first, second)
+    assert not np.allclose(short[0], short[1])  # the noise is still there
 
 
 def test_the_raw_batch_is_the_stations_observation_under_the_configs_cameras():
