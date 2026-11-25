@@ -211,9 +211,11 @@ class Loop:
     def __init__(self, *, config, station, mode: str, source=None, bundle=None, steering=None,
                  adapter_from_corruption: str | None = None)   # mode: teleop | autonomous | steered
     def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False,
-            states: statefiles.Recorder | None = None) -> None
+            states: statefiles.Recorder | None = None, on_tick: TickHook | None = None,
+            initial_obs: Mapping | None = None) -> None
     def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False,
-                      states: statefiles.Recorder | None = None) -> Path
+                      states: statefiles.Recorder | None = None, on_tick: TickHook | None = None,
+                      initial_obs: Mapping | None = None) -> Path
 ```
 The loop owns the readout, not the caller: it resolves the corruption spec and `q0` at the first episode,
 applies gain/noise, and redraws a per-trial `random` family at every episode — including the `mars-f` adapter
@@ -548,11 +550,14 @@ Cartesian mapping. A trial reports the mean over its engaged steps: the measured
 supposed to buy.
 
 **Records.** `<out>/<run>/trials.jsonl`, one line per trial: `run, arm, pair, prompt, success, steps,
-duration_s, authority, engaged_fraction, mean_|r|, q0, scene_hash, config, timestamp`;
-`<out>/<run>/config.json` and `run.json` (config path + digest, git HEAD and working-tree dirty flag, timestamp);
-the per-tick npz above; and `<out>/<run>/trials/` holds them.
+duration_s, authority, engaged_fraction, mean_r` (the mean command L2 norm), `q0, scene_hash, config,
+config_sha256, timestamp`; `<out>/<run>/config.toml` (a byte copy), `run.json` (config path + digest, git HEAD
+and dirty flag, timestamp, arms/trials/order, completed/aborted), and `<out>/<run>/trials/` with the per-tick npz.
+`study` resets the station **once** per trial, digests that observation, and hands it to `Loop.run` as
+`initial_obs`, so the pairing key provably describes the first observation the trial's first action used.
 
-**Analysis.** `analysis.py` reads one or more run directories and prints (and writes as CSV):
+**Analysis.** `analysis.py` reads one or more run directories (`mars-franka analyse --run DIR …`, optional
+`--out DIR` for the two CSVs `per_arm.csv` and `paired.csv`) and prints (and writes as CSV):
 the per-arm table — `n`, the success rate with a Wilson 95% interval, mean authority; and the paired tests on
 matched `(pair, scene_hash)` trials — McNemar's exact test for success, the Wilcoxon signed-rank test for
 authority — between every pair of arms. It is a library plus a `mars-franka analyse` command? No: it is a
