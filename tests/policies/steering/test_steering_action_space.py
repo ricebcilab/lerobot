@@ -147,6 +147,16 @@ def test_a_nonpositive_reference_step_is_refused():
             SteeringConfig(reference_step=bad)
 
 
+def test_a_nonpositive_n_dims_is_refused():
+    """``n_dims`` is the width two rules slice by (flow control's write, FRS's delegation beyond the command): a
+    config that would quietly write the wrong dims fails closed instead."""
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="n_dims"):
+            SteeringConfig(n_dims=bad)
+    assert SteeringConfig(n_dims=2).n_dims == 2
+    assert SteeringConfig(n_dims=7).n_dims == 7
+
+
 def test_frs_delegates_the_dims_beyond_the_command():
     """The gripper depends on it: with a 7-wide command on a 32-wide action space, dims 0-6 are pinned for the
     reference's pinned prefix only, and dim 7 (the gripper) and the padding are the policy's at every step."""

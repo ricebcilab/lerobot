@@ -157,6 +157,11 @@ class SteeringConfig(PreTrainedConfig):
             raise ValueError(
                 f"reference_step must be > 0 (action units per control step), got {self.reference_step!r}"
             )
+        if self.n_dims < 1:
+            raise ValueError(
+                f"n_dims must be >= 1 (the action dims the adapter acts on; flow control writes them, and FRS "
+                f"delegates the ones beyond the command), got {self.n_dims!r}"
+            )
         self.check_operator_dims(self.operator_dims or ())
         self.check_operator_dims(self.zeroed_dims or ())
         if (
