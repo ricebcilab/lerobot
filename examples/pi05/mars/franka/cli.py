@@ -26,12 +26,13 @@ every shared command use the config's ``[readout]``. The loop owns the readout a
 resolves; this module only chooses the config. ``--record NAME`` switches to
 ``Loop.run_recording`` and prints the dataset path it returns.
 
-``train-user`` and ``validate-user`` (DESIGN.md's Phase B) are the user module's trainer and its
-offline validator, not sessions: they take ``--config`` and ``--prompt`` only and read the states, the
-checkpoint and the output path from ``[user]``; ``train-user`` calls ``train_user.train`` and prints
-the checkpoint it writes, ``validate-user`` calls ``validate.validate`` and prints the validation JSON's
-path. Both load the checkpoint, so their imports are lazy (another command's path never pulls torch);
-the trainer and the validator print their own progress and tables.
+``train-user`` and ``validate-user`` (DESIGN.md's Phase B) and ``train-task`` (Phase C) are the
+trainers and the offline validator, not sessions: they take ``--config`` and ``--prompt`` only and read
+their input, output and checkpoint paths from their own table (``[user]`` or ``[task]``);
+``train-user`` calls ``train_user.train``, ``validate-user`` calls ``validate.validate``, and
+``train-task`` calls ``train_task.train``, printing the file each writes. All three load the checkpoint,
+so their imports are lazy (another command's path never pulls torch); they print their own progress,
+and ``validate-user`` its table.
 
 ``probe`` is a later slice: its import is lazy, and it records nothing, so ``--record`` is
 refused. Ctrl-C is caught here, and only here, after the station and the source are closed; 130 is
@@ -69,15 +70,18 @@ EXAMPLE_DIR = Path(__file__).parent  # the shipped config and every relative ass
 DEFAULT_CONFIG = EXAMPLE_DIR / "configs" / "franka.toml"
 
 STEERED_COMMANDS = ("fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
-NON_SESSION_COMMANDS = ("train-user", "validate-user")
-"""The commands that are not a control session: no station, no source, no loop (Phase B's trainer and validator)."""
+NON_SESSION_COMMANDS = ("train-user", "validate-user", "train-task")
+"""The commands that are not a control session: no station, no source, no loop (the Phase B/C trainers and validator)."""
 COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS, *NON_SESSION_COMMANDS, "probe")
 
 _PROMPT_OPTIONAL = ("teleop", "probe")
 """The commands that run without a task text; every other command requires ``--prompt``."""
 
 _NON_SESSION_FLAGS = ("record", "record_states", "steps", "trace", "corrupted", "dry_run")
-"""The session flags ``train-user``/``validate-user`` refuse: ``[user]`` names their input and output."""
+"""The session flags the trainers and the validator refuse: their table names their input and output."""
+
+_NON_SESSION_SECTION = {"train-task": "[task]"}
+"""The config table a non-session command's input and output come from (``[user]`` when not named)."""
 
 _DRY_RUN_ACTION_STD = 0.3
 """One stand-in action standard deviation per dim, when a dry run has no statistics file."""
@@ -108,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
             return _train_user(args, config)
         if args.command == "validate-user":
             return _validate_user(args, config)
+        if args.command == "train-task":
+            return _train_task(args, config)
         return _run(args, config)
     except KeyboardInterrupt:  # only here: the run has closed the station and the source on the way out
         print("\nmars-franka: interrupted", file=sys.stderr)
@@ -167,9 +173,10 @@ def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
     if args.command in NON_SESSION_COMMANDS:
         given = [f"--{name.replace('_', '-')}" for name in _NON_SESSION_FLAGS if getattr(args, name)]
         if given:
+            section = _NON_SESSION_SECTION.get(args.command, "[user]")
             parser.error(
                 f"{args.command} takes --config and --prompt only ({given[0]} is not one): "
-                "[user] names its input and its output"
+                f"{section} names its input and its output"
             )
 
 
@@ -220,6 +227,19 @@ def _validate_user(args: argparse.Namespace, config: Config) -> int:
         config, prompt=args.prompt, states_path=config.user.states, checkpoint=config.user.checkpoint
     )
     print(f"validation: {result['out']}", flush=True)
+    return 0
+
+
+def _train_task(args: argparse.Namespace, config: Config) -> int:
+    """``train-task`` over the config's ``[task]`` demonstrations and output; the trainer prints its progress.
+
+    Lazy import for the same reason as the other non-session commands: the trainer loads the checkpoint
+    (torch, its processor pipelines) and the scene encoder, so no other command's path should pull them.
+    """
+    import train_task
+
+    path = train_task.train(config, prompt=args.prompt, demos_path=config.task.demos, out=config.task.out)
+    print(f"task module: {path}", flush=True)
     return 0
 
 

@@ -56,8 +56,6 @@ import argparse
 import dataclasses
 import hashlib
 import json
-import math
-import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,7 +71,7 @@ from cues import cue_commands, cue_twists, magnitudes
 from numpy.typing import NDArray
 from policy import Bundle, load_bundle, make_steering
 from stats import CHECKPOINT_WIDTH
-from torch import nn
+from training import step_if_finite, train_module
 
 from lerobot.policies.steering import AdapterModules, Flow, LearnedUserModule
 from lerobot.teleoperators import readout
@@ -174,65 +172,13 @@ def split_states(
 
 
 # ---------------------------------------------------------------- the training loop
-#
-# Moved verbatim from lerobot.policies.steering (train_module, step_if_finite), which keeps no training
-# loop, and from the LIBERO and cursor trainers, which each kept a copy of these two.
 
 
-def _step_if_finite(opt: torch.optim.Optimizer, loss: torch.Tensor, params, clip: float = 1.0) -> bool:
-    """One optimizer step, unless the loss or the clipped gradient norm is not finite (a batch where a flow
-    blew up): then the step is skipped and the weights stay whole. Returns whether a step was taken."""
-    opt.zero_grad(set_to_none=True)
-    if not torch.isfinite(loss):
-        return False
-    loss.backward()
-    norm = nn.utils.clip_grad_norm_(list(params), clip)
-    if not torch.isfinite(norm):
-        opt.zero_grad(set_to_none=True)
-        return False
-    opt.step()
-    return True
-
-
-def _train_module(
-    module: nn.Module,
-    steps: int,
-    lr: float,
-    batch_loss: Callable[[int], torch.Tensor],
-    validate: Callable[[], dict] | None = None,
-    log_every: int = 1000,
-    weight_decay: float = 1e-4,
-    clip: float = 1.0,
-) -> list[dict]:
-    """This trainer's loop for a MARS module: AdamW with a cosine schedule over ``steps``, gradients clipped
-    to ``clip``, non-finite batches skipped (``_step_if_finite``). ``batch_loss(step)`` returns one batch's
-    loss. Every ``log_every`` steps, and at the last, the module is put in eval mode for ``validate()``
-    (named numbers, or None) and {step, train_loss (the window's mean), skipped, **validation} is logged and
-    printed. Returns the log."""
-    opt = torch.optim.AdamW(module.parameters(), lr=lr, weight_decay=weight_decay)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
-    log: list[dict] = []
-    running, skipped, tic = 0.0, 0, time.time()
-    for step in range(1, steps + 1):
-        loss = batch_loss(step)
-        skipped += not _step_if_finite(opt, loss, module.parameters(), clip)
-        sched.step()
-        running += loss.item() if torch.isfinite(loss) else 0.0
-        if step % log_every == 0 or step == steps:
-            module.eval()
-            val = validate() if validate is not None else {}
-            module.train()
-            entry = {"step": step, "train_loss": running / log_every, "skipped": skipped, **val}
-            log.append(entry)
-            shown = "  ".join(f"{k} {v:.3f}" if isinstance(v, float) else f"{k} {v}" for k, v in val.items())
-            print(
-                f"step {step:6d}  train {entry['train_loss']:.4f}  {shown}"
-                + (f"  skipped {skipped}" if skipped else "")
-                + f"  ({time.time() - tic:.0f}s)",
-                flush=True,
-            )
-            running = 0.0
-    return log
+# The loop itself is `training.train_module`'s (the one shared by both trainers: AdamW + cosine, gradients
+# clipped, non-finite batches skipped). The private names stay as aliases so the loop's old home keeps its
+# call sites and its tests.
+_step_if_finite = step_if_finite
+_train_module = train_module
 
 
 # ---------------------------------------------------------------- one run's fixed pieces
