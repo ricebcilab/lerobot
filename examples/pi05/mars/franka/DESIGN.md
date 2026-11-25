@@ -369,8 +369,9 @@ and leaves the gripper (dim 7) and the padding to the policy.
 
 # Phase B: the MARS user module
 
-Status: interface freeze, no implementation yet. Everything above stays as it is; Phase B adds files and
-two commands (`train-user`, `validate-user`) and never changes the control loop's semantics.
+Status: implemented offline (B1-B4), hardware verification pending. Everything above stays as it is; Phase B
+adds files and the commands `--record-states`, `train-user`, `validate-user` and `mars-u`, and never changes
+the control loop's semantics.
 
 **What is learned.** `LearnedUserModule` (main's) corrects the velocity field of the *reversal* only:
 `x += h U(x_t, t) v`, so it changes the latent the forward flow starts from, not the executed policy. Its
@@ -412,11 +413,15 @@ station records. It adds no control behaviour. Format (frozen; numpy, no pickle)
 corruption spec, config path and digest, noise, seed, timestamp, format version). A re-recorded take retracts
 its rows (`Recorder.drop_episode`).
 
-**Validation (offline, no arm, no env).** On held-out states, for each FRS depth in `val_depths`: what
-steering would execute (`FlowReversalSteering` with the reference pinned) against the cue's intent, as the
-mean cosine between the executed translation (the executed joint velocities through `J(q)`) and the intent
-twist, for arms `plan`, `none`, `clean`, `ideal`, `F` (the fixed lift), `user` (the trained module). The
-module is worth the study only if `user` moves from `none` toward `clean`.
+**Validation (offline, no arm, no env).** The trainer's own held-out split; one fresh cue per held-out state
+(seed `[seed, 2]`, sigma fixed at the middle of `[user] sigma`); for each FRS depth in `val_depths`, every arm
+from the *same* seeded flow noise — `plan` (the policy's own chunk), `none` (FRS on the served command),
+`clean` (on the faithful command), `ideal` (the intent, no noise), `f` (the fixed lift), `user` (the trained
+module) — measured as the mean cosine between the executed translation (the executed joint velocities through
+`J(q)` at the state) and the cue's intent twist. Written to `<[user] out>/validation.json` and printed as a
+table; no exit status encodes the verdict, because the reader's gate is: **the module is worth the study only
+where it moves the heading from `none` toward `clean`** (`|user - clean| < |none - clean|`). The checkpoint
+must record the same `--prompt` it was trained under, and its file's readout must match the config's.
 
 **Files.** `readout.py` (the session's readout as a value: `F`, gain, σ, `serve`, `resolve`; the loop uses
 it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their IK'd commands; pure), `statefiles.py`
@@ -434,8 +439,8 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
           horizon = null                           # null = the checkpoint's chunk_size
           d = 256 ; tdim = 64 ; time_embedding = "mars"
           step_rank = null ; cross_step_rank = 0 ; additive = false
-          correct_by = null ; checkpoint = "assets/user/rotz20/user.pt"
-[training] steps = 3000 ; batch = 8 ; lr = 1e-3 ; val_frac = 0.1 ; seed = 0 ; log_every = 100
+          correct_by = null
+          checkpoint = "assets/user/rotz20/user.pt"[training] steps = 3000 ; batch = 8 ; lr = 1e-3 ; val_frac = 0.1 ; seed = 0 ; log_every = 100
           device = "cuda" ; val_depths = [10, 4]
 [states]  dir = "assets/states"                     # a session's --record-states NAME lands here
 [modes.mars-u]  mode = "frs" ; adapter_user = "assets/user/rotz20/user.pt"
