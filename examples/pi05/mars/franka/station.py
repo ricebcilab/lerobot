@@ -32,6 +32,13 @@ STATE_DIMS = 32
 """PI05 declares ``observation.state`` (32,). The model pads actions itself but not state, so the
 station sends 32 wide: the arm and gripper in dims 0-7, zeros beyond (DESIGN.md)."""
 
+SCENE_IMAGES = "observation.scene_images"
+"""The scene step's input key: one scene camera picture, uint8 channel-first, in the raw batch.
+
+The task module's scene step (``scene.Scene``) reads pictures of its render size and writes
+``observation.scene_tokens``; a raw batch is one row, so the picture here is ``(3, size, size)`` (the
+step itself takes a batch of them, ``[B, 3, size, size]``)."""
+
 
 # ---------------------------------------------------------------- the manifest
 
@@ -244,7 +251,13 @@ def action_dict(action8: NDArray, arm: str) -> dict[str, NDArray]:
 
 
 def observation_batch(
-    obs: Mapping[str, NDArray], *, arm: str, cameras: Mapping[str, str | None], task: str
+    obs: Mapping[str, NDArray],
+    *,
+    arm: str,
+    cameras: Mapping[str, str | None],
+    task: str,
+    scene: NDArray | None = None,
+    scene_size: int | None = None,
 ) -> dict[str, NDArray | str]:
     """One c3po observation as the policy's raw batch, before any processor runs.
 
@@ -252,6 +265,11 @@ def observation_batch(
     a uint8 frame would be multiplied as 0-255 and destroyed. The third image is omitted unless
     ``cameras["third"]`` names a feed: ``PI05Policy.prepare_images`` fills an absent image feature
     with a -1 image and a zero mask, whereas a zeros image would be an unmasked real input.
+
+    ``scene``/``scene_size`` add a task checkpoint's scene picture under ``SCENE_IMAGES``: the scene
+    camera's frame letterboxed to the module's render size, uint8 channel-first. ``scene`` is the
+    ``(H, W, 3)`` uint8 frame (letterboxed here) or the picture ``scene.scene_images`` already made;
+    without it the batch is exactly the policy's and the scene step has nothing to encode.
     """
     batch: dict[str, NDArray | str] = {
         "observation.images.base_0_rgb": _camera_image(obs, _camera_feed(cameras, "exterior")),
@@ -262,6 +280,10 @@ def observation_batch(
     third = cameras.get("third")
     if third is not None:
         batch["observation.images.right_wrist_0_rgb"] = _camera_image(obs, third)
+    if scene is not None:
+        if scene_size is None:
+            raise ValueError(f"observation_batch needs scene_size with scene: {SCENE_IMAGES}'s render size")
+        batch[SCENE_IMAGES] = _scene_pictures(scene, scene_size)
     return batch
 
 
@@ -311,6 +333,21 @@ def _camera_image(obs: Mapping[str, NDArray], feed: str) -> NDArray:
         )
     image = resize_with_pad(frame).astype(np.float32) / 255.0
     return np.moveaxis(image, -1, 0)
+
+
+def _scene_pictures(scene: NDArray, size: int) -> NDArray:
+    """The scene step's one picture: ``scene`` letterboxed to ``size``, uint8 channel-first.
+
+    ``scene`` is the scene camera's (H, W, 3) uint8 frame -- letterboxed here through the same openpi
+    ``resize_with_pad`` the policy's images take -- or the picture ``scene.scene_images`` already made
+    (the loop's), which is returned as it is.
+    """
+    picture = np.asarray(scene)
+    if picture.shape == (3, size, size):
+        if picture.dtype != np.uint8:
+            raise ValueError(f"{SCENE_IMAGES} must be uint8 pictures, got {picture.dtype}")
+        return picture
+    return np.moveaxis(resize_with_pad(picture, size), -1, 0)
 
 
 def _state(obs: Mapping[str, NDArray], arm: str) -> NDArray:

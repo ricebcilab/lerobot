@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 import policy as policy_module
 import pytest
+import scene as scene_module
 import torch
 from config import (
     Config as ExampleConfig,
@@ -36,7 +37,18 @@ from policy import (
     steering_batch,
     teleop_action,
 )
+from scene import Scene
 from stats import CHECKPOINT_WIDTH
+
+from lerobot.policies.steering import (
+    VLM_SCENE_DIM,
+    VLM_SCENE_TOKENS,
+    AdapterModules,
+    LearnedTaskModule,
+    SteeringSceneTokensProcessorStep,
+)
+from lerobot.policies.steering.processor_steering import OBS_SCENE_TOKENS, steering_batch_to_transition
+from lerobot.processor import PolicyProcessorPipeline
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
 REAL_STATS = EXAMPLE_DIR / "assets" / "droid" / "norm_stats.json"
@@ -494,6 +506,111 @@ def test_load_bundle_treats_a_missing_statistics_file_as_absent(tmp_path, monkey
     bundle = load_bundle(cfg, device="cpu")
     assert bundle.mean is None and bundle.std is None
     assert ctx.installed == []
+
+
+# ---------------------------------------------------------------- a task checkpoint's scene
+
+SCENE_SIZE = 128
+
+
+def _task_checkpoint(path: Path, source: str = "vlm_image") -> Path:
+    """A MARS task module checkpoint built with no training: its config is the scene ``load_bundle`` reads."""
+    module = LearnedTaskModule(**LearnedTaskModule.spec(source, SCENE_SIZE))
+    return AdapterModules.save_module(module, path, kind="task")
+
+
+class _FakeEncoder:
+    """The scene step's encoder contract without the 14 GB VLM: float16 tokens per picture batch."""
+
+    def image_tokens(self, images, batch=64) -> torch.Tensor:
+        return torch.zeros((len(images), VLM_SCENE_TOKENS, VLM_SCENE_DIM), dtype=torch.float16)
+
+    def prefix_tokens(self, images, batch=64) -> torch.Tensor:
+        raise AssertionError("a vlm_image step reads image_tokens")
+
+
+def _fake_scene_step(self, *, device, encoder=None) -> PolicyProcessorPipeline:
+    """``Scene.step`` with the fake encoder: the real one-step pipeline, no VLM loaded."""
+    return PolicyProcessorPipeline(
+        steps=[
+            SteeringSceneTokensProcessorStep(
+                source=self.source, render_size=self.render_size, device=device, encoder=_FakeEncoder()
+            )
+        ],
+        to_transition=steering_batch_to_transition,
+    )
+
+
+def test_load_bundle_builds_the_scene_of_a_task_checkpoint(tmp_path, monkeypatch):
+    """A task checkpoint's recorded scene goes on the bundle; without one the bundle has none."""
+    ctx = _fake_loading(monkeypatch, tmp_path)
+    path = _task_checkpoint(tmp_path / "task.pt")
+
+    bundle = load_bundle(ctx.cfg, device="cpu", task=path)
+
+    assert bundle.scene == Scene(source="vlm_image", render_size=SCENE_SIZE)
+    assert load_bundle(ctx.cfg, device="cpu").scene is None
+
+
+def test_prepare_encodes_the_scene_pictures_before_the_base_preprocessor(tmp_path, monkeypatch):
+    """``Bundle.prepare`` runs the scene step first: the batch the base pre-processor sees carries the
+    scene's tokens (float16 ``[1, 256, 2048]``) beside the station's state and prompt."""
+    ctx = _fake_loading(monkeypatch, tmp_path)
+    path = _task_checkpoint(tmp_path / "task.pt")
+    monkeypatch.setattr(scene_module.Scene, "step", _fake_scene_step)
+    seen = {}
+
+    def base_preprocessor(bundle, raw_batch: dict) -> dict:
+        seen["batch"] = raw_batch
+        return dict(raw_batch)
+
+    monkeypatch.setattr(policy_module, "steering_batch", base_preprocessor)
+    bundle = load_bundle(ctx.cfg, device="cpu", task=path)
+    pictures = np.full((3, SCENE_SIZE, SCENE_SIZE), 5, dtype=np.uint8)
+    raw_batch = {
+        "observation.scene_images": pictures,
+        "observation.state": np.zeros(32, dtype=np.float32),
+        "task": "pick the cube",
+    }
+
+    prepared = bundle.prepare(raw_batch)
+
+    tokens = prepared[OBS_SCENE_TOKENS]
+    assert torch.is_tensor(tokens)
+    assert tokens.shape == (1, VLM_SCENE_TOKENS, VLM_SCENE_DIM)
+    assert tokens.dtype == torch.float16
+    # the base pre-processor ran after the scene step, on its output
+    assert seen["batch"] is not raw_batch
+    np.testing.assert_array_equal(seen["batch"][OBS_SCENE_TOKENS].numpy(), tokens.numpy())
+    np.testing.assert_array_equal(seen["batch"]["observation.state"], raw_batch["observation.state"])
+    assert seen["batch"]["task"] == "pick the cube"
+
+
+def test_prepare_without_a_scene_is_the_base_preprocessor_on_the_raw_batch(tmp_path, monkeypatch):
+    ctx = _fake_loading(monkeypatch, tmp_path)
+    seen = {}
+
+    def base_preprocessor(bundle, raw_batch: dict) -> dict:
+        seen["batch"] = raw_batch
+        return dict(raw_batch)
+
+    monkeypatch.setattr(policy_module, "steering_batch", base_preprocessor)
+    bundle = load_bundle(ctx.cfg, device="cpu")
+    raw_batch = {"observation.state": np.zeros(32, dtype=np.float32), "task": "pick"}
+
+    prepared = bundle.prepare(raw_batch)
+
+    assert seen["batch"] is raw_batch and prepared == raw_batch
+    assert OBS_SCENE_TOKENS not in prepared
+
+
+@pytest.mark.parametrize("source", ["cnn", "discs"])
+def test_load_bundle_refuses_a_task_checkpoint_whose_scene_is_out_of_scope(tmp_path, source):
+    """The scene is read before the checkpoint or the VLM it would need is loaded: an out-of-scope task
+    module's source is refused by name (DESIGN.md's Phase C scope)."""
+    path = _task_checkpoint(tmp_path / "task.pt", source)
+    with pytest.raises(ValueError, match="out of scope"):
+        load_bundle(ExampleConfig(), device="cpu", task=path)
 
 
 # ---------------------------------------------------------------- the real checkpoint (chopper)

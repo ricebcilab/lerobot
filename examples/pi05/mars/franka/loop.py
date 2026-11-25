@@ -53,6 +53,7 @@ from bridge import ARM_DIMS, TWIST_DIMS
 from numpy.typing import NDArray
 from policy import teleop_action
 from readout import ADAPTER_SOURCES, Readout, resolve
+from scene import scene_images
 from source import DeflectionSource
 from station import RecordingStation, observation_batch
 from stats import action_std
@@ -75,6 +76,13 @@ class Loop:
     checked here, before the first observation, so a mis-composed run fails on the ground rather than
     after a reset. ``adapter_from_corruption`` is the shared modes' adapter sync (``mars-f``); it
     needs the steering policy, so it is refused by the other modes.
+
+    A bundle with a scene (``Bundle.scene``, from a task checkpoint the composition root loaded the
+    bundle with) adds the scene camera's pictures to every chunk's raw batch, under
+    ``observation.scene_images``: the bundle's ``prepare`` then encodes them into the tokens the task
+    module reads. The scene is fixed for the run -- it is whatever task checkpoint the mode's
+    ``adapter_task`` path named when the bundle was built, which is the CLI's choice, not the loop's --
+    so a run cannot change it mid-session. A bundle without one changes nothing.
     """
 
     def __init__(
@@ -249,8 +257,24 @@ class Loop:
         return self._readout.serve(intent, self._noise_rng)
 
     def _raw_batch(self, obs: dict[str, NDArray], prompt: str) -> dict:
-        """The station's observation as the policy's raw batch (before the pre-processor)."""
-        return observation_batch(obs, arm=self._arm, cameras=self._cameras, task=prompt)
+        """The station's observation as the policy's raw batch (before the pre-processor).
+
+        A bundle with a scene adds the scene camera's picture: the configured exterior feed (the ZED2)
+        letterboxed to the task module's render size, uint8 channel-first, under
+        ``observation.scene_images``. The bundle's ``prepare`` encodes it into the tokens the task module
+        reads. Without a scene the batch is exactly the station's.
+        """
+        scene = None if self._bundle is None else self._bundle.scene
+        if scene is None:
+            return observation_batch(obs, arm=self._arm, cameras=self._cameras, task=prompt)
+        return observation_batch(
+            obs,
+            arm=self._arm,
+            cameras=self._cameras,
+            task=prompt,
+            scene=scene_images(obs, self._cameras["exterior"], scene.render_size),
+            scene_size=scene.render_size,
+        )
 
     def _record(self, raw_batch: dict, obs: dict[str, NDArray], *, tick: int, prompt: str) -> None:
         """Append one chunk-boundary row to the caller's recorder, if there is one.

@@ -25,9 +25,10 @@ from bridge import ARM_DIMS, TWIST_DIMS
 from config import CommandConfig, Config, ReadoutConfig
 from loop import Loop
 from policy import STATION_DIMS, fake_bundle, teleop_action
+from scene import scene_images
 from source import FakeSource
 from statefiles import Recorder, load
-from station import FakeStation, observation_batch
+from station import SCENE_IMAGES, FakeStation, observation_batch
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
 
@@ -68,11 +69,24 @@ class _Station(FakeStation):
         return observation
 
 
-class _CountingBundle:
-    """A numpy-only bundle that records the tick's halves; ``act`` returns a fixed action."""
+class _Scene:
+    """A bundle's scene as the loop reads it: only the render size matters (the bundle encodes it)."""
 
-    def __init__(self, std: np.ndarray | None = None) -> None:
+    def __init__(self, render_size: int) -> None:
+        self.render_size = render_size
+
+
+class _CountingBundle:
+    """A numpy-only bundle that records the tick's halves; ``act`` returns a fixed action.
+
+    ``scene`` is ``None`` (no scene step: the raw batch is the station's) or a task checkpoint's scene
+    (the loop adds the scene camera's pictures to the raw batch; the bundle's ``prepare`` would encode
+    them, which this fake records instead).
+    """
+
+    def __init__(self, std: np.ndarray | None = None, scene: _Scene | None = None) -> None:
         self.std = np.linspace(0.2, 0.9, STATION_DIMS) if std is None else np.asarray(std)
+        self.scene = scene
         self.batches: list[dict] = []
         self.commands: list[np.ndarray | None] = []
         self.resets = 0
@@ -450,6 +464,47 @@ def test_the_raw_batch_is_the_stations_observation_under_the_configs_cameras():
         "task",
     }
     assert batch["observation.state"].shape == (32,)
+    assert SCENE_IMAGES not in batch  # a bundle without a scene adds nothing
+
+
+def test_the_raw_batch_carries_the_scene_camera_when_the_bundle_has_a_scene():
+    """A task checkpoint's bundle gives the loop a scene: the configured exterior feed (the ZED2) goes
+    into the raw batch letterboxed to the module's render size, uint8 channel-first, so the bundle's
+    scene step can encode it; every other key is the station's."""
+    observations = _observations()
+    bundle = _CountingBundle(scene=_Scene(8))
+    loop = Loop(
+        config=_config(n_action_steps=4), station=_Station(observations), mode="autonomous", bundle=bundle
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    batch = bundle.batches[0]
+    assert set(batch) == {
+        "observation.images.base_0_rgb",
+        "observation.images.left_wrist_0_rgb",
+        "observation.state",
+        "task",
+        SCENE_IMAGES,
+    }
+    pictures = batch[SCENE_IMAGES]
+    assert pictures.shape == (3, 8, 8) and pictures.dtype == np.uint8
+    # the configured exterior feed, letterboxed to the scene's render size
+    np.testing.assert_array_equal(pictures, scene_images(observations[0], "scene_zed", 8))
+
+
+def test_the_scene_pictures_do_not_change_the_actions():
+    """The scene camera's pictures are one more input key: same station, same bundle behaviour, same
+    actions sent."""
+    plain, with_scene = _Station(_observations()), _Station(_observations())
+    Loop(config=_config(), station=plain, mode="autonomous", bundle=_CountingBundle()).run(
+        prompt="pick", max_steps=3
+    )
+    Loop(
+        config=_config(), station=with_scene, mode="autonomous", bundle=_CountingBundle(scene=_Scene(8))
+    ).run(prompt="pick", max_steps=3)
+
+    np.testing.assert_array_equal(np.stack(plain.actions), np.stack(with_scene.actions))
 
 
 def test_autonomous_prepares_once_per_chunk_and_acts_without_a_command():

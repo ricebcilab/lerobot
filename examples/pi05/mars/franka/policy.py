@@ -10,7 +10,9 @@ its cached pre/post-processor JSONs declare the features empty and the ``normali
 
 This module is the policy half of that: ``load_bundle`` builds the checkpoint and its two pipelines on
 the configured device (weights and the gated PaliGemma tokenizer are needed for a real one: the probe on
-the station is that [V]); ``make_steering`` wraps the loaded policy in the mode's ``SteeringPolicy``;
+the station is that [V]), and, when the caller names a MARS task checkpoint, that checkpoint's scene
+step (``scene.Scene``) so ``prepare`` turns the scene camera's pictures into the tokens the task module
+reads; ``make_steering`` wraps the loaded policy in the mode's ``SteeringPolicy``;
 ``Bundle.prepare``/``Bundle.act`` are the two halves of a control tick — the batch once per chunk, the
 action every tick, because the policies only read a batch when their action queue is empty — and
 ``Bundle.action`` is the convenient single call for callers without that boundary; and
@@ -36,10 +38,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
+from station import SCENE_IMAGES
 from stats import STATION_DIMS, install_stats
 
 if TYPE_CHECKING:
     from config import Config, SteeringConfig
+    from scene import Scene
 
     from lerobot.policies.steering import SteeringPolicy
 
@@ -69,9 +73,13 @@ class Bundle:
     affine form, 8 wide and in raw action units (``None`` when no statistics file was installed).
     ``deadband`` is the operator's idle threshold (``config.command.deadband``): it lives outside the
     ``[steering]``/``[modes.*]`` tables in the config, and ``make_steering(bundle, steering)`` has no
-    other place to read it. ``_cache`` holds the one ``SteeringPolicy`` ``make_steering`` makes (the
-    loop calls ``act`` about 15 times a second, so it is made once and reset per episode) and the fake
-    bundle's fixed action.
+    other place to read it. ``scene`` is a task checkpoint's scene (``scene.Scene``: the token source
+    and render size its module was built with), or ``None`` when no task checkpoint was named: its one
+    step is what ``prepare`` adds to the batch, while the module itself stays the steering policy's to
+    load from the mode's ``adapter_task`` path. ``_cache`` holds the one ``SteeringPolicy``
+    ``make_steering`` makes (the loop calls ``act`` about 15 times a second, so it is made once and
+    reset per episode), the scene step's pipeline (built once: its encoder and token cache are state)
+    and the fake bundle's fixed action.
 
     A control tick has two halves, because the policies only read a batch when their action queue is
     empty (once per chunk of ``n_action_steps``): ``prepare`` runs the pre-processor (the expensive part:
@@ -86,6 +94,7 @@ class Bundle:
     mean: NDArray | None = None
     std: NDArray | None = None
     deadband: float = DEFAULT_DEADBAND
+    scene: Scene | None = None
     _cache: dict = field(default_factory=dict, repr=False, compare=False, hash=False)
 
     def prepare(self, raw_batch: dict) -> dict:
@@ -94,7 +103,16 @@ class Bundle:
         The expensive half of a tick, so the loop builds the batch once per chunk of ``n_action_steps``
         and calls ``act`` on the ticks in between (the policies only read a batch when their action queue
         is empty). The operator's command is not added here.
+
+        With a ``scene`` (a task checkpoint's), the scene's one-step pipeline runs first: it encodes
+        ``observation.scene_images`` into ``observation.scene_tokens``, the tokens the steering policy
+        hands the task module, and the base pre-processor then carries them to the device with the rest
+        of the batch. A raw batch is one row, so its scene picture is given the leading batch dimension
+        the step reads ([B, 3, S, S]; a trainer's batch of B rows is already there). Without a scene the
+        batch is exactly the pre-processor's.
         """
+        if self.scene is not None:
+            raw_batch = self._scene_pipeline()(_scene_row(raw_batch))
         return steering_batch(self, raw_batch)
 
     def act(self, batch: dict, command7: NDArray | None = None) -> NDArray:
@@ -149,11 +167,19 @@ class Bundle:
             )
         return steering
 
+    def _scene_pipeline(self) -> Any:
+        """The scene's one-step pipeline, built once and kept: its encoder and its token cache are state."""
+        pipeline = self._cache.get("scene_pipeline")
+        if pipeline is None:
+            pipeline = self.scene.step(device=str(_device(self)))
+            self._cache["scene_pipeline"] = pipeline
+        return pipeline
+
 
 # ---------------------------------------------------------------- loading
 
 
-def load_bundle(cfg: Config, device: str | None = None) -> Bundle:
+def load_bundle(cfg: Config, device: str | None = None, task: Path | None = None) -> Bundle:
     """pi0.5-DROID on ``device`` (default: ``cfg.policy.device``) with its pipelines and statistics.
 
     The config's ``pretrained_path``, ``device``, ``dtype`` and ``n_action_steps`` are put on the
@@ -165,9 +191,24 @@ def load_bundle(cfg: Config, device: str | None = None) -> Bundle:
     openpi asset is gitignored): the shared modes then refuse to build in ``make_steering`` and
     ``Bundle.action`` refuses to act, and teleop never comes here at all.
 
+    ``task`` is a MARS task module's checkpoint (``AdapterModules.save_module``'s format). Its recorded
+    scene (``scene.from_checkpoint``: the token source and render size no module or weights are
+    needed to read) goes on the bundle, so ``prepare`` encodes the scene camera's pictures before the
+    base pre-processor; the module itself is still loaded by the ``SteeringPolicy`` from the mode's
+    ``adapter_task`` path, which is the composition root's choice: the scene step is the only thing the
+    bundle adds. Without ``task`` there is no scene and ``prepare`` is exactly the policy's. A task
+    checkpoint whose token source is out of this phase's scope raises here, before the checkpoint or the
+    VLM it would need is loaded.
+
     This needs the checkpoint's weights and the gated PaliGemma tokenizer; it cannot run in the
     offline test environment (it runs on the station, ``probe`` first).
     """
+    scene = None
+    if task is not None:
+        from scene import from_checkpoint
+
+        scene = from_checkpoint(Path(task))
+
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.factory import get_policy_class
@@ -205,6 +246,7 @@ def load_bundle(cfg: Config, device: str | None = None) -> Bundle:
         mean=mean,
         std=std,
         deadband=float(getattr(command, "deadband", DEFAULT_DEADBAND)),
+        scene=scene,
     )
 
 
@@ -301,6 +343,21 @@ def steering_batch(bundle: Bundle, raw_batch: dict) -> dict:
     ``batch["command"]`` afterwards (the LIBERO session's order), because only the shared modes have one.
     """
     return bundle.preprocessor(raw_batch)
+
+
+def _scene_row(raw_batch: dict) -> dict:
+    """The raw batch with its scene picture given the leading batch dimension the scene step reads.
+
+    A raw observation is one row: its ``observation.scene_images`` is the station's channel-first
+    picture, ``(3, S, S)`` (``scene.scene_images``'s), while ``SteeringSceneTokensProcessorStep`` reads a
+    batch, ``[B, 3, S, S]``. A batch that already has the leading dimension (a trainer's, B rows) is left
+    as it is; a batch without the key is left to the step, which refuses it by name.
+    """
+    pictures = raw_batch.get(SCENE_IMAGES)
+    if pictures is None:
+        return raw_batch
+    array = np.asarray(pictures)
+    return raw_batch if array.ndim != 3 else {**raw_batch, SCENE_IMAGES: array[None]}
 
 
 def _command_batch(batch: dict, command7: NDArray, device: Any) -> dict:
