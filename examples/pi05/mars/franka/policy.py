@@ -350,12 +350,19 @@ def fake_bundle(action8: tuple[float, ...] = (0.1,) * ARM_DIMS + (1.0,)) -> Bund
 
     No checkpoint, no tokenizer, no torch: the "policy" is the fixed action, the pipelines are the
     identity, and the action is returned whatever the command (a dry run walks every mode's
-    composition without steering anything).
+    composition without steering anything). ``std`` is a stand-in (0.3 in every action dim) so the
+    loop's readout noise, which is defined in action-standard-deviation units, has a scale to use
+    without the checkpoint's statistics; ``mean`` stays None because no statistics were installed.
     """
     action = np.asarray(action8, dtype=np.float64).reshape(-1)
     if action.shape != (STATION_DIMS,):
         raise ValueError(f"a fake action must be ({STATION_DIMS},), got shape {action.shape}")
-    bundle = Bundle(policy=_FixedActionPolicy(action), preprocessor=_identity, postprocessor=_identity)
+    bundle = Bundle(
+        policy=_FixedActionPolicy(action),
+        preprocessor=_identity,
+        postprocessor=_identity,
+        std=np.full(STATION_DIMS, 0.3),
+    )
     bundle._cache["fixed_action"] = action
     return bundle
 

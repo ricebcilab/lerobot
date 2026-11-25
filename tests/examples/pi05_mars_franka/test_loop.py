@@ -1,7 +1,7 @@
 """The one control loop: one station step per action, per-chunk batches, readout, recording pattern.
 
 No c3po, no torch, no checkpoint: the station is ``station.FakeStation``, the bundle and the steering
-policy are counting fakes, and the command source is the loop's own ``FakeSource``. The tests check the
+policy are counting fakes, and the command source is ``source.py``'s ``FakeSource``. The tests check the
 contract the composition root relies on — one ``station.step`` per action and none elsewhere, one
 ``bundle.prepare`` per chunk and one ``bundle.act`` per tick with the chunk's held command, the bridge's
 readout for a known deflection, the seeded corruption draws, the ``mars-f`` adapter sync, and c3po's
@@ -14,7 +14,6 @@ import json
 import os
 import subprocess
 import sys
-import types
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,8 +23,9 @@ import numpy as np
 import pytest
 from bridge import ARM_DIMS
 from config import CommandConfig, Config, ReadoutConfig
-from loop import FakeSource, Loop, SpaceMouseSource
-from policy import STATION_DIMS, teleop_action
+from loop import Loop
+from policy import STATION_DIMS, fake_bundle, teleop_action
+from source import FakeSource
 from station import FakeStation
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
@@ -47,17 +47,13 @@ DEFLECTION = np.array([0.2, -0.1, 0.3, 0.05, -0.05, 0.1])
 
 
 class _Station(FakeStation):
-    """``FakeStation`` plus the single-arm property and the per-step hook a test scripts."""
+    """``FakeStation`` plus the per-step hook a test scripts."""
 
     def __init__(self, observations, rate: float = 15.0) -> None:
         super().__init__(observations, rate)
         self.on_step = None
         self.resets = 0
         self.steps = 0
-
-    @property
-    def arm(self) -> str:
-        return self.manifest.arms[0]
 
     def reset(self) -> dict[str, np.ndarray]:
         self.resets += 1
@@ -269,29 +265,6 @@ def test_teleop_carries_the_operator_gripper_latch_into_the_action():
     expected = _expected_served(DEFLECTION, JOINT)
     for action, closed in zip(station.actions, (False, True, True), strict=True):
         np.testing.assert_allclose(action, teleop_action(expected, closed))
-
-
-def test_the_spacemouse_button_latches_the_gripper_once_per_press(monkeypatch):
-    """lerobot's reader is a bitmask with a ``take_press`` edge; a press toggles the latch, so the
-    button is a switch and not a momentary "hold to close" (DESIGN's SpaceMouse contract)."""
-    twist = SimpleNamespace(
-        twist=np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0]),
-        reader=SimpleNamespace(take_press=lambda: presses.pop(0) if presses else False),
-        close=lambda: closed.append(True),
-    )
-    presses = [False, True, False, True, False]
-    closed = []
-    module = types.ModuleType("lerobot.teleoperators.spacemouse.teleop_spacemouse")
-    module.SpaceMouseTwist = lambda **kwargs: twist
-    monkeypatch.setitem(sys.modules, "lerobot.teleoperators.spacemouse.teleop_spacemouse", module)
-
-    source = SpaceMouseSource()
-    assert [source.gripper() for _ in range(5)] == [False, True, True, False, False]
-    np.testing.assert_array_equal(source.deflection(), np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0]))
-    source.reset()
-    assert source.gripper() is False
-    source.close()
-    assert closed == [True]
 
 
 # ---------------------------------------------------------------- the chunk cadence
@@ -510,17 +483,9 @@ def test_teleop_noise_reads_the_action_std_from_the_statistics_file(tmp_path, mo
     np.testing.assert_allclose(seen[0], expected)
 
 
-def test_a_bundle_without_statistics_draws_no_noise(monkeypatch):
-    """``--dry-run``'s bundle is a fixed action with no statistics: noise in action-std units has no
-    scale to be expressed in, and a dry run checks composition, not the numbers drawn."""
-    seen = []
-    real = bridge.readout
-
-    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
-        seen.append(noise_std7)
-        return real(intent7, matrix7, noise_std7, gain, rng)
-
-    monkeypatch.setattr(bridge, "readout", spy)
+def test_a_bundle_without_statistics_refuses_the_noise(monkeypatch):
+    """Noise is in action-standard-deviation units: a bundle with ``std=None`` has no scale for it, so
+    the run fails clearly instead of silently drawing none."""
     bundle = _CountingBundle()
     bundle.std = None
     loop = Loop(
@@ -532,9 +497,33 @@ def test_a_bundle_without_statistics_draws_no_noise(monkeypatch):
         steering=_steering(),
     )
 
+    with pytest.raises(ValueError, match="action statistics"):
+        loop.run(prompt="pick", max_steps=1)
+
+
+def test_the_dry_run_bundle_carries_a_stand_in_std_for_the_noise(monkeypatch):
+    """``fake_bundle`` has no checkpoint statistics, but noise must still be expressible in a dry run:
+    its stand-in std (0.3 in every dim) is what ``readout.noise`` multiplies."""
+    seen = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        seen.append(noise_std7)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+    loop = Loop(
+        config=_config(n_action_steps=1, readout=ReadoutConfig(noise=0.35)),
+        station=_Station(_observations()),
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=fake_bundle(),
+        steering=_steering(),
+    )
+
     loop.run(prompt="pick", max_steps=1)
 
-    assert seen[0] is None
+    np.testing.assert_allclose(seen[0], 0.35 * np.full(ARM_DIMS, 0.3))
 
 
 def test_autonomous_draws_no_readout():
@@ -701,6 +690,18 @@ def test_run_recording_follows_c3pos_episode_pattern(tmp_path):
     assert destination.is_dir()
 
 
+def test_run_recording_refuses_a_station_that_cannot_record(tmp_path):
+    """The recording surface is a declared port: a plain FakeStation has no ``record``/``download``,
+    so the loop says so instead of failing on a missing attribute mid-episode."""
+    station = _Station(_observations())
+    loop = Loop(config=_config(), station=station, mode="teleop", source=FakeSource(deflection=DEFLECTION))
+
+    with pytest.raises(ValueError, match="recording station"):
+        loop.run_recording(name="pilot", dest=tmp_path, prompt="pick")
+
+    assert station.steps == 0
+
+
 # ---------------------------------------------------------------- construction
 
 
@@ -776,7 +777,7 @@ def test_importing_the_loop_needs_neither_torch_nor_c3po():
         "import sys, loop; "
         "assert 'torch' not in sys.modules, 'loop imported torch'; "
         "assert 'c3po' not in sys.modules, 'loop imported c3po'; "
-        "assert hasattr(loop, 'Loop') and hasattr(loop, 'SpaceMouseSource') and hasattr(loop, 'FakeSource')"
+        "assert hasattr(loop, 'Loop')"
     )
     subprocess.run(
         [sys.executable, "-c", code],

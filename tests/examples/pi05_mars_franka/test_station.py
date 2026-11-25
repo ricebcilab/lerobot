@@ -20,6 +20,7 @@ from station import (
     STATE_DIMS,
     C3poStation,
     FakeStation,
+    RecordingStation,
     StationManifest,
     _manifest_from_observations,
     _manifest_from_robot,
@@ -106,6 +107,30 @@ def test_the_manifest_from_observations_orders_arms_and_actions():
         "right_follower/gripper_position",
     )
     assert manifest.control_rate == 15.0
+
+
+# ---------------------------------------------------------------- the arm
+
+
+def test_the_fake_station_names_its_single_arm():
+    """The loop drives exactly one arm; the fake derives it from its observation like the manifest."""
+    assert FakeStation(_canned(2), rate=15.0).arm == "follower"
+
+
+def test_the_fake_station_refuses_an_arm_it_cannot_name():
+    """A station with no arm or two arms is not this example's: the same refusal as the real station."""
+    two_arms = [
+        {
+            "left_follower/joint_position": np.zeros(ARM_DIMS),
+            "left_follower/gripper_position": np.zeros(1),
+            "right_follower/joint_position": np.zeros(ARM_DIMS),
+            "right_follower/gripper_position": np.zeros(1),
+            "front_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+    ]
+    station = FakeStation(two_arms, rate=15.0)
+    with pytest.raises(ValueError, match="arms"):
+        _ = station.arm
 
 
 # ---------------------------------------------------------------- the images
@@ -299,6 +324,18 @@ def test_the_fake_rejects_a_wrong_width_action():
 
 
 # ---------------------------------------------------------------- the recording contract
+
+
+def test_only_a_station_with_record_and_download_is_a_recording_station():
+    """``Loop.run_recording`` reads the recording surface through ``station.RecordingStation``: the
+    real station is one, the fake records nothing and is not."""
+    assert not isinstance(FakeStation(_canned(1), rate=15.0), RecordingStation)
+
+    station = object.__new__(C3poStation)
+    station._manifest = StationManifest(
+        arms=("follower",), cameras=("front_rgb",), action_keys=(), control_rate=15.0
+    )
+    assert isinstance(station, RecordingStation)
 
 
 def test_the_fake_station_has_nothing_to_cancel():

@@ -1,9 +1,10 @@
 """The c3po station port: the real station, the fake, and the two dictionaries between them.
 
-DESIGN.md freezes this module's interface. A station is a dict-in, dict-out MDP port:
+DESIGN.md freezes this module's interface. A ``Station`` is a dict-in, dict-out MDP port:
 ``reset()`` and ``step(action8)`` hand back the raw c3po observation, and this module says what the
 policy reads from it (the 32-wide state, the letterboxed camera images as [0,1] float) and what the
-station receives back (the two action keys). c3po is imported inside ``C3poStation`` only, so the
+station receives back (the two action keys). ``RecordingStation`` is the port ``run_recording``
+needs: the same station plus c3po's ``record``/``download``. c3po is imported inside ``C3poStation`` only, so the
 fake, ``--dry-run`` and every test here run with no c3po — and no torch — installed. The adapters
 are the previous project's ``examples-from-unrelated-project/droid.py`` (openpi's own DROID
 client); the letterbox's provenance is on ``resize_with_pad``.
@@ -14,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 from bridge import ARM_DIMS
@@ -91,18 +92,37 @@ def _is_arm_state_key(key: str, arms: tuple[str, ...]) -> bool:
 class Station(Protocol):
     """The port the loop drives: c3po owns the clock, one ``step`` per control step.
 
-    ``cancel_episode`` is c3po's recording-loop contract: after the ``r`` flag the researcher
-    discards the in-progress episode before re-recording it. A station that records nothing
-    implements it as a no-op; ``C3poStation`` forwards it to ``robot.cancel_episode()``.
+    ``arm`` is the single arm this example drives (a station may expose none or two); ``cancel_episode``
+    is c3po's recording-loop contract: after the ``r`` flag the researcher discards the in-progress
+    episode before re-recording it. A station that records nothing implements the cancel as a no-op;
+    ``C3poStation`` forwards it to ``robot.cancel_episode()``.
     """
 
     @property
     def manifest(self) -> StationManifest: ...
 
+    @property
+    def arm(self) -> str: ...
+
     def reset(self) -> dict[str, NDArray]: ...
     def step(self, action8: NDArray) -> dict[str, NDArray]: ...
     def close(self) -> None: ...
     def cancel_episode(self) -> None: ...
+
+
+@runtime_checkable
+class RecordingStation(Station, Protocol):
+    """A station that can record a dataset: c3po's recording contract, ``Loop.run_recording``'s port.
+
+    ``record`` is c3po's ``robot.recording(name)`` context manager and ``download`` its
+    ``robot.download_dataset`` (call it after the recording context and before ``close``).
+    ``C3poStation`` implements both; ``FakeStation`` neither, because it records nothing — so the loop
+    can refuse a station that is not one instead of hoping for the attributes.
+    """
+
+    def record(self, name: str) -> Recording: ...
+
+    def download(self, name: str, dest: Path) -> Path: ...
 
 
 class C3poStation:
@@ -174,6 +194,14 @@ class FakeStation:
     def actions(self) -> list[NDArray]:
         """The action8s sent, in order — the policy's numbers, not the c3po action dicts."""
         return list(self._actions)
+
+    @property
+    def arm(self) -> str:
+        """The single arm this example drives; a fake station may have none or two."""
+        arms = self._manifest.arms
+        if len(arms) != 1:
+            raise ValueError(f"the station has {len(arms)} arms {arms}; this example drives exactly one")
+        return arms[0]
 
     def reset(self) -> dict[str, NDArray]:
         self._next = 1 % len(self._observations)

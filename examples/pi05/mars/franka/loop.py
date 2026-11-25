@@ -17,7 +17,8 @@ nothing.
 The station's raw batch is built once per chunk (``bundle.prepare``) and reused for the
 ``n_action_steps - 1`` mid-chunk ticks (``bundle.act``): the pre-processor (two images, the
 tokenizer, the device transfer) is the expensive half of a tick, and the policies read a batch only
-when their queue is empty. Teleop has no bundle and never builds a batch.
+when their queue is empty. Teleop has no bundle and never builds a batch. The operator's device port
+lives in ``source.py`` (``DeflectionSource`` and its two adapters); this module only consumes it.
 
 Corruption is resolved lazily, at the first episode, because it needs ``q0``: the configured
 ``command.q0`` or else the reset pose. A fixed corruption is drawn once and printed in the run
@@ -38,19 +39,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import bridge
 import numpy as np
 from bridge import ARM_DIMS, TWIST_DIMS
 from numpy.typing import NDArray
 from policy import teleop_action
-from station import observation_batch
+from source import DeflectionSource
+from station import RecordingStation, observation_batch
 from stats import action_std
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from config import Config
     from policy import Bundle
     from station import Station
@@ -60,102 +60,6 @@ MODES = ("teleop", "autonomous", "steered")
 
 ADAPTER_SOURCES = ("corruption", "corruption_inverse")
 """How ``mars-f``'s fixed adapter follows the episode's corruption; None leaves the holder alone."""
-
-
-class DeflectionSource(Protocol):
-    """The operator's device: six deflection axes in [-1, 1] and a latched gripper button.
-
-    The axes are the device's, ``[x, y, z, rx, ry, rz]``; the loop scales the first three to m/s and
-    the last three to rad/s. ``gripper()`` is a latch, not a momentary press: it returns True while
-    the operator has the gripper closed. The protocol has no episode reset; the concrete sources each
-    provide ``reset()`` for the latch (the loop calls it when it has one).
-    """
-
-    def deflection(self) -> NDArray: ...
-
-    def gripper(self) -> bool: ...
-
-    def close(self) -> None: ...
-
-
-class SpaceMouseSource:
-    """A 3Dconnexion SpaceMouse as a :class:`DeflectionSource`: lerobot's six-channel twist, latched.
-
-    ``path``/``hid_id``/``full_scale``/``rotation_full_scale`` are ``SpaceMouseTwist``'s (environment
-    variables' defaults included); ``source``/``sign`` map the device's six channels onto the twist's
-    axes, identity by default. A press of any button toggles the gripper latch; the device's button
-    report is a bitmask, so ``reader.take_press()`` is the once-per-press edge. lerobot is imported
-    inside ``__init__``: its teleoperator package imports torch, and ``import loop`` must not.
-    """
-
-    def __init__(
-        self,
-        *,
-        path: str | None = None,
-        hid_id: str | None = None,
-        full_scale: float | None = None,
-        rotation_full_scale: float | None = None,
-        source: Sequence[int] | None = None,
-        sign: Sequence[float] | None = None,
-    ) -> None:
-        from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTwist
-
-        self._twist = SpaceMouseTwist(
-            source=(0, 1, 2, 3, 4, 5) if source is None else source,
-            sign=(1.0,) * TWIST_DIMS if sign is None else sign,
-            path=path,
-            hid_id=hid_id,
-            full_scale=full_scale,
-            rotation_full_scale=rotation_full_scale,
-        )
-        self._closed = False
-
-    def deflection(self) -> NDArray:
-        return np.asarray(self._twist.twist, dtype=np.float64)
-
-    def gripper(self) -> bool:
-        """True while the gripper is latched closed; each button press toggles the latch."""
-        if self._twist.reader.take_press():
-            self._closed = not self._closed
-        return self._closed
-
-    def reset(self) -> None:
-        """A new episode starts with the gripper open (the latch, not the device)."""
-        self._closed = False
-
-    def close(self) -> None:
-        self._twist.close()
-
-
-class FakeSource:
-    """A deterministic :class:`DeflectionSource` for tests and ``--dry-run``: fields, not a device.
-
-    ``deflection_vector`` and ``gripper_closed`` are settable between ticks (a test changes the stick
-    mid-chunk); ``reset`` opens the gripper latch at each episode. ``reads`` counts the deflection
-    reads, which is how a test checks the command cadence.
-    """
-
-    def __init__(self, *, deflection: NDArray | None = None, gripper: bool = False) -> None:
-        self.deflection_vector = np.zeros(TWIST_DIMS) if deflection is None else np.asarray(deflection)
-        if self.deflection_vector.shape != (TWIST_DIMS,):
-            raise ValueError(
-                f"deflection must be ({TWIST_DIMS},) in [-1, 1], got shape {self.deflection_vector.shape}"
-            )
-        self.gripper_closed = bool(gripper)
-        self.reads = 0
-
-    def deflection(self) -> NDArray:
-        self.reads += 1
-        return np.asarray(self.deflection_vector, dtype=np.float64).copy()
-
-    def gripper(self) -> bool:
-        return self.gripper_closed
-
-    def reset(self) -> None:
-        self.gripper_closed = False
-
-    def close(self) -> None:
-        pass
 
 
 @dataclass(frozen=True)
@@ -198,7 +102,7 @@ class Loop:
         self._steering = steering
         self._adapter_from_corruption = adapter_from_corruption
 
-        self._arm = _arm(station)
+        self._arm = station.arm
         self._n_action_steps = int(config.policy.n_action_steps)
         self._length = float(config.command.twist_length)
         self._cameras = _cameras(config.cameras)
@@ -229,24 +133,32 @@ class Loop:
     def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False) -> Path:
         """Record episodes with c3po's keyboard flags, download the dataset, return its local path.
 
-        c3po's documented ``recording()`` pattern: ``q`` stops, ``n`` ends an episode, ``r`` discards
-        the episode that just ended (``station.cancel_episode()``) before it is re-recorded. ``dest``
-        is created if absent; the returned path is the station's (``dest / name`` for c3po).
+        The station must be a ``station.RecordingStation`` (``C3poStation``): this raises rather than
+        hoping for ``record``/``download`` on whatever it was given. c3po's documented ``recording()``
+        pattern: ``q`` stops, ``n`` ends an episode, ``r`` discards the episode that just ended
+        (``station.cancel_episode()``) before it is re-recorded. ``dest`` is created if absent; the
+        returned path is the station's (``dest / name`` for c3po).
         """
+        station = self._station
+        if not isinstance(station, RecordingStation):
+            raise ValueError(
+                "run_recording needs a recording station (station.RecordingStation: record/download, "
+                f"C3poStation); got {type(station).__name__}, which records nothing"
+            )
         destination = Path(dest)
         destination.mkdir(parents=True, exist_ok=True)
-        with self._station.record(name) as rec:
+        with station.record(name) as rec:
             while not rec.stop:
-                obs = self._station.reset()
+                obs = station.reset()
                 self._begin_episode(obs)
                 tick = 0
                 while not rec.stop and not rec.done:
-                    obs = self._station.step(self._tick(obs, prompt=prompt, tick=tick, trace=trace))
+                    obs = station.step(self._tick(obs, prompt=prompt, tick=tick, trace=trace))
                     tick += 1
                 if rec.rerecord:
-                    self._station.cancel_episode()
+                    station.cancel_episode()
                 rec.clear()
-        return self._station.download(name, destination)
+        return station.download(name, destination)
 
     # ------------------------------------------------------------ the episode
 
@@ -254,7 +166,8 @@ class Loop:
         """A fresh episode: the policy's queues, the operator's latch, and the corruption's draw."""
         if self._bundle is not None:
             self._bundle.reset()
-        self._reset_source()
+        if self._source is not None:  # autonomous has no operator device
+            self._source.reset()
         self._held_deflection = None
         self._batch = None
         # autonomous has no operator command, so there is nothing to corrupt: no readout is drawn
@@ -294,12 +207,6 @@ class Loop:
     def _raw_batch(self, obs: dict[str, NDArray], prompt: str) -> dict:
         """The station's observation as the policy's raw batch (before the pre-processor)."""
         return observation_batch(obs, arm=self._arm, cameras=self._cameras, task=prompt)
-
-    def _reset_source(self) -> None:
-        """Reset the operator's gripper latch for the new episode (the protocol's concrete sources do)."""
-        reset = getattr(self._source, "reset", None)
-        if callable(reset):
-            reset()
 
     # ------------------------------------------------------------ corruption
 
@@ -360,8 +267,9 @@ class Loop:
 
         The per-dim standard deviations come from the bundle's statistics in the shared modes and from
         the statistics file directly in teleop, which never loads the checkpoint (or torch). A bundle
-        without statistics (``--dry-run``'s fixed-action stand-in) has no scale to express the noise
-        in, so it draws none; a real steered bundle always has them (``make_steering`` refuses else).
+        without statistics has no scale to express the noise in, and that is refused rather than
+        silently drawing none: ``--dry-run``'s ``fake_bundle`` carries a stand-in std for this reason,
+        and a real steered bundle always has them (``make_steering`` refuses otherwise).
         """
         noise = float(self._config.readout.noise)
         if not noise:
@@ -370,8 +278,12 @@ class Loop:
             std = action_std(self._config.policy.stats)
         else:
             std = self._bundle.std
-            if std is None:  # --dry-run's fixed-action bundle has no statistics to scale
-                return None
+            if std is None:
+                raise ValueError(
+                    "readout noise is in action-standard-deviation units and the bundle has no action "
+                    "statistics (std is None): set [policy] stats and reload the bundle, or set "
+                    "[readout] noise = 0.0"
+                )
         return noise * np.asarray(std, dtype=np.float64)[:ARM_DIMS]
 
     # ------------------------------------------------------------ the trace
@@ -431,21 +343,6 @@ def _validate(
                 f"adapter_from_corruption: expected None, 'corruption' or 'corruption_inverse', "
                 f"got {adapter_from_corruption!r}"
             )
-
-
-def _arm(station: Station) -> str:
-    """The arm the loop drives: the station's own ``arm``, else the manifest's single arm.
-
-    ``C3poStation`` has an ``arm`` property; ``FakeStation`` has only the manifest, and both the
-    tests and ``--dry-run`` run the loop on the fake, so the manifest is the fallback.
-    """
-    arm = getattr(station, "arm", None)
-    if arm is not None:
-        return arm
-    arms = station.manifest.arms
-    if len(arms) != 1:
-        raise ValueError(f"the station has {len(arms)} arms {arms}; this example drives exactly one")
-    return arms[0]
 
 
 def _cameras(cameras: Any) -> dict[str, str | None]:
