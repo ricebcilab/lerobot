@@ -30,24 +30,32 @@ def _features(
     *,
     arm: str = "follower",
     action_prefix: str = "action/follower",
+    single_action: bool = False,
     cameras: tuple[str, ...] = ("scene_zed", "wrist_zed"),
     image_style: str = "bare",
     observed_velocity: bool = True,
     joint_shape: tuple[int, ...] = (ARM_DIMS,),
     extra: dict | None = None,
 ) -> dict:
-    """A dataset's feature mapping: the arm state, the two recorded actions, cameras, bookkeeping."""
+    """A dataset's feature mapping: the arm state, the recorded actions, cameras, bookkeeping.
+
+    ``single_action`` is the other accepted schema: one ``action`` column of shape ``(8,)`` instead of
+    the separated ``<prefix>/joint_velocity`` + ``<prefix>/gripper_position`` pair.
+    """
     features = {
         f"{arm}/joint_position": {"dtype": "float32", "shape": joint_shape},
         f"{arm}/gripper_position": {"dtype": "float32", "shape": (1,)},
-        f"{action_prefix}/joint_velocity": {"dtype": "float32", "shape": (ARM_DIMS,)},
-        f"{action_prefix}/gripper_position": {"dtype": "float32", "shape": (1,)},
         "timestamp": {"dtype": "float32", "shape": (1,)},
         "frame_index": {"dtype": "int64", "shape": (1,)},
         "episode_index": {"dtype": "int64", "shape": (1,)},
         "index": {"dtype": "int64", "shape": (1,)},
         "task_index": {"dtype": "int64", "shape": (1,)},
     }
+    if single_action:
+        features["action"] = {"dtype": "float32", "shape": (ACTION_DIMS,)}
+    else:
+        features[f"{action_prefix}/joint_velocity"] = {"dtype": "float32", "shape": (ARM_DIMS,)}
+        features[f"{action_prefix}/gripper_position"] = {"dtype": "float32", "shape": (1,)}
     if observed_velocity:
         features[f"{arm}/joint_velocity"] = {"dtype": "float32", "shape": (ARM_DIMS,)}
     for name in cameras:
@@ -76,6 +84,7 @@ def _dataset_frames(
     episode_lengths: tuple[int, ...],
     arm: str = "follower",
     action_prefix: str = "action/follower",
+    single_action: bool = False,
     camera_features: tuple[str, ...] = ("scene_zed", "wrist_zed"),
 ) -> list[dict]:
     """Frames ordered by episode then position, keyed by feature name, with deterministic values."""
@@ -92,9 +101,12 @@ def _dataset_frames(
                 f"{arm}/joint_position": np.arange(ARM_DIMS, dtype=np.float64) + index / 100.0,
                 f"{arm}/gripper_position": np.array([float(index % 2)]),
                 f"{arm}/joint_velocity": np.full(ARM_DIMS, -index / 100.0),
-                f"{action_prefix}/joint_velocity": _frame_action(index)[:ARM_DIMS],
-                f"{action_prefix}/gripper_position": np.array([_frame_action(index)[ARM_DIMS]]),
             }
+            if single_action:
+                frame["action"] = _frame_action(index)
+            else:
+                frame[f"{action_prefix}/joint_velocity"] = _frame_action(index)[:ARM_DIMS]
+                frame[f"{action_prefix}/gripper_position"] = np.array([_frame_action(index)[ARM_DIMS]])
             for offset, name in enumerate(camera_features):
                 frame[name] = (
                     ((np.arange(int(np.prod(IMAGE_HW)) * 3) + index + 7 * offset) % 256)
@@ -205,6 +217,55 @@ def test_discovery_reads_the_actions_outside_the_arms_observed_velocity_namespac
     without = discover(_Meta(_features(observed_velocity=False)), CAMERAS)
 
     assert with_observed.joint_velocity == without.joint_velocity == "action/follower/joint_velocity"
+
+
+def test_discovery_accepts_a_single_eight_wide_action_column():
+    """LeRobot's other convention: one ``action`` column, dims 0-6 joints and dim 7 the gripper."""
+    features = discover(_Meta(_features(single_action=True)), CAMERAS)
+
+    assert features.action == ("action",)
+    assert features.joint_velocity == features.gripper_action == "action"
+    assert features.arm == "follower" and features.gripper == "follower/gripper_position"
+    assert features.cameras == CAMERAS
+
+
+def test_discovery_prefers_the_separated_form_when_both_are_recorded():
+    features = _features()
+    features["action"] = {"dtype": "float32", "shape": (ACTION_DIMS,)}
+
+    discovered = discover(_Meta(features), CAMERAS)
+
+    assert discovered.joint_velocity == "action/follower/joint_velocity"
+    assert discovered.gripper_action == "action/follower/gripper_position"
+    assert discovered.action == (
+        "action/follower/joint_velocity",
+        "action/follower/gripper_position",
+    )
+
+
+def test_discovery_refuses_a_seven_wide_action_column():
+    features = _features(single_action=True)
+    features["action"]["shape"] = (ARM_DIMS,)
+
+    with pytest.raises(ValueError, match="gripper") as error:
+        discover(_Meta(features), CAMERAS)
+    assert "'action'" in str(error.value)
+
+
+def test_discovery_refuses_a_non_float_action_column():
+    features = _features(single_action=True)
+    features["action"]["dtype"] = "int64"
+
+    with pytest.raises(ValueError, match="float"):
+        discover(_Meta(features), CAMERAS)
+
+
+def test_discovery_refuses_an_action_column_of_the_wrong_shape():
+    features = _features(single_action=True)
+    features["action"]["shape"] = (ACTION_DIMS + 1,)
+
+    with pytest.raises(ValueError, match="shape"):
+        discover(_Meta(features), CAMERAS)
 
 
 def test_discovery_refuses_a_dataset_without_a_joint_position_feature():
@@ -320,6 +381,32 @@ def test_one_sample_per_chunk_boundary_with_the_chunk_clamped_at_the_episode_end
         assert chunk.dtype == np.float64
         indices = [min(start + offset, 9) for offset in range(4)]
         np.testing.assert_array_equal(chunk, np.stack([_frame_action(index) for index in indices]))
+
+
+def test_the_single_action_column_is_read_in_the_checkpoint_layout(monkeypatch):
+    frames = _dataset_frames(episode_lengths=(6,), single_action=True)
+    demos, _ = _open(monkeypatch, _features(single_action=True), frames, chunk_size=2, n_action_steps=1)
+
+    assert len(demos) == 6
+    for sample in range(len(demos)):
+        indices = [min(sample + offset, 5) for offset in range(2)]
+        np.testing.assert_array_equal(
+            demos.chunk(sample), np.stack([_frame_action(index) for index in indices])
+        )
+    np.testing.assert_array_equal(demos.chunk(0)[0, :ARM_DIMS], _frame_action(0)[:ARM_DIMS])
+    assert demos.chunk(0)[0, ARM_DIMS] == _frame_action(0)[ARM_DIMS]
+    np.testing.assert_array_equal(
+        demos.observation(0)["follower/joint_position"], frames[0]["follower/joint_position"]
+    )
+
+
+def test_the_separated_form_is_read_when_a_redundant_action_column_is_also_declared(monkeypatch):
+    """The frames carry only the separated keys, so a loader that preferred ``action`` would fail."""
+    features = _features()
+    features["action"] = {"dtype": "float32", "shape": (ACTION_DIMS,)}
+    demos, _ = _open(monkeypatch, features, _dataset_frames(episode_lengths=(4,)), chunk_size=2)
+
+    np.testing.assert_array_equal(demos.chunk(0), np.stack([_frame_action(0), _frame_action(1)]))
 
 
 def test_observation_returns_the_raw_station_dict_with_full_uint8_frames(monkeypatch):

@@ -12,9 +12,14 @@ refusing anything it cannot map by name:
 
 - the arm is the prefix of the one ``<arm>/joint_position`` observation feature, and its gripper
   observation is ``<arm>/gripper_position``;
-- the recorded actions are one ``<prefix>/joint_velocity`` feature and its sibling
-  ``<prefix>/gripper_position``, under a prefix other than the arm's (the observation namespace), so
-  the measured joint velocity the station also streams cannot be mistaken for the command;
+- the recorded actions are either one float ``action`` feature of shape ``(8,)`` -- LeRobot's own
+  convention, dims 0-6 the joint velocities in action units and dim 7 the gripper -- or one
+  ``<prefix>/joint_velocity`` feature and its sibling ``<prefix>/gripper_position``, under a prefix
+  other than the arm's (the observation namespace), so the measured joint velocity the station also
+  streams cannot be mistaken for the command. Both schemas are accepted as a deliberate hedge until
+  the first recorded dataset settles which one r2d2 writes; when both are present the separated form
+  wins because it names both halves of the action explicitly. A seven-wide ``action`` is refused:
+  the task module learns the grasp timing, so it needs the gripper dim;
 - a camera feed is an image/video feature (``dtype`` ``image``/``video``, or a ``uint8`` HWC frame),
   matched to a configured ``[cameras]`` role by full name or last path component, so ``scene_zed``
   and ``observation.images.scene_zed`` both name the exterior camera.
@@ -71,8 +76,13 @@ class Features:
 
     ``cameras`` maps a configured ``[cameras]`` role (``exterior``, ``wrist``, ``third``) to the
     dataset feature holding that feed, so it is exactly the mapping ``station.observation_batch``
-    needs. ``action`` is the recorded action features in the dataset's own order; the chunk is built
-    in the checkpoint's layout (see the module docstring), so the order is provenance, not layout.
+    needs. ``joint_velocity`` and ``gripper_action`` name the features carrying each half of the
+    recorded action: two separate features when r2d2 records the separated schema, or both that one
+    ``action`` column when it records the single-column schema (there is no separate half then, so
+    ``joint_velocity == gripper_action == "action"`` and ``action == ("action",)``; the loader reads
+    that column in the checkpoint's layout, dims 0-6 joints and dim 7 the gripper). ``action`` is the
+    recorded action features in the dataset's own order; the chunk is built in the checkpoint's
+    layout (see the module docstring), so the order is provenance, not layout.
     """
 
     arm: str
@@ -114,8 +124,6 @@ def discover(meta: DatasetMetadata, cameras: Mapping[str, str]) -> Features:
     _require_vector(features, gripper, 1, "the arm's gripper observation")
 
     joint_velocity, gripper_action = _action_features(features, arm)
-    _require_vector(features, joint_velocity, ARM_DIMS, "the recorded joint velocities")
-    _require_vector(features, gripper_action, 1, "the recorded gripper commands")
 
     action = tuple(name for name in features if name in (joint_velocity, gripper_action))
     return Features(
@@ -150,23 +158,38 @@ def _single_arm(features: Mapping[str, Mapping[str, Any]]) -> tuple[str, str]:
 
 
 def _action_features(features: Mapping[str, Mapping[str, Any]], arm: str) -> tuple[str, str]:
-    """The recorded action's ``joint_velocity`` and its sibling ``gripper_position`` feature names.
+    """The recorded action's two role names: ``(joint_velocity, gripper_action)`` feature names.
 
-    The command namespace is the prefix of the one ``*/joint_velocity`` feature that is not the arm's
-    own (the station streams a measured ``<arm>/joint_velocity`` too, which is not an action). Any
-    other feature under that prefix, or any other ``*/joint_velocity``/``*/gripper_position`` feature
-    outside the arm's namespace, is refused: the actions are exactly those two.
+    The separated schema's command namespace is the prefix of the one ``*/joint_velocity`` feature
+    that is not the arm's own (the station streams a measured ``<arm>/joint_velocity`` too, which is
+    not an action); its sibling ``<prefix>/gripper_position`` is the gripper command. With no such
+    namespace, the single ``action`` column is accepted instead. The separated schema wins when both
+    are present because it names each half of the action, so the loader need not assume the column's
+    internal layout; the column is then redundant and ignored. With neither, the refusal names both
+    accepted schemas.
     """
     candidates: dict[str, str] = {}
     for name in features:
         split = _split_suffix(name, "joint_velocity")
         if split is not None and split[0] != arm:
             candidates[split[0]] = name
-    if not candidates:
-        raise ValueError(
-            "the dataset records no action joint_velocity: expected one '*/joint_velocity' feature "
-            f"under a prefix other than the arm's {arm!r}; its features are {_names(features)}"
-        )
+    if candidates:  # it names each half, so the separated form wins when both schemas are recorded
+        return _separated_actions(features, arm, candidates)
+    if "action" in features:
+        _require_action_column(features["action"])
+        return "action", "action"  # one column: each role names where its half lives, so both name it
+    raise ValueError(
+        "the dataset records no action: expected either one float 'action' feature of shape "
+        f"({ACTION_DIMS},) -- seven joint velocities then the gripper -- or a "
+        "'<prefix>/joint_velocity' feature plus its '<prefix>/gripper_position' sibling under a "
+        f"prefix other than the arm's {arm!r}; its features are {_names(features)}"
+    )
+
+
+def _separated_actions(
+    features: Mapping[str, Mapping[str, Any]], arm: str, candidates: dict[str, str]
+) -> tuple[str, str]:
+    """The separated schema's ``joint_velocity`` and its sibling ``gripper_position``, both checked."""
     if len(candidates) > 1:
         raise ValueError(
             f"the dataset records {len(candidates)} action joint_velocity features "
@@ -188,7 +211,30 @@ def _action_features(features: Mapping[str, Mapping[str, Any]], arm: str) -> tup
                 f"the recorded actions are exactly {joint_velocity!r} and {gripper_action!r}; "
                 f"the dataset also records {name!r}, an action-like feature under another prefix"
             )
+    _require_vector(features, joint_velocity, ARM_DIMS, "the recorded joint velocities")
+    _require_vector(features, gripper_action, 1, "the recorded gripper commands")
     return joint_velocity, gripper_action
+
+
+def _require_action_column(feature: Mapping[str, Any]) -> None:
+    """The single ``'action'`` column is the whole 8-wide float action, joints then gripper.
+
+    A seven-wide column is refused rather than filled: the task module learns the grasp timing, so a
+    demonstrated chunk without a gripper dim has no target for the checkpoint's dim 7.
+    """
+    shape = _shape(feature)
+    if shape != (ACTION_DIMS,):
+        raise ValueError(
+            f"the dataset's 'action' feature declares shape {shape}; expected ({ACTION_DIMS},) -- "
+            "the seven joint velocities then the gripper. A narrower action carries no gripper "
+            "command, and the task module learns the grasp timing"
+        )
+    dtype = str(feature.get("dtype", ""))
+    if not dtype.startswith("float"):
+        raise ValueError(
+            f"the dataset's 'action' feature has dtype {dtype!r}; expected a float action column of "
+            f"shape ({ACTION_DIMS},)"
+        )
 
 
 def _camera_features(features: Mapping[str, Mapping[str, Any]], cameras: Mapping[str, str]) -> dict[str, str]:
@@ -402,7 +448,13 @@ def split(demos: Demos, *, val_frac: float, seed: int) -> tuple[NDArray, NDArray
 
 
 def _frame_action(frame: Mapping[str, Any], features: Features) -> NDArray:
-    """One frame's recorded action as ``(8,)`` in the checkpoint's layout: joints then gripper."""
+    """One frame's recorded action as ``(8,)`` in the checkpoint's layout: joints then gripper.
+
+    The single-column schema is already that layout. The separated schema concatenates its two
+    features in the checkpoint's order, whatever order the dataset declared them in.
+    """
+    if features.joint_velocity == features.gripper_action:  # the one 'action' column
+        return _frame_vector(frame, features.joint_velocity, ACTION_DIMS)
     joints = _frame_vector(frame, features.joint_velocity, ARM_DIMS)
     gripper = _frame_vector(frame, features.gripper_action, 1)
     return np.concatenate([joints, gripper])
