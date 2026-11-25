@@ -19,16 +19,21 @@ from pathlib import Path
 import cli
 import numpy as np
 import pytest
+import torch
 from config import load_config
+from policy import Bundle
 from source import FakeSource
 from statefiles import Recorder, load
 from station import FakeStation as RealFakeStation
+from stats import CHECKPOINT_WIDTH
+
+from lerobot.policies.steering import AdapterModules, LearnedUserModule
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
 SHIPPED = EXAMPLE_DIR / "configs" / "franka.toml"
 
 MODE_COMMANDS = ("autonomous", "fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
-SHIPPED_COMMANDS = ("autonomous", "teleop", "fc", "frs", "mars-f")
+SHIPPED_COMMANDS = ("autonomous", "teleop", "fc", "frs", "mars-f", "mars-u")
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -127,6 +132,74 @@ def real_components(monkeypatch):
     return _RecordingLoop
 
 
+def _steering_bundle() -> Bundle:
+    """The little ``make_steering`` reads before it refuses a missing adapter file: action statistics."""
+    return Bundle(
+        policy=object(),
+        preprocessor=None,
+        postprocessor=None,
+        mean=np.zeros(8),
+        std=np.full(8, 0.3),
+    )
+
+
+class _SamplerConfig:
+    """pi0.5's sampler interface, as ``make_steering`` builds its core from it."""
+
+    chunk_size = 8
+    max_action_dim = CHECKPOINT_WIDTH
+    num_inference_steps = 10
+    n_action_steps = 8
+    noise_time = 1.0
+    type = "pi05"
+    device = "cpu"
+
+
+class _SamplerPolicy:
+    """A base policy with the sampler contract and nothing loaded."""
+
+    def __init__(self) -> None:
+        self.config = _SamplerConfig()
+
+    def reset(self) -> None:
+        pass
+
+    def predict_action_chunk(self, batch: dict, **kwargs) -> torch.Tensor:
+        return torch.zeros(1, self.config.chunk_size, self.config.max_action_dim)
+
+    def velocity_field(self, batch: dict):
+        return lambda x, time: torch.zeros_like(x)
+
+
+class _StatsStep:
+    """An unnormalizer-like step for the core's ``action_mean_std``: action mean/std in raw units."""
+
+    def __init__(self) -> None:
+        mean = np.zeros(CHECKPOINT_WIDTH)
+        std = np.full(CHECKPOINT_WIDTH, 0.25)
+        self.stats = {"action": {"mean": mean, "std": std}}
+        self.norm_map = {}
+
+
+class _Postprocessor:
+    def __init__(self) -> None:
+        self.steps = [_StatsStep()]
+
+    def __call__(self, action):
+        return torch.as_tensor(action)
+
+
+def _trained_bundle() -> Bundle:
+    """A fake bundle the real ``make_steering`` can build its core over: sampler fields and statistics."""
+    return Bundle(
+        policy=_SamplerPolicy(),
+        preprocessor=lambda raw: raw,
+        postprocessor=_Postprocessor(),
+        mean=np.zeros(8),
+        std=np.full(8, 0.25),
+    )
+
+
 @pytest.fixture
 def fake_hardware(monkeypatch):
     """The real loop over a fake station and a fake source: no c3po, no mouse, no faked loop."""
@@ -201,8 +274,12 @@ def test_the_shipped_config_is_the_study_config():
     )
     assert config.command.translation_gain == 0.11 and config.command.gain == "auto"
     assert config.readout.corruption == {"rotation_z_deg": 20} and config.readout.noise == 0.35
-    assert set(config.modes) == {"fc", "frs", "mars-f"}  # mars-u/t/mars need checkpoints that do not exist
+    # mars-u names Phase B's user module (its checkpoint is the one [user] checkpoint points at);
+    # mars-t and mars need a task module, which Phase C does not ship yet.
+    assert set(config.modes) == {"fc", "frs", "mars-f", "mars-u"}
     assert config.modes["fc"].ic_gain == 15.0 and config.modes["mars-f"].adapter_matrix == "corruption"
+    assert config.modes["mars-u"].mode == "frs"
+    assert config.modes["mars-u"].adapter_user == config.user.checkpoint
     assert (config.steering.n_reversal_steps, config.steering.pinned_steps) == (10, 8)
     assert config.spacemouse.source == (0, 1, 2, 3, 4, 5)
     assert config.recording.dir == EXAMPLE_DIR / "outputs" / "mars_franka"
@@ -333,7 +410,10 @@ def test_a_bug_in_the_run_keeps_its_traceback_and_still_closes_the_devices(real_
 # ---------------------------------------------------------------- the policy commands
 
 
-@pytest.mark.parametrize(("command", "mode"), [("fc", "flow_control"), ("frs", "frs"), ("mars-f", "frs")])
+@pytest.mark.parametrize(
+    ("command", "mode"),
+    [("fc", "flow_control"), ("frs", "frs"), ("mars-f", "frs"), ("mars-u", "frs")],
+)
 def test_a_steered_command_builds_its_mode_table(command, mode, real_components, monkeypatch):
     calls, bundle, steering = _patch_policy(monkeypatch)
     assert cli.main([command, "--prompt", "pick", "--config", str(SHIPPED), "--steps", "1"]) == 0
@@ -364,12 +444,50 @@ def test_autonomous_loads_the_bundle_and_has_no_operator(real_components, monkey
     assert "steering" not in calls  # make_steering is never reached
 
 
-@pytest.mark.parametrize("command", ["mars-u", "mars-t", "mars"])
+def test_mars_u_composes_the_real_steering_policy_from_a_saved_user_module(
+    tmp_path, real_components, monkeypatch
+):
+    """Once ``[modes.mars-u]`` points at a trained checkpoint, the command builds the real MARS-U arm:
+    the module is loaded into the steering policy's adapter and the loop gets that policy."""
+    checkpoint = AdapterModules.save_module(
+        LearnedUserModule(_SamplerConfig.chunk_size, 7, d=16, tdim=8),
+        tmp_path / "user" / "user.pt",
+        kind="user",
+        meta={"prompt": "pick"},
+    )
+    monkeypatch.setattr(cli, "load_bundle", lambda config: _trained_bundle())
+    path = _write(
+        tmp_path,
+        f'[modes.mars-u]\nmode = "frs"\nadapter_user = "{checkpoint}"\n',
+    )
+    assert cli.main(["mars-u", "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 0
+    loop = real_components.instances[-1]
+    assert loop.kwargs["mode"] == "steered"
+    assert loop.kwargs["adapter_from_corruption"] is None
+    steering = loop.kwargs["steering"]
+    assert steering.config.adapter_user == str(checkpoint)
+    assert isinstance(steering.adapter.user, LearnedUserModule)
+    assert steering.adapter.user.horizon == _SamplerConfig.chunk_size
+    assert steering.adapter.user.n_dims == 7
+    assert steering.adapter.matrix is None  # mars-u is the module alone, no fixed lift
+
+
+@pytest.mark.parametrize("command", ["mars-t", "mars"])
 def test_a_missing_mode_table_names_it_and_how_to_add_one(command, capsys):
     assert cli.main([command, "--prompt", "pick", "--config", str(SHIPPED), "--dry-run"]) == 2
     error = capsys.readouterr().err
     assert f"[modes.{command}]" in error
     assert "add one" in error
+
+
+def test_mars_u_names_a_missing_user_checkpoint(tmp_path, real_components, monkeypatch, capsys):
+    """The shipped table's checkpoint is gitignored until `train-user` has run: the run names the file."""
+    missing = tmp_path / "user" / "user.pt"  # never written
+    monkeypatch.setattr(cli, "load_bundle", lambda config: _steering_bundle())
+    path = _write(tmp_path, f'[modes.mars-u]\nmode = "frs"\nadapter_user = "{missing}"\n')
+    assert cli.main(["mars-u", "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 2
+    error = capsys.readouterr().err
+    assert str(missing) in error and "adapter_user" in error and "train-user" in error
 
 
 # ---------------------------------------------------------------- the train-user command
@@ -390,14 +508,15 @@ def test_train_user_requires_a_prompt(capsys):
     assert "--prompt is required" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("command", ["train-user", "validate-user"])
 @pytest.mark.parametrize(
     "flags",
     [["--steps", "2"], ["--record", "pilot"], ["--record-states", "pilot"], ["--dry-run"], ["--trace"]],
 )
-def test_train_user_takes_no_session_flags(flags, capsys):
-    """``[user]`` names the trainer's input and output; a session flag has no meaning for it."""
+def test_the_user_commands_take_no_session_flags(command, flags, capsys):
+    """``[user]`` names the trainer's and validator's input and output; a session flag has no meaning."""
     with pytest.raises(SystemExit) as exit:
-        cli.main(["train-user", "--config", str(SHIPPED), "--prompt", "pick", *flags])
+        cli.main([command, "--config", str(SHIPPED), "--prompt", "pick", *flags])
     assert exit.value.code == 2
     assert "takes --config and --prompt only" in capsys.readouterr().err
 
@@ -439,6 +558,65 @@ def test_train_user_reports_a_user_error_as_one_line(tmp_path, monkeypatch, caps
     monkeypatch.setattr(train_user, "train", refuses)
     assert cli.main(["train-user", "--config", str(_user_config(tmp_path)), "--prompt", "pick"]) == 2
     assert "[user] states" in capsys.readouterr().err
+
+
+def test_validate_user_requires_a_prompt(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["validate-user", "--config", str(SHIPPED)])
+    assert exit.value.code == 2
+    assert "--prompt is required" in capsys.readouterr().err
+
+
+def test_validate_user_reaches_the_validator_with_the_configs_values(tmp_path, monkeypatch, capsys):
+    """The command is the validator's composition root: it hands it the file's ``[user]`` states and
+    checkpoint and the session's prompt, and prints the validation JSON's path."""
+    import validate
+
+    config_path = _write(
+        tmp_path,
+        f'[user]\nstates = "{tmp_path}/states/pilot"\ncheckpoint = "{tmp_path}/user/user.pt"\n'
+        f'out = "{tmp_path}/validation"\n',
+    )
+    calls = []
+
+    def fake_validate(config, *, prompt, states_path, checkpoint, out=None):
+        calls.append(
+            {
+                "config": config,
+                "prompt": prompt,
+                "states_path": Path(states_path),
+                "checkpoint": Path(checkpoint),
+                "out": out,
+            }
+        )
+        return {"out": str(Path(config.user.out) / "validation.json")}
+
+    monkeypatch.setattr(validate, "validate", fake_validate)
+    assert cli.main(["validate-user", "--config", str(config_path), "--prompt", "pick the cube"]) == 0
+
+    configured = load_config(config_path)
+    assert configured.user.states == tmp_path / "states" / "pilot"
+    assert calls == [
+        {
+            "config": configured,
+            "prompt": "pick the cube",
+            "states_path": configured.user.states,
+            "checkpoint": configured.user.checkpoint,
+            "out": None,
+        }
+    ]
+    assert f"validation: {configured.user.out / 'validation.json'}" in capsys.readouterr().out
+
+
+def test_validate_user_reports_a_user_error_as_one_line(tmp_path, monkeypatch, capsys):
+    import validate
+
+    def refuses(*args, **kwargs):
+        raise ValueError("[user] checkpoint: no such user module")
+
+    monkeypatch.setattr(validate, "validate", refuses)
+    assert cli.main(["validate-user", "--config", str(_user_config(tmp_path)), "--prompt", "pick"]) == 2
+    assert "[user] checkpoint" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------- the config flag and the SpaceMouse

@@ -226,7 +226,8 @@ def make_steering(bundle: Bundle, steering: SteeringConfig) -> SteeringPolicy:
     tick, as the LIBERO session does. A mode that steers (flow control and FRS) needs the checkpoint's
     action statistics: without them the cores cannot build, so a bundle without ``mean``/``std`` gets
     a ``ValueError`` naming the missing file, and ``mode = "none"`` (the base policy's own chunk) does
-    not need them.
+    not need them. A named ``adapter_user``/``adapter_task`` checkpoint that is not on disk is refused
+    here too, before anything is loaded: ``train-user`` writes the user module, and the message says so.
     """
     from lerobot.policies.steering import SteeringConfig as PolicySteeringConfig, SteeringPolicy
 
@@ -238,6 +239,13 @@ def make_steering(bundle: Bundle, steering: SteeringConfig) -> SteeringPolicy:
             f"steering mode {mode!r} needs the checkpoint's action statistics, and the bundle has none: "
             "set [policy] stats = assets/droid/norm_stats.json (openpi's assets) and reload the bundle"
         )
+    for kind in ("user", "task"):
+        path = getattr(steering, f"adapter_{kind}", None)
+        if path is not None and not Path(path).is_file():
+            raise ValueError(
+                f"adapter_{kind}: {path} is not a file. Train the {kind} module first (Phase B's "
+                f"`mars-franka train-user` for the user module) or point the mode table at a checkpoint"
+            )
 
     base_config = getattr(bundle.policy, "config", None)
     reference_step = getattr(steering, "reference_step", None)

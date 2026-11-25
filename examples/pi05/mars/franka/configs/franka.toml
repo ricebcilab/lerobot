@@ -41,9 +41,10 @@ seed = 0
 n_reversal_steps = 10 # the full reversal (Tang et al.)
 pinned_steps = 8 # the executed prefix: 8/10 is the pin-executed ratio
 
-# The methods this slice ships as tables. `mars-u`, `mars-t` and the composed `mars` are deliberately
-# absent: they need trained user/task adapter checkpoints that do not exist yet (Phase B), so a
-# `mars-franka mars-u` run names the missing [modes.mars-u] table instead of loading nothing.
+# The methods this slice ships as tables. `mars-t` and the composed `mars` are deliberately absent: they
+# need a trained task module, which Phase C does not ship yet, so a `mars-franka mars-t` run names the
+# missing [modes.mars-t] table instead of loading nothing. `mars-u` names Phase B's user module; the
+# checkpoint is gitignored and absent until `train-user` has run, and then a run names the missing file.
 [modes.fc]
 mode = "flow_control"
 tau = 8 # Kao et al.'s DROID numbers (flow-steering's constants)
@@ -56,6 +57,12 @@ mode = "frs"
 [modes.mars-f]
 mode = "frs"
 adapter_matrix = "corruption" # the corruption's fixed 7x7 F, or "corruption_inverse", or 7 rows
+
+[modes.mars-u]
+mode = "frs"
+# Phase B's learned user module: `train-user` writes <out>/user.pt and `validate-user` gates it offline
+# before a study. The asset is gitignored and absent until then, so a real run names the missing file.
+adapter_user = "assets/user/rotz20/user.pt"
 
 [spacemouse]
 # The defaults are unverified on hardware: the probe measures the real scales and channel mapping.

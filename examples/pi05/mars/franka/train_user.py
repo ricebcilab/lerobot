@@ -368,31 +368,97 @@ def _field(run: _Run, rows: list[dict]) -> Callable:
 # ---------------------------------------------------------------- the cues and their paths
 
 
+@dataclass(frozen=True)
+class Cues:
+    """One state's cue draws, and the same intent served through the session's readout and a faithful one.
+
+    ``twists`` (C, 6) is the cue in physical units (m/s, rad/s): the intention, the quantity an executed
+    motion is compared against. ``intent`` (C, 7) is its command through the operator's bridge at the
+    state's joints; ``served`` (C, 7) is this config's readout's serve (corruption, gain, one noise draw
+    at the cue's sigma); ``clean`` (C, 7) is a faithful readout's serve of the *same* noise draw
+    (corruption off), the validator's ``clean`` arm. ``matrix`` is the readout's corruption lift F in
+    action units at the session's ``q0`` (None: corruption off), and the validator's ``f`` arm holds it.
+    """
+
+    twists: NDArray
+    intent: NDArray
+    served: NDArray
+    clean: NDArray
+    matrix: NDArray | None
+
+
+def served_cues(
+    config: Config,
+    *,
+    q: NDArray,
+    episode: int,
+    pool: NDArray,
+    q0: NDArray,
+    action_std7: NDArray,
+    rng: np.random.Generator,
+    sigma: float | None = None,
+    count: int | None = None,
+) -> Cues:
+    """One state's cue draws, served through the session's readout and through a faithful one.
+
+    The cue's speed is drawn from ``pool`` (``cues.magnitudes`` of a pilot's deflections) and its
+    direction from the unit sphere, then pushed through the operator's own bridge at ``q``
+    (``cues.cue_twists``/``cue_commands``): the intention in both spaces. ``served`` is
+    ``readout.resolve``'s readout at ``q0`` and the row's ``episode`` -- a ``{random: ...}`` family
+    redraws per episode -- with a std drawn from ``[user] sigma`` per cue, or ``sigma`` when given (the
+    validator fixes it at the middle of the range so every draw uses the same one). ``clean`` is the same
+    intent and the same noise draw through a faithful readout (no corruption, the config's own gain), so
+    the two commands differ in the corruption alone; the trainer ignores it, the validator's ``clean``
+    arm steers it. ``count`` defaults to ``[user] cues``: the calibration draws that many per state, the
+    validator one.
+    """
+    session = session_readout.resolve(config, q0=q0, action_std7=action_std7, episode=episode)
+    faithful = session_readout.resolve(
+        dataclasses.replace(config, readout=dataclasses.replace(config.readout, corruption=None)),
+        q0=q0,
+        action_std7=action_std7,
+        episode=episode,
+    )
+    std7 = np.asarray(action_std7, dtype=np.float64)[:ARM_DIMS]
+    twists = cue_twists(config.user.cues if count is None else count, pool, rng)
+    intent = cue_commands(twists, q, config.command.twist_length)
+    if not len(intent):
+        return Cues(twists, intent, np.empty((0, ARM_DIMS)), np.empty((0, ARM_DIMS)), session.matrix7)
+    served, clean = [], []
+    for draw in range(len(intent)):
+        sigma7 = (float(sigma) if sigma is not None else float(rng.uniform(*config.user.sigma))) * std7
+        state = rng.bit_generator.state  # the faithful serve gets the session's noise draw
+        served.append(dataclasses.replace(session, sigma7=sigma7).serve(intent[draw], rng))
+        rng.bit_generator.state = state
+        clean.append(dataclasses.replace(faithful, sigma7=sigma7).serve(intent[draw], rng))
+    return Cues(twists, intent, np.stack(served), np.stack(clean), session.matrix7)
+
+
 def _add_cues(run: _Run, rows: list[dict], pool: NDArray, rng: np.random.Generator) -> None:
     """Add each state's cue draws: its served commands and the reversal paths of their intents.
 
     The cue's speed comes from the pilot's deflection pool, its direction from a unit sphere, and its
     intent goes through the operator's own bridge at the state's joints. The readout is the session's
-    (``resolve``: its corruption lifted at the file's ``q0``, its gain, its episode for a random family),
-    with ``[user] sigma``'s std drawn per cue and ``serve`` drawing the noise, so the recorded command is
-    the one a session of this length would have served. The paths are the plain reversal of each intent's
-    own reference through the state's field, which is discarded after the state.
+    (``readout.resolve``: its corruption lifted at the file's ``q0``, its gain, its episode for a random
+    family), with ``[user] sigma``'s std drawn per cue and ``serve`` drawing the noise, so the recorded
+    command is the one a session of this length would have served (``served_cues``). The paths are the
+    plain reversal of each intent's own reference through the state's field, which is discarded after the
+    state.
     """
-    std7 = np.asarray(run.bundle.std[:ARM_DIMS], dtype=np.float64)
     for row in rows:
-        session = session_readout.resolve(
-            run.config, q0=run.q0, action_std7=run.bundle.std, episode=row["episode"]
+        cued = served_cues(
+            run.config,
+            q=row["joint_position"],
+            episode=row["episode"],
+            pool=pool,
+            q0=run.q0,
+            action_std7=run.bundle.std,
+            rng=rng,
         )
-        twists = cue_twists(run.config.user.cues, pool, rng)
-        intent = cue_commands(twists, row["joint_position"], run.config.command.twist_length)
-        served = []
-        for draw in range(len(intent)):
-            sigma7 = float(rng.uniform(*run.config.user.sigma)) * std7
-            served.append(dataclasses.replace(session, sigma7=sigma7).serve(intent[draw], rng))
-        reference = run.core.reference_chunk(intent).float().to(run.device)
+        reference = run.core.reference_chunk(cued.intent).float().to(run.device)
         with torch.no_grad():
             path = reversal_path(Flow(_field(run, [row])), reference, run.num_steps)
-        row["served"] = np.stack(served)
+        row["served"] = cued.served
         row["paths"] = path.float().cpu()
     print(f"cued {len(rows)} states, {run.config.user.cues} cues each", flush=True)
 
