@@ -37,7 +37,6 @@ returns its local path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +45,7 @@ import numpy as np
 from bridge import ARM_DIMS, TWIST_DIMS
 from numpy.typing import NDArray
 from policy import teleop_action
+from readout import ADAPTER_SOURCES, Readout, resolve
 from source import DeflectionSource
 from station import RecordingStation, observation_batch
 from stats import action_std
@@ -57,19 +57,6 @@ if TYPE_CHECKING:
 
 MODES = ("teleop", "autonomous", "steered")
 """The loop's three modes: the operator alone, the policy alone, the operator through a method."""
-
-ADAPTER_SOURCES = ("corruption", "corruption_inverse")
-"""How ``mars-f``'s fixed adapter follows the episode's corruption; None leaves the holder alone."""
-
-
-@dataclass(frozen=True)
-class _Readout:
-    """One episode's readout in force: the lifted corruption (None off), the gain and the noise std."""
-
-    matrix7: NDArray | None = field(repr=False)  # F, the lifted corruption; None = corruption off
-    adapter: NDArray | None = field(repr=False)  # the matrix mars-f's holder gets; None = leave it
-    gain: float
-    sigma7: NDArray | None = field(repr=False)
 
 
 class Loop:
@@ -109,8 +96,8 @@ class Loop:
         self._noise_rng = np.random.default_rng(int(config.readout.seed))
         self._episode = 0  # the episode index: the random family's seed
         self._q0: NDArray | None = None  # the corruption's nominal pose, captured at the first episode
-        self._fixed_readout: _Readout | None = None  # a fixed corruption, resolved once
-        self._readout: _Readout | None = None  # the episode's readout in force
+        self._fixed_readout: Readout | None = None  # a fixed corruption, resolved once
+        self._readout: Readout | None = None  # the episode's readout in force
         self._held_served: NDArray | None = None  # the shared modes' per-chunk command, in force
         self._batch: dict | None = None  # the chunk's prepared batch, reused mid-chunk
 
@@ -204,10 +191,9 @@ class Loop:
         """The operator's served command: deflection -> twist -> IK -> F, gain, one noise draw."""
         if self._readout is None:
             raise RuntimeError("the episode's readout is not resolved: call run() to begin an episode")
-        readout = self._readout
         twist = _twist(self._source.deflection(), self._config.command)
         intent = bridge.operator_command(twist, bridge.nominal_pose(obs, self._arm), self._length)
-        return bridge.readout(intent, readout.matrix7, readout.sigma7, readout.gain, self._noise_rng)
+        return self._readout.serve(intent, self._noise_rng)
 
     def _raw_batch(self, obs: dict[str, NDArray], prompt: str) -> dict:
         """The station's observation as the policy's raw batch (before the pre-processor)."""
@@ -215,39 +201,24 @@ class Loop:
 
     # ------------------------------------------------------------ corruption
 
-    def _resolve_readout(self, obs: dict[str, NDArray]) -> _Readout:
-        """This episode's corruption, gain and noise: once for a fixed spec, per episode for random."""
+    def _resolve_readout(self, obs: dict[str, NDArray]) -> Readout:
+        """This episode's readout: once for a fixed spec, redrawn per episode for a random family."""
         spec = self._config.readout.corruption
         random_family = isinstance(spec, dict) and set(spec) == {"random"}
         if self._fixed_readout is not None and not random_family:
             return self._fixed_readout
-        rng = (
-            np.random.default_rng([int(self._config.readout.seed), self._episode]) if random_family else None
-        )
-        matrix6 = bridge.matrix6_from_spec(spec, rng) if spec is not None else np.eye(TWIST_DIMS)
-        lifted = spec is not None or self._adapter_from_corruption is not None
-        q0 = self._nominal_pose(obs) if lifted else None
-        matrix7 = bridge.corruption_lift(matrix6, q0, self._length) if lifted else None
-        adapter = None
-        if self._adapter_from_corruption == "corruption":
-            adapter = matrix7
-        elif self._adapter_from_corruption == "corruption_inverse":
-            adapter = bridge.lift_inverse(matrix6, q0, self._length)
-        readout = _Readout(
-            matrix7=matrix7 if spec is not None else None,
-            adapter=adapter,
-            gain=self._gain(spec, matrix7),
-            sigma7=self._device_noise(),
+        episode_readout = resolve(
+            self._config,
+            q0=self._nominal_pose(obs),
+            action_std7=self._action_std(),
+            episode=self._episode,
+            adapter_from_corruption=self._adapter_from_corruption,
         )
         if not random_family:
-            self._fixed_readout = readout
-            if spec is not None:
-                print(
-                    f"readout: fixed corruption {spec!r} "
-                    f"(gain {readout.gain:.4f}, noise {self._config.readout.noise:g} sigma)",
-                    flush=True,
-                )
-        return readout
+            self._fixed_readout = episode_readout
+            if episode_readout.label:  # a fixed corruption names itself, once, in the run header
+                print(f"readout: {episode_readout.label}", flush=True)
+        return episode_readout
 
     def _nominal_pose(self, obs: dict[str, NDArray]) -> NDArray:
         """``command.q0`` when configured, else the first reset pose: the lift's fixed pose, once."""
@@ -260,36 +231,21 @@ class Loop:
             )
         return self._q0
 
-    def _gain(self, spec: Any, matrix7: NDArray | None) -> float:
-        """``command.gain``, with ``auto`` = 1 / ||F||_2 when the corruption is on, else 1.0."""
-        gain = self._config.command.gain
-        if gain != "auto":
-            return float(gain)
-        return 1.0 if spec is None or matrix7 is None else 1.0 / float(np.linalg.norm(matrix7, 2))
+    def _action_std(self) -> NDArray | None:
+        """The per-dim action standard deviation the noise is expressed in, or None when off.
 
-    def _device_noise(self) -> NDArray | None:
-        """``readout.noise`` in action-std units, or None (no draws) when the noise is off.
-
-        The per-dim standard deviations come from the bundle's statistics in the shared modes and from
-        the statistics file directly in teleop, which never loads the checkpoint (or torch). A bundle
-        without statistics has no scale to express the noise in, and that is refused rather than
-        silently drawing none: ``--dry-run``'s ``fake_bundle`` carries a stand-in std for this reason,
-        and a real steered bundle always has them (``make_steering`` refuses otherwise).
+        The bundle carries the statistics in the shared modes; teleop never loads the checkpoint (or
+        torch), so it reads the statistics file directly. ``readout.noise = 0`` needs no scale at all,
+        so a clean teleop run neither reads nor requires the file. A bundle without statistics has no
+        unit for the noise, and ``readout.resolve`` refuses that rather than silently drawing none:
+        ``--dry-run``'s ``fake_bundle`` carries a stand-in std for this reason, and a real steered
+        bundle always has them (``make_steering`` refuses otherwise).
         """
-        noise = float(self._config.readout.noise)
-        if not noise:
+        if not float(self._config.readout.noise):
             return None
         if self._bundle is None:
-            std = action_std(self._config.policy.stats)
-        else:
-            std = self._bundle.std
-            if std is None:
-                raise ValueError(
-                    "readout noise is in action-standard-deviation units and the bundle has no action "
-                    "statistics (std is None): set [policy] stats and reload the bundle, or set "
-                    "[readout] noise = 0.0"
-                )
-        return noise * np.asarray(std, dtype=np.float64)[:ARM_DIMS]
+            return action_std(self._config.policy.stats)
+        return self._bundle.std
 
     # ------------------------------------------------------------ the trace
 
