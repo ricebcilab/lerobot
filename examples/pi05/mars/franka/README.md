@@ -667,12 +667,14 @@ The provenance of the numbers, because the runbook is also the record:
 - `[modes.fc] tau = 8`, `lam = 1`, `ic_gain = 15.0` are Kao et al.'s DROID numbers [R].
 - `[policy] n_action_steps = 8` is the chunk prefix executed before the policy is recomputed. Nothing
   in the papers sets 8; it is a study choice, and the probe measures the pause it causes.
-- `[spacemouse] full_scale` and `rotation_full_scale` ship as unverified 350.0 defaults. The probe
-  replaces them with measured counts; until it does, the stick's deflection is a guess.
+- `[spacemouse] full_scale` and `rotation_full_scale` are **measured 350** on this station (2026-11-25):
+  a stop-to-stop push and a stop-to-stop twist each reached ~350 raw counts on all three axes. A device
+  that reports rotation as its own id 2 works too, with the same scales. What remains unmeasured is the
+  **axis sign map** (`[spacemouse] sign`): only a jog can settle that.
 - `[spacemouse] tare = true` subtracts the device's rest six-vector, captured at start after the
-  node's reports arrive and the stick settles. It is on because the session measured `x = +0.154` at
-  rest: without the offset a released stick commands a slow drift. The offset is the sensor's, not
-  the session's, so it should repeat; the probe prints it.
+  node's reports arrive and the stick settles. It is on because one session measured `x = +0.154` at
+  rest (a later session read exactly zero, so the offset moves with the device's state): without it a
+  released stick could command a slow drift. The probe prints the captured offset every session.
 - `[user] cues = 3` and `sigma = [0.2, 0.5]` are the calibration's: three cue draws per state, their
   readout noise uniform in that action-std range. `validate-user` fixes the noise at the midpoint and
   draws one fresh cue per held-out state; these are study choices, nothing measures them.
@@ -793,32 +795,36 @@ sessions. The probe prints both the pose and the 7×7 `F` it produces.
 Fill this in after the probe and the first teleop, and keep it with the run outputs. These are the
 facts the code cannot know.
 
+Session of 2026-11-25 (probe only; the first teleop has not run yet, so the rows it unlocks say so).
+
 | fact | this session |
 | --- | --- |
-| date, host, station | |
-| station native control rate (Hz) | |
-| arms, action keys | |
-| camera feeds (exterior / wrist / third) | |
-| SpaceMouse node and HID id | |
-| translation full scale (`[spacemouse] full_scale`) | |
-| rotation full scale (`[spacemouse] rotation_full_scale`) | |
-| `source` / `sign` | |
-| rest-state six-vector | |
-| gripper ends: the `gripper_position` value that closes the jaws | |
-| reset pose `q0` | |
-| `||F7||2`, auto gain, noise sigma | |
-| chunk time (ms) at `n_action_steps`: autonomous / `fc` / `frs` | |
-| third camera convention | |
-| user module: states file, scene, collecting runs | |
-| `train-user` wall time, final held-out loss | |
-| `validate-user`: per-arm cosines at each depth (paste the table) | |
-| `mars-u` session check (date, what the push did) | |
-| demonstrations: `[task] demos` dataset, episode count, action schema it recorded | |
-| `lerobot/pi05_base` cache location and size (the scene encoder) | |
-| `train-task` wall time, final held-out flow-matching loss (`train_log.json`) | |
-| `mars-t` / `mars` session check (date, what the task module changed) | |
-| study block: date, arms, rounds, order, the run directory (`run.json`'s `run`, `git_head`, `git_dirty`) | |
-| study block: operator (who drove every arm and entered every outcome; the numbers are per-operator) | |
-| study block: scene reset -- does `reset()` restore the objects? (matched vs unmatched counts per pair) | |
-| study block: what the per-arm and paired tables said (paste the two tables or the CSVs' paths) | |
-| probe output | `examples/pi05/mars/franka/outputs/mars_franka/probe-session.txt` |
+| date, host, station | 2026-11-25; `chopper` (RTX 5090) ↔ `bb8` (r2d2 station); arm `follower` |
+| station native control rate (Hz) | **15**, and the loop's requested 15 matches it (probe `[PASS] rate`) |
+| arms, action keys | one arm, `follower`; actions `follower/joint_velocity` (7,) + `follower/gripper_position` (1,); command mode advertised `joint_velocity` |
+| station holds with no command | yes: max \|dq\| 0.0000 rad over 1.07 s (a chunk pause does not drift the arm) |
+| camera feeds (exterior / wrist / third) | exterior `scene_zed` 480x853x3 uint8 (mean 111/255), wrist `wrist_zed` 480x853x3 uint8 (mean 124/255); `wrist_zed_depth` 480x853 uint16 is present and unused; no third feed |
+| SpaceMouse node and HID id | 3Dconnexion **SpaceMouse Wireless** via its Universal Receiver, HID `0003:0000256F:0000C652`; the 3D-mouse interface is a **combined 13-byte report id 1** (translations at offset 1, rotations at offset 7) and streams on `/dev/hidraw8`; the receiver's other four nodes are silent |
+| translation full scale (`[spacemouse] full_scale`) | **350** measured (a stop-to-stop push reached 350 on x, y and z across the two runs) |
+| rotation full scale (`[spacemouse] rotation_full_scale`) | **350** measured (a stop-to-stop twist reached 350 on rx, ry and rz) |
+| `source` / `sign` | configured `[0, 1, 2, 3, 4, 5]` / `[+1, +1, +1, +1, +1, +1]` -- **not yet verified by a jog**; the first teleop confirms or flips them |
+| rest-state six-vector | `[0, 0, 0, 0, 0, 0]` after the tare this session; an earlier session saw x = +0.154, which is why `tare = true` |
+| gripper ends: the `gripper_position` value that closes the jaws | **not yet verified**; the loop binarizes at 0.5 and sends 1.0/0.0 -- confirm at the first teleop |
+| reset pose `q0` | `[+0.010, -0.629, -0.002, -2.511, -0.010, +1.906, +0.007]` rad (reproducible to ~0.001 rad across the two probes; pinned in `[command] q0`) |
+| `||F7||2`, auto gain, noise sigma | 1.3846; auto gain 0.7222 (= 1/||F7||2); noise 0.35 sigma -> action units `[+0.158, +0.275, +0.157, +0.301, +0.226, +0.229, +0.262]` for the 7 command dims (the 8th, +0.175, is the gripper dim the operator does not command) |
+| chunk time (ms) at `n_action_steps`: autonomous / `fc` / `frs` | prepare 21; autonomous **670** (the first, cold chunk; the later warm chunks are inferred ~250-300) / `fc` 299 / `frs` 368; the 8-action window is 533 ms, so the warm chunks fit and only the session's first chunk overruns |
+| checkpoint / statistics | `lerobot/pi05_droid`, chunk 15, 10 denoising steps, 8-d action; cold `load_bundle` 57 s; statistics installed from the 8 meaningful dims of openpi's 32-wide file; both image keys present |
+| third camera convention | `right_wrist_0_rgb` omitted -> the model fills it with a -1 image and a zero mask (verified on the real pipeline: only `base_0_rgb` and `left_wrist_0_rgb` in the prepared batch) |
+| user module: states file, scene, collecting runs | pending -- Phase B (unlocked by `--record-states` on the pilot runs) |
+| `train-user` wall time, final held-out loss | pending -- Phase B |
+| `validate-user`: per-arm cosines at each depth (paste the table) | pending -- Phase B |
+| `mars-u` session check (date, what the push did) | pending -- Phase B, after `validate-user` passes the gate |
+| demonstrations: `[task] demos` dataset, episode count, action schema it recorded | pending -- Phase C (unlocked by `teleop --record`); the loader accepts a single 8-wide `action` column or namespace-separated action keys |
+| `lerobot/pi05_base` cache location and size (the scene encoder) | pending -- Phase C (about 14 GB, a second VLM in the process) |
+| `train-task` wall time, final held-out flow-matching loss (`train_log.json`) | pending -- Phase C |
+| `mars-t` / `mars` session check (date, what the task module changed) | pending -- Phase C |
+| study block: date, arms, rounds, order, the run directory (`run.json`'s `run`, `git_head`, `git_dirty`) | pending -- Phase D |
+| study block: operator (who drove every arm and entered every outcome; the numbers are per-operator) | pending -- Phase D |
+| study block: scene reset -- does `reset()` restore the objects? (matched vs unmatched counts per pair) | pending -- Phase D |
+| study block: what the per-arm and paired tables said (paste the two tables or the CSVs' paths) | pending -- Phase D |
+| probe output | `examples/pi05/mars/franka/outputs/mars_franka/probe-session.txt` (4/4 sections pass, 2026-11-25) |

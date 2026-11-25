@@ -24,7 +24,7 @@ dtype = "bfloat16"
 
 [command]
 translation_gain = 0.11 # m/s at full deflection: flow-steering App. E's ~11 cm/s
-rotation_gain = 0.5 # rad/s at full deflection; a guess until the probe measures the stick
+rotation_gain = 0.5 # rad/s at full deflection (ours: a mapping choice; the sign needs a jog)
 twist_length = 0.2 # m, the mixed-unit scale of the IK's 6-row solve
 deadband = 0.02 # action units below which the operator counts as idle
 gain = "auto" # 1 / ||F||_2 with the corruption on, else 1.0, so the corrupted command cannot clip
@@ -80,19 +80,21 @@ adapter_user = "assets/user/rotz20/user.pt"
 adapter_task = "assets/task/pilot/task.pt"
 
 [spacemouse]
-# The defaults are unverified on hardware: the probe measures the real scales and channel mapping.
-# "" = search: the source opens the device's hidraw nodes and takes the one that delivers translation
-# reports (one 3Dconnexion device exposes five nodes; only /dev/hidraw8 carried the motion). A pinned
-# path skips that search. The probe prints the node the source picks and the rest six-vector.
+# Measured on this station 2026-11-25: a SpaceMouse Wireless through its Universal Receiver, all six
+# axes in one 13-byte report id 1 (offset 1 translation, offset 7 rotation), streaming on /dev/hidraw8;
+# both full scales are 350 and the receiver's other nodes are silent. "" = search: the source opens the
+# candidate nodes and takes the one that delivers motion. What no probe can measure is the sign map:
+# the first jog sets it. The probe prints the node the source picks and the rest six-vector.
 path = "" # "" = search for the device (SPACEMOUSE_HID_ID, when set, pins it instead)
 hid_id = "" # "" = search; otherwise a HID id such as 0000046D:0000C62B
 full_scale = 350.0
-rotation_full_scale = 350.0 # a guess until the probe measures it
+rotation_full_scale = 350.0 # measured 2026-11-25: the rotation triple peaked at 350 raw counts
 source = [0, 1, 2, 3, 4, 5] # device channels in the twist's [x, y, z, rx, ry, rz] order
 sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 # Subtract the rest six-vector once at start (captured after reports arrive and the stick settles),
-# so a released stick is a zero command: the session measured x = +0.154 at rest. This is a property
-# of the device, not the session; the probe prints the captured offset. false reads it untared.
+# so a released stick is a zero command: one session read x = +0.154 at rest, a later one exactly 0,
+# so the offset moves with the device's state. The probe prints the captured offset each session.
+# false reads it untared.
 tare = true
 
 [recording]
