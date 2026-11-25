@@ -1,0 +1,786 @@
+"""The one control loop: one station step per action, per-chunk batches, readout, recording pattern.
+
+No c3po, no torch, no checkpoint: the station is ``station.FakeStation``, the bundle and the steering
+policy are counting fakes, and the command source is the loop's own ``FakeSource``. The tests check the
+contract the composition root relies on — one ``station.step`` per action and none elsewhere, one
+``bundle.prepare`` per chunk and one ``bundle.act`` per tick with the chunk's held command, the bridge's
+readout for a known deflection, the seeded corruption draws, the ``mars-f`` adapter sync, and c3po's
+documented recording episode pattern.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import types
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import bridge
+import numpy as np
+import pytest
+from bridge import ARM_DIMS
+from config import CommandConfig, Config, ReadoutConfig
+from loop import FakeSource, Loop, SpaceMouseSource
+from policy import STATION_DIMS, teleop_action
+from station import FakeStation
+
+EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
+
+TRANSLATION_GAIN = CommandConfig().translation_gain
+ROTATION_GAIN = CommandConfig().rotation_gain
+TWIST_LENGTH = CommandConfig().twist_length
+
+JOINT = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.75])
+"""A DROID-like reset pose: the IK's ``q``, and the default corruption lift's ``q0``."""
+
+Q0 = tuple(float(value) for value in JOINT)
+
+DEFLECTION = np.array([0.2, -0.1, 0.3, 0.05, -0.05, 0.1])
+"""A known stick deflection, in the source's device axes ([x, y, z, rx, ry, rz])."""
+
+
+# ---------------------------------------------------------------- the fakes
+
+
+class _Station(FakeStation):
+    """``FakeStation`` plus the single-arm property and the per-step hook a test scripts."""
+
+    def __init__(self, observations, rate: float = 15.0) -> None:
+        super().__init__(observations, rate)
+        self.on_step = None
+        self.resets = 0
+        self.steps = 0
+
+    @property
+    def arm(self) -> str:
+        return self.manifest.arms[0]
+
+    def reset(self) -> dict[str, np.ndarray]:
+        self.resets += 1
+        return super().reset()
+
+    def step(self, action):
+        observation = super().step(action)
+        self.steps += 1
+        if self.on_step is not None:
+            self.on_step(self)
+        return observation
+
+
+class _CountingBundle:
+    """A numpy-only bundle that records the tick's halves; ``act`` returns a fixed action."""
+
+    def __init__(self, std: np.ndarray | None = None) -> None:
+        self.std = np.linspace(0.2, 0.9, STATION_DIMS) if std is None else np.asarray(std)
+        self.batches: list[dict] = []
+        self.commands: list[np.ndarray | None] = []
+        self.resets = 0
+
+    def prepare(self, raw_batch: dict) -> dict:
+        self.batches.append(raw_batch)
+        return {"prepared": len(self.batches)}
+
+    def act(self, batch: dict, command7: np.ndarray | None = None) -> np.ndarray:
+        self.commands.append(None if command7 is None else np.array(command7, copy=True))
+        return np.linspace(-0.3, 0.4, STATION_DIMS)
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+class _Adapter:
+    """A fake steering policy's adapter holder: records every matrix the loop assigns."""
+
+    def __init__(self) -> None:
+        self.matrices: list[np.ndarray] = []
+
+    @property
+    def matrix(self) -> np.ndarray | None:
+        return self.matrices[-1] if self.matrices else None
+
+    @matrix.setter
+    def matrix(self, value) -> None:
+        self.matrices.append(np.array(value, copy=True))
+
+
+def _steering() -> SimpleNamespace:
+    return SimpleNamespace(adapter=_Adapter())
+
+
+class _ScriptedRecording:
+    """c3po's ``Recording`` flags, driven by ``(episode, tick, flag)`` entries the test writes.
+
+    ``advance`` is called after each station step and sets the named flag when the schedule matches;
+    ``clear`` is c3po's: it resets ``done``/``rerecord`` (never ``stop``) and starts the next episode.
+    """
+
+    def __init__(self, schedule) -> None:
+        self.schedule = list(schedule)
+        self.episode = 0
+        self.tick = 0
+        self.stop = self.done = self.rerecord = False
+        self.clears = 0
+
+    def advance(self) -> None:
+        self.tick += 1
+        for episode, tick, flag in self.schedule:
+            if episode == self.episode and tick == self.tick:
+                setattr(self, flag, True)
+
+    def clear(self) -> None:
+        self.clears += 1
+        self.done = self.rerecord = False
+        self.episode += 1
+        self.tick = 0
+
+    def __enter__(self) -> _ScriptedRecording:
+        return self
+
+    def __exit__(self, *exception) -> None:
+        pass
+
+
+class _RecordingStation(_Station):
+    """``_Station`` plus c3po's recording surface: ``record``, ``download`` and ``cancel_episode``."""
+
+    def __init__(self, observations, schedule) -> None:
+        super().__init__(observations)
+        self.schedule = list(schedule)
+        self.recording: _ScriptedRecording | None = None
+        self.record_names: list[str] = []
+        self.downloads: list[tuple[str, Path]] = []
+        self.cancels = 0
+
+    def record(self, name: str) -> _ScriptedRecording:
+        self.record_names.append(name)
+        self.recording = _ScriptedRecording(self.schedule)
+        return self.recording
+
+    def download(self, name: str, dest: Path) -> Path:
+        self.downloads.append((name, Path(dest)))
+        path = Path(dest) / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def cancel_episode(self) -> None:
+        self.cancels += 1
+
+    def step(self, action):
+        observation = super().step(action)
+        if self.recording is not None:
+            self.recording.advance()
+        return observation
+
+
+TELEOP_STD = np.linspace(0.5, 4.0, STATION_DIMS)
+"""The synthetic statistics file's action q99 (and so its per-dim standard deviation, halved)."""
+
+
+def _stats_file(path: Path) -> Path:
+    """A hermetic ``norm_stats.json``: 32 wide, meaningful in the 8 station dims (``stats.action_std``'s
+    layout check), with an action q99 a known multiple away from zero."""
+    zeros = np.zeros(32 - STATION_DIMS)
+    q01 = np.concatenate([np.zeros(STATION_DIMS), zeros])
+    q99 = np.concatenate([TELEOP_STD, zeros])
+
+    def group() -> dict:
+        return {
+            "mean": q01.tolist(),
+            "std": np.ones(32).tolist(),
+            "q01": q01.tolist(),
+            "q99": q99.tolist(),
+        }
+
+    payload = {"norm_stats": {"state": group(), "actions": group()}}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _observations(count: int = 3, joint: np.ndarray | None = None) -> list[dict]:
+    """A fake station's canned observations: two camera feeds and the arm state at ``joint``."""
+    joint = JOINT if joint is None else np.asarray(joint)
+    return [
+        {
+            "follower/joint_position": joint.copy(),
+            "follower/gripper_position": np.zeros(1),
+            "scene_zed": np.full((8, 8, 3), 10 * index, dtype=np.uint8),
+            "wrist_zed": np.full((8, 8, 3), 20 * index, dtype=np.uint8),
+        }
+        for index in range(count)
+    ]
+
+
+def _config(*, n_action_steps: int = 4, readout: ReadoutConfig | None = None, command=None) -> Config:
+    config = Config()
+    return replace(
+        config,
+        policy=replace(config.policy, n_action_steps=n_action_steps),
+        readout=config.readout if readout is None else readout,
+        command=config.command if command is None else command,
+    )
+
+
+def _expected_served(deflection, q, *, spec=None, q0=None, gain=None, sigma=None, rng=None) -> np.ndarray:
+    """The bridge's chain for ``deflection`` at ``q``, with the corruption lifted as the loop lifts it."""
+    twist = np.asarray(deflection, dtype=np.float64).copy()
+    twist[:3] *= TRANSLATION_GAIN
+    twist[3:] *= ROTATION_GAIN
+    intent = bridge.operator_command(twist, q, TWIST_LENGTH)
+    if spec is None:
+        return bridge.readout(intent, None, sigma, 1.0 if gain is None else gain, rng)
+    f7 = bridge.corruption_lift(bridge.matrix6_from_spec(spec), q0, TWIST_LENGTH)
+    auto = 1.0 / float(np.linalg.norm(f7, 2))
+    return bridge.readout(intent, f7, sigma, auto if gain is None else gain, rng)
+
+
+# ---------------------------------------------------------------- teleop
+
+
+def test_teleop_sends_one_station_step_per_tick_and_records_the_teleop_action():
+    """c3po owns the clock: exactly one ``step(action8)`` per action, and teleop's action is the
+    served command plus the binarized gripper, with no policy in the chain."""
+    station = _Station(_observations())
+    source = FakeSource(deflection=DEFLECTION)
+    loop = Loop(config=_config(n_action_steps=4), station=station, mode="teleop", source=source)
+
+    loop.run(prompt="pick the cube", max_steps=6)
+
+    assert station.steps == 6
+    assert len(station.actions) == 6
+    expected = teleop_action(_expected_served(DEFLECTION, JOINT), False)
+    for action in station.actions:
+        np.testing.assert_allclose(action, expected)
+    assert source.reads == 6  # teleop reads the stick every tick
+
+
+def test_teleop_carries_the_operator_gripper_latch_into_the_action():
+    station = _Station(_observations())
+    source = FakeSource(deflection=DEFLECTION)
+    station.on_step = lambda fake: setattr(source, "gripper_closed", fake.steps >= 1)
+    loop = Loop(config=_config(), station=station, mode="teleop", source=source)
+
+    loop.run(prompt="pick", max_steps=3)
+
+    assert [int(action[ARM_DIMS]) for action in station.actions] == [0, 1, 1]
+    expected = _expected_served(DEFLECTION, JOINT)
+    for action, closed in zip(station.actions, (False, True, True), strict=True):
+        np.testing.assert_allclose(action, teleop_action(expected, closed))
+
+
+def test_the_spacemouse_button_latches_the_gripper_once_per_press(monkeypatch):
+    """lerobot's reader is a bitmask with a ``take_press`` edge; a press toggles the latch, so the
+    button is a switch and not a momentary "hold to close" (DESIGN's SpaceMouse contract)."""
+    twist = SimpleNamespace(
+        twist=np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0]),
+        reader=SimpleNamespace(take_press=lambda: presses.pop(0) if presses else False),
+        close=lambda: closed.append(True),
+    )
+    presses = [False, True, False, True, False]
+    closed = []
+    module = types.ModuleType("lerobot.teleoperators.spacemouse.teleop_spacemouse")
+    module.SpaceMouseTwist = lambda **kwargs: twist
+    monkeypatch.setitem(sys.modules, "lerobot.teleoperators.spacemouse.teleop_spacemouse", module)
+
+    source = SpaceMouseSource()
+    assert [source.gripper() for _ in range(5)] == [False, True, True, False, False]
+    np.testing.assert_array_equal(source.deflection(), np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0]))
+    source.reset()
+    assert source.gripper() is False
+    source.close()
+    assert closed == [True]
+
+
+# ---------------------------------------------------------------- the chunk cadence
+
+
+def test_steered_prepares_once_per_chunk_and_holds_the_boundary_command():
+    """One ``prepare`` per chunk and one ``act`` per tick; the command read at the chunk's first tick
+    is held for the chunk, so a stick moved mid-chunk does not move the executed command until the
+    next boundary."""
+    station = _Station(_observations())
+    source = FakeSource(deflection=DEFLECTION)
+    bundle = _CountingBundle()
+    changed = np.array([-0.3, 0.2, 0.0, 0.0, 0.0, 0.0])
+
+    def change_mid_chunk(fake: _Station) -> None:
+        if fake.steps == 1:  # after the first tick, two ticks before the next boundary
+            source.deflection_vector = changed
+
+    station.on_step = change_mid_chunk
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="steered",
+        source=source,
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick the cube", max_steps=8)
+
+    assert len(bundle.batches) == 2
+    assert len(bundle.commands) == 8
+    assert source.reads == 2  # the stick is read at the two chunk boundaries only
+    assert bundle.resets == 1
+    for command in bundle.commands[:4]:
+        np.testing.assert_allclose(command, _expected_served(DEFLECTION, JOINT))
+    for command in bundle.commands[4:]:
+        np.testing.assert_allclose(command, _expected_served(changed, JOINT))
+
+
+def test_the_raw_batch_is_the_stations_observation_under_the_configs_cameras():
+    """The batch the pre-processor sees is ``station.observation_batch``'s dict: the two configured
+    feeds, the 32-wide state and the prompt; the third image key stays omitted."""
+    bundle = _CountingBundle()
+    station = _Station(_observations())
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick the cube", max_steps=1)
+
+    batch = bundle.batches[0]
+    assert batch["task"] == "pick the cube"
+    assert set(batch) == {
+        "observation.images.base_0_rgb",
+        "observation.images.left_wrist_0_rgb",
+        "observation.state",
+        "task",
+    }
+    assert batch["observation.state"].shape == (32,)
+
+
+def test_autonomous_prepares_once_per_chunk_and_acts_without_a_command():
+    station = _Station(_observations())
+    bundle = _CountingBundle()
+    loop = Loop(config=_config(n_action_steps=4), station=station, mode="autonomous", bundle=bundle)
+
+    loop.run(prompt="pick", max_steps=8)
+
+    assert len(bundle.batches) == 2
+    assert len(bundle.commands) == 8
+    assert all(command is None for command in bundle.commands)
+
+
+# ---------------------------------------------------------------- the readout
+
+
+SPEC = {"scale": [2.0, 1.0, 1.0]}
+"""(6, 6)'s translation block doubled on x: the lift through ``J(q0)`` is the loop's fixed F."""
+
+
+def test_a_corruption_is_lifted_through_the_configured_q0():
+    """DESIGN's chain: ``M6`` is lifted to a fixed 7x7 ``F = I + J+(q0)(M6 - I)J(q0)`` and read out
+    with ``gain = auto = 1 / ||F||_2``, so a known deflection's served command is bridge's own."""
+    config = _config(
+        n_action_steps=1,
+        readout=ReadoutConfig(corruption=SPEC, noise=0.0, seed=0),
+        command=CommandConfig(q0=Q0),
+    )
+    station = _Station(_observations())
+    bundle = _CountingBundle()
+    loop = Loop(
+        config=config,
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    expected = _expected_served(DEFLECTION, JOINT, spec=SPEC, q0=JOINT)
+    np.testing.assert_allclose(bundle.commands[0], expected)
+    assert not np.allclose(bundle.commands[0], _expected_served(DEFLECTION, JOINT))  # not the clean readout
+
+
+def test_noise_off_hands_the_readout_no_noise_std(monkeypatch):
+    """``readout.noise = 0`` means no draw at all: ``bridge.readout`` gets no sigma (not zeros)."""
+    seen = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        seen.append(noise_std7)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+    station = _Station(_observations())
+    loop = Loop(
+        config=_config(n_action_steps=1, readout=ReadoutConfig(noise=0.0)),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=_CountingBundle(),
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=2)
+
+    assert seen and all(sigma is None for sigma in seen)
+
+
+def test_the_noise_std_is_the_configured_noise_in_action_std_units(monkeypatch):
+    seen = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        seen.append(noise_std7)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+    station = _Station(_observations())
+    bundle = _CountingBundle()
+    loop = Loop(
+        config=_config(n_action_steps=1, readout=ReadoutConfig(noise=0.3)),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    np.testing.assert_allclose(seen[0], 0.3 * bundle.std[:ARM_DIMS])
+
+
+def test_a_seeded_run_reproduces_the_noise():
+    """The readout's generator is ``readout.seed``'s: the same seed gives the same commands, the same
+    actions as ``bridge.readout`` draws them, and another seed does not."""
+    noise, seed = 0.3, 7
+
+    def commands(run_seed: int) -> list[np.ndarray]:
+        station = _Station(_observations())
+        bundle = _CountingBundle()
+        loop = Loop(
+            config=_config(n_action_steps=1, readout=ReadoutConfig(noise=noise, seed=run_seed)),
+            station=station,
+            mode="steered",
+            source=FakeSource(deflection=DEFLECTION),
+            bundle=bundle,
+            steering=_steering(),
+        )
+        loop.run(prompt="pick", max_steps=6)
+        return bundle.commands
+
+    one, two, other = commands(seed), commands(seed), commands(seed + 1)
+    for first, second in zip(one, two, strict=True):
+        np.testing.assert_array_equal(first, second)
+    assert not np.allclose(np.stack(one), np.stack(other))
+    expected = _expected_served(
+        DEFLECTION, JOINT, sigma=noise * _CountingBundle().std[:ARM_DIMS], rng=np.random.default_rng(seed)
+    )
+    np.testing.assert_allclose(one[0], expected)
+
+
+def test_teleop_noise_reads_the_action_std_from_the_statistics_file(tmp_path, monkeypatch):
+    """Teleop must not load the checkpoint to know what its noise means: it reads the file's action
+    quantiles directly (``stats.action_std``)."""
+    stats = _stats_file(tmp_path / "stats.json")
+    config = _config(n_action_steps=1, readout=ReadoutConfig(noise=0.3))
+    config = replace(config, policy=replace(config.policy, stats=stats))
+    seen = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        seen.append(noise_std7)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+    loop = Loop(
+        config=config,
+        station=_Station(_observations()),
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    expected = 0.3 * np.maximum(TELEOP_STD / 2.0, 1e-6)[:ARM_DIMS]
+    np.testing.assert_allclose(seen[0], expected)
+
+
+def test_a_bundle_without_statistics_draws_no_noise(monkeypatch):
+    """``--dry-run``'s bundle is a fixed action with no statistics: noise in action-std units has no
+    scale to be expressed in, and a dry run checks composition, not the numbers drawn."""
+    seen = []
+    real = bridge.readout
+
+    def spy(intent7, matrix7, noise_std7, gain=1.0, rng=None):
+        seen.append(noise_std7)
+        return real(intent7, matrix7, noise_std7, gain, rng)
+
+    monkeypatch.setattr(bridge, "readout", spy)
+    bundle = _CountingBundle()
+    bundle.std = None
+    loop = Loop(
+        config=_config(n_action_steps=1, readout=ReadoutConfig(noise=0.3)),
+        station=_Station(_observations()),
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    assert seen[0] is None
+
+
+def test_autonomous_draws_no_readout():
+    """Autonomous has no operator command, so there is nothing to corrupt: a corruption/noise config
+    must not fail a run that reads neither (and a fake bundle has no statistics)."""
+    bundle = _CountingBundle()
+    bundle.std = None
+    loop = Loop(
+        config=_config(
+            n_action_steps=1,
+            readout=ReadoutConfig(corruption={"scale": [2.0, 1.0, 1.0]}, noise=0.3),
+        ),
+        station=_Station(_observations()),
+        mode="autonomous",
+        bundle=bundle,
+    )
+
+    loop.run(prompt="pick", max_steps=2)
+
+    assert bundle.commands == [None, None]
+
+
+# ---------------------------------------------------------------- mars-f's adapter sync
+
+
+def test_mars_f_follows_the_fixed_corruption_at_every_episode(tmp_path):
+    """The 7x7 ``F`` of the episode goes into the steering policy's holder at each episode, so a
+    re-record (or a per-trial redraw) cannot leave a stale matrix behind."""
+    schedule = [(0, 1, "done"), (1, 1, "stop")]
+    config = _config(
+        n_action_steps=1,
+        readout=ReadoutConfig(corruption=SPEC, noise=0.0, seed=0),
+        command=CommandConfig(q0=Q0),
+    )
+    station = _RecordingStation(_observations(), schedule)
+    steering = _steering()
+    loop = Loop(
+        config=config,
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=_CountingBundle(),
+        steering=steering,
+        adapter_from_corruption="corruption",
+    )
+
+    loop.run_recording(name="mars_f", dest=tmp_path / "mars_f", prompt="pick")
+
+    f7 = bridge.corruption_lift(bridge.matrix6_from_spec(SPEC), JOINT, TWIST_LENGTH)
+    assert len(steering.adapter.matrices) == 2
+    for matrix in steering.adapter.matrices:
+        np.testing.assert_allclose(matrix, f7)
+
+
+def test_mars_f_can_hold_the_corruptions_inverse():
+    config = _config(
+        n_action_steps=1,
+        readout=ReadoutConfig(corruption=SPEC, noise=0.0, seed=0),
+        command=CommandConfig(q0=Q0),
+    )
+    station = _Station(_observations())
+    steering = _steering()
+    loop = Loop(
+        config=config,
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=_CountingBundle(),
+        steering=steering,
+        adapter_from_corruption="corruption_inverse",
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    inverse = bridge.lift_inverse(bridge.matrix6_from_spec(SPEC), JOINT, TWIST_LENGTH)
+    np.testing.assert_allclose(steering.adapter.matrices[0], inverse)
+    np.testing.assert_allclose(
+        inverse @ bridge.corruption_lift(bridge.matrix6_from_spec(SPEC), JOINT, TWIST_LENGTH),
+        np.eye(ARM_DIMS),
+        atol=1e-12,
+    )
+
+
+def _expected_family_f7(family: dict, *, episode: int, seed: int) -> np.ndarray:
+    matrix6 = bridge.matrix6_from_spec(family, np.random.default_rng([seed, episode]))
+    return bridge.corruption_lift(matrix6, JOINT, TWIST_LENGTH)
+
+
+def test_a_random_family_redraws_the_adapter_per_episode_for_the_seed(tmp_path):
+    """A ``{random: ...}`` family draws its matrix at every episode from
+    ``default_rng([readout.seed, episode])``: the same seed replays the sequence, and F changes."""
+    family = {"random": {"scale": [0.5, 2.0], "rotation_deg": [0.0, 90.0]}}
+    schedule = [(0, 1, "done"), (1, 1, "done"), (2, 1, "stop")]
+
+    def matrices(seed: int, dest: Path) -> list[np.ndarray]:
+        station = _RecordingStation(_observations(), schedule)
+        steering = _steering()
+        loop = Loop(
+            config=_config(n_action_steps=1, readout=ReadoutConfig(corruption=family, noise=0.0, seed=seed)),
+            station=station,
+            mode="steered",
+            source=FakeSource(deflection=DEFLECTION),
+            bundle=_CountingBundle(),
+            steering=steering,
+            adapter_from_corruption="corruption",
+        )
+        loop.run_recording(name="random", dest=dest, prompt="pick")
+        return steering.adapter.matrices
+
+    first = matrices(5, tmp_path / "random_a")
+    replay = matrices(5, tmp_path / "random_b")
+    assert len(first) == 3
+    for one, two in zip(first, replay, strict=True):
+        np.testing.assert_array_equal(one, two)
+    assert not np.allclose(first[0], first[1])
+    assert not np.allclose(first[1], first[2])
+    np.testing.assert_allclose(first[0], _expected_family_f7(family, episode=0, seed=5))
+
+
+def test_mars_f_with_the_corruption_off_holds_the_identity():
+    station = _Station(_observations())
+    steering = _steering()
+    loop = Loop(
+        config=_config(n_action_steps=1),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=_CountingBundle(),
+        steering=steering,
+        adapter_from_corruption="corruption",
+    )
+
+    loop.run(prompt="pick", max_steps=1)
+
+    np.testing.assert_allclose(steering.adapter.matrices[0], np.eye(ARM_DIMS))
+
+
+# ---------------------------------------------------------------- recording
+
+
+SCHEDULE = [(0, 2, "done"), (1, 1, "done"), (1, 1, "rerecord"), (2, 1, "stop")]
+"""Three episodes: the first ends done at tick 2, the second is re-recorded after tick 1, the third
+stops at tick 1 (``r`` alone does not end an episode: c3po's inner loop checks only done/stop)."""
+
+
+def test_run_recording_follows_c3pos_episode_pattern(tmp_path):
+    destination = tmp_path / "outputs" / "demos"
+    station = _RecordingStation(_observations(), SCHEDULE)
+    source = FakeSource(deflection=DEFLECTION)
+    loop = Loop(config=_config(), station=station, mode="teleop", source=source)
+
+    path = loop.run_recording(name="pilot", dest=destination, prompt="pick")
+
+    assert station.record_names == ["pilot"]
+    assert station.resets == 3  # reset once per episode, inside the recording context
+    assert station.steps == 4  # 2 + 1 + 1 ticks, one station step each
+    assert len(station.actions) == 4
+    assert source.reads == 4  # teleop reads the stick every tick
+    assert station.recording.clears == 3
+    assert station.cancels == 1  # the re-recorded episode is discarded
+    assert station.downloads == [("pilot", destination)]
+    assert path == destination / "pilot"
+    assert path.is_dir()
+    assert destination.is_dir()
+
+
+# ---------------------------------------------------------------- construction
+
+
+@pytest.mark.parametrize(
+    ("mode", "parts"),
+    [
+        ("teleop", {}),
+        ("teleop", {"source": FakeSource(deflection=DEFLECTION), "bundle": _CountingBundle()}),
+        ("teleop", {"source": FakeSource(deflection=DEFLECTION), "steering": _steering()}),
+        ("autonomous", {}),
+        ("autonomous", {"bundle": _CountingBundle(), "source": FakeSource(deflection=DEFLECTION)}),
+        ("autonomous", {"bundle": _CountingBundle(), "steering": _steering()}),
+        ("steered", {"source": FakeSource(deflection=DEFLECTION)}),
+        ("steered", {"source": FakeSource(deflection=DEFLECTION), "bundle": _CountingBundle()}),
+        ("steered", {"bundle": _CountingBundle(), "steering": _steering()}),
+        (
+            "steering",
+            {
+                "source": FakeSource(deflection=DEFLECTION),
+                "bundle": _CountingBundle(),
+                "steering": _steering(),
+            },
+        ),
+    ],
+)
+def test_construction_refuses_a_mode_whose_parts_do_not_fit(mode, parts):
+    with pytest.raises(ValueError, match=r"teleop|autonomous|steered|mode"):
+        Loop(config=_config(), station=_Station(_observations()), mode=mode, **parts)
+
+
+def test_construction_refuses_an_adapter_sync_the_mode_cannot_use():
+    with pytest.raises(ValueError, match="adapter"):
+        Loop(
+            config=_config(),
+            station=_Station(_observations()),
+            mode="teleop",
+            source=FakeSource(deflection=DEFLECTION),
+            adapter_from_corruption="corruption",
+        )
+    with pytest.raises(ValueError, match="adapter"):
+        Loop(
+            config=_config(),
+            station=_Station(_observations()),
+            mode="steered",
+            source=FakeSource(deflection=DEFLECTION),
+            bundle=_CountingBundle(),
+            steering=_steering(),
+            adapter_from_corruption="stale",
+        )
+
+
+def test_each_mode_constructs_with_its_own_parts():
+    station = _Station(_observations())
+    assert Loop(config=_config(), station=station, mode="teleop", source=FakeSource(deflection=DEFLECTION))
+    assert Loop(config=_config(), station=station, mode="autonomous", bundle=_CountingBundle())
+    assert Loop(
+        config=_config(),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=_CountingBundle(),
+        steering=_steering(),
+    )
+
+
+# ---------------------------------------------------------------- the import boundary
+
+
+def test_importing_the_loop_needs_neither_torch_nor_c3po():
+    """The loop is on ``--dry-run``'s path: c3po is the station's, torch the policy's, and the
+    SpaceMouse import lives inside ``SpaceMouseSource.__init__``."""
+    code = (
+        "import sys, loop; "
+        "assert 'torch' not in sys.modules, 'loop imported torch'; "
+        "assert 'c3po' not in sys.modules, 'loop imported c3po'; "
+        "assert hasattr(loop, 'Loop') and hasattr(loop, 'SpaceMouseSource') and hasattr(loop, 'FakeSource')"
+    )
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(EXAMPLE_DIR)},
+    )

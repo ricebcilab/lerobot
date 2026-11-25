@@ -89,7 +89,12 @@ def _is_arm_state_key(key: str, arms: tuple[str, ...]) -> bool:
 
 
 class Station(Protocol):
-    """The port the loop drives: c3po owns the clock, one ``step`` per control step."""
+    """The port the loop drives: c3po owns the clock, one ``step`` per control step.
+
+    ``cancel_episode`` is c3po's recording-loop contract: after the ``r`` flag the researcher
+    discards the in-progress episode before re-recording it. A station that records nothing
+    implements it as a no-op; ``C3poStation`` forwards it to ``robot.cancel_episode()``.
+    """
 
     @property
     def manifest(self) -> StationManifest: ...
@@ -97,6 +102,7 @@ class Station(Protocol):
     def reset(self) -> dict[str, NDArray]: ...
     def step(self, action8: NDArray) -> dict[str, NDArray]: ...
     def close(self) -> None: ...
+    def cancel_episode(self) -> None: ...
 
 
 class C3poStation:
@@ -128,6 +134,10 @@ class C3poStation:
 
     def close(self) -> None:
         self._robot.close()
+
+    def cancel_episode(self) -> None:
+        """c3po's ``robot.cancel_episode()``: discard the episode in progress on re-record."""
+        self._robot.cancel_episode()
 
     def record(self, name: str) -> Recording:
         """c3po's ``robot.recording(name)``: the keyboard-controlled recording context manager."""
@@ -178,6 +188,9 @@ class FakeStation:
 
     def close(self) -> None:
         """Nothing to release: a fake station is a list."""
+
+    def cancel_episode(self) -> None:
+        """Nothing to discard: a fake station records no dataset (the recording loop's no-op)."""
 
 
 # ---------------------------------------------------------------- the two dictionaries

@@ -18,6 +18,7 @@ from bridge import ARM_DIMS
 from station import (
     IMAGE_SIZE,
     STATE_DIMS,
+    C3poStation,
     FakeStation,
     StationManifest,
     _manifest_from_observations,
@@ -295,6 +296,28 @@ def test_the_fake_rejects_a_wrong_width_action():
     station.reset()
     with pytest.raises(ValueError, match=r"action8 must be \(8,\)"):
         station.step(np.zeros(ARM_DIMS))
+
+
+# ---------------------------------------------------------------- the recording contract
+
+
+def test_the_fake_station_has_nothing_to_cancel():
+    """c3po's recording loop cancels a re-recorded episode; a station that records nothing no-ops."""
+    station = FakeStation(_canned(2), rate=15.0)
+    station.reset()
+    station.cancel_episode()
+    assert station.actions == []
+    station.step(np.zeros(ARM_DIMS + 1))
+    assert len(station.actions) == 1
+
+
+def test_c3po_station_forwards_cancel_episode_to_its_robot():
+    """The port's cancel is c3po's ``robot.cancel_episode()`` (no c3po: the robot is a stub)."""
+    calls = []
+    station = object.__new__(C3poStation)
+    station._robot = SimpleNamespace(cancel_episode=lambda: calls.append(True))
+    station.cancel_episode()
+    assert calls == [True]
 
 
 # ---------------------------------------------------------------- the boundaries

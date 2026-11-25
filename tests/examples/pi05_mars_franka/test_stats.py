@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from stats import CHECKPOINT_WIDTH, STATION_DIMS, install_stats
+from stats import CHECKPOINT_WIDTH, STATION_DIMS, action_std, install_stats
 
 from lerobot.configs import FeatureType, NormalizationMode
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
@@ -215,3 +215,43 @@ def test_install_stats_on_the_real_openpi_asset():
     np.testing.assert_allclose(mean, (q01[:STATION_DIMS] + q99[:STATION_DIMS]) / 2)
     np.testing.assert_allclose(std, (q99[:STATION_DIMS] - q01[:STATION_DIMS]) / 2)
     assert np.all(np.asarray(normalizer.stats["observation.state"]["q01"])[STATION_DIMS:] == 0.0)
+
+
+# ---------------------------------------------------------------- action_std (teleop's noise)
+
+
+def test_action_std_is_the_quantiles_half_range_in_action_std_units(tmp_path):
+    """Teleop's noise is defined in action-standard-deviation units and teleop must not load the
+    checkpoint: ``action_std`` reads the same file's action quantiles directly."""
+    path = _stats_file(tmp_path / "stats.json")
+    std = action_std(path)
+    expected = np.maximum((ACTIONS_Q99 - ACTIONS_Q01) / 2.0, 1e-6)
+    assert std.shape == (STATION_DIMS,)
+    np.testing.assert_allclose(std, expected)
+    assert not np.allclose(std, FILE_STD[:STATION_DIMS])  # the file's own std is not the QUANTILES map
+
+
+def test_action_std_returns_the_first_dims_and_floors_at_the_epsilon(tmp_path):
+    path = _stats_file(tmp_path / "stats.json")
+    np.testing.assert_allclose(action_std(path, dims=STATION_DIMS - 1), action_std(path)[: STATION_DIMS - 1])
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["norm_stats"]["actions"]["q01"][0] = 0.5  # a constant dim: q01 == q99
+    payload["norm_stats"]["actions"]["q99"][0] = 0.5
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    std = action_std(path)
+    assert std[0] == 1e-6
+    np.testing.assert_allclose(std[1:], np.maximum((ACTIONS_Q99[1:] - ACTIONS_Q01[1:]) / 2.0, 1e-6))
+
+
+@pytest.mark.parametrize("dims", [0, STATION_DIMS + 1, 2.5, True])
+def test_action_std_refuses_a_width_that_is_not_a_count_of_dims(tmp_path, dims):
+    path = _stats_file(tmp_path / "stats.json")
+    with pytest.raises(ValueError, match="dims"):
+        action_std(path, dims=dims)
+
+
+def test_action_std_refuses_a_file_that_is_not_the_checkpoints_stats(tmp_path):
+    path = _stats_file(tmp_path / "stats.json", meaningful=STATION_DIMS - 1)
+    with pytest.raises(ValueError, match="norm_stats"):
+        action_std(path)
