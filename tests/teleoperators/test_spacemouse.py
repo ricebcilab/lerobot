@@ -33,6 +33,7 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SpaceMouseAxes,
     SpaceMouseReader,
     find_spacemouse,
+    parse_motion,
     parse_report,
 )
 from lerobot.teleoperators.utils import make_teleoperator_from_config
@@ -41,6 +42,11 @@ from lerobot.utils.errors import DeviceNotConnectedError
 
 def motion(x: int, y: int, z: int) -> bytes:
     return b"\x01" + struct.pack("<hhh", x, y, z)
+
+
+def six_axis(x: int, y: int, z: int, rx: int, ry: int, rz: int) -> bytes:
+    """The combined layout: one 13-byte id 1 report with translation then rotation (six int16)."""
+    return b"\x01" + struct.pack("<hhhhhh", x, y, z, rx, ry, rz)
 
 
 def rotation(rx: int, ry: int, rz: int) -> bytes:
@@ -103,6 +109,48 @@ def test_parse_report_rotation():
     assert parse_report(rotation(350, -175, 0)) == ("rotation", (350, -175, 0))
     assert parse_report(motion(1, -2, 3)) == ("translation", (1, -2, 3))  # id 1 is unchanged
     assert parse_report(b"\x02\x00") == ("other", None)  # too short for a rotation
+
+
+def test_parse_motion_reads_the_combined_layouts_second_triple():
+    """The pair layout's 7-byte id 1 report has no rotation half; the combined layout's 13-byte one
+    does (the SpaceMouse Wireless through its Universal Receiver sends all six axes in one report)."""
+    assert parse_motion(motion(350, -175, 0)) == ((350, -175, 0), None)
+    assert parse_motion(six_axis(350, -175, 0, 700, -350, 35)) == ((350, -175, 0), (700, -350, 35))
+    # The shared contract is untouched: parse_report still reports id 1 as the translation triple.
+    assert parse_report(six_axis(1, -2, 3, 4, -5, 6)) == ("translation", (1, -2, 3))
+
+
+def test_a_six_axis_report_sets_the_axes_and_the_rotation_together(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([six_axis(350, -175, 70, 700, -350, 35)], rotation_full_scale=700)
+    assert reader.axes == (1.0, -0.5, 0.2)  # the translation triple at offset 1, by full_scale
+    assert reader.rotation == (1.0, -0.5, 0.05)  # the second triple at offset 7, by its own scale
+    assert reader.motion_reports == 1
+    assert reader.reports_handled == 1
+
+
+def test_a_seven_byte_report_leaves_the_combined_rotation_alone(monkeypatch):
+    """A 7-byte id 1 report is translation only: it must not zero a rotation that arrived with it."""
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([six_axis(0, 0, 0, 700, -350, 35), motion(350, -175, 70)], rotation_full_scale=700)
+    assert reader.axes == (1.0, -0.5, 0.2)
+    assert reader.rotation == (1.0, -0.5, 0.05)
+
+
+def test_a_combined_release_report_zeroes_the_rotation(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader(
+        [six_axis(350, -175, 70, 700, -350, 35), six_axis(0, 0, 0, 0, 0, 0)],
+        rotation_full_scale=700,
+    )
+    assert reader.axes == (0.0, 0.0, 0.0)
+    assert reader.rotation == (0.0, 0.0, 0.0)
+
+
+def test_a_combined_report_clips_the_rotation(monkeypatch):
+    clear_scale_env(monkeypatch)
+    reader = pipe_reader([six_axis(0, 0, 0, 700, -350, 35)])  # the default rotation full scale is 350
+    assert reader.rotation == (1.0, -1.0, 0.1)
 
 
 def test_find_by_vendor(tmp_path):

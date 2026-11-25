@@ -16,13 +16,17 @@
 
 """A 3Dconnexion SpaceMouse read straight from Linux /dev/hidraw (no driver or package needed).
 
-The device sends a translation report (id 1: three int16 counts x, y, z) whenever the stick
-moves, including a zeroing report on release, a rotation report (id 2: three int16 counts
-rx, ry, rz) whenever it is twisted, and a button report (id 3: a bitmask) whenever a button
-changes. Device channels: x is a push to the right (+), y a pull toward you (+), z a press down
-(+); the rotation channels are the device's own rx, ry, rz order. The rotation full scale is not
-known yet (the probe measures it), so `rotation` divides by the translation's full scale unless
-`SPACEMOUSE_ROTATION_FULL_SCALE` overrides it.
+The device sends its motion in one of two layouts, and this module decodes both. In the pair layout
+(the SpaceMouse Pro and similar) a translation report (id 1: three int16 counts x, y, z) arrives
+whenever the stick moves, including a zeroing report on release, and a separate rotation report
+(id 2: three int16 counts rx, ry, rz) whenever it is twisted. In the combined layout (the SpaceMouse
+Wireless through its Universal Receiver, measured on our station 2026-11-25) one 13-byte report under
+id 1 carries all six axes: the translation triple at offset 1 and the rotation triple at offset 7, so
+id 2 never arrives and a reader that only waits for it loses the twist. A button report (id 3: a
+bitmask) arrives whenever a button changes in both layouts. Device channels: x is a push to the right
+(+), y a pull toward you (+), z a press down (+); the rotation channels are the device's own rx, ry, rz
+order. The rotation full scale is not known yet (the probe measures it), so `rotation` divides by the
+translation's full scale unless `SPACEMOUSE_ROTATION_FULL_SCALE` overrides it.
 
 `SpaceMouseReader` keeps the latest state in a background thread; `SpaceMouseTeleop` wraps it
 as a LeRobot teleoperator. `SpaceMouseAxes` is a reader mapped onto an application's axes (which
@@ -61,6 +65,8 @@ REPORT_TRANSLATION = 1
 REPORT_ROTATION = 2
 REPORT_BUTTONS = 3
 READ_SIZE = 64
+TRANSLATION_REPORT_SIZE = 7  # the report id, then the translation's three int16 counts
+COMBINED_REPORT_SIZE = 13  # the report id, then six int16 counts: translation, then rotation
 
 TWIST_DIMS = 6  # device channels in twist order: x, y, z (translation) then rx, ry, rz (rotation)
 
@@ -105,13 +111,32 @@ def parse_report(data: bytes) -> tuple[str, tuple[int, int, int] | int | None]:
     Returns ("translation", (x, y, z)) or ("rotation", (rx, ry, rz)) with raw int16 counts,
     ("buttons", bitmask), or ("other", None).
     """
-    if len(data) >= 7 and data[0] == REPORT_TRANSLATION:
+    if len(data) >= TRANSLATION_REPORT_SIZE and data[0] == REPORT_TRANSLATION:
         return "translation", struct.unpack_from("<hhh", data, 1)
-    if len(data) >= 7 and data[0] == REPORT_ROTATION:
+    if len(data) >= TRANSLATION_REPORT_SIZE and data[0] == REPORT_ROTATION:
         return "rotation", struct.unpack_from("<hhh", data, 1)
     if len(data) >= 2 and data[0] == REPORT_BUTTONS:
         return "buttons", int.from_bytes(data[1:5], "little")
     return "other", None
+
+
+def parse_motion(data: bytes) -> tuple[tuple[int, int, int], tuple[int, int, int] | None]:
+    """A translation report's int16 triples: the translation at offset 1 and the rotation at offset 7.
+
+    The two device layouts (module docstring): a 7-byte id 1 report carries the translation alone and
+    the rotation half is None; a 13-byte id 1 report (the combined layout) carries both in one packet.
+    ``data`` is a report `parse_report` accepted as "translation" (id 1, at least
+    `TRANSLATION_REPORT_SIZE` bytes), which is what guarantees the first triple exists.
+    """
+    translation = struct.unpack_from("<hhh", data, 1)
+    rotation = struct.unpack_from("<hhh", data, 7) if len(data) >= COMBINED_REPORT_SIZE else None
+    return translation, rotation
+
+
+def _scaled(counts, scale: float) -> tuple[float, float, float]:
+    """Three raw int16 counts as floats in [-1, 1], clipped, at `scale` counts full deflection."""
+    values = np.clip(np.array(counts, dtype=np.float64) / scale, -1.0, 1.0)
+    return (float(values[0]), float(values[1]), float(values[2]))
 
 
 class SpaceMouseReader:
@@ -120,8 +145,10 @@ class SpaceMouseReader:
     `axes` is the latest device (x, y, z) divided by `full_scale` and clipped to [-1, 1];
     `rotation` the latest device (rx, ry, rz) divided by `rotation_full_scale` and clipped to
     [-1, 1]; `buttons` the latest bitmask; `presses` counts new presses (a bit going from up to
-    down) and `take_press()` is True once per press since the last call. When the device is
-    unplugged or closed the thread ends and `connected` turns False; `axes`, `rotation` and
+    down) and `take_press()` is True once per press since the last call. Both device layouts are
+    decoded (module docstring): an id 1 report with 13 bytes sets `axes` and `rotation` together,
+    a 7-byte id 1 report sets `axes` alone, and an id 2 report sets `rotation` alone. When the device
+    is unplugged or closed the thread ends and `connected` turns False; `axes`, `rotation` and
     `buttons` keep their last values. The node is only read, never written.
     """
 
@@ -162,14 +189,17 @@ class SpaceMouseReader:
 
     def _handle(self, data: bytes) -> None:
         kind, value = parse_report(data)
+        combined_rotation = None
+        if kind == "translation":  # id 1: the translation, plus the rotation in the combined layout
+            value, combined_rotation = parse_motion(data)
         with self._lock:
             if kind == "translation":
-                scaled = np.clip(np.array(value, dtype=np.float64) / self.full_scale, -1.0, 1.0)
-                self._axes = (float(scaled[0]), float(scaled[1]), float(scaled[2]))
+                self._axes = _scaled(value, self.full_scale)
+                if combined_rotation is not None:
+                    self._rotation = _scaled(combined_rotation, self.rotation_full_scale)
                 self._motion_reports += 1
             elif kind == "rotation":
-                scaled = np.clip(np.array(value, dtype=np.float64) / self.rotation_full_scale, -1.0, 1.0)
-                self._rotation = (float(scaled[0]), float(scaled[1]), float(scaled[2]))
+                self._rotation = _scaled(value, self.rotation_full_scale)
             elif kind == "buttons":
                 if value & ~self._buttons:  # a new press
                     self._presses += 1
@@ -290,7 +320,9 @@ class SpaceMouseTwist:
 
     Axis i of `twist` is `sign[i]` times device channel `source[i]`, over the concatenated device
     channels (0: x, 1: y, 2: z, 3: rx, 4: ry, 5: rz), each in [-1, 1]; `[x, y, z, rx, ry, rz]` with
-    the translation axes first. The rotation full scale is a guess (see `SpaceMouseReader.rotation`).
+    the translation axes first. The reader decodes both device layouts, so the rotation channels are
+    filled whether the device sent an id 2 report or put the rotation in the id 1 report's second
+    triple. The rotation full scale is a guess (see `SpaceMouseReader.rotation`).
 
     Without `path` the device is searched for by `hid_id` (default: the SPACEMOUSE_HID_ID environment
     variable, unset = any 3Dconnexion device); `full_scale` defaults to SPACEMOUSE_FULL_SCALE (unset =

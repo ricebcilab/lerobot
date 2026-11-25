@@ -11,12 +11,15 @@ step raised after collecting them; the section now returns its lines with the fa
 unexpected exception prints its traceback: a diagnostic must not swallow the stack.
 
 The SpaceMouse section answers the question the session exposed: a 3Dconnexion device can expose five
-hidraw nodes for one mouse and only one carries the reports. It prints every 3Dconnexion node's
-``HID_NAME`` and report-descriptor size, tallies every ``(report id, byte length)`` pair over the read
-window, and for each pair prints the max ``|int16|`` of the triple at offset 1 and — for a payload of 12
-bytes or more — of the second triple at offset 7, so a six-axis single report (or a rotation report
-under another id) is visible instead of lost. Then it builds the real ``SpaceMouseSource`` and prints
-the node it picks, the rest six-vector and whether it tared.
+hidraw nodes for one mouse and only one carries the reports, and the six axes can arrive in one of two
+layouts. It prints every 3Dconnexion node's ``HID_NAME`` and report-descriptor size, tallies every
+``(report id, byte length)`` pair over the read window, and for each pair prints the max ``|int16|`` of
+the translation triple at offset 1 and — for a payload of 12 bytes or more — of the rotation triple at
+offset 7. The verdict accepts both layouts: rotation is present when id 2 reports arrive (a SpaceMouse
+Pro and similar) or when the id 1 six-axis report's second triple moved beyond a few counts (a
+SpaceMouse Wireless through its Universal Receiver sends all six axes in one 13-byte report and never
+an id 2). Then it builds the real ``SpaceMouseSource`` and prints the node it picks, the rest
+six-vector and whether it tared.
 """
 
 from __future__ import annotations
@@ -57,6 +60,21 @@ HIDRAW_SYSFS = Path("/sys/class/hidraw")
 # is a pure function of synthetic report bytes (the section imports lerobot only to find the device).
 REPORT_TRANSLATION = 1
 REPORT_ROTATION = 2
+
+SIX_AXIS_REPORT_BYTES = 13
+"""The six-axis single report's length: the id, then three translation and three rotation int16s."""
+
+ROTATION_MOTION_COUNTS = 5
+"""The |int16| an id 1 second triple must exceed to count as the operator twisting: the rest triple is
+zero and a full twist reached 350 counts, so five counts is noise, not motion."""
+
+STEERED_MODES = ("fc", "frs")
+"""The modes the policy section times: flow control and FRS, the two shipped methods that steer."""
+
+STEER_DUMMY_COUNTS = 0.05
+"""The steered timing's dummy command in dims 0-2: above [command] deadband (0.02), so the steering
+core takes its steered path (FRS's reversal) instead of the unsteered one, and small enough to be
+irrelevant -- nothing is sent."""
 
 
 def _error(error: BaseException | None) -> str:
@@ -330,10 +348,11 @@ def _node_line(node: str, is_spacemouse: bool, sysfs: Path | str | None = None) 
 def _tally(tally: Tally, node: str, data: bytes) -> None:
     """Count one raw hidraw report and keep the maxima of its int16 triples.
 
-    The first byte is the report id, so a translation report (three int16) is 7 bytes and the second
+    The first byte is the report id, so a translation report (three int16) is 7 bytes and the rotation
     triple at offset 7 needs 12 bytes after the id (a 13-byte report: the six-axis single report's
-    shape). Reports shorter than a triple are counted but have no maxima; that which ids arrive is
-    the finding, so a short report still counts toward its pair.
+    shape, where the translation is triple one and the rotation triple two). Reports shorter than a
+    triple are counted but have no maxima; that which ids arrive is the finding, so a short report
+    still counts toward its pair.
     """
     pair = (data[0], len(data))
     counts = tally.seen.setdefault(node, {})
@@ -341,7 +360,7 @@ def _tally(tally: Tally, node: str, data: bytes) -> None:
     if len(data) < 7:
         return
     first = struct.unpack_from("<hhh", data, 1)
-    second = struct.unpack_from("<hhh", data, 7) if len(data) >= 13 else None
+    second = struct.unpack_from("<hhh", data, 7) if len(data) >= SIX_AXIS_REPORT_BYTES else None
     key = (node, *pair)
     tally.serial += 1
     tally.order[key] = tally.serial
@@ -386,6 +405,16 @@ def _max_counts(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
     return tuple(max(triple[axis] for triple in triples) for axis in range(3))  # type: ignore[return-value]
 
 
+def _second_counts(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
+    """The per-axis largest |int16| of a report id's second triple (offset 7); None if none was wide enough."""
+    triples = [
+        maxima[1] for key, maxima in tally.peaks.items() if key[1] == report_id and maxima[1] is not None
+    ]
+    if not triples:
+        return None
+    return tuple(max(triple[axis] for triple in triples) for axis in range(3))  # type: ignore[return-value]
+
+
 def _newest(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
     """The first triple of the newest report of ``report_id`` across the nodes; None if absent."""
     keys = [key for key in tally.last if key[1] == report_id]
@@ -394,8 +423,21 @@ def _newest(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
     return tally.last[max(keys, key=tally.order.__getitem__)][0]
 
 
+def _newest_second(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
+    """The second triple of the newest report of ``report_id`` wide enough to carry one; None if absent."""
+    keys = [key for key, maxima in tally.last.items() if key[1] == report_id and maxima[1] is not None]
+    if not keys:
+        return None
+    return tally.last[max(keys, key=tally.order.__getitem__)][1]
+
+
 def _tally_lines(tally: Tally) -> list[str]:
-    """Every pair's count per node, then every pair's triple maxima — the rotation-shape evidence."""
+    """Every pair's count per node, then every pair's triple maxima — the rotation-shape evidence.
+
+    The triples are labelled by the layout they belong to: the translation is the triple at offset 1
+    (id 1), the rotation is at offset 7 of the combined id 1 report (and at offset 1 of the id 2 pair
+    layout's report, which the per-pair ``id`` already names).
+    """
     lines: list[str] = []
     for node in sorted(tally.seen):
         pairs = ", ".join(
@@ -406,9 +448,9 @@ def _tally_lines(tally: Tally) -> list[str]:
     for key in sorted(tally.peaks, key=lambda item: (item[0], item[1], item[2])):
         node, report, length = key
         first, second = tally.peaks[key]
-        line = f"  {node} id {report} ({length} bytes): max |int16| offset 1 {_counts(first)}"
+        line = f"  {node} id {report} ({length} bytes): max |int16| translation (offset 1) {_counts(first)}"
         if second is not None:
-            line += f", offset 7 {_counts(second)}"
+            line += f", rotation (offset 7) {_counts(second)}"
         lines.append(line)
     return lines
 
@@ -416,7 +458,11 @@ def _tally_lines(tally: Tally) -> list[str]:
 def _rest_from_tally(tally: Tally, config: Config) -> NDArray:
     """The rest six-vector from the newest raw reports, scaled and mapped like the source would."""
     translation = _newest(tally, REPORT_TRANSLATION) or (0, 0, 0)
-    rotation = _newest(tally, REPORT_ROTATION) or (0, 0, 0)
+    rotation = (
+        _newest(tally, REPORT_ROTATION)
+        or _newest_second(tally, REPORT_TRANSLATION)  # the combined layout carries it in the id 1 report
+        or (0, 0, 0)
+    )
     raw = np.asarray([*translation, *rotation], dtype=np.float64)
     scale = np.asarray([config.spacemouse.full_scale] * 3 + [config.spacemouse.rotation_full_scale] * 3)
     source = np.asarray(config.spacemouse.source, dtype=np.intp)
@@ -460,7 +506,12 @@ def _mouse_report(
     source: SourceFacts | None,
     source_error: Exception | None,
 ) -> tuple[list[str], int]:
-    """The tallied report, the checks, the scales to copy, and the source's pick, rest and tare."""
+    """The tallied report, the checks, the scales to copy, and the source's pick, rest and tare.
+
+    Rotation is one check over both device layouts: id 2 reports are the pair layout's rotation
+    (SpaceMouse Pro and similar), while the combined layout puts it in the id 1 six-axis report's
+    second triple (SpaceMouse Wireless through its Universal Receiver) and sends no id 2 at all.
+    """
     hi = lines.append
     lines.extend(_tally_lines(tally))
     translation = _max_counts(tally, REPORT_TRANSLATION)
@@ -473,24 +524,40 @@ def _mouse_report(
         lines, translation is not None, f"id {REPORT_TRANSLATION} (translation) reports", detail
     )
     rotation = _max_counts(tally, REPORT_ROTATION)
-    if rotation is None:
+    combined = _second_counts(tally, REPORT_TRANSLATION)
+    combined_moved = combined is not None and max(combined) > ROTATION_MOTION_COUNTS
+    rotation_scale = None
+    if rotation is not None:  # the pair layout: id 2 reports are the rotation's own evidence
+        detail = f"max |counts| x {rotation[0]} y {rotation[1]} z {rotation[2]}"
+        failures += _check(lines, True, f"id {REPORT_ROTATION} (rotation) reports", detail)
+        rotation_scale = max(rotation)
+    elif combined_moved:  # the combined layout: rotation is the id 1 report's second triple
+        detail = (
+            f"max |counts| x {combined[0]} y {combined[1]} z {combined[2]} "
+            f"(the id {REPORT_TRANSLATION} six-axis report's second triple, offset 7)"
+        )
+        failures += _check(lines, True, "rotation in the combined report", detail)
+        rotation_scale = max(combined)
+    else:
         failures += _check(
             lines, False, f"id {REPORT_ROTATION} (rotation) reports", "none arrived on any node"
         )
         hi(
-            "[DIAG] no rotation report arrived on any node: twist each rotation axis to its stop again "
-            "during the 5 s window. The device may report rotation under another id or as the second "
-            "triple of a wider single report; the (id, bytes) tally above shows both, so a pair that is "
-            "not id 1 with 7 bytes — a six-axis report is 13 bytes — is the place to look, and its "
-            "second triple would be the rotation."
+            "[DIAG] no rotation motion arrived in either layout: id 2 never arrived and no id "
+            f"{REPORT_TRANSLATION} six-axis report ({SIX_AXIS_REPORT_BYTES} bytes) moved its second "
+            f"triple above +{ROTATION_MOTION_COUNTS} counts; twist each rotation axis to its stop again "
+            "during the 5 s window. The (id, bytes) tally above shows every shape, so a pair that is not "
+            "id 1 with 7 bytes is the place to look, and a six-axis single report's second triple is the "
+            "rotation."
         )
-    else:
-        detail = f"max |counts| x {rotation[0]} y {rotation[1]} z {rotation[2]}"
-        failures += _check(lines, True, f"id {REPORT_ROTATION} (rotation) reports", detail)
     if translation is not None:
         hi(f"copy into [spacemouse] full_scale = {max(translation):g}; the shipped 350.0 is unverified")
-    if rotation is not None:
-        hi(f"copy into [spacemouse] rotation_full_scale = {max(rotation):g}; the shipped 350.0 is unverified")
+    if rotation_scale is not None:
+        where = "id 2" if rotation is not None else "the id 1 second triple"
+        hi(
+            f"copy into [spacemouse] rotation_full_scale = {rotation_scale:g} (the observed peak: {where}); "
+            "the shipped 350.0 is unverified"
+        )
     source_map, sign = list(config.spacemouse.source), [float(value) for value in config.spacemouse.sign]
     hi(f"configured source {source_map}, sign {sign}; channels 0 x, 1 y, 2 z, 3 rx, 4 ry, 5 rz")
     fallback = _rest_from_tally(tally, config)
@@ -571,8 +638,66 @@ def spacemouse_section(config: Config, lines: list[str] | None = None) -> Report
 # ---------------------------------------------------------------- the checkpoint
 
 
+def _chunk_line(name: str, mode: str, chunk_ms: float, config: Config, detail: str = "") -> str:
+    """One steered chunk's timing line: the chunk's cost and, when it overruns, the pause it implies.
+
+    The window is ``n_action_steps`` control periods at ``[station] rate``; the pause is
+    ``chunk_ms - n_action_steps * 1000 / rate``, printed only when positive (a chunk inside the window
+    costs no pause). ``detail`` is the prepare/act breakdown beside the total.
+    """
+    steps = int(config.policy.n_action_steps)
+    window_ms = steps * 1000.0 / config.station.rate
+    line = f"steered chunk time {name} ({mode}): {chunk_ms:.0f} ms"
+    if detail:
+        line += f" ({detail})"
+    pause = chunk_ms - window_ms
+    return line + (f"; pause at n_action_steps {steps}: {pause:.0f} ms" if pause > 0 else "")
+
+
+def _steered_timing(config: Config, prepared, prepare_ms: float, bundle, lines: list[str]) -> None:
+    """Time one steered chunk per shared mode: build the mode's steering policy, act once, reset.
+
+    The autonomous chunk above is the base policy's; a steered mode runs the same prepare and then its
+    core, and FRS's reversal does roughly twice the base's velocity evaluations, so its chunk can
+    overrun the ``n_action_steps`` window the autonomous one already overruns. A command of zero would
+    take the cores' unsteered path (``steered_chunk`` with an all-zero command), timing the base policy
+    again instead of the reversal this exists to measure, so the probe uses a dummy of the
+    deadband-crossing magnitude. The batch is the one ``prepare`` made and the action is thrown away:
+    this is a diagnostic, so no action is sent and the real bundle is only read.
+    """
+    from policy import make_steering
+
+    hi = lines.append
+    command = np.zeros(ARM_DIMS)
+    command[:3] = STEER_DUMMY_COUNTS
+    for name in STEERED_MODES:
+        table = config.modes.get(name)
+        if table is None:
+            hi(f"[INFO] steered timing {name}: the config has no [modes.{name}] table")
+            continue
+        bundle.reset()  # the autonomous act left its queue: every chunk starts from a reset policy
+        try:
+            make_steering(bundle, table)
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            hi(f"[INFO] steered timing {name} ({table.mode}) did not run: {_error(error)}")
+            continue
+        started = time.monotonic()
+        bundle.act(prepared, command)
+        act_ms = 1000.0 * (time.monotonic() - started)
+        bundle.reset()
+        hi(
+            _chunk_line(
+                name,
+                table.mode,
+                prepare_ms + act_ms,
+                config,
+                detail=f"prepare {prepare_ms:.0f} + act {act_ms:.0f}",
+            )
+        )
+
+
 def policy_section(config: Config, observation, lines: list[str] | None = None) -> Report:
-    """The checkpoint, the statistics file, and one timed prepare + act."""
+    """The checkpoint, the statistics file, one timed prepare + act, and the steered modes' timing."""
     if shutil.which("nvidia-smi") is None:
         return _unavailable(
             [] if lines is None else lines,
@@ -652,6 +777,7 @@ def policy_section(config: Config, observation, lines: list[str] | None = None) 
         f"one {config.station.rate:g} Hz tick is {tick:.1f} ms"
     )
     hi(f"action (8, action units): {_vec(action)}")
+    _steered_timing(config, prepared, prepare_ms, bundle, lines)
     keys = sorted(key for key in prepared if key.startswith("observation.images."))
     third = "present" if "observation.images.right_wrist_0_rgb" in prepared else "omitted (zero mask)"
     hi(f"image keys present: {', '.join(keys) or 'none'}; third camera: {third}")

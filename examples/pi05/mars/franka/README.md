@@ -89,13 +89,18 @@ One 3Dconnexion device can expose several hidraw nodes and only one carries the 
 saw five nodes for one mouse and translation reports on `/dev/hidraw8` only, so the source searches
 for the node that reports instead of taking the first by name. The section prints, per 3Dconnexion
 node, its `HID_NAME` and report-descriptor size, then tallies every `(report id, byte length)` pair
-and the max `|int16|` of the triple at offset 1 and — for a payload of 12 bytes or more — the second
-triple at offset 7. That is how a six-axis single report, or a rotation report under another id, shows
-up even when id 2 never arrives. Finally it prints which node the real source picks, the rest
-six-vector it captures and whether it tared.
+and the max `|int16|` of the translation triple at offset 1 and — for a payload of 12 bytes or more —
+the rotation triple at offset 7. The verdict accepts both device layouts: rotation is present when
+id 2 reports arrive (a SpaceMouse Pro and similar) or when the id 1 six-axis report's second triple
+moved above a few counts (a SpaceMouse Wireless through its Universal Receiver sends all six axes in
+one 13-byte report and no id 2 at all, which is what the station measured). The section prints the
+translation and rotation peaks to copy as the two full scales. Finally it prints which node the real
+source picks, the rest six-vector it captures and whether it tared.
 
 The first probe run downloads and loads the checkpoint, so the policy section can take minutes. Its
-`chunk time` is the number that decides whether the chunk pause fits the control loop, so record it.
+`chunk time` (the autonomous chunk) and the `steered chunk time fc`/`frs` lines after it (the same
+prepare plus each mode's chunk-boundary act) are the numbers that decide whether the chunk pause fits
+the control loop, so record them.
 
 Copy the report's hardware facts into the config while the report is fresh:
 
@@ -758,16 +763,26 @@ sessions. The probe prints both the pose and the 7×7 `F` it produces.
   file as above.
 - **The SpaceMouse is not found, or its axes are wrong** — the probe's SpaceMouse section lists every
   hidraw node with its `HID_ID` and marks the 3Dconnexion ones: no node means the device or the udev
-  rule, a silent node means the stick or the wrong interface, and a missing id 2 means rotation is
-  not arriving. The probe names the node the source picks (`source would pick:`) and tallies
-  `(id, byte length)` pairs: if id 2 never arrives, twist again and look for a wider report whose
-  second triple (offset 7) is the rotation. Fix the direction with `[spacemouse] source`/`sign` after
-  a low-gain jog; the probe cannot see a sign because that needs motion.
+  rule, a silent node means the stick or the wrong interface. Rotation is one check over both device
+  layouts, so a `[FAIL] id 2 (rotation) reports` on the combined layout means neither the id 2 path
+  nor the id 1 six-axis report's second triple (offset 7) moved. The probe names the node the source
+  picks (`source would pick:`) and tallies `(id, byte length)` pairs: a six-axis single report is
+  13 bytes, and its second triple is the rotation. Fix the direction with `[spacemouse] source`/`sign`
+  after a low-gain jog; the probe cannot see a sign because that needs motion.
 - **A pause every chunk** — expected in Phase A. The probe's `chunk time` is how long the
   pre-processor plus one denoising pass takes; when it exceeds one control period you get a pause
-  every `n_action_steps` actions. The loop does not hide it (no prefetch, no compile, no real-time
-  chunking in Phase A); it is a measured session fact, so compare a run's behaviour with the probe's
-  number before looking for a fault.
+  every `n_action_steps` actions. The station measured **640 ms** (prepare 6 + act 634) for the
+  autonomous chunk on the 5090, and at `n_action_steps = 8` the window is only 533 ms of actions, so
+  the pause is already ~107 ms per chunk. The probe now also prints `steered chunk time fc` and
+  `steered chunk time frs` after the autonomous chunk: each is the same prepare plus the mode's
+  chunk-boundary act, and FRS's reversal does roughly twice the velocity evaluations, so those are
+  the numbers that decide whether the 15 Hz loop stalls. The loop does not hide the pause (no
+  prefetch, no compile, no real-time chunking in Phase A); it is a measured session fact, so compare
+  a run's behaviour with the probe's numbers before looking for a fault. If the pause matters, raise
+  `[policy] n_action_steps` toward the checkpoint's 15: the same chunk cost then spans 15 control
+  periods instead of 8 (1000 ms instead of 533 ms), at the cost of a longer executed prefix before
+  the operator's next command is read; `[modes.*] pinned_steps` (FRS's executed reversal prefix)
+  follows it up so the same prefix is pinned.
 - **`teleop --corrupted` refuses to start with a missing statistics file** — the readout's noise is
   in action-standard-deviation units and the std comes from `assets/droid/norm_stats.json`. Plain
   `teleop` is clean and does not need it; `--corrupted` and every shared command do. Download the
@@ -792,7 +807,7 @@ facts the code cannot know.
 | gripper ends: the `gripper_position` value that closes the jaws | |
 | reset pose `q0` | |
 | `||F7||2`, auto gain, noise sigma | |
-| chunk time (ms) at `n_action_steps` | |
+| chunk time (ms) at `n_action_steps`: autonomous / `fc` / `frs` | |
 | third camera convention | |
 | user module: states file, scene, collecting runs | |
 | `train-user` wall time, final held-out loss | |
