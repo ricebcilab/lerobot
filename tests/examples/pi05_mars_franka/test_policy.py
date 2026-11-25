@@ -1,11 +1,14 @@
-"""``Bundle.action``, ``make_steering`` and ``load_bundle``: the policy half, tested without a checkpoint.
+"""``Bundle.prepare``/``Bundle.action``, ``make_steering`` and ``load_bundle``: the policy half, no checkpoint.
 
 The steering-policy tests use a fake base policy that satisfies the sampler contract (a config with
 pi0.5's fields, ``predict_action_chunk`` honouring the cores' hooks, ``reset``, ``velocity_field``) and
 a fake postprocessor carrying action statistics, so no checkpoint, tokenizer or GPU is needed. The
-statistics half (``install_stats`` against real normalization steps) is ``test_stats.py``. Only the
-end-to-end test at the bottom needs the real pi0.5: it is skipped unless the gated PaliGemma tokenizer,
-CUDA and openpi's droid statistics are all present (it runs on chopper).
+statistics half (``install_stats`` against real normalization steps) is ``test_stats.py``. The
+pre-processor regression tests need only the cached checkpoint's own config and processor JSONs and
+openpi's statistics asset; the gated tokenizer is stubbed out, so they run on CPU and skip cleanly when
+the cache or the asset is absent. Only the end-to-end test at the bottom needs the real pi0.5: it is
+skipped unless the gated PaliGemma tokenizer, CUDA and openpi's droid statistics are all present (it
+runs on chopper).
 """
 
 import dataclasses
@@ -38,7 +41,8 @@ from policy import (
     teleop_action,
 )
 from scene import Scene
-from stats import CHECKPOINT_WIDTH
+from station import IMAGE_SIZE, observation_batch
+from stats import CHECKPOINT_WIDTH, install_stats
 
 from lerobot.policies.steering import (
     VLM_SCENE_DIM,
@@ -190,11 +194,26 @@ FC = ExampleSteering(mode="flow_control", tau=3, lam=1, ic_gain=2.0, n_reversal_
 FRS = ExampleSteering(mode="frs", n_reversal_steps=6, pinned_steps=8)
 
 
+def _prepared_like_the_real_pipeline(raw_batch: dict) -> dict:
+    """A stand-in for the real pre-processor: the types and batch dimension it leaves for the policy.
+
+    The real pipeline turns the station's ``(32,)`` state into a ``(1, 32)`` tensor; the steering policy
+    reads the batch size from the first tensor in the batch, so a fake preprocessor must add that
+    dimension too -- a bare ``(32,)`` tensor would be read as a batch of 32 rows -- or the command's
+    ``(1, 7)`` would not match it.
+    """
+    batch = dict(raw_batch)
+    state = batch.get("observation.state")
+    if state is not None:
+        batch["observation.state"] = torch.as_tensor(np.asarray(state), dtype=torch.float32)[None]
+    return batch
+
+
 def _fake_bundle(*, with_stats: bool = True) -> Bundle:
     """A ``Bundle`` over the fake policy and postprocessor, with 8-wide statistics unless asked otherwise."""
     return Bundle(
         policy=_FakePolicy(),
-        preprocessor=lambda raw_batch: dict(raw_batch),
+        preprocessor=_prepared_like_the_real_pipeline,
         postprocessor=_FakePostprocessor(),
         mean=np.zeros(STATION_DIMS) if with_stats else None,
         std=np.full(STATION_DIMS, 0.25) if with_stats else None,
@@ -281,7 +300,7 @@ class _CountingPreprocessor:
 
     def __call__(self, raw_batch: dict) -> dict:
         self.calls += 1
-        return dict(raw_batch)
+        return _prepared_like_the_real_pipeline(raw_batch)
 
 
 def test_steering_batch_is_the_preprocessor_and_the_caller_adds_the_command():
@@ -657,14 +676,17 @@ def test_prepare_encodes_the_scene_pictures_before_the_base_preprocessor(tmp_pat
     assert torch.is_tensor(tokens)
     assert tokens.shape == (1, VLM_SCENE_TOKENS, VLM_SCENE_DIM)
     assert tokens.dtype == torch.float16
-    # the base pre-processor ran after the scene step, on its output
+    # the base pre-processor ran after the scene step, on its output adapted for the pipeline
     assert seen["batch"] is not raw_batch
     np.testing.assert_array_equal(seen["batch"][OBS_SCENE_TOKENS].numpy(), tokens.numpy())
-    np.testing.assert_array_equal(seen["batch"]["observation.state"], raw_batch["observation.state"])
-    assert seen["batch"]["task"] == "pick the cube"
+    assert torch.is_tensor(seen["batch"]["observation.state"])
+    np.testing.assert_array_equal(seen["batch"]["observation.state"].numpy(), raw_batch["observation.state"])
+    assert seen["batch"]["task"] == ["pick the cube"]
 
 
-def test_prepare_without_a_scene_is_the_base_preprocessor_on_the_raw_batch(tmp_path, monkeypatch):
+def test_prepare_without_a_scene_adapts_the_stations_batch_for_the_preprocessor(tmp_path, monkeypatch):
+    """Without a scene the batch is the station's plus ``_policy_batch``'s adapter: the numpy arrays are
+    tensors and the bare prompt is a one-element list (the caller's own batch is not mutated)."""
     ctx = _fake_loading(monkeypatch, tmp_path)
     seen = {}
 
@@ -678,8 +700,12 @@ def test_prepare_without_a_scene_is_the_base_preprocessor_on_the_raw_batch(tmp_p
 
     prepared = bundle.prepare(raw_batch)
 
-    assert seen["batch"] is raw_batch and prepared == raw_batch
+    assert seen["batch"] is not raw_batch
+    assert torch.is_tensor(seen["batch"]["observation.state"])
+    assert seen["batch"]["observation.state"].shape == (32,)
+    assert seen["batch"]["task"] == ["pick"]
     assert OBS_SCENE_TOKENS not in prepared
+    assert raw_batch["task"] == "pick" and isinstance(raw_batch["observation.state"], np.ndarray)
 
 
 @pytest.mark.parametrize("source", ["cnn", "discs"])
@@ -689,6 +715,182 @@ def test_load_bundle_refuses_a_task_checkpoint_whose_scene_is_out_of_scope(tmp_p
     path = _task_checkpoint(tmp_path / "task.pt", source)
     with pytest.raises(ValueError, match="out of scope"):
         load_bundle(ExampleConfig(), device="cpu", task=path)
+
+
+# ---------------------------------------------------------------- the station's types, the pipeline's
+
+STATION_CAMERAS = {"exterior": "scene_rgb", "wrist": "wrist_rgb"}
+"""The config's camera role -> station feed mapping, as ``station.observation_batch`` reads it."""
+
+
+def _station_batch() -> dict:
+    """One station observation as ``station.observation_batch`` hands it to ``Bundle.prepare``."""
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    observation = {
+        "follower/joint_position": np.arange(ARM_DIMS, dtype=np.float64) / 10.0,
+        "follower/gripper_position": np.array([0.25]),
+        "scene_rgb": frame,
+        "wrist_rgb": np.flipud(frame),
+    }
+    return observation_batch(observation, arm="follower", cameras=STATION_CAMERAS, task="pick up the cube")
+
+
+def test_prepare_adapts_the_stations_numpy_batch_to_the_pipelines_types():
+    """The station hands numpy arrays and a bare prompt string; the pre-processor's batch step batches
+    only tensors and pi0.5's state tokenizer iterates a list of prompts. ``prepare`` is the adapter: it
+    converts the arrays with ``torch.from_numpy`` (keeping their unbatched shapes, which is what the
+    batch step then grows) and wraps the prompt in a one-element list."""
+    seen = {}
+    bundle = Bundle(
+        policy=None,
+        preprocessor=lambda batch: seen.update(batch=batch) or batch,
+        postprocessor=None,
+    )
+    raw_batch = _station_batch()
+
+    prepared = bundle.prepare(raw_batch)
+
+    adapted = seen["batch"]
+    assert adapted is not raw_batch
+    for key in ("observation.images.base_0_rgb", "observation.images.left_wrist_0_rgb"):
+        assert torch.is_tensor(adapted[key])
+        assert adapted[key].shape == (3, IMAGE_SIZE, IMAGE_SIZE)
+        assert adapted[key].dtype == torch.float32
+        np.testing.assert_array_equal(adapted[key].numpy(), raw_batch[key])
+    assert torch.is_tensor(adapted["observation.state"])
+    assert adapted["observation.state"].shape == (CHECKPOINT_WIDTH,)
+    assert adapted["task"] == ["pick up the cube"]
+    assert prepared is adapted  # what the pre-processor returns is what prepare returns
+    # the adapter copies the dict: the caller's batch and its values are untouched
+    assert raw_batch["task"] == "pick up the cube"
+    assert isinstance(raw_batch["observation.state"], np.ndarray)
+
+
+def test_prepare_leaves_an_already_tensor_batch_and_a_prompt_list_alone():
+    """The adapter converts only the station's types: a batch already in the pipeline's (tensors, the
+    scene step's tokens, a caller's prompt list) goes through untouched, so nothing is batched or
+    wrapped twice."""
+    image = torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE)
+    state = torch.zeros(CHECKPOINT_WIDTH)
+    tokens = torch.zeros(1, VLM_SCENE_TOKENS, VLM_SCENE_DIM, dtype=torch.float16)
+    prompt = ["pick up the cube"]
+    raw_batch = {
+        "observation.images.base_0_rgb": image,
+        "observation.state": state,
+        OBS_SCENE_TOKENS: tokens,
+        "task": prompt,
+    }
+    seen = {}
+    bundle = Bundle(
+        policy=None,
+        preprocessor=lambda batch: seen.update(batch=batch) or batch,
+        postprocessor=None,
+    )
+
+    bundle.prepare(raw_batch)
+
+    adapted = seen["batch"]
+    assert adapted["observation.images.base_0_rgb"] is image
+    assert adapted["observation.state"] is state
+    assert adapted[OBS_SCENE_TOKENS] is tokens
+    assert adapted["task"] is prompt
+
+
+# ---------------------------------------------------------------- the real pre-processors (CPU)
+
+PROCESSOR_FILES = ("config.json", "policy_preprocessor.json", "policy_postprocessor.json")
+"""The checkpoint's own files the pre-processor regression needs: its config and its two pipelines."""
+
+
+def _real_processors_ready() -> bool:
+    """The cached checkpoint's config and processor JSONs and openpi's statistics: no weights needed."""
+    if not REAL_STATS.is_file():
+        return False
+    from huggingface_hub import try_to_load_from_cache
+
+    cached = [try_to_load_from_cache("lerobot/pi05_droid", name) for name in PROCESSOR_FILES]
+    return all(isinstance(path, str) for path in cached)
+
+
+@pytest.fixture
+def real_processors(monkeypatch) -> Bundle:
+    """The cached checkpoint's real pre/post-processors on CPU, the gated tokenizer stubbed out.
+
+    The stub is what makes this runnable on a machine without the gated PaliGemma tokenizer:
+    ``TokenizerProcessorStep.__post_init__`` would load it from the Hub and ``__call__`` would tokenize
+    the prompt. The defect is about the batch handed to those two steps, not about token ids, so both
+    are replaced by no-ops. The checkpoint's weights are not loaded either: ``policy`` stays ``None``
+    (``prepare`` never reads it); the pre-processor is loaded from the cached snapshot directory so
+    nothing touches the network.
+    """
+    if not _real_processors_ready():
+        pytest.skip("needs the cached lerobot/pi05_droid processor JSONs and openpi's droid statistics")
+    from huggingface_hub import snapshot_download
+
+    import lerobot.processor.tokenizer_processor as tokenizer_processor
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies import make_pre_post_processors
+
+    monkeypatch.setattr(tokenizer_processor.TokenizerProcessorStep, "__post_init__", lambda self: None)
+    monkeypatch.setattr(
+        tokenizer_processor.TokenizerProcessorStep, "__call__", lambda self, transition: transition
+    )
+    snapshot = snapshot_download("lerobot/pi05_droid", local_files_only=True)
+    policy_cfg = PreTrainedConfig.from_pretrained(snapshot)
+    policy_cfg.pretrained_path = snapshot
+    policy_cfg.device = "cpu"
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy_cfg,
+        pretrained_path=snapshot,
+        preprocessor_overrides={
+            "device_processor": {"device": "cpu"},
+            "rename_observations_processor": {"rename_map": {}},
+        },
+    )
+    mean, std = install_stats(preprocessor, postprocessor, REAL_STATS)
+    return Bundle(policy=None, preprocessor=preprocessor, postprocessor=postprocessor, mean=mean, std=std)
+
+
+def test_the_real_pre_processor_takes_the_stations_raw_batch(real_processors):
+    """The chopper probe's section-4 failure: ``prepare`` on ``station.observation_batch``'s batch raised
+    ``TypeError: 'numpy.int64' object is not iterable`` in pi0.5's state tokenizer (the state was never
+    batched and the prompt was a bare string). Through the real cached pre-processor, ``prepare`` now
+    hands the model two ``(1, 3, 224, 224)`` float32 images, a ``(1, 32)`` float32 state, and one prompt
+    built from the whole task text rather than one per character."""
+    raw_batch = _station_batch()
+    assert isinstance(raw_batch["observation.state"], np.ndarray)
+    assert raw_batch["observation.state"].shape == (CHECKPOINT_WIDTH,)
+    assert raw_batch["observation.images.base_0_rgb"].shape == (3, IMAGE_SIZE, IMAGE_SIZE)
+
+    prepared = real_processors.prepare(raw_batch)
+
+    for key in ("observation.images.base_0_rgb", "observation.images.left_wrist_0_rgb"):
+        assert torch.is_tensor(prepared[key])
+        assert prepared[key].shape == (1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        assert prepared[key].dtype == torch.float32
+    state = prepared["observation.state"]
+    assert torch.is_tensor(state) and state.shape == (1, CHECKPOINT_WIDTH) and state.dtype == torch.float32
+    assert len(prepared["task"]) == 1
+    prompt = prepared["task"][0]
+    assert prompt.startswith("Task: pick up the cube, State: ")
+    assert prompt.endswith(";\nAction: ")
+
+
+def test_the_real_pre_processor_does_not_batch_a_tensor_batch_twice(real_processors):
+    """A batch already in the pipeline's types goes straight through the real pre-processor: the images
+    keep one batch dimension (not ``(1, 1, 3, 224, 224)``) and the prompt list stays one prompt."""
+    raw_batch = _station_batch()
+    batch = {
+        key: (torch.from_numpy(value) if isinstance(value, np.ndarray) else [value])
+        for key, value in raw_batch.items()
+    }
+
+    prepared = real_processors.prepare(batch)
+
+    for key in ("observation.images.base_0_rgb", "observation.images.left_wrist_0_rgb"):
+        assert prepared[key].shape == (1, 3, IMAGE_SIZE, IMAGE_SIZE)
+    assert prepared["observation.state"].shape == (1, CHECKPOINT_WIDTH)
+    assert len(prepared["task"]) == 1
 
 
 # ---------------------------------------------------------------- the real checkpoint (chopper)

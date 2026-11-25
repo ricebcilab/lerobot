@@ -90,10 +90,12 @@ class _LinearPolicy:
 
 
 class _BatchingPreprocessor:
-    """The little it takes of the real pre-processor: a raw observation into a B = 1 tensor batch.
+    """The little it takes of the real pre-processor: a prepared observation into a B = 1 tensor batch.
 
-    The scene step's output is already a batch (``[1, 256, 2048]``), so it is passed through; every
-    raw observation key gets the leading batch dimension the policies read.
+    ``Bundle.prepare`` is the adapter that makes the station's numpy arrays tensors and its prompt a
+    one-element list (see ``policy._policy_batch``), so this fake preprocessor is the next step: the
+    scene step's output is already a batch (``[1, 256, 2048]``) and is passed through, every other
+    observation key gets the leading batch dimension the policies read.
     """
 
     def __call__(self, raw: dict) -> dict:
@@ -101,10 +103,10 @@ class _BatchingPreprocessor:
         for key, value in raw.items():
             if key == OBS_SCENE_TOKENS:
                 out[key] = value if torch.is_tensor(value) else torch.as_tensor(value)
-            elif isinstance(value, str):
-                out[key] = [value]
+            elif isinstance(value, list):
+                out[key] = value
             else:
-                out[key] = torch.as_tensor(np.array(value, copy=True))[None]
+                out[key] = torch.as_tensor(value)[None]
         return out
 
 
