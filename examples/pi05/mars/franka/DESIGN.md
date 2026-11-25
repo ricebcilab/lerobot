@@ -217,7 +217,9 @@ applies gain/noise, and redraws a per-trial `random` family at every episode —
 matrix, because that matrix *is* the session's corruption.
 - The command is read **once per chunk** in the shared modes (`tick % n_action_steps == 0`) and **every
   tick** in teleop; the steering core reads the batch's command only when its queue is empty, so a
-  per-tick read would change nothing.
+  per-tick read would change nothing. The whole served command — IK at the boundary pose, the corruption,
+  the gain and **one noise draw** — is computed at that boundary and held for the chunk, so a seeded run's
+  noise sequence does not depend on `n_action_steps`.
 - `run_recording` follows c3po's documented `recording()` pattern (`n`/`r`/`q` flags, `cancel_episode`),
   takes a `RecordingStation`, downloads the dataset with its `download` after the recording context exits and
   before `close`, and returns its local path.
@@ -225,8 +227,9 @@ matrix, because that matrix *is* the session's corruption.
   episode, applies `gain = 1/||F7||2` (`auto`) and `sigma = readout.noise * action_std[:7]`, and redraws a
   per-trial `random` family (F7, gain and the `mars-f` adapter matrix) at every episode. It prints the resolved
   corruption, `q0`, `F7` and gain once, when it first resolves them.
-- No sleeps, no counters of station ticks. `trace` prints one line per tick: tick, command, action, q,
-  gripper, chosen method.
+- No sleeps, no counters of station ticks. `trace` prints one line per tick: tick, mode, the command in force
+  for that chunk, the action, the joint positions before it, and the operator's gripper bit (a dash in the
+  shared modes, where the gripper is the policy's).
 
 ### `cli.py`
 
