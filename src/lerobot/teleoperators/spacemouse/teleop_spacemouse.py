@@ -21,7 +21,7 @@ moves, including a zeroing report on release, a rotation report (id 2: three int
 rx, ry, rz) whenever it is twisted, and a button report (id 3: a bitmask) whenever a button
 changes. Device channels: x is a push to the right (+), y a pull toward you (+), z a press down
 (+); the rotation channels are the device's own rx, ry, rz order. The rotation full scale is not
-known yet (the probe measures it), so `rotation` divides by `FULL_SCALE` unless
+known yet (the probe measures it), so `rotation` divides by the translation's full scale unless
 `SPACEMOUSE_ROTATION_FULL_SCALE` overrides it.
 
 `SpaceMouseReader` keeps the latest state in a background thread; `SpaceMouseTeleop` wraps it
@@ -231,13 +231,15 @@ def env_full_scale() -> float:
 
 
 def env_rotation_full_scale() -> float:
-    """The `SPACEMOUSE_ROTATION_FULL_SCALE` environment variable (raw counts at full rotation), default
-    `ROTATION_FULL_SCALE`: a guess, since the rotation full scale has not been measured on the hardware yet.
+    """The `SPACEMOUSE_ROTATION_FULL_SCALE` environment variable (raw counts at full rotation), falling back
+    to `SPACEMOUSE_FULL_SCALE` (unset = `FULL_SCALE`).
 
-    It is separate from `SPACEMOUSE_FULL_SCALE` because the translation and rotation reports are scaled
-    independently by the device.
+    The explicit rotation variable wins. Falling back to the translation's full scale keeps a user who set
+    only `SPACEMOUSE_FULL_SCALE` from getting a stale rotation scale; the device scales the two reports
+    independently, so a measured rotation scale still overrides it. The rotation full scale has not been
+    measured on the hardware yet, so the fallback is a guess either way.
     """
-    return float(os.environ.get("SPACEMOUSE_ROTATION_FULL_SCALE") or ROTATION_FULL_SCALE)
+    return float(os.environ.get("SPACEMOUSE_ROTATION_FULL_SCALE") or env_full_scale())
 
 
 class SpaceMouseAxes:
@@ -292,9 +294,9 @@ class SpaceMouseTwist:
 
     Without `path` the device is searched for by `hid_id` (default: the SPACEMOUSE_HID_ID environment
     variable, unset = any 3Dconnexion device); `full_scale` defaults to SPACEMOUSE_FULL_SCALE (unset =
-    `FULL_SCALE`) and the rotation scale to SPACEMOUSE_ROTATION_FULL_SCALE (unset = `ROTATION_FULL_SCALE`).
-    `reader` is the `SpaceMouseReader` underneath (buttons, presses, report counts); like it, `twist`
-    keeps its last value when the device is unplugged.
+    `FULL_SCALE`), and `rotation_full_scale` to SPACEMOUSE_ROTATION_FULL_SCALE (unset =
+    SPACEMOUSE_FULL_SCALE, unset = `FULL_SCALE`). `reader` is the `SpaceMouseReader` underneath (buttons,
+    presses, report counts); like it, `twist` keeps its last value when the device is unplugged.
     """
 
     def __init__(
@@ -304,6 +306,7 @@ class SpaceMouseTwist:
         path: str | None = None,
         hid_id: str | None = None,
         full_scale: float | None = None,
+        rotation_full_scale: float | None = None,
     ):
         self.source = np.asarray(source, dtype=np.intp)
         self.sign = np.asarray(sign, dtype=np.float64)
@@ -315,7 +318,11 @@ class SpaceMouseTwist:
             raise ValueError(f"source indexes the device channels 0-{TWIST_DIMS - 1}, got {source!r}")
         self.path = path or find_spacemouse(hid_id if hid_id is not None else env_hid_id())
         self.reader = SpaceMouseReader(
-            self.path, full_scale=full_scale if full_scale is not None else env_full_scale()
+            self.path,
+            full_scale=full_scale if full_scale is not None else env_full_scale(),
+            rotation_full_scale=rotation_full_scale
+            if rotation_full_scale is not None
+            else env_rotation_full_scale(),
         )
 
     def map(self, device_xyzrot) -> np.ndarray:
