@@ -14,4 +14,5 @@ The two do not share code: the feeding pipeline is a dataset converter plus a
 `mars/` is the MARS project: shared-autonomy steering of generative policies by a person's
 low-dimensional command. `mars/cursor/` runs it on a 2D cursor task with a flow-matching policy, a
 human-study portal, a simulated users x tasks grid and the paper's analysis; `mars/libero/` runs the
-same steering methods on pi0.5 in LIBERO. Start with [`mars/README.md`](mars/README.md).
+same steering methods on pi0.5 in LIBERO; `mars/franka/` steers pi0.5-DROID on an N-Droids Franka arm
+through a SpaceMouse. Start with [`mars/README.md`](mars/README.md).
