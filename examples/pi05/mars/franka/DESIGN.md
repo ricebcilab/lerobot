@@ -397,6 +397,12 @@ exact. The module models the *readout*, not a person: it is trained from cues, n
    dims (our operator commands every joint; LIBERO's translation-only loss is not ours).
 A faithful command leaves `U` the identity: a zero-initialised module is plain FRS.
 
+**Two fail-closed rules the trainer enforces.** It replays *this config's* `[readout]` over the states, so it
+refuses a states file whose recorded readout (corruption, noise, seed, and the `q0` when one is configured)
+differs from the config's — training on a file from another condition would silently learn that condition's
+inverse. And its active-row weight is `[command] deadband`, the same threshold the control loop steers by,
+not the readout module's default.
+
 **State collection.** `mars-franka <any session command> --record-states NAME` writes chunk-boundary states
 (the same `prepare` boundary the loop already has) to `assets/states/NAME/states.npz`, alongside whatever the
 station records. It adds no control behaviour. Format (frozen; numpy, no pickle):
@@ -428,9 +434,9 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
           horizon = null                           # null = the checkpoint's chunk_size
           d = 256 ; tdim = 64 ; time_embedding = "mars"
           step_rank = null ; cross_step_rank = 0 ; additive = false
-          correct_by = null
+          correct_by = null ; checkpoint = "assets/user/rotz20/user.pt"
 [training] steps = 3000 ; batch = 8 ; lr = 1e-3 ; val_frac = 0.1 ; seed = 0 ; log_every = 100
-          val_depths = [10, 4] ; device = "cuda" ; dtype = "bfloat16"
+          device = "cuda" ; val_depths = [10, 4]
 [states]  dir = "assets/states"                     # a session's --record-states NAME lands here
 [modes.mars-u]  mode = "frs" ; adapter_user = "assets/user/rotz20/user.pt"
 ```
