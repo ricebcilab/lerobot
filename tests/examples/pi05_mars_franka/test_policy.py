@@ -320,6 +320,84 @@ def test_act_takes_a_prepared_batch_and_returns_the_eights():
     assert np.isfinite(out).all()
 
 
+# ---------------------------------------------------------------- the tick's plan
+
+
+class _FakeSteering:
+    """A steering policy whose plan differs from the action it serves, so the study sees which is which."""
+
+    def __init__(self) -> None:
+        self.actions = 0
+        self.last_policy_action = None
+
+    def select_action(self, batch: dict) -> torch.Tensor:
+        self.actions += 1
+        self.last_policy_action = torch.full((1, CHECKPOINT_WIDTH), 3.0)
+        return torch.full((1, CHECKPOINT_WIDTH), 9.0)
+
+    def reset(self) -> None:
+        self.last_policy_action = None
+
+
+def test_plan8_is_the_steering_policys_plan_not_the_action():
+    """A steered fake whose plan (3.0) differs from the action it serves (9.0): ``plan8`` must be the
+    former, post-processed exactly as the action was."""
+    bundle = _fake_bundle()
+    steering = _FakeSteering()
+    bundle._cache["steering"] = steering
+    action = bundle.act({}, np.zeros(ARM_DIMS))
+    assert steering.actions == 1
+    np.testing.assert_array_equal(action, np.full(STATION_DIMS, 9.0))
+    plan = bundle.plan8
+    assert plan.shape == (STATION_DIMS,) and plan.dtype == np.float64
+    np.testing.assert_array_equal(plan, np.full(STATION_DIMS, 3.0))
+    assert not np.allclose(plan, action)
+
+
+def test_plan8_is_the_policys_own_chunk_in_a_steered_mode():
+    """The real ``SteeringPolicy``: in flow control the action carries the operator's written command
+    while the policy's own plan is the unsteered chunk it started from, so the two differ."""
+    bundle = _fake_bundle()
+    make_steering(bundle, FC)
+    batch = bundle.prepare({"observation.state": np.zeros(CHECKPOINT_WIDTH)})
+    action = bundle.act(batch, np.full(ARM_DIMS, 0.5))
+    plan = bundle.plan8
+    np.testing.assert_allclose(plan, np.zeros(STATION_DIMS))  # the fake policy's own chunk
+    assert not np.allclose(plan, action)  # the write is in the action, not in the plan
+
+
+def test_plan8_is_the_action_itself_when_nothing_steered():
+    """The autonomous mode has no steering policy: the action *is* the base policy's own chunk step,
+    so the plan is that same step, snapshotted for the tick."""
+    bundle = _fake_bundle()
+    action = bundle.act(bundle.prepare({"observation.state": np.zeros(CHECKPOINT_WIDTH)}))
+    np.testing.assert_array_equal(bundle.plan8, action)
+    assert bundle.plan8 is not action  # a snapshot, not the caller's array
+
+
+def test_plan8_is_the_action_for_a_mode_none_steering_table():
+    """A ``mode = "none"`` table (the S2 task-module anchor) steers nothing: the steering policy's
+    ``last_policy_action`` is the base's own chunk, and that is the action too."""
+    bundle = _fake_bundle()
+    make_steering(bundle, dataclasses.replace(FRS, mode="none"))
+    action = bundle.act({}, np.zeros(ARM_DIMS))
+    np.testing.assert_array_equal(bundle.plan8, action)
+
+
+def test_the_fake_bundle_never_has_a_plan_and_reset_clears_it():
+    """``--dry-run``'s fixed action is not a policy plan (None); a new episode drops the last plan."""
+    fake = fake_bundle()
+    fake.act(fake.prepare({}), np.zeros(ARM_DIMS))
+    assert fake.plan8 is None
+
+    bundle = _fake_bundle()
+    bundle._cache["steering"] = _FakeSteering()
+    bundle.act({}, np.zeros(ARM_DIMS))
+    assert bundle.plan8 is not None
+    bundle.reset()
+    assert bundle.plan8 is None
+
+
 def test_prepare_once_per_chunk_and_act_per_tick_matches_action_per_tick():
     """The policies read a batch only when their action queue is empty (once per ``n_action_steps``), so
     the loop can prepare once per chunk and act on the ticks in between: the same actions as calling the

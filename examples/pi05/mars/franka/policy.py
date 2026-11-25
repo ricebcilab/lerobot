@@ -15,8 +15,9 @@ step (``scene.Scene``) so ``prepare`` turns the scene camera's pictures into the
 reads; ``make_steering`` wraps the loaded policy in the mode's ``SteeringPolicy``;
 ``Bundle.prepare``/``Bundle.act`` are the two halves of a control tick — the batch once per chunk, the
 action every tick, because the policies only read a batch when their action queue is empty — and
-``Bundle.action`` is the convenient single call for callers without that boundary; and
-``teleop_action`` is the no-policy path's 8-wide action. The statistics half lives in ``stats.py``
+``Bundle.plan8`` is the base policy's own chunk step for the tick ``act`` just served (the study's
+authority needs it); ``Bundle.action`` is the convenient single call for callers without that
+boundary; and ``teleop_action`` is the no-policy path's 8-wide action. The statistics half lives in ``stats.py``
 (``install_stats``, with the ``normalize_processor.py`` lines it follows in that module's docstring).
 ``fake_bundle`` is the numpy-only stand-in ``--dry-run`` uses, so importing this module and driving it
 must not need torch, the checkpoint or the tokenizer: every lerobot import is inside the function that
@@ -86,6 +87,11 @@ class Bundle:
     two images, the tokenizer, the device transfer) once per chunk, ``act`` turns a prepared batch into
     one action every tick, and ``action`` is the convenient single call for callers without a chunk
     boundary.
+
+    ``plan8`` is the other half of the study's per-tick record: after ``act``, the base policy's own
+    chunk step for the tick just served, post-processed to ``(8,)`` action units. The steered modes
+    read the steering policy's ``last_policy_action`` (the base's chunk from the same noise); the
+    autonomous mode hands back its action (nothing steered), and the fake bundle has no plan at all.
     """
 
     policy: Any
@@ -96,6 +102,17 @@ class Bundle:
     deadband: float = DEFAULT_DEADBAND
     scene: Scene | None = None
     _cache: dict = field(default_factory=dict, repr=False, compare=False, hash=False)
+
+    @property
+    def plan8(self) -> NDArray | None:
+        """The base policy's own chunk step for the tick ``act`` just served, in action units ``(8,)``.
+
+        Set by ``act``: the steering policy's ``last_policy_action`` post-processed in the steered modes
+        (including a ``mode = "none"`` table, whose base chunk is the action too), the action itself in
+        the autonomous mode, and None for ``fake_bundle`` -- a dry run's fixed action is not a policy
+        plan -- and before the first tick (or after ``reset``).
+        """
+        return self._cache.get("plan8")
 
     def prepare(self, raw_batch: dict) -> dict:
         """The station's raw observation through the pre-processor: batched, normalized, tokenized, on device.
@@ -120,7 +137,8 @@ class Bundle:
 
         ``command7`` None: the base policy's action (``autonomous``); the operator's 7 joint-velocity
         command in action units otherwise (the steered modes, through the mode's ``SteeringPolicy``).
-        The action is post-processed and its first 8 dims returned as float64.
+        The action is post-processed and its first 8 dims returned as float64. ``plan8`` is set to the
+        tick's base-policy plan beside it (see the property).
 
         Without action statistics there is no action unit to return: the checkpoint's QUANTILES
         normalization is what maps the model's normalized output into action units, so this raises
@@ -128,6 +146,7 @@ class Bundle:
         """
         fixed = self._cache.get("fixed_action")
         if fixed is not None:  # --dry-run's bundle: the stand-in action, whatever the command
+            self._cache["plan8"] = None
             return fixed.copy()
         if self.mean is None or self.std is None:
             raise ValueError(
@@ -138,7 +157,27 @@ class Bundle:
             action = self.policy.select_action(batch)
         else:
             action = self._steering().select_action(_command_batch(batch, command7, _device(self)))
-        return _action_units(self.postprocessor(action))
+        action8 = _action_units(self.postprocessor(action))
+        self._cache["plan8"] = self._ticked_plan8(action8, command7)
+        return action8
+
+    def _ticked_plan8(self, action8: NDArray, command7: NDArray | None) -> NDArray:
+        """The base policy's own chunk step for the tick ``act`` just served, in action units.
+
+        Nothing steered in the autonomous mode, so the action itself is the base's chunk step. A steered
+        mode reads the steering policy's ``last_policy_action`` -- the base's own chunk from the same
+        noise, which the core served this tick's action from -- and unnormalizes it exactly as the action
+        was; the fake bundle never gets past ``act``'s fixed action.
+        """
+        if command7 is None:
+            return action8.copy()
+        plan = getattr(self._steering(), "last_policy_action", None)
+        if plan is None:
+            raise ValueError(
+                "the steering policy served no plan for this tick (last_policy_action is None): the "
+                "study's per-tick record needs the base policy's own chunk step"
+            )
+        return _action_units(self.postprocessor(plan))
 
     def action(self, raw_batch: dict, command7: NDArray | None = None) -> NDArray:
         """``act(prepare(raw_batch), command7)``: the convenient call, preprocessing every time.
@@ -150,6 +189,7 @@ class Bundle:
 
     def reset(self) -> None:
         """Start a new episode: the base policy's chunk queues and the steering policy's rollout state."""
+        self._cache["plan8"] = None
         reset = getattr(self.policy, "reset", None)
         if callable(reset):
             reset()

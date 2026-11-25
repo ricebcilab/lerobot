@@ -40,10 +40,17 @@ joint positions are the observation the action was computed from, i.e. the state
 action. ``run`` catches nothing: Ctrl-C propagates and the caller closes the station. ``run_recording`` follows c3po's documented ``recording()`` pattern (``n``/``r``/
 ``q`` flags, ``cancel_episode``), downloads the dataset before the caller closes the station, and
 returns its local path.
+
+``run``/``run_recording`` take the study's ``on_tick`` hook: called once per control step, before
+``station.step``, as ``on_tick(tick, action8, plan8, served7, q7)`` -- the executed action, the base
+policy's own chunk step for the tick (``Bundle.plan8``; None under teleop), the served command (None
+under ``autonomous``) and the joint positions the action was computed from. Without a hook the loop is
+unchanged.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +73,9 @@ if TYPE_CHECKING:
 
 MODES = ("teleop", "autonomous", "steered")
 """The loop's three modes: the operator alone, the policy alone, the operator through a method."""
+
+TickHook = Callable[[int, NDArray, NDArray | None, NDArray | None, NDArray], None]
+"""The per-tick hook: ``on_tick(tick, action8, plan8, served7, q7)``, called before ``station.step``."""
 
 
 class Loop:
@@ -118,6 +128,7 @@ class Loop:
         self._held_deflection: NDArray | None = None  # the deflection that command came from
         self._batch: dict | None = None  # the chunk's prepared batch, reused mid-chunk
         self._states: Recorder | None = None  # the caller's recorder, set by run/run_recording
+        self._on_tick: TickHook | None = None  # the caller's per-tick hook, set by run/run_recording
 
     # ------------------------------------------------------------ the run
 
@@ -128,6 +139,7 @@ class Loop:
         max_steps: int | None = None,
         trace: bool = False,
         states: Recorder | None = None,
+        on_tick: TickHook | None = None,
     ) -> None:
         """Drive one episode: ``max_steps`` ticks, or until interrupted (Ctrl-C propagates).
 
@@ -135,10 +147,15 @@ class Loop:
         positions are the observation that tick's action was computed from, i.e. the state *before*
         the action. ``states`` is an optional ``statefiles.Recorder``: one pre-action state row is
         appended at every chunk boundary (``_record``), in every mode. The loop never saves it -- the
-        CLI does, like the dataset download -- so an interrupted run writes no partial file. The
-        caller closes the station.
+        CLI does, like the dataset download -- so an interrupted run writes no partial file.
+        ``on_tick`` is the study's per-tick hook, called once per control step before ``station.step``
+        as ``on_tick(tick, action8, plan8, served7, q7)``: the action being sent, the base policy's own
+        chunk step for it (``Bundle.plan8``; None under teleop), the served command (None under
+        autonomous) and the observation's joint positions the action was computed from. The caller
+        closes the station.
         """
         self._states = states
+        self._on_tick = on_tick
         obs = self._station.reset()
         self._begin_episode(obs)
         tick = 0
@@ -154,6 +171,7 @@ class Loop:
         prompt: str,
         trace: bool = False,
         states: Recorder | None = None,
+        on_tick: TickHook | None = None,
     ) -> Path:
         """Record episodes with c3po's keyboard flags, download the dataset, return its local path.
 
@@ -164,7 +182,8 @@ class Loop:
         returned path is the station's (``dest / name`` for c3po). ``states`` is the same optional
         recorder ``run`` takes; it collects rows from every episode, and a ``r`` re-record retracts the
         discarded take's rows (``Recorder.drop_episode``) together with c3po's dataset cancel, so only
-        takes the operator kept reach the file.
+        takes the operator kept reach the file. ``on_tick`` is ``run``'s per-tick hook, called the same
+        way in every episode.
         """
         station = self._station
         if not isinstance(station, RecordingStation):
@@ -175,6 +194,7 @@ class Loop:
         destination = Path(dest)
         destination.mkdir(parents=True, exist_ok=True)
         self._states = states
+        self._on_tick = on_tick
         with station.record(name) as rec:
             while not rec.stop:
                 obs = station.reset()
@@ -218,7 +238,9 @@ class Loop:
         boundary's *pre-action* state: the raw batch before the pre-processor, the observation's joint
         positions and gripper, the deflection the command was read from and the served command in
         force. The call happens before the action is computed, and it neither draws a random number
-        nor reads the operator's device again, so the actions are the same with or without it.
+        nor reads the operator's device again, so the actions are the same with or without it. The
+        per-tick hook (``_on_tick``), when there is one, is called last, before the caller's
+        ``station.step``: it draws nothing and moves nothing either.
         """
         chunk_start = tick % self._n_action_steps == 0
         if self._mode == "teleop":
@@ -240,6 +262,9 @@ class Loop:
             action = self._bundle.act(self._batch, served)
         if trace:
             self._trace(tick, served, action, obs)
+        if self._on_tick is not None:
+            plan8 = None if self._mode == "teleop" else self._bundle.plan8
+            self._on_tick(tick, action, plan8, served, bridge.nominal_pose(obs, self._arm))
         return action
 
     def _command(self, obs: dict[str, NDArray]) -> NDArray:
