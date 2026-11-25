@@ -536,7 +536,7 @@ may not restore the scene.
 
 **Per-tick record (the loop's hook).** `Loop.run(..., on_tick=callback)` calls
 `callback(tick, action8, plan8 | None, served7 | None, q7)` once per control step, before `station.step`. `plan8`
-is the base policy's own chunk step for that tick, unnormalized (`Bundle.plan`), or None under teleop; `served7`
+is the base policy's own chunk step for that tick, unnormalized (`Bundle.plan8`), or None under teleop; `served7`
 is the command in force (None under autonomous). Nothing else in the loop changes. The study writes those rows to
 `<out>/<run>/trials/<arm>-<pair>.npz` (`executed` (T,8), `plan` (T,8), `served` (T,7), `q` (T,7)).
 
@@ -557,6 +557,11 @@ the per-arm table — `n`, the success rate with a Wilson 95% interval, mean aut
 matched `(pair, scene_hash)` trials — McNemar's exact test for success, the Wilcoxon signed-rank test for
 authority — between every pair of arms. It is a library plus a `mars-franka analyse` command? No: it is a
 `python -m …`-free command, `mars-franka analyse --run <dir> [--run <dir>...]`, printing the tables.
+
+**Commands.** `mars-franka study --config … --prompt "…"` runs the block the `[study]` section describes and
+writes the records; `mars-franka analyse --run <dir> [--run <dir> …]` prints the tables. Any name that is not a
+fixed command but names a `[modes.<name>]` table runs that mode, which is how a `policy+task` anchor
+(`mode = "none"`, `adapter_task = …`) is run without new code.
 
 **Config.**
 ```toml
