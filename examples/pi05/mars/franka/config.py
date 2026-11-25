@@ -15,7 +15,9 @@ example's directory, not the caller's working directory. Phase B's ``[user]`` an
 tables are the user-module trainer's knobs (DESIGN.md, "Phase B"); the ``null`` defaults there
 (``horizon``, ``step_rank``, ``correct_by``) are the absent key, since TOML cannot spell a null.
 Phase C's ``[task]`` table is the task-module trainer's (DESIGN.md, "Phase C"): the demonstrations
-dataset, the output, and the module's scene and width knobs; ``[training]`` is shared with it.
+dataset, the output, and the module's scene and width knobs; ``[training]`` is shared with it. The
+Phase C arms' tables assert their composition: ``[modes.mars-t]`` must name ``adapter_task`` and the
+composed ``[modes.mars]`` both adapters, so an arm's name cannot describe a plain FRS run.
 """
 
 from __future__ import annotations
@@ -61,6 +63,17 @@ _MODE_KNOBS = {
     "frs": frozenset({"n_reversal_steps", "pinned_steps", "adapter_matrix", "adapter_user", "adapter_task"}),
 }
 """The knobs each steering mode reads; a mode table may not set another mode's knobs."""
+
+_MODE_ADAPTERS = {
+    "mars-t": ("task",),
+    "mars": ("user", "task"),
+}
+"""The Phase C arms' names assert their composition: a ``mars-t`` table with no task module would be
+plain FRS under the task arm's name, and the composed ``mars`` is user ∘ task, so it needs both. A
+custom mode name (``fc``, ``frs``, a study's own table) requires nothing beyond its mode's knobs."""
+
+_ADAPTER_TOOLS = {"user": ("[user] checkpoint", "train-user"), "task": ("[task] checkpoint", "train-task")}
+"""Where an adapter checkpoint comes from, for the messages: its config section and the trainer that writes it."""
 
 
 # ---------------------------------------------------------------- the config tree
@@ -588,7 +601,24 @@ def _modes(table: Any, base: SteeringConfig) -> Mapping[str, SteeringConfig]:
             if key in knobs
         }
         resolved[name] = replace(base, mode=mode, **knobs)
+        _check_arm_adapters(name, resolved[name], where)
     return MappingProxyType(resolved)
+
+
+def _check_arm_adapters(name: str, steering: SteeringConfig, where: str) -> None:
+    """The Phase C arms' tables must name the modules their names assert (``_MODE_ADAPTERS``).
+
+    A study's data is the arms' names: a ``mars-t`` run that loaded no task module would be plain FRS
+    reported as the task arm. The checkpoint itself is checked at run composition (it may not exist
+    yet); this checks that the table asks for one.
+    """
+    for kind in _MODE_ADAPTERS.get(name, ()):
+        if getattr(steering, f"adapter_{kind}") is None:
+            section, tool = _ADAPTER_TOOLS[kind]
+            raise ValueError(
+                f"{where}: the {name!r} arm is FRS with the {kind} module, so it must name adapter_{kind} "
+                f"(the checkpoint `mars-franka {tool}` writes, {section}); add `adapter_{kind} = ...`"
+            )
 
 
 # ---------------------------------------------------------------- reading a file

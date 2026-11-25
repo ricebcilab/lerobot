@@ -18,11 +18,14 @@ timestamp, so a collected file can be replayed against the config that produced 
 ``teleop`` is the operator alone (no bundle, no steering), ``autonomous`` the policy alone, and
 ``fc``/``frs``/``mars-f``/``mars-u``/``mars-t``/``mars`` read their ``[modes.<command>]`` table
 and steer the policy with it; a missing table is named with how to add it, and a mode whose adapter
-checkpoint is absent names that file (the shipped config ships ``mars-u``, whose checkpoint Phase B's
-``train-user`` writes). ``--prompt`` is required by every policy
-command, optional for teleop and probe. ``teleop`` without ``--corrupted`` uses the **clean**
-readout (no corruption, no noise), the demonstration-collection path; ``teleop --corrupted`` and
-every shared command use the config's ``[readout]``. The loop owns the readout and prints what it
+checkpoint is absent names that file (the shipped config ships ``mars-u``, ``mars-t`` and the composed
+``mars``, whose checkpoints Phase B's ``train-user`` and Phase C's ``train-task`` write). A mode that
+names ``adapter_task`` hands that checkpoint to ``policy.load_bundle(config, task=...)``, so the bundle
+carries the task module's recorded scene step and the loop adds the scene camera's frame to every
+chunk's batch; a mode without one loads the bundle exactly as before. ``--prompt`` is required by
+every policy command, optional for teleop and probe. ``teleop`` without ``--corrupted`` uses the
+**clean** readout (no corruption, no noise), the demonstration-collection path; ``teleop --corrupted``
+and every shared command use the config's ``[readout]``. The loop owns the readout and prints what it
 resolves; this module only chooses the config. ``--record NAME`` switches to
 ``Loop.run_recording`` and prints the dataset path it returns.
 
@@ -249,7 +252,7 @@ def _train_task(args: argparse.Namespace, config: Config) -> int:
 def _run(args: argparse.Namespace, config: Config) -> int:
     """Build the command's objects, close the devices whichever way the run ends, and print the dataset."""
     method = _method(args.command, config, args.config)
-    bundle, steering = _policy(method, config, dry_run=args.dry_run)
+    bundle, steering = _policy(method, config, dry_run=args.dry_run, command=args.command)
     prompt = "" if args.prompt is None else args.prompt
     with ExitStack() as stack:
         source = None
@@ -306,16 +309,53 @@ def _method(command: str, config: Config, config_path: Path) -> _Method:
     return _Method(loop_mode="steered", steering=steering, adapter=adapter)
 
 
-def _policy(method: _Method, config: Config, *, dry_run: bool) -> tuple[Any, Any]:
-    """The bundle and steering policy the mode needs: fakes for a dry run, the real ones otherwise."""
+def _policy(method: _Method, config: Config, *, dry_run: bool, command: str) -> tuple[Any, Any]:
+    """The bundle and steering policy the mode needs: fakes for a dry run, the real ones otherwise.
+
+    A real run of a mode whose table names ``adapter_task`` loads that task module's checkpoint into the
+    bundle (``load_bundle(config, task=<path>)``): the bundle then carries the checkpoint's recorded
+    scene (``Bundle.scene``), so the loop includes the scene camera's frame in every chunk's batch and
+    ``prepare`` encodes it into the tokens the task module reads. The module itself is still the steering
+    policy's to load from the same path, so this adds the scene step and nothing else.
+
+    A mode without a task adapter calls ``load_bundle(config)`` exactly as before. A dry run builds the
+    fake bundle and never touches a checkpoint (no torch), so a shipped-but-not-yet-trained checkpoint
+    does not stop it -- the same contract as ``mars-u``'s user module.
+    """
     if method.loop_mode == "teleop":
         return None, None
-    bundle = fake_bundle() if dry_run else load_bundle(config)
+    bundle = fake_bundle() if dry_run else _loaded_bundle(method, config, command)
     if method.loop_mode == "autonomous":
         return bundle, None
     if dry_run:
         return bundle, _DrySteering()
     return bundle, make_steering(bundle, _effective_steering(method))
+
+
+def _loaded_bundle(method: _Method, config: Config, command: str) -> Any:
+    """``load_bundle`` with the mode's task checkpoint when it names one, exactly as before when it does not."""
+    task = _task_checkpoint(method.steering, command)
+    return load_bundle(config) if task is None else load_bundle(config, task=task)
+
+
+def _task_checkpoint(steering: SteeringConfig | None, command: str) -> Path | None:
+    """The mode's task-module checkpoint, or None when the table names no ``adapter_task``.
+
+    The path is the config layer's: a relative one resolves beside the example directory, as every other
+    config path does. The file is checked before the base checkpoint is loaded, so an absent Phase C asset
+    is one line naming the checkpoint and the command that writes it (``train-task``), never a traceback
+    from reading a checkpoint that is not there.
+    """
+    if steering is None or steering.adapter_task is None:
+        return None
+    path = Path(steering.adapter_task)
+    path = path if path.is_absolute() else EXAMPLE_DIR / path
+    if not path.is_file():
+        raise ValueError(
+            f"[modes.{command}] adapter_task: {path} is not a file. Phase C's `mars-franka train-task "
+            "--prompt <task>` writes it from [task] demos ([task] out names where)"
+        )
+    return path
 
 
 def _effective_steering(method: _Method) -> SteeringConfig:

@@ -170,12 +170,53 @@ def test_an_unknown_section_is_rejected(tmp_path):
         ('[modes.frs]\nmode = "frs"\ntau = 4\n', "tau"),
         ('[modes.fc]\nmode = "flow_control"\npinned_steps = 8\n', "pinned_steps"),
         ('[modes.clean]\nmode = "none"\nadapter_user = "assets/user/u.pt"\n', "adapter_user"),
+        ('[modes.clean]\nmode = "none"\nadapter_task = "assets/task/t.pt"\n', "adapter_task"),
         ('[modes.fc]\nmode = "flow_control"\nadapter_task = "assets/task/t.pt"\n', "adapter_task"),
     ],
 )
 def test_a_mode_rejects_a_knob_of_another_mode(tmp_path, text, knob):
     with pytest.raises(ValueError, match=knob):
         _load(tmp_path, text)
+
+
+def test_the_task_arm_tables_parse_with_their_adapter_and_inherit_the_steering_defaults(tmp_path):
+    """``mars-t`` and the composed ``mars`` are ``frs`` tables whose adapters are the Phase B/C
+    checkpoints; they inherit ``[steering]`` and resolve the adapter paths beside the example."""
+    cfg = _load(
+        tmp_path,
+        "[steering]\nn_reversal_steps = 12\n\n"
+        '[modes.mars-t]\nmode = "frs"\nadapter_task = "assets/task/pilot/task.pt"\n\n'
+        '[modes.mars]\nmode = "frs"\nadapter_user = "assets/user/rotz20/user.pt"\n'
+        'adapter_task = "assets/task/pilot/task.pt"\n',
+    )
+    assert set(cfg.modes) == {"mars-t", "mars"}
+    assert cfg.modes["mars-t"].n_reversal_steps == 12 and cfg.modes["mars-t"].pinned_steps == 8
+    assert cfg.modes["mars-t"].adapter_task == EXAMPLE_DIR / "assets/task/pilot/task.pt"
+    assert cfg.modes["mars-t"].adapter_user is None
+    assert cfg.modes["mars"].adapter_user == EXAMPLE_DIR / "assets/user/rotz20/user.pt"
+    assert cfg.modes["mars"].adapter_task == EXAMPLE_DIR / "assets/task/pilot/task.pt"
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ('[modes.mars-t]\nmode = "frs"\n', "adapter_task"),
+        ('[modes.mars]\nmode = "frs"\n', "adapter_user"),
+        ('[modes.mars]\nmode = "frs"\nadapter_task = "assets/task/t.pt"\n', "adapter_user"),
+    ],
+)
+def test_the_phase_c_arms_must_name_their_modules(tmp_path, text, key):
+    """An arm's name states its composition: `mars-t` is FRS+task and `mars` is user ∘ task, so a table
+    without the module would silently report a plain FRS run under the arm's name."""
+    with pytest.raises(ValueError, match=key) as error:
+        _load(tmp_path, text)
+    assert "[modes.mars" in str(error.value) and "train-" in str(error.value)
+
+
+def test_a_custom_mode_name_needs_no_adapter(tmp_path):
+    """Only the shipped arm names assert a composition; a study's own table is free to be plain FRS."""
+    cfg = _load(tmp_path, '[modes.slow]\nmode = "frs"\n')
+    assert cfg.modes["slow"].adapter_user is None and cfg.modes["slow"].adapter_task is None
 
 
 def test_a_mode_must_name_one_of_the_three_modes(tmp_path):

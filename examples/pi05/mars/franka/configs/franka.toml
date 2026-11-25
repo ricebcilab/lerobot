@@ -41,10 +41,8 @@ seed = 0
 n_reversal_steps = 10 # the full reversal (Tang et al.)
 pinned_steps = 8 # the executed prefix: 8/10 is the pin-executed ratio
 
-# The methods this slice ships as tables. `mars-t` and the composed `mars` are deliberately absent: they
-# need a trained task module, which Phase C does not ship yet, so a `mars-franka mars-t` run names the
-# missing [modes.mars-t] table instead of loading nothing. `mars-u` names Phase B's user module; the
-# checkpoint is gitignored and absent until `train-user` has run, and then a run names the missing file.
+# The methods this config ships as tables. `mars-u`, `mars-t` and the composed `mars` name Phase B/C
+# checkpoints that are gitignored until their trainers have run: a run names the missing file.
 [modes.fc]
 mode = "flow_control"
 tau = 8 # Kao et al.'s DROID numbers (flow-steering's constants)
@@ -63,6 +61,20 @@ mode = "frs"
 # Phase B's learned user module: `train-user` writes <out>/user.pt and `validate-user` gates it offline
 # before a study. The asset is gitignored and absent until then, so a real run names the missing file.
 adapter_user = "assets/user/rotz20/user.pt"
+
+[modes.mars-t]
+mode = "frs"
+# Phase C's learned task module: `train-task --prompt "<task>"` writes <out>/task.pt from [task] demos.
+# The asset is gitignored and absent until then, so a real run names the missing file. The checkpoint
+# also records the scene it was built on, which is what makes the bundle encode the scene camera's frame.
+adapter_task = "assets/task/pilot/task.pt"
+
+[modes.mars]
+mode = "frs"
+# The composed method, MARS = user ∘ task: FRS with both learned modules. It names Phase B's user module
+# and Phase C's task module; neither asset ships, and a run names the first one that is missing.
+adapter_user = "assets/user/rotz20/user.pt"
+adapter_task = "assets/task/pilot/task.pt"
 
 [spacemouse]
 # The defaults are unverified on hardware: the probe measures the real scales and channel mapping.
@@ -98,12 +110,12 @@ additive = false # true: the module supplies its own velocity term, U v + b
 
 [task]
 # Phase C's task module: `train-task` reads the demonstrations and writes <out>/task.pt and
-# train_log.json; a `[modes.mars-t]`/`[modes.mars]` table (Phase C4) will read <checkpoint>. Both the
-# dataset and the checkpoint are gitignored: `teleop --record pilot` makes the dataset, and the checkpoint
-# does not exist until `train-task` has run (it is what the C4 arms load).
+# train_log.json; `[modes.mars-t]` and the composed `[modes.mars]` read <checkpoint>. Both the dataset
+# and the checkpoint are gitignored: `teleop --record pilot` makes the dataset, and the checkpoint does
+# not exist until `train-task` has run (it is what the C4 arms load).
 demos = "assets/demos/pilot" # a downloaded `teleop --record` dataset
 out = "assets/task/pilot" # train-task writes out/task.pt and out/train_log.json (gitignored)
-checkpoint = "assets/task/pilot/task.pt" # what [modes.mars-t] and [modes.mars] read (Phase C4)
+checkpoint = "assets/task/pilot/task.pt" # what [modes.mars-t] and [modes.mars] read
 token_source = "vlm_image" # the scene's token source: vlm_image only in this phase
 render_size = 224 # side of the square scene render the VLM's tokens come from
 # scene_rank = ...    # absent = full-width (2048) VLM tokens; an integer fits a fixed token reduction

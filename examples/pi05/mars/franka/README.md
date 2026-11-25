@@ -7,10 +7,11 @@ Phase A can do six things: `teleop` (the operator alone, and the demo-recording 
 (the policy alone), and `fc`, `frs`, `mars-f` (the three methods whose numbers already exist), plus
 `probe` (the read-only bring-up report). Phase B adds the learned user module: `--record-states`
 collects the states a session visits, `train-user` calibrates the module on them, `validate-user`
-compares it offline against the fixed methods, and `mars-u` runs it. The task module (`mars-t`) and the
-composed `mars` arm still need Phase C checkpoints, and there is no study protocol, success entry or
-analysis yet; `configs/franka.toml` has no table for those two, so a run names the missing table
-instead of loading nothing. `DESIGN.md` is the interface contract; this file is the runbook.
+compares it offline against the fixed methods, and `mars-u` runs it. Phase C adds the learned task
+module: `teleop --record` records demonstrations, `train-task` trains the module on them, and `mars-t`
+(FRS with the task module) and the composed `mars` (FRS with both learned modules) run it; S2's
+verdict is task success on the robot, and the design of that block is in the Phase C section.
+`DESIGN.md` is the interface contract; this file is the runbook.
 
 Everything below runs from the lerobot checkout on `chopper`.
 
@@ -181,7 +182,7 @@ uv run --extra pi mars-franka mars-f --prompt "put the red block in the bowl" --
 FRS with the session's corruption lifted into the 7×7 `F` and inverted as the adapter. Push the same
 directions as in step 5 and compare: the corrupted command should be pulled back toward what you
 intended. This is the Phase A method arm; the learned user module (`mars-u`) is Phase B, below, and
-the task module is Phase C.
+the task module (`mars-t` and the composed `mars`) is Phase C.
 
 ### 7. Record demonstrations
 
@@ -193,7 +194,9 @@ Plain teleop is the clean-readout path, so the demonstrations are the operator's
 c3po's recording keys apply: `n` ends and keeps the episode, `r` discards it for a re-record, `q`
 stops and finalizes the dataset. The station records a LeRobot v3.0 dataset on `bb8`; c3po downloads
 it when the recording context exits, and the command prints `dataset: <path>`. `--record` works for
-every session command; the probe refuses it because it records nothing.
+every session command; the probe refuses it because it records nothing. These are Phase C's
+demonstrations: the dataset lands in `[recording] dir` and `[task] demos` points at it, so Phase C,
+below, starts here.
 
 ## Phase B: train and validate the user module
 
@@ -306,6 +309,120 @@ directions as in `frs` and compare: the corrupted command should be pulled back 
 The module is a correction of the readout, not a task policy -- if a push still heads wrong, validate
 first rather than adjusting the module by feel.
 
+## Phase C: the task module
+
+`mars-t` adds the *task* module: a learned adaptation of the policy's velocity field, conditioned on
+the task and the scene and fit to demonstrations of the task. The task module is not a correction of
+the operator's readout; it reshapes every chunk the frozen policy produces, in both flow directions,
+so it is a policy-level adaptation and it is always attached to a base policy, never a method of its
+own. `[task]` names the demonstrations, the output and the module's shape; `[modes.mars-t]` and
+`[modes.mars]` name the checkpoint the trainer writes. This section makes that checkpoint and runs it.
+
+### 1. Record demonstrations
+
+The demonstrations are plain teleop: the clean readout, the operator's own commands, the station's own
+cameras (step 7 of the bring-up order).
+
+```bash
+uv run --extra pi mars-franka teleop --record pilot
+```
+
+`n` ends and keeps an episode, `r` discards the take that just ended for a re-record, and `q` finishes
+the session. The station records a LeRobot v3.0 dataset on `bb8`; when the recording context exits,
+c3po downloads it and the command prints `dataset: <path>`. The dataset lands in `[recording] dir`, so
+the shipped config's download is `examples/pi05/mars/franka/outputs/mars_franka/pilot/`.
+
+The task module learns the grasp timing, so the recorded action has to carry the gripper. The shipped
+station writes `{arm}/joint_velocity` (7) and `{arm}/gripper_position` (1), and the loader accepts the
+single 8-wide `action` column too; it refuses a 7-wide action or a feature it cannot map by name
+(Troubleshooting). Record with the shipped station and config: the dataset's schema is r2d2's, and the
+first recording is where it is verified.
+
+### 2. Point `[task]` at the dataset, and train
+
+`[task] demos` has to name the downloaded dataset. Move the download under the example's gitignored
+assets (the shipped value), or point `[task] demos` at wherever it sits:
+
+```bash
+mkdir -p examples/pi05/mars/franka/assets/demos
+mv examples/pi05/mars/franka/outputs/mars_franka/pilot examples/pi05/mars/franka/assets/demos/pilot
+```
+
+Then train, with the study's prompt:
+
+```bash
+uv run --extra pi mars-franka train-task --config examples/pi05/mars/franka/configs/franka.toml \
+  --prompt "put the red block in the bowl"
+```
+
+`train-task` reads `[task] demos`, the `[training]` loop and `[task]`'s module shape. It writes
+`assets/task/pilot/task.pt` -- the checkpoint `[modes.mars-t]`, `[modes.mars]` and `[task] checkpoint`
+name -- and `train_log.json` beside it: the dataset's provenance and digest, its held-out split, the
+module's recorded scene (`token_source`, `render_size`, `scene_rank`), the checkpoint facts the module
+was built for, and every logged loss. The prompt is part of the field: the checkpoint records it, and
+`train-task` refuses to replace a module trained under a different prompt.
+
+The cost is the scene. The task module reads the frozen VLM's image tokens of the scene camera, so
+`train-task` needs `lerobot/pi05_base` (about 14 GB) for its `SceneEncoder`: a **second VLM resident in
+the process**, beside `lerobot/pi05_droid` on the same GPU. Each training step encodes its minibatch's
+scene pictures, one VLM encode per sample per step (only the last pictures are cached), then runs the
+field; the same second VLM is resident at inference whenever `mars-t` or `mars` runs, so both the
+training time and the card's memory carry it. If the weights are not cached, the first call refuses to
+encode rather than use a randomly initialised VLM.
+
+Read the held-out loss in `train_log.json`: `log` holds one entry every `[training] log_every` steps
+and at the last, with `step`, `train_loss`, `val_loss` and `skipped`. `val_loss` is the flow-matching
+loss on the demonstrations the module never saw (whole episodes when the dataset has several, else a
+seeded row split, per `[training] val_frac` and `seed`), with the noise and flow times redrawn from
+the seed so the curve is the module's. It is a fit diagnostic, not the study's answer: see the S2
+design below.
+
+Budget tens of minutes to an hour on the 5090 for the first run, and put the wall time and the final
+held-out loss in the hardware facts table. `[training] steps` is a config key, not a flag.
+
+### 3. Then `mars-t`
+
+```bash
+uv run --extra pi mars-franka mars-t --prompt "put the red block in the bowl" --trace
+```
+
+`[modes.mars-t] adapter_task` is the checkpoint just trained. The command hands it to
+`policy.load_bundle(config, task=...)`, so the bundle carries the checkpoint's recorded scene: the
+loop adds the ZED2 frame (letterboxed to `[task] render_size`) to every chunk's batch, the policy's
+scene step encodes it into tokens, and the task module reads them. FRS + the task module: the executed
+prefix is pinned to the reversed command, and every chunk the field produces is reshaped by the
+module. The composed method is `mars`, FRS with the user module in the reversal *and* the task module
+in the field (MARS is `user ∘ task`):
+
+```bash
+uv run --extra pi mars-franka mars --prompt "put the red block in the bowl" --trace
+```
+
+`[modes.mars]` names both checkpoints; a run names the first one that is missing.
+
+### The S2 design
+
+The task module is a policy-level adaptation, so the study block that measures it holds the module
+constant across its arms and compares each arm with the same arm without it:
+
+| arm with the task module | the same arm without it |
+| --- | --- |
+| `autonomous+task` | `autonomous` |
+| `frs+task`, i.e. `mars-t` | `frs` |
+| `mars` (FRS + user + task) | `mars-u` (FRS + user) |
+
+The point of the pairing is that the only difference inside a row is the task module: the base policy,
+the operator's readout and the prompt stay fixed. `mars-t` and `mars` are shipped commands.
+`autonomous+task` is the task module on the base-policy anchor, and `frs+task` is the `mars-t`
+composition under the block's name. The protocol that runs the whole block -- trial count, success
+entry, analysis -- is not in this repository yet; until it is, the block is the design, not a command.
+
+**S2's verdict is task success on the robot.** There is no simulation-free proxy for it: the question
+is whether the arm performs the task more often with the task module than without it. The offline
+number is the held-out flow-matching loss in `train_log.json` and nothing else -- it says the module
+fit the held-out demonstrations, not that the policy solves the task, so it gates a run (a module that
+did not fit is not worth a block) but it is not the verdict.
+
 ## Commands
 
 ```bash
@@ -322,9 +439,11 @@ uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--recor
 | `frs` | flow reversal steering (Tang et al.): the executed prefix is pinned to the reversed command |
 | `mars-f` | FRS with the fixed corruption adapter (`[modes.mars-f] adapter_matrix = "corruption"`) |
 | `mars-u` | FRS with the learned user module (`[modes.mars-u] adapter_user`, written by `train-user`); a run names the file while it does not exist |
+| `mars-t` | FRS with the learned task module (`[modes.mars-t] adapter_task`, written by `train-task`); a run names the file while it does not exist |
+| `mars` | the composed method, MARS = `user ∘ task`: FRS with both learned modules (`[modes.mars] adapter_user` and `adapter_task`) |
 | `train-user` | Phase B's user-module trainer: reads `[user] states`, writes `[user] out/user.pt` and `train_log.json`; not a session |
 | `validate-user` | Phase B's offline validator: evaluates `[user] checkpoint` on the held-out states and writes `[user] out/validation.json`; no arm, no station |
-| `mars-t`, `mars` | not built: Phase C adapters; the command names the missing `[modes.*]` table |
+| `train-task` | Phase C's task-module trainer: reads `[task] demos`, writes `[task] out/task.pt` and `train_log.json`; not a session |
 | `probe` | the bring-up report; moves nothing and records nothing |
 
 | flag | meaning |
@@ -359,8 +478,11 @@ A variant file overrides individual keys, so a study condition is a file the rep
 | `[modes.frs]` | `mode = "frs"` |
 | `[modes.mars-f]` | `mode = "frs"`, `adapter_matrix = "corruption"` (or `"corruption_inverse"`, or 7×7 rows) |
 | `[modes.mars-u]` | `mode = "frs"`, `adapter_user`: the user module `train-user` writes; absent until then |
+| `[modes.mars-t]` | `mode = "frs"`, `adapter_task`: the task module `train-task` writes; absent until then |
+| `[modes.mars]` | `mode = "frs"`, `adapter_user` and `adapter_task`: the composed method, both modules; each absent until its trainer has run |
 | `[states]` | `dir = "assets/states"`: a session's `--record-states NAME` lands at `<dir>/NAME/states.npz` |
 | `[user]` | `states` (the file or the session directory), `out` (`user.pt`, `train_log.json`, `validation.json`), `checkpoint` (`validate-user` and the study read it), `cues`, `sigma`, and the module's shape (`horizon`, `d`, `tdim`, `time_embedding`, `step_rank`, `cross_step_rank`, `additive`, `correct_by`) |
+| `[task]` | `demos` (the downloaded `teleop --record` dataset), `out` (`task.pt`, `train_log.json`), `checkpoint` (`[modes.mars-t]`/`[modes.mars]` read it), `token_source = "vlm_image"`, `render_size = 224`, `scene_rank`, `d`, `tdim`, `lambda_id` |
 | `[training]` | `steps`, `batch`, `lr`, `val_frac`, `seed`, `log_every`, `val_depths`, `device`: the trainer's loop, its held-out split and the depths the validator runs |
 | `[spacemouse]` | `path`, `hid_id`, `full_scale`, `rotation_full_scale`, `source`, `sign` |
 | `[recording]` | `dir = "outputs/mars_franka"`, relative to this folder |
@@ -392,9 +514,16 @@ The provenance of the numbers, because the runbook is also the record:
 - `[user] cues = 3` and `sigma = [0.2, 0.5]` are the calibration's: three cue draws per state, their
   readout noise uniform in that action-std range. `validate-user` fixes the noise at the midpoint and
   draws one fresh cue per held-out state; these are study choices, nothing measures them.
+- `[task] token_source = "vlm_image"` is the one scene source this phase implements: the frozen VLM's
+  image tokens of the scene camera (the ZED2). `render_size = 224` is what the camera frame is
+  letterboxed to before the encoder; the VLM resizes it to its own resolution, so the number is the
+  batch's side, not the model's. `lambda_id = 1e-3` is main's pull of the module's `A, b` toward the
+  identity (a fresh, zero-head module is plain FRS). `d`/`tdim` are the module's width and time
+  embedding; `[task] checkpoint` is what the study's task arms load.
 - `[training] val_frac = 0.1`, `seed = 0` and `val_depths = [10, 4]` are the split and the two reversal
   depths the validator reports: the full reversal (`n_reversal_steps`) and a partial one. The
-  validator reuses the trainer's split, so the module never saw the evaluated states.
+  validator reuses the trainer's split, so the module never saw the evaluated states; `train-task`
+  holds out the demonstrations with the same rule (whole episodes when there are several).
 - `[training] steps = 3000` is a study choice; nothing in the papers sets it. The first training run's
   wall time belongs in the hardware facts table below.
 
@@ -414,7 +543,34 @@ reset pose must not be trusted.
   cached? Set `HF_HUB_OFFLINE=1` to skip the check.
 - **`--dry-run` passes but the real run fails** — the dry run builds fakes: no c3po, no SpaceMouse, no
   checkpoint, no station. A real run needs all of them, plus the statistics file when the readout has
-  noise. The dry run checks the composition, not the hardware.
+  noise. The dry run also runs `mars-t`/`mars` without their task checkpoints (they are gitignored), so
+  it checks the composition, not the hardware or the assets.
+- **`lerobot/pi05_base` is missing (the scene tokens)** — the task module's scene reads the frozen
+  VLM's image tokens, and its `SceneEncoder` loads `lerobot/pi05_base` (about 14 GB) on first use, at
+  `train-task` and at `mars-t`/`mars`. Without the weights it refuses to encode rather than run a
+  randomly initialised VLM (`no model.safetensors for ...`). The repo needs the same Hub auth as
+  `pi05_droid`; a cache already populated on `chopper` works offline. It is a second VLM in the
+  process, so a CUDA out-of-memory on a run that used to fit is this, not the policy.
+- **`train-task` refuses the demonstrations dataset** — the loader discovers the dataset's feature
+  names and refuses what it cannot map, naming the feature or role: it needs one `<arm>/joint_position`
+  observation, that arm's `gripper_position`, and an action that is either one 8-wide float `action`
+  or `<prefix>/joint_velocity` plus its `gripper_position` sibling; each configured camera role
+  (`[cameras] exterior`/`wrist`) must match an image or video feature. The schema is r2d2's and is
+  verified on the first recording; a refusal naming the action schema means a dataset from a
+  different station build or a recording made with a 7-wide action (the task module learns the grasp
+  timing, so the gripper dim is required). Re-record with the shipped station and config.
+- **`mars-t`/`mars` names a missing task checkpoint** — the tables name `[task] checkpoint`
+  (`assets/task/pilot/task.pt`), which is gitignored and absent until `train-task --prompt "<task>"`
+  has run (with `[task] demos` pointed at the recorded dataset). The error names the file and the
+  command that writes it; a dry run does not need it.
+- **`train-task` refuses a checkpoint trained under another prompt** — a task module shapes one
+  prompt-conditioned field, so the checkpoint records the prompt it was trained with and `train-task`
+  refuses to overwrite a module recorded under another one. Point `[task] out`/`checkpoint` elsewhere
+  for a different task, or move the module.
+- **`teleop --corrupted` refuses to start with a missing statistics file** — the readout's noise is
+  in action-standard-deviation units and the std comes from `assets/droid/norm_stats.json`. Plain
+  `teleop` is clean and does not need it; `--corrupted` and every shared command do. Download the
+  file as above.
 - **The SpaceMouse is not found, or its axes are wrong** — the probe's SpaceMouse section lists every
   hidraw node with its `HID_ID` and marks the 3Dconnexion ones: no node means the device or the udev
   rule, a silent node means the stick or the wrong interface, and a missing id 2 means rotation is
@@ -455,4 +611,8 @@ facts the code cannot know.
 | `train-user` wall time, final held-out loss | |
 | `validate-user`: per-arm cosines at each depth (paste the table) | |
 | `mars-u` session check (date, what the push did) | |
+| demonstrations: `[task] demos` dataset, episode count, action schema it recorded | |
+| `lerobot/pi05_base` cache location and size (the scene encoder) | |
+| `train-task` wall time, final held-out flow-matching loss (`train_log.json`) | |
+| `mars-t` / `mars` session check (date, what the task module changed) | |
 | probe output | `examples/pi05/mars/franka/outputs/mars_franka/probe-session.txt` |
