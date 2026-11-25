@@ -466,11 +466,14 @@ def test_a_real_run_without_the_statistics_file_still_fails_naming_it(fake_hardw
 
 
 def test_the_command_surface_imports_without_torch_or_c3po():
-    """A dry run must not need either: cli's imports are the loop's, which are pure at module level."""
+    """A dry run must not need either, and imports neither Phase D command: cli's imports are the
+    loop's, which are pure at module level; ``study`` and ``analysis`` are imported by their handlers."""
     code = (
         "import sys, cli; "
         "assert 'torch' not in sys.modules, 'cli imported torch'; "
         "assert 'c3po' not in sys.modules, 'cli imported c3po'; "
+        "assert 'study' not in sys.modules, 'cli imported study'; "
+        "assert 'analysis' not in sys.modules, 'cli imported analysis'; "
         "assert hasattr(cli, 'main')"
     )
     subprocess.run(
@@ -902,6 +905,174 @@ def test_train_task_names_the_missing_demonstrations_dataset(tmp_path, capsys):
     error = capsys.readouterr().err
     assert str(missing) in error and "teleop --record" in error
     assert error.count("Traceback") == 0
+
+
+# ---------------------------------------------------------------- the study and analysis commands
+
+
+def _study_config(tmp_path: Path) -> Path:
+    """A config whose ``[study]`` names a one-arm, one-trial block under ``tmp_path``."""
+    return _write(
+        tmp_path,
+        '[modes.frs]\nmode = "frs"\n\n'
+        "[study]\n"
+        'arms = ["frs"]\n'
+        "trials = 1\n"
+        'order = "blocked"\n'
+        "max_steps = 2\n"
+        f'out = "{tmp_path}/study"\n',
+    )
+
+
+def test_study_requires_a_prompt(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["study", "--config", str(SHIPPED)])
+    assert exit.value.code == 2
+    assert "--prompt is required for 'study'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--steps", "2"],
+        ["--record", "pilot"],
+        ["--record-states", "pilot"],
+        ["--dry-run"],
+        ["--trace"],
+        ["--corrupted"],
+    ],
+)
+def test_study_takes_no_session_flags(flags, tmp_path, capsys):
+    """``[study]`` names the block, its rounds and its cap; a session flag has no meaning."""
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["study", "--config", str(_study_config(tmp_path)), "--prompt", "pick", *flags])
+    assert exit.value.code == 2
+    assert "study takes --config and --prompt only" in capsys.readouterr().err
+
+
+def test_run_is_only_the_analysis_flag(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["study", "--config", str(_study_config(tmp_path)), "--prompt", "pick", "--run", "x"])
+    assert exit.value.code == 2
+    assert "--run is analyse only" in capsys.readouterr().err
+
+
+def test_out_is_only_the_analysis_flag(real_components, tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["teleop", "--config", str(SHIPPED), "--steps", "1", "--out", str(tmp_path)])
+    assert exit.value.code == 2
+    assert "--out is analyse only" in capsys.readouterr().err
+
+
+def test_study_reaches_the_runner_with_the_configs_block(tmp_path, monkeypatch, capsys):
+    """The command is the runner's composition root: it hands it the file's parsed config and path."""
+    import study
+
+    config_path = _study_config(tmp_path)
+    calls = []
+
+    def fake_run(config, *, prompt, out=None, config_path=None):
+        calls.append({"config": config, "prompt": prompt, "out": out, "config_path": config_path})
+        return Path(tmp_path) / "study" / "run1"
+
+    monkeypatch.setattr(study, "run", fake_run)
+    assert cli.main(["study", "--config", str(config_path), "--prompt", "pick the cube"]) == 0
+
+    configured = load_config(config_path)
+    assert calls == [
+        {"config": configured, "prompt": "pick the cube", "out": None, "config_path": config_path}
+    ]
+    assert f"study: {tmp_path / 'study' / 'run1'}" in capsys.readouterr().out
+
+
+def test_study_reports_a_missing_dependency_as_one_line(tmp_path, capsys):
+    """The runner opens the station before the block; without c3po that is one line, no traceback."""
+    config_path = _study_config(tmp_path)
+    assert cli.main(["study", "--config", str(config_path), "--prompt", "pick"]) == 2
+    error = capsys.readouterr().err
+    assert "c3po" in error and "Traceback" not in error
+    assert len(error.strip().splitlines()) == 1
+
+
+def test_analyse_requires_a_run(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["analyse"])
+    assert exit.value.code == 2
+    assert "analyse needs --run" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--steps", "2"],
+        ["--record", "pilot"],
+        ["--record-states", "pilot"],
+        ["--dry-run"],
+        ["--trace"],
+        ["--corrupted"],
+        ["--config", str(SHIPPED)],
+        ["--prompt", "pick"],
+    ],
+)
+def test_analyse_takes_no_session_or_config_flags(flags, tmp_path, capsys):
+    """``analyse`` reads the runs' records: no config, no session, and its only flag is ``--run``."""
+    run = tmp_path / "run1"
+    run.mkdir()
+    (run / "trials.jsonl").write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["analyse", "--run", str(run), *flags])
+    assert exit.value.code == 2
+    assert "analyse takes --run DIR only" in capsys.readouterr().err
+
+
+def test_analyse_reaches_the_analysis_with_every_run(tmp_path, monkeypatch, capsys):
+    """The command reads each ``--run`` through the analysis module and prints its tables and CSVs."""
+    import analysis
+
+    run = tmp_path / "run1"
+    run.mkdir()
+    (run / "trials.jsonl").write_text("", encoding="utf-8")
+    seen = []
+
+    def fake_analyse(runs):
+        seen.append(list(runs))
+        return {"run_dirs": [str(run)], "n_trials": 0, "per_arm": [], "paired": []}
+
+    monkeypatch.setattr(analysis, "analyse", fake_analyse)
+    assert cli.main(["analyse", "--run", str(run)]) == 0
+
+    assert seen == [[run]]
+    printed = capsys.readouterr().out
+    assert "per arm" in printed and "csv:" in printed
+    assert (tmp_path / "per_arm.csv").is_file()  # the default CSV directory: the runs' parent
+
+
+def test_analyse_forwards_out_as_the_csv_directory(tmp_path, monkeypatch, capsys):
+    """``--out DIR`` is the analysis's CSV directory; it reaches ``analysis.main`` like ``--run`` does."""
+    import analysis
+
+    run = tmp_path / "run1"
+    run.mkdir()
+    (run / "trials.jsonl").write_text("", encoding="utf-8")
+    output = tmp_path / "tables"
+
+    def fake_analyse(runs):
+        return {"run_dirs": [str(run)], "n_trials": 0, "per_arm": [], "paired": []}
+
+    monkeypatch.setattr(analysis, "analyse", fake_analyse)
+    assert cli.main(["analyse", "--run", str(run), "--out", str(output)]) == 0
+
+    assert (output / "per_arm.csv").is_file() and (output / "paired.csv").is_file()
+    assert not (tmp_path / "per_arm.csv").exists()
+    assert f"csv: {output / 'per_arm.csv'}" in capsys.readouterr().out
+
+
+def test_analyse_reports_a_missing_run_as_one_line(tmp_path, capsys):
+    missing = tmp_path / "nothing"
+    assert cli.main(["analyse", "--run", str(missing)]) == 2
+    error = capsys.readouterr().err
+    assert str(missing) in error and "Traceback" not in error
+    assert len(error.strip().splitlines()) == 1
 
 
 # ---------------------------------------------------------------- the config flag and the SpaceMouse
