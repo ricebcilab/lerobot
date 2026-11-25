@@ -1,0 +1,70 @@
+# The MARS-on-Franka study config: what one session's station, command, readout and method are.
+#
+# DESIGN.md's "Config schema" is the contract; this file is the shipped study values written out.
+# A variant file overrides individual keys and writes `corruption = "none"` / `mode = "none"` to turn
+# a setting off that it inherits (TOML has no null: an absent key is the built-in neutral default).
+
+[station]
+host = "10.42.0.1"
+port = 9090
+arm = "follower"
+rate = 15.0 # the checkpoint's action rate: one served action per control step
+
+[cameras]
+exterior = "scene_zed"
+wrist = "wrist_zed"
+# third = ...   # absent: the third image key is omitted (the model fills it with a zero mask)
+
+[policy]
+path = "lerobot/pi05_droid"
+stats = "assets/droid/norm_stats.json" # openpi's statistics; gitignored, see assets/README.md
+device = "cuda"
+n_action_steps = 8
+dtype = "bfloat16"
+
+[command]
+translation_gain = 0.11 # m/s at full deflection: flow-steering App. E's ~11 cm/s
+rotation_gain = 0.5 # rad/s at full deflection; a guess until the probe measures the stick
+twist_length = 0.2 # m, the mixed-unit scale of the IK's 6-row solve
+deadband = 0.02 # action units below which the operator counts as idle
+gain = "auto" # 1 / ||F||_2 with the corruption on, else 1.0, so the corrupted command cannot clip
+q0 = [] # [] = the station's reset pose, captured once at connect
+
+[readout]
+# The study's known corruption: a 20 degree rotation about z in the command's translation block,
+# lifted once through J(q0) to a fixed 7x7 (DESIGN.md, "The control model").
+corruption = {rotation_z_deg = 20}
+noise = 0.35 # std per joint, in action-standard-deviation units
+seed = 0
+
+[steering]
+n_reversal_steps = 10 # the full reversal (Tang et al.)
+pinned_steps = 8 # the executed prefix: 8/10 is the pin-executed ratio
+
+# The methods this slice ships as tables. `mars-u`, `mars-t` and the composed `mars` are deliberately
+# absent: they need trained user/task adapter checkpoints that do not exist yet (Phase B), so a
+# `mars-franka mars-u` run names the missing [modes.mars-u] table instead of loading nothing.
+[modes.fc]
+mode = "flow_control"
+tau = 8 # Kao et al.'s DROID numbers (flow-steering's constants)
+lam = 1
+ic_gain = 15.0
+
+[modes.frs]
+mode = "frs"
+
+[modes.mars-f]
+mode = "frs"
+adapter_matrix = "corruption" # the corruption's fixed 7x7 F, or "corruption_inverse", or 7 rows
+
+[spacemouse]
+# The defaults are unverified on hardware: the probe measures the real scales and channel mapping.
+path = "" # "" = search for the device (SPACEMOUSE_HID_ID, when set, pins it instead)
+hid_id = "" # "" = search; otherwise a HID id such as 0000046D:0000C62B
+full_scale = 350.0
+rotation_full_scale = 350.0 # a guess until the probe measures it
+source = [0, 1, 2, 3, 4, 5] # device channels in the twist's [x, y, z, rx, ry, rz] order
+sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+[recording]
+dir = "outputs/mars_franka" # relative to examples/pi05/mars/franka/
