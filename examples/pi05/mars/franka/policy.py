@@ -64,6 +64,9 @@ config's own ``reference_step`` when a config provides one)."""
 STEERING_MODES = ("none", "flow_control", "frs")
 """The modes ``make_steering`` builds, matching ``config.STEERING_MODES`` and the steering config's."""
 
+TASK_KEY = "task"
+"""The pre-processors' prompt key: ``TokenizerProcessorStep.task_key``'s and pi0.5's tokenizer's default."""
+
 
 @dataclass(frozen=True)
 class Bundle:
@@ -127,10 +130,17 @@ class Bundle:
         of the batch. A raw batch is one row, so its scene picture is given the leading batch dimension
         the step reads ([B, 3, S, S]; a trainer's batch of B rows is already there). Without a scene the
         batch is exactly the pre-processor's.
+
+        This is also where the station's raw types become the pre-processor's: ``_policy_batch`` turns
+        the numpy arrays into tensors and the prompt into a one-element list, because the pre-processor's
+        batch step only batches tensors and its state tokenizer iterates a list of prompts. The fake
+        bundle is exempt: its pipeline is the identity and ``--dry-run`` must not import torch.
         """
+        if self._cache.get("fixed_action") is not None:
+            return self.preprocessor(raw_batch)
         if self.scene is not None:
             raw_batch = self._scene_pipeline()(_scene_row(raw_batch))
-        return steering_batch(self, raw_batch)
+        return steering_batch(self, _policy_batch(raw_batch))
 
     def act(self, batch: dict, command7: NDArray | None = None) -> NDArray:
         """One station action, in raw action units, from a batch ``prepare`` made: no preprocessing.
@@ -400,6 +410,36 @@ def _scene_row(raw_batch: dict) -> dict:
         return raw_batch
     array = np.asarray(pictures)
     return raw_batch if array.ndim != 3 else {**raw_batch, SCENE_IMAGES: array[None]}
+
+
+def _policy_batch(raw_batch: dict) -> dict:
+    """The station's raw batch as the policy pre-processor reads it: tensors, and one prompt in a list.
+
+    ``station.observation_batch`` hands numpy arrays and a bare string: the two images are float32
+    ``(3, 224, 224)`` in [0, 1] and the state float32 ``(32,)``, the state's first dims the arm and the
+    gripper. The pre-processor's ``AddBatchDimensionProcessorStep`` adds the batch dimension only to
+    values that are already ``torch.Tensor`` (``src/lerobot/processor/batch_processor.py``), so the numpy
+    state would stay ``(32,)``; ``Pi05PrepareStateTokenizerProcessorStep`` then indexes it per prompt and
+    iterates the tasks (``src/lerobot/policies/pi05/processor_pi05.py``), which a scalar and a string
+    cannot survive. The station's contract is numpy/string, so this adapter -- not the station -- is what
+    converts: every array becomes the tensor ``torch.from_numpy`` makes (a strided view shares the
+    array, which is fine because nothing writes it; a read-only one is copied, because torch refuses to
+    share it) and a string prompt becomes a one-element list. Values already tensors or lists (the scene
+    step's tokens) are passed through untouched.
+    """
+    batch = dict(raw_batch)
+    arrays = [key for key, value in batch.items() if isinstance(value, np.ndarray)]
+    if arrays:
+        import torch  # the real pipeline's path only: the fake bundle's prepare never gets here
+
+        for key in arrays:
+            value = batch[key]
+            # this shares the array's memory, which torch refuses to do with a read-only one (a
+            # letterboxed scene picture is a view of a PIL image): copy only those
+            batch[key] = torch.from_numpy(value if value.flags.writeable else value.copy())
+    if isinstance(batch.get(TASK_KEY), str):
+        batch[TASK_KEY] = [batch[TASK_KEY]]
+    return batch
 
 
 def _command_batch(batch: dict, command7: NDArray, device: Any) -> dict:

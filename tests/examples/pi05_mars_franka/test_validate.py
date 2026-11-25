@@ -167,11 +167,15 @@ class _RecordingCore:
 
 
 class _BatchingPreprocessor:
-    """The little it takes of the pre-processor: a raw observation into a B = 1 tensor batch."""
+    """The little it takes of the pre-processor: a prepared observation into a B = 1 tensor batch.
+
+    ``Bundle.prepare`` is the adapter that makes the station's numpy arrays tensors and its prompt a
+    one-element list; this fake preprocessor is the next step, so it only adds the batch dimension.
+    """
 
     def __call__(self, raw: dict) -> dict:
         return {
-            key: [value] if isinstance(value, str) else torch.as_tensor(value)[None]
+            key: value if isinstance(value, list) else torch.as_tensor(value)[None]
             for key, value in raw.items()
         }
 
