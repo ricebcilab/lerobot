@@ -1,10 +1,11 @@
 """The probe's pure and offline parts: the station report and action contract, the raw-report tally
-and its summary, the configuration numbers, and main reporting an absent station instead of crashing.
+with its (report id, byte length) pairs and both int16 triples, the configuration numbers, the
+lines-on-failure/traceback rules, and main reporting an absent station instead of crashing.
 
 No c3po, no torch, no checkpoint, no SpaceMouse. A fake station supplies the manifest that c3po's
-describe handshake would give, the tally is fed synthetic reports in the module's layout (three int16
-counts after the report id), and main's hardware gates are patched, so every test is deterministic on
-a machine with a device and on one without.
+describe handshake would give, the tally is fed synthetic reports in the module's layout (the report
+id, then three and six int16 counts), and main's hardware gates are patched, so every test is
+deterministic on a machine with a device and on one without.
 """
 
 from __future__ import annotations
@@ -14,12 +15,14 @@ import os
 import struct
 import subprocess
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import bridge
 import numpy as np
 import probe
+import pytest
 import stats as stats_module
 from config import load_config
 from station import StationManifest
@@ -30,14 +33,26 @@ SHIPPED = EXAMPLE_DIR / "configs" / "franka.toml"
 ARM = "follower"
 ACTION_KEYS = (f"{ARM}/joint_velocity", f"{ARM}/gripper_position")
 CHECKPOINT_WIDTH = 32
+SESSION_Q0 = [0.010, -0.629, -0.002, -2.511, -0.010, 1.906, 0.007]
 
 
 # ---------------------------------------------------------------- the fakes
 
 
 def _report(report_id: int, x: int, y: int, z: int) -> bytes:
-    """One raw hidraw report: the id, then three little-endian int16 counts."""
+    """One raw hidraw translation/rotation report: the id, then three little-endian int16 counts."""
     return bytes([report_id]) + struct.pack("<hhh", x, y, z)
+
+
+def _report6(report_id: int, *values: int) -> bytes:
+    """One raw six-axis report: the id, then two int16 triples (13 bytes, the 6-axis shape)."""
+    return bytes([report_id]) + struct.pack("<hhhhhh", *values)
+
+
+def _tally(data: bytes, tally: probe.Tally | None = None, node: str = "/dev/hidraw0") -> probe.Tally:
+    tally = probe.Tally() if tally is None else tally
+    probe._tally(tally, node, data)
+    return tally
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -95,6 +110,19 @@ mode = "flow_control"
 tau = 4
 lam = 2
 ic_gain = 7.0
+
+[modes.mars-f]
+mode = "frs"
+adapter_matrix = "corruption"
+
+[modes.mars-u]
+mode = "frs"
+adapter_user = "assets/user/u/user.pt"
+
+[modes.mars]
+mode = "frs"
+adapter_user = "assets/user/u/user.pt"
+adapter_task = "assets/task/t/task.pt"
 """
 
 
@@ -127,14 +155,27 @@ def _fake_station(*, action_keys=ACTION_KEYS, native: float = 15.0, command_mode
     return SimpleNamespace(manifest=manifest, _robot=robot)
 
 
-def _tally(data: bytes, ids=(1, 2, 3), seen=None, peaks=None, last=None):
-    seen, peaks, last = (
-        seen if seen is not None else {},
-        peaks if peaks is not None else {},
-        last if last is not None else {},
+def _mouse_tally() -> probe.Tally:
+    """The session's shape: hidraw8 delivered two translation reports, no rotation on any node."""
+    tally = probe.Tally()
+    _tally(_report(1, 350, -40, 12), tally, "/dev/hidraw8")
+    _tally(_report(1, 300, 45, -5), tally, "/dev/hidraw8")
+    return tally
+
+
+def _source_facts(*, rest=(0.154, 0.0, 0.0, 0.0, 0.0, 0.0)) -> probe.SourceFacts:
+    return probe.SourceFacts(
+        path="/dev/hidraw8",
+        tare=True,
+        rest=np.asarray(rest, dtype=np.float64),
+        at_rest=np.zeros(6),
     )
-    probe._tally("/dev/hidraw0", data, ids, seen, peaks, last)
-    return seen, peaks, last
+
+
+def _mouse_report(tally: probe.Tally, source=None, error=None, config=None) -> tuple[list[str], int]:
+    return probe._mouse_report(
+        [], 0, load_config(SHIPPED) if config is None else config, tally, source, error
+    )
 
 
 # ---------------------------------------------------------------- the station report
@@ -191,48 +232,152 @@ def test_an_absent_station_is_one_unavailable_line():
 # ---------------------------------------------------------------- the raw-report tally
 
 
-def test_the_tally_counts_report_ids_per_node_and_keeps_the_peak_counts():
-    seen, peaks, last = {}, {}, {}
-    probe._tally("/dev/hidraw0", _report(1, 350, -40, 12), (1, 2, 3), seen, peaks, last)
-    probe._tally("/dev/hidraw0", _report(1, 300, 45, -5), (1, 2, 3), seen, peaks, last)
-    probe._tally("/dev/hidraw1", _report(2, -300, 210, 55), (1, 2, 3), seen, peaks, last)
-    probe._tally("/dev/hidraw1", bytes([3, 1, 0, 0, 0]), (1, 2, 3), seen, peaks, last)
-    assert seen == {"/dev/hidraw0": {1: 2}, "/dev/hidraw1": {2: 1, 3: 1}}
-    assert peaks == {1: (350, 45, 12), 2: (300, 210, 55)}  # |−40| < 45; |−5| < 12
-    assert last == {1: (300, 45, -5), 2: (-300, 210, 55)}
+def test_the_tally_counts_pairs_per_node_and_keeps_the_first_triple_maxima():
+    """A pair is (report id, byte length): a 7-byte report is a triple after the id, and a different
+    length is a different report shape even under the same id."""
+    tally = _tally(_report(1, 350, -40, 12), node="/dev/hidraw0")
+    _tally(_report(1, 300, 45, -5), tally, "/dev/hidraw0")
+    _tally(_report(2, -300, 210, 55), tally, "/dev/hidraw1")
+    _tally(bytes([3, 1, 0, 0, 0]), tally, "/dev/hidraw1")
+    assert tally.seen == {
+        "/dev/hidraw0": {(1, 7): 2},
+        "/dev/hidraw1": {(2, 7): 1, (3, 5): 1},
+    }
+    assert tally.peaks[("/dev/hidraw0", 1, 7)] == ((350, 45, 12), None)  # |−40| < 45; |−5| < 12
+    assert tally.peaks[("/dev/hidraw1", 2, 7)] == ((300, 210, 55), None)
+    assert tally.last[("/dev/hidraw0", 1, 7)] == ((300, 45, -5), None)
 
 
-def test_a_short_report_counts_toward_its_id_but_cannot_move_a_peak():
+def test_a_short_report_counts_toward_its_pair_but_cannot_move_a_peak():
     """Which ids arrive is the finding, so a truncated report is counted; its counts only exist when
     the three int16s are all there."""
-    seen, peaks, last = _tally(bytes([2, 3]))
-    assert seen == {"/dev/hidraw0": {2: 1}} and peaks == {} and last == {}
+    tally = _tally(bytes([2, 3]))
+    assert tally.seen == {"/dev/hidraw0": {(2, 2): 1}} and tally.peaks == {} and tally.last == {}
 
 
-def test_the_mouse_summary_prints_the_max_counts_and_the_scales_to_copy():
-    """The summary lines are the artifact: max |counts| per axis, the two full scales to write into
-    [spacemouse], the configured mapping and the rest six-vector."""
-    seen, peaks, last = {}, {}, {}
-    probe._tally("/dev/hidraw0", _report(1, 350, -40, 12), (1, 2, 3), seen, peaks, last)
-    probe._tally("/dev/hidraw1", _report(2, -300, 210, 55), (1, 2, 3), seen, peaks, last)
-    lines, failures = probe._mouse_report([], 0, load_config(SHIPPED), seen, peaks, last, (1, 2, 3))
+def test_a_six_axis_report_shows_its_second_triple_at_offset_seven():
+    """The session's rotation question: a 13-byte report under any id exposes triple two, so a
+    six-axis single report (or rotation in a wider report) is visible instead of lost."""
+    tally = _tally(_report6(1, 350, -40, 12, 100, -20, 7))
+    assert tally.seen == {"/dev/hidraw0": {(1, 13): 1}}
+    assert tally.peaks[("/dev/hidraw0", 1, 13)] == ((350, 40, 12), (100, 20, 7))
+    assert tally.last[("/dev/hidraw0", 1, 13)] == ((350, -40, 12), (100, -20, 7))
+
+
+def test_the_second_triple_is_not_printed_for_a_seven_byte_report():
+    tally = _tally(_report(1, 350, -40, 12))
+    lines = probe._tally_lines(tally)
+    assert any("offset 1 [+350 +40 +12]" in line and "offset 7" not in line for line in lines)
+
+
+def test_the_tally_lines_print_every_pair_and_its_maxima():
+    tally = _tally(_report(1, 350, -40, 12), node="/dev/hidraw8")
+    _tally(_report6(1, 12, -350, 4, 3, 4, -5), tally, "/dev/hidraw8")
+    text = "\n".join(probe._tally_lines(tally))
+    assert "/dev/hidraw8 reports: id 1 (7 bytes) x 1, id 1 (13 bytes) x 1" in text
+    assert "/dev/hidraw8 id 1 (7 bytes): max |int16| offset 1 [+350 +40 +12]" in text
+    assert "/dev/hidraw8 id 1 (13 bytes): max |int16| offset 1 [+12 +350 +4], offset 7 [+3 +4 +5]" in text
+
+
+# ---------------------------------------------------------------- the SpaceMouse report
+
+
+def test_translation_passes_and_missing_rotation_fails_with_the_diagnosis():
+    """The session's shape: translation arrived on hidraw8; no id 2 anywhere, so rotation is a FAIL
+    whose diagnosis says to twist again and that the tally is where another id/shape would show."""
+    lines, failures = _mouse_report(_mouse_tally(), source=_source_facts())
+    text = "\n".join(lines)
+    assert failures == 1
+    assert "[PASS] id 1 (translation) reports: max |counts| x 350 y 45 z 12" in text
+    assert "[FAIL] id 2 (rotation) reports: none arrived on any node" in text
+    assert "[DIAG] no rotation report arrived on any node" in text
+    assert "twist each rotation axis to its stop again" in text
+    assert "second triple" in text and "13 bytes" in text
+
+
+def test_a_rotation_report_passes_the_check():
+    tally = _mouse_tally()
+    _tally(_report(2, -300, 210, 55), tally, "/dev/hidraw8")
+    lines, failures = _mouse_report(tally, source=_source_facts())
     text = "\n".join(lines)
     assert failures == 0
-    assert "/dev/hidraw0: id 1 x 1" in text and "/dev/hidraw1: id 2 x 1" in text
-    assert "max |counts| x 350 y 40 z 12" in text
-    assert "max |counts| x 300 y 210 z 55" in text
-    assert "copy into [spacemouse] full_scale = 350" in text
+    assert "[PASS] id 2 (rotation) reports: max |counts| x 300 y 210 z 55" in text
+    assert "[DIAG]" not in text
     assert "copy into [spacemouse] rotation_full_scale = 300" in text
-    assert "configured source [0, 1, 2, 3, 4, 5]" in text
-    assert "rest-state six-vector [x y z rx ry rz]" in text
 
 
-def test_no_rotation_reports_is_a_failed_check():
-    seen, peaks, last = {}, {}, {}
-    probe._tally("/dev/hidraw0", _report(1, 350, 0, 0), (1, 2, 3), seen, peaks, last)
-    lines, failures = probe._mouse_report([], 0, load_config(SHIPPED), seen, peaks, last, (1, 2, 3))
-    assert failures == 1
-    assert "[FAIL] id 2 (rotation) reports: none arrived" in "\n".join(lines)
+def test_no_reports_at_all_fails_both_checks():
+    lines, failures = _mouse_report(probe.Tally(), source=_source_facts())
+    assert failures == 2
+    assert "[FAIL] id 1 (translation) reports: none arrived" in "\n".join(lines)
+
+
+def test_the_source_line_names_the_pick_the_rest_vector_and_the_tare():
+    """The report the session needs next: which node the source takes (not the first by name), the
+    rest six-vector it captured, and that it tared (the session's x = +0.154 rest offset)."""
+    lines, failures = _mouse_report(_mouse_tally(), source=_source_facts())
+    text = "\n".join(lines)
+    assert failures == 1  # only rotation: the source itself is fine
+    assert "source would pick: /dev/hidraw8" in text
+    assert "source tare: on" in text
+    assert "rest six-vector [x y z rx ry rz]: [+0.154 +0.000 +0.000 +0.000 +0.000 +0.000]" in text
+    assert "at rest after tare: [+0.000 +0.000 +0.000 +0.000 +0.000 +0.000]" in text
+
+
+def test_an_absent_source_fails_and_the_rest_vector_still_prints_from_the_tally():
+    lines, failures = _mouse_report(
+        _mouse_tally(), source=None, error=FileNotFoundError("no node delivered motion")
+    )
+    text = "\n".join(lines)
+    assert failures == 2  # rotation and the source
+    assert "[FAIL] source: FileNotFoundError: no node delivered motion" in text
+    assert "rest six-vector [x y z rx ry rz]: [+0.857 +0.129 -0.014" in text  # 300/350, 45/350...
+    assert "the source is absent" in text
+
+
+def test_tare_off_prints_the_untared_rest_vector():
+    facts = probe.SourceFacts(path="/dev/hidraw8", tare=False, rest=None, at_rest=np.zeros(6))
+    lines, _ = _mouse_report(_mouse_tally(), source=facts)
+    text = "\n".join(lines)
+    assert "source tare: off" in text
+    assert "no tare captured" in text
+
+
+# ---------------------------------------------------------------- the nodes
+
+
+def _sysfs_node(root: Path, name: str, uevent: str, descriptor: bytes | None = None) -> None:
+    device = root / name / "device"
+    device.mkdir(parents=True)
+    (device / "uevent").write_text(uevent, encoding="utf-8")
+    if descriptor is not None:
+        (device / "report_descriptor").write_bytes(descriptor)
+
+
+def test_a_3dconnexion_node_line_names_its_hid_name_and_descriptor_size(tmp_path):
+    """The session could not see why hidraw3 was silent: the report descriptor's size and HID_NAME
+    are per-node facts, and a reader must know which node is which interface."""
+    sysfs = tmp_path / "hidraw"
+    _sysfs_node(
+        sysfs,
+        "hidraw3",
+        "DRIVER=hid-generic\nHID_ID=0003:0000256F:0000C652\nHID_NAME=3Dconnexion SpaceMouse Pro\n",
+        descriptor=b"\x05\x01\x09\x02\xa1\x01",
+    )
+    _sysfs_node(sysfs, "hidraw0", "HID_ID=0003:000026CE:000001A2\nHID_NAME=Some keyboard\n")
+    line = probe._node_line("/dev/hidraw3", True, sysfs=sysfs)
+    assert "HID_ID 0003:0000256F:0000C652 (3Dconnexion)" in line
+    assert "HID_NAME '3Dconnexion SpaceMouse Pro'" in line
+    assert "report descriptor 6 bytes" in line
+    other = probe._node_line("/dev/hidraw0", False, sysfs=sysfs)
+    assert "(other)" in other and "report descriptor" not in other
+
+
+def test_a_node_without_a_readable_descriptor_says_so(tmp_path):
+    sysfs = tmp_path / "hidraw"
+    _sysfs_node(sysfs, "hidraw3", "HID_ID=0003:0000256F:0000C652\n")
+    line = probe._node_line("/dev/hidraw3", True, sysfs=sysfs)
+    assert "report descriptor unavailable" in line and "HID_NAME ?" in line
 
 
 # ---------------------------------------------------------------- the configuration section
@@ -260,7 +405,25 @@ def test_the_configuration_section_prints_its_numbers_from_a_temp_config(tmp_pat
     assert f"||F7||2 = {norm:.4f}" in text
     assert f"gain: {1.0 / norm:.4f} (auto = 1/||F7||2)" in text
     sigma = config.readout.noise * stats_module.action_std(config.policy.stats)
-    assert f"noise sigma (7, action units): {probe._vec(sigma)}" in text
+    assert (
+        f"noise sigma (8 dims: 7 command dims + gripper; the loop's noise is the first 7): {probe._vec(sigma)}"
+        in text
+    )
+    assert f"({config.readout.noise:g} x action std)" in text
+
+
+def test_the_modes_line_names_each_modes_adapter(tmp_path):
+    """A session record has to show what an arm composes: the corruption matrix, the user module and
+    the task module each appear beside their mode, not only their knobs."""
+    path = _write(tmp_path, _config_text(_stats_file(tmp_path)))
+    lines, _, _ = probe.configuration_section(load_config(path), path, None, None)
+    modes = next(line for line in lines if line.startswith("modes: "))
+    assert "mars-f=frs(n_reversal_steps 10, pinned_steps 8, adapter matrix corruption)" in modes
+    mars_u = next(part for part in modes.split("; ") if part.startswith("mars-u="))
+    assert "adapter user " in mars_u and mars_u.endswith("assets/user/u/user.pt)")
+    mars = next(part for part in modes.split("; ") if part.startswith("mars="))
+    assert "adapter user " in mars and "assets/user/u/user.pt" in mars
+    assert "task " in mars and "assets/task/t/task.pt" in mars
 
 
 def test_the_lift_falls_back_to_the_station_reset_pose_when_q0_is_empty(tmp_path):
@@ -284,13 +447,32 @@ def test_an_unresolvable_corruption_is_reported_as_information_not_an_identity(t
     assert "F7 (7x7" not in text
 
 
+# ---------------------------------------------------------------- the shipped config
+
+
+def test_the_shipped_config_pins_the_session_reset_pose_and_turns_the_tare_on():
+    """The measured reset pose is pinned so F7, the mars-f adapter and the trainer's replay agree
+    across sessions; its lift is the session's 1.3846, which the pinned q0 reproduces."""
+    config = load_config(SHIPPED)
+    np.testing.assert_allclose(config.command.q0, SESSION_Q0)
+    assert config.spacemouse.tare is True
+    matrix7 = bridge.corruption_lift(
+        bridge.matrix6_from_spec(config.readout.corruption),
+        np.asarray(config.command.q0, dtype=np.float64),
+        config.command.twist_length,
+    )
+    assert float(np.linalg.norm(matrix7, 2)) == pytest.approx(1.3846, abs=1e-3)
+    lines, failures, _ = probe.configuration_section(config, SHIPPED, None, None)
+    text = "\n".join(lines)
+    assert failures == 0
+    assert "q0: [+0.010 -0.629 -0.002 -2.511 -0.010 +1.906 +0.007] (from [command] q0)" in text
+
+
 # ---------------------------------------------------------------- the command
 
 
-def test_main_reports_an_unavailable_station_and_exits_non_zero(tmp_path, monkeypatch, capsys):
-    """No c3po here: the station section says unavailable and the probe continues, then exits non-zero.
-    The CUDA gate and the hidraw enumeration are patched too, so this never touches a real device."""
-    path = _write(tmp_path, _config_text(q0="[]"))
+def _patch_absent_hardware(monkeypatch):
+    """The station, the hidraw enumeration and the CUDA gate all absent, as on a laptop."""
     import station as station_module
 
     def no_c3po(*args, **kwargs):
@@ -299,13 +481,118 @@ def test_main_reports_an_unavailable_station_and_exits_non_zero(tmp_path, monkey
     monkeypatch.setattr(station_module, "C3poStation", no_c3po)
     monkeypatch.setattr(probe, "hidraw_nodes", lambda: [])
     monkeypatch.setattr(probe.shutil, "which", lambda name: None)
+
+
+def test_main_reports_an_unavailable_station_and_exits_non_zero(tmp_path, monkeypatch, capsys):
+    """No c3po here: the station section says unavailable and the probe continues, then exits non-zero."""
+    path = _write(tmp_path, _config_text(q0="[]"))
+    _patch_absent_hardware(monkeypatch)
     assert probe.main(["--config", str(path)]) == 1
     output = capsys.readouterr().out
     assert "=== 1/4 configuration ===" in output
     assert "=== 2/4 station ===" in output and "UNAVAILABLE" in output
     assert "c3po is not installed" in output
+    assert "=== 3/4 spacemouse ===" in output and "no /dev/hidraw* node" in output
     assert "=== 4/4 policy ===" in output
     assert "probe: 1/4 sections passed" in output
+
+
+def test_a_section_that_raises_keeps_its_collected_lines_and_prints_the_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """The session's loss: checkpoint facts collected, then the policy step raised and the section
+    returned one line. A raising section must print what it collected *and* the stack."""
+    path = _write(tmp_path, _config_text(q0="[]"))
+    _patch_absent_hardware(monkeypatch)
+
+    def exploding(config, observation, lines=None):
+        lines.append("checkpoint: type pi05; chunk_size 8 (the facts survived the raise)")
+        raise TypeError("'numpy.int64' object is not iterable")
+
+    monkeypatch.setattr(probe, "policy_section", exploding)
+    assert probe.main(["--config", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "checkpoint: type pi05; chunk_size 8 (the facts survived the raise)" in captured.out
+    assert "[FAIL] the section raised TypeError: 'numpy.int64' object is not iterable" in captured.out
+    assert "status: FAIL (1 checks failed)" in captured.out
+    assert "Traceback (most recent call last)" in captured.err
+    assert "TypeError: 'numpy.int64' object is not iterable" in captured.err
+    # The sections after the raising one still ran: a diagnostic does not hide the rest.
+    assert "probe: 1/4 sections passed" in captured.out
+
+
+def test_an_unavailable_section_keeps_the_lines_it_collected_before_the_gate(tmp_path, monkeypatch, capsys):
+    """The session's exact loss: the checkpoint facts were collected, then prepare failed and the
+    section returned only `[UNAVAILABLE]`; the facts must be printed too."""
+    path = _write(tmp_path, _config_text(q0="[]"))
+    _patch_absent_hardware(monkeypatch)
+
+    def gated(config, observation, lines=None):
+        lines.append("checkpoint: type pi05; chunk_size 8 (collected before the gate)")
+        return probe._unavailable(lines, "prepare + act: TypeError: boom")
+
+    monkeypatch.setattr(probe, "policy_section", gated)
+    assert probe.main(["--config", str(path)]) == 1
+    output = capsys.readouterr().out
+    assert "checkpoint: type pi05; chunk_size 8 (collected before the gate)" in output
+    assert "[UNAVAILABLE] prepare + act: TypeError: boom" in output
+    assert "status: UNAVAILABLE: prepare + act: TypeError: boom" in output
+
+
+def _install_fake_cuda_and_checkpoint(monkeypatch):
+    """A GPU-looking torch and a checkpoint config, so the policy section runs on a laptop.
+
+    The real checkpoint is not downloaded (the HF cache is not on the workspace): the config stands
+    in so the section reaches its prepare step, which is the point of the session's failure.
+    """
+    torch = types.ModuleType("torch")
+    torch.cuda = SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "lerobot.policies", types.ModuleType("lerobot.policies"))
+    checkpoint = SimpleNamespace(
+        type="pi05",
+        chunk_size=8,
+        n_action_steps=8,
+        num_inference_steps=10,
+        max_action_dim=32,
+        max_state_dim=32,
+        use_relative_actions=False,
+        dtype="bfloat16",
+        input_features={"observation.images.exterior": None},
+    )
+    configs = types.ModuleType("lerobot.configs.policies")
+    configs.PreTrainedConfig = SimpleNamespace(from_pretrained=lambda path: checkpoint)
+    monkeypatch.setitem(sys.modules, "lerobot.configs.policies", configs)
+    monkeypatch.setattr(probe.shutil, "which", lambda name: "nvidia-smi")
+
+
+class _BrokenBundle:
+    """The session's failure: the checkpoint loaded, then prepare raised a TypeError."""
+
+    def prepare(self, batch):
+        raise TypeError("'numpy.int64' object is not iterable")
+
+
+def test_the_policy_section_prints_its_checkpoint_facts_before_a_failing_prepare(
+    tmp_path, monkeypatch, capsys
+):
+    """The session's exact loss: the checkpoint facts and statistics were collected, then prepare
+    raised. The facts stay in the report and the stack is printed; nothing is swallowed."""
+    import policy as policy_module
+
+    path = _write(tmp_path, _config_text(_stats_file(tmp_path), q0="[]"))
+    _patch_absent_hardware(monkeypatch)
+    _install_fake_cuda_and_checkpoint(monkeypatch)
+    monkeypatch.setattr(policy_module, "load_bundle", lambda config: _BrokenBundle())
+    assert probe.main(["--config", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "checkpoint: lerobot/pi05_droid; type pi05; chunk_size 8" in captured.out
+    assert "load_bundle: " in captured.out
+    assert "statistics file:" in captured.out
+    assert "action mean (8)" in captured.out
+    assert "Traceback (most recent call last)" in captured.err
+    assert "TypeError: 'numpy.int64' object is not iterable" in captured.err
+    assert "probe: 1/4 sections passed" in captured.out
 
 
 def test_an_unreadable_config_is_a_user_error(tmp_path, capsys):

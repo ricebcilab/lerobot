@@ -1104,7 +1104,24 @@ def test_the_spacemouse_table_reaches_the_source(real_components, tmp_path):
         "rotation_full_scale": 350.0,
         "source": (3, 4, 5, 0, 1, 2),
         "sign": (1.0, 1.0, 1.0, -1.0, -1.0, -1.0),
+        "tare": True,
     }
+
+
+def test_the_run_header_names_the_source_and_its_tare(real_components, monkeypatch, capsys):
+    """The chosen node is only known once the source exists, so its line follows the header's config
+    facts: a session record must say which node was read and whether a rest offset was subtracted."""
+
+    class DescribedMouse(_FakeSpaceMouse):
+        def describe(self):
+            return "/dev/hidraw8 (tare on, rest offset [+0.154 +0.000 +0.000 +0.000 +0.000 +0.000])"
+
+    monkeypatch.setattr(cli, "SpaceMouseSource", DescribedMouse)
+    assert cli.main(["teleop", "--config", str(SHIPPED), "--steps", "1"]) == 0
+    assert (
+        "source: /dev/hidraw8 (tare on, rest offset "
+        "[+0.154 +0.000 +0.000 +0.000 +0.000 +0.000])" in capsys.readouterr().out
+    )
 
 
 def test_an_empty_spacemouse_path_means_search(real_components):

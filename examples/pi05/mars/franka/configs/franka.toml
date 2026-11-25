@@ -28,7 +28,10 @@ rotation_gain = 0.5 # rad/s at full deflection; a guess until the probe measures
 twist_length = 0.2 # m, the mixed-unit scale of the IK's 6-row solve
 deadband = 0.02 # action units below which the operator counts as idle
 gain = "auto" # 1 / ||F||_2 with the corruption on, else 1.0, so the corrupted command cannot clip
-q0 = [] # [] = the station's reset pose, captured once at connect
+# The session's measured reset pose (the probe's "reset pose q"), pinned so the corruption lift F7,
+# the `mars-f` adapter matrix and the trainer's replay are the same 7x7 and noise sequence across
+# sessions and stations; [] would take the station's reset pose, which is what the probe reported.
+q0 = [0.010, -0.629, -0.002, -2.511, -0.010, 1.906, 0.007]
 
 [readout]
 # The study's known corruption: a 20 degree rotation about z in the command's translation block,
@@ -78,12 +81,19 @@ adapter_task = "assets/task/pilot/task.pt"
 
 [spacemouse]
 # The defaults are unverified on hardware: the probe measures the real scales and channel mapping.
+# "" = search: the source opens the device's hidraw nodes and takes the one that delivers translation
+# reports (one 3Dconnexion device exposes five nodes; only /dev/hidraw8 carried the motion). A pinned
+# path skips that search. The probe prints the node the source picks and the rest six-vector.
 path = "" # "" = search for the device (SPACEMOUSE_HID_ID, when set, pins it instead)
 hid_id = "" # "" = search; otherwise a HID id such as 0000046D:0000C62B
 full_scale = 350.0
 rotation_full_scale = 350.0 # a guess until the probe measures it
 source = [0, 1, 2, 3, 4, 5] # device channels in the twist's [x, y, z, rx, ry, rz] order
 sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+# Subtract the rest six-vector once at start (captured after reports arrive and the stick settles),
+# so a released stick is a zero command: the session measured x = +0.154 at rest. This is a property
+# of the device, not the session; the probe prints the captured offset. false reads it untared.
+tare = true
 
 [recording]
 dir = "outputs/mars_franka" # relative to examples/pi05/mars/franka/

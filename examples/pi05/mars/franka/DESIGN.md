@@ -205,7 +205,8 @@ class DeflectionSource(Protocol):
     def gripper(self) -> bool         # True = closed (a latched toggle)
     def reset(self) -> None           # a new episode: clear the latch
     def close(self) -> None
-class SpaceMouseSource:               # wraps SpaceMouseTwist; the lerobot import is inside __init__
+class SpaceMouseSource:               # wraps SpaceMouseTwist on the node that reports motion;
+                                      # tared (rest six-vector subtracted); lerobot import is lazy
 class FakeSource:                     # tests and --dry-run
 class Loop:
     def __init__(self, *, config, station, mode: str, source=None, bundle=None, steering=None,
@@ -293,8 +294,10 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 [modes.mars-t]  mode = "frs" ; adapter_task = "assets/task/<task>/task.pt"
 [modes.mars]    mode = "frs" ; adapter_user = ... ; adapter_task = ...
 [spacemouse] path = "" ; hid_id = "" ; full_scale = 350.0 ; rotation_full_scale = 350.0
-             source = [0, 1, 2, 3, 4, 5] ; sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+             source = [0, 1, 2, 3, 4, 5] ; sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] ; tare = true
              # rotation_full_scale is a guess until the probe measures it; empty path/hid_id = search
+             # for the node that delivers translation reports (one device exposes several nodes)
+             # tare subtracts the rest six-vector: captured after reports arrive and the stick settles
 [recording] dir = "outputs/mars_franka"
 ```
 Unknown keys are rejected. Values are the method's own defaults unless the file sets them: FC's `tau=8`,

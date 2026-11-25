@@ -4,19 +4,35 @@
 action: the one ``reset()`` is the station's own episode signal and the only other station call is a
 read-only ``step(None)``. A section that cannot run says why and the next one still runs; the exit
 status is 0 only when every section passed.
+
+Two rules make the report usable when something goes wrong. Every line a section collected is printed
+even when a later step of that section fails (the session lost the checkpoint facts because the policy
+step raised after collecting them; the section now returns its lines with the failure). And an
+unexpected exception prints its traceback: a diagnostic must not swallow the stack.
+
+The SpaceMouse section answers the question the session exposed: a 3Dconnexion device can expose five
+hidraw nodes for one mouse and only one carries the reports. It prints every 3Dconnexion node's
+``HID_NAME`` and report-descriptor size, tallies every ``(report id, byte length)`` pair over the read
+window, and for each pair prints the max ``|int16|`` of the triple at offset 1 and — for a payload of 12
+bytes or more — of the second triple at offset 7, so a six-axis single report (or a rotation report
+under another id) is visible instead of lost. Then it builds the real ``SpaceMouseSource`` and prints
+the node it picks, the rest six-vector and whether it tared.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import os
 import select
 import shutil
 import struct
 import sys
 import time
+import traceback
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import bridge
@@ -24,6 +40,7 @@ import numpy as np
 import stats
 from bridge import ARM_DIMS
 from config import Config, load_config
+from numpy.typing import NDArray
 from station import observation_batch
 
 DEFAULT_CONFIG = Path(__file__).parent / "configs" / "franka.toml"
@@ -33,6 +50,13 @@ HOLD_SECONDS = 1.0  # the read-only step(None) window: about 15 control steps at
 HOLD_TOLERANCE_RAD = 0.1  # measured uncommanded drift is 0.0001-0.005 rad per step (plant.md)
 SPACEMOUSE_SECONDS = 5.0  # two full pushes per axis
 REST_WINDOW = 0.5  # after the pushes the operator releases; this catches the zeroing reports
+HIDRAW_SYSFS = Path("/sys/class/hidraw")
+"""Where a hidraw node's uevent and report descriptor live."""
+
+# lerobot's teleop_spacemouse.REPORT_TRANSLATION/REPORT_ROTATION, kept local so the formatting below
+# is a pure function of synthetic report bytes (the section imports lerobot only to find the device).
+REPORT_TRANSLATION = 1
+REPORT_ROTATION = 2
 
 
 def _error(error: BaseException | None) -> str:
@@ -45,18 +69,26 @@ def _vec(values: Sequence[float]) -> str:
     return "[" + " ".join(f"{float(value):+.3f}" for value in values) + "]"
 
 
+def _counts(values: Sequence[int]) -> str:
+    """The tally's maxima as raw counts, signed: ``[+350 -40 +12]``."""
+    return "[" + " ".join(f"{int(value):+d}" for value in values) + "]"
+
+
 def _check(lines: list[str], passed: bool, label: str, detail: str = "") -> int:
     lines.append(f"[{'PASS' if passed else 'FAIL'}] {label}" + (f": {detail}" if detail else ""))
     return 0 if passed else 1
 
 
-def _unavailable(reason: str) -> Report:
-    return [f"[UNAVAILABLE] {reason}"], 0, reason
+def _unavailable(lines: list[str], reason: str) -> Report:
+    lines.append(f"[UNAVAILABLE] {reason}")
+    return lines, 0, reason
 
 
-def configuration_section(config: Config, path, observation, reset_error) -> Report:
+def configuration_section(
+    config: Config, path, observation, reset_error, lines: list[str] | None = None
+) -> Report:
     """The config summary, then q0 / F7 / gain / noise sigma as the loop would resolve them."""
-    lines: list[str] = []
+    lines = [] if lines is None else lines
     hi = lines.append
     st, cmd, pol, cam, ro = config.station, config.command, config.policy, config.cameras, config.readout
     hi(f"config: {path} (unknown keys refused); command: probe")
@@ -79,7 +111,14 @@ def configuration_section(config: Config, path, observation, reset_error) -> Rep
             knobs = f"tau {mode.tau}, lam {mode.lam}, ic_gain {mode.ic_gain:g}"
         else:
             knobs = f"n_reversal_steps {mode.n_reversal_steps}, pinned_steps {mode.pinned_steps}"
-        adapter = f", adapter_matrix {mode.adapter_matrix}" if mode.adapter_matrix is not None else ""
+        adapters = []
+        if mode.adapter_matrix is not None:
+            adapters.append(f"matrix {mode.adapter_matrix}")
+        if mode.adapter_user is not None:
+            adapters.append(f"user {mode.adapter_user}")
+        if mode.adapter_task is not None:
+            adapters.append(f"task {mode.adapter_task}")
+        adapter = f", adapter {', '.join(adapters)}" if adapters else ""
         modes.append(f"{name}={mode.mode}({knobs}{adapter})")
     hi("modes: " + "; ".join(modes) + "; plain teleop is clean, --corrupted/shared use [readout]")
     q0, source = None, None
@@ -124,16 +163,22 @@ def configuration_section(config: Config, path, observation, reset_error) -> Rep
         except (OSError, ValueError) as error:
             hi(f"[INFO] noise sigma: cannot be scaled: {_error(error)}; the loop refuses noise")
         else:
-            hi(f"noise sigma (7, action units): {_vec(sigma)} ({ro.noise:g} x action std)")
+            hi(
+                f"noise sigma (8 dims: 7 command dims + gripper; the loop's noise is the first "
+                f"{ARM_DIMS}): {_vec(sigma)} ({ro.noise:g} x action std)"
+            )
     return lines, 0, None
 
 
-def station_section(config: Config, station, observation, reset_error) -> Report:
+def station_section(
+    config: Config, station, observation, reset_error, lines: list[str] | None = None
+) -> Report:
     """The station: manifest, rates, one reset, the camera feeds, a held second, the action contract."""
     if station is None:
         reason = _error(reset_error) if reset_error is not None else "the station is not available"
-        return _unavailable(reason)
-    lines, failures = [], 0
+        return _unavailable([] if lines is None else lines, reason)
+    lines = [] if lines is None else lines
+    failures = 0
     hi = lines.append
     m, cfg = station.manifest, config.station
     robot = getattr(station, "_robot", None)
@@ -202,24 +247,122 @@ def station_section(config: Config, station, observation, reset_error) -> Report
     return lines, failures, None
 
 
+# ---------------------------------------------------------------- the SpaceMouse
+
+
+@dataclass
+class Tally:
+    """The SpaceMouse read window: every ``(report id, byte length)`` pair the nodes delivered.
+
+    ``seen`` counts each pair per node; ``peaks`` holds the maxima of the int16 triples at offset 1
+    (and at offset 7 when the report is long enough), keyed by ``(node, report id, length)``;
+    ``last`` holds those triples as of the newest report and ``order`` records arrival sequence, so
+    the rest six-vector can use the newest translation/rotation report.
+    """
+
+    seen: dict[str, dict[tuple[int, int], int]] = field(default_factory=dict)
+    peaks: dict[tuple[str, int, int], tuple[tuple[int, int, int], tuple[int, int, int] | None]] = field(
+        default_factory=dict
+    )
+    last: dict[tuple[str, int, int], tuple[tuple[int, int, int], tuple[int, int, int] | None]] = field(
+        default_factory=dict
+    )
+    order: dict[tuple[str, int, int], int] = field(default_factory=dict)
+    serial: int = 0
+
+
+@dataclass(frozen=True)
+class SourceFacts:
+    """What the real ``SpaceMouseSource`` reported when the probe built one after the read window."""
+
+    path: str
+    tare: bool
+    rest: NDArray | None
+    at_rest: NDArray
+
+
 def hidraw_nodes() -> list[str]:
     """Every /dev/hidraw* node, sorted; empty on a machine without Linux hidraw devices."""
     return sorted(str(path) for path in Path("/dev").glob("hidraw*"))
 
 
-def _tally(node: str, data: bytes, ids, seen: dict, peaks: dict, last: dict) -> None:
-    report = data[0]
-    counts = seen.setdefault(node, {})
-    counts[report] = counts.get(report, 0) + 1
-    if report in ids[:2] and len(data) >= 7:
-        values = struct.unpack_from("<hhh", data, 1)
-        last[report] = values
-        peaks[report] = tuple(
-            max(abs(value), peak) for value, peak in zip(values, peaks.get(report, (0, 0, 0)), strict=True)
+def _uevent(node: str, sysfs: Path | str | None = None) -> str:
+    """A node's uevent (``HID_ID``, ``HID_NAME``, ...); "" when the sysfs entry is unreadable."""
+    root = HIDRAW_SYSFS if sysfs is None else Path(sysfs)
+    try:
+        return (root / Path(node).name / "device" / "uevent").read_text()
+    except OSError:
+        return ""
+
+
+def _uevent_field(uevent: str, name: str) -> str | None:
+    prefix = f"{name}="
+    for line in uevent.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
+
+
+def _report_descriptor_size(node: str, sysfs: Path | str | None = None) -> int | None:
+    """The HID report descriptor's byte length from sysfs, or None when it is not readable."""
+    root = HIDRAW_SYSFS if sysfs is None else Path(sysfs)
+    try:
+        return (root / Path(node).name / "device" / "report_descriptor").stat().st_size
+    except OSError:
+        return None
+
+
+def _node_line(node: str, is_spacemouse: bool, sysfs: Path | str | None = None) -> str:
+    """One hidraw node; a 3Dconnexion node also says its ``HID_NAME`` and descriptor size."""
+    uevent = _uevent(node, sysfs)
+    hid = _uevent_field(uevent, "HID_ID") or "?"
+    kind = "3Dconnexion" if is_spacemouse else "other"
+    line = f"hidraw {node}: HID_ID {hid} ({kind})"
+    if not is_spacemouse:
+        return line
+    name = _uevent_field(uevent, "HID_NAME")
+    line += f", HID_NAME {name!r}" if name else ", HID_NAME ?"
+    size = _report_descriptor_size(node, sysfs)
+    line += f", report descriptor {size} bytes" if size is not None else ", report descriptor unavailable"
+    return line
+
+
+def _tally(tally: Tally, node: str, data: bytes) -> None:
+    """Count one raw hidraw report and keep the maxima of its int16 triples.
+
+    The first byte is the report id, so a translation report (three int16) is 7 bytes and the second
+    triple at offset 7 needs 12 bytes after the id (a 13-byte report: the six-axis single report's
+    shape). Reports shorter than a triple are counted but have no maxima; that which ids arrive is
+    the finding, so a short report still counts toward its pair.
+    """
+    pair = (data[0], len(data))
+    counts = tally.seen.setdefault(node, {})
+    counts[pair] = counts.get(pair, 0) + 1
+    if len(data) < 7:
+        return
+    first = struct.unpack_from("<hhh", data, 1)
+    second = struct.unpack_from("<hhh", data, 7) if len(data) >= 13 else None
+    key = (node, *pair)
+    tally.serial += 1
+    tally.order[key] = tally.serial
+    previous = tally.peaks.get(key)
+    if previous is None:
+        tally.peaks[key] = (
+            tuple(abs(value) for value in first),
+            None if second is None else tuple(abs(value) for value in second),
         )
+    else:
+        peak_first, peak_second = previous
+        tally.peaks[key] = (
+            tuple(max(abs(value), peak) for value, peak in zip(first, peak_first, strict=True)),
+            None
+            if peak_second is None or second is None
+            else tuple(max(abs(value), peak) for value, peak in zip(second, peak_second, strict=True)),
+        )
+    tally.last[key] = (first, second)
 
 
-def _read_reports(opened: dict, seconds: float, ids, seen: dict, peaks: dict, last: dict) -> None:
+def _read_reports(opened: dict, seconds: float, tally: Tally) -> None:
     fds, deadline = list(opened), time.monotonic() + seconds
     while fds and time.monotonic() < deadline:
         ready, _, _ = select.select(fds, [], [], 0.25)
@@ -230,66 +373,176 @@ def _read_reports(opened: dict, seconds: float, ids, seen: dict, peaks: dict, la
                 fds.remove(fd)
                 continue
             if data:
-                _tally(opened[fd], data, ids, seen, peaks, last)
+                _tally(tally, opened[fd], data)
             else:
                 fds.remove(fd)  # b"" means the device went away, not a report
 
 
-def _mouse_report(
-    lines: list[str], failures: int, config: Config, seen: dict, peaks: dict, last: dict, ids
-) -> tuple[list[str], int]:
-    hi = lines.append
-    for node in sorted(seen):
-        hi(f"{node}: " + ", ".join(f"id {report} x {count}" for report, count in sorted(seen[node].items())))
-    for report, name in ((ids[0], "translation"), (ids[1], "rotation")):
-        peak = peaks.get(report)
-        detail = "none arrived" if peak is None else f"max |counts| x {peak[0]} y {peak[1]} z {peak[2]}"
-        failures += _check(lines, peak is not None, f"id {report} ({name}) reports", detail)
-    if ids[0] in peaks:
-        hi(f"copy into [spacemouse] full_scale = {max(peaks[ids[0]]):g}; the shipped 350.0 is unverified")
-    if ids[1] in peaks:
-        hi(
-            f"copy into [spacemouse] rotation_full_scale = {max(peaks[ids[1]]):g}; the shipped 350.0 is unverified"
+def _max_counts(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
+    """The per-axis largest |int16| of a report id's triples, across nodes and lengths; None if absent."""
+    triples = [maxima[0] for key, maxima in tally.peaks.items() if key[1] == report_id]
+    if not triples:
+        return None
+    return tuple(max(triple[axis] for triple in triples) for axis in range(3))  # type: ignore[return-value]
+
+
+def _newest(tally: Tally, report_id: int) -> tuple[int, int, int] | None:
+    """The first triple of the newest report of ``report_id`` across the nodes; None if absent."""
+    keys = [key for key in tally.last if key[1] == report_id]
+    if not keys:
+        return None
+    return tally.last[max(keys, key=tally.order.__getitem__)][0]
+
+
+def _tally_lines(tally: Tally) -> list[str]:
+    """Every pair's count per node, then every pair's triple maxima — the rotation-shape evidence."""
+    lines: list[str] = []
+    for node in sorted(tally.seen):
+        pairs = ", ".join(
+            f"id {report} ({length} bytes) x {count}"
+            for (report, length), count in sorted(tally.seen[node].items())
         )
-    source, sign = list(config.spacemouse.source), [float(value) for value in config.spacemouse.sign]
-    hi(f"configured source {source}, sign {sign}; channels 0 x, 1 y, 2 z, 3 rx, 4 ry, 5 rz")
-    raw = np.asarray([*last.get(ids[0], (0, 0, 0)), *last.get(ids[1], (0, 0, 0))], dtype=np.float64)
+        lines.append(f"  {node} reports: {pairs}")
+    for key in sorted(tally.peaks, key=lambda item: (item[0], item[1], item[2])):
+        node, report, length = key
+        first, second = tally.peaks[key]
+        line = f"  {node} id {report} ({length} bytes): max |int16| offset 1 {_counts(first)}"
+        if second is not None:
+            line += f", offset 7 {_counts(second)}"
+        lines.append(line)
+    return lines
+
+
+def _rest_from_tally(tally: Tally, config: Config) -> NDArray:
+    """The rest six-vector from the newest raw reports, scaled and mapped like the source would."""
+    translation = _newest(tally, REPORT_TRANSLATION) or (0, 0, 0)
+    rotation = _newest(tally, REPORT_ROTATION) or (0, 0, 0)
+    raw = np.asarray([*translation, *rotation], dtype=np.float64)
     scale = np.asarray([config.spacemouse.full_scale] * 3 + [config.spacemouse.rotation_full_scale] * 3)
-    hi(f"rest-state six-vector [x y z rx ry rz]: {_vec(raw[source] * np.asarray(sign) / scale)}")
+    source = np.asarray(config.spacemouse.source, dtype=np.intp)
+    sign = np.asarray(config.spacemouse.sign, dtype=np.float64)
+    return raw[source] * sign / scale
+
+
+def _source_facts(config: Config) -> tuple[SourceFacts | None, Exception | None]:
+    """Build the real ``SpaceMouseSource`` the session uses, and record what it chose and tared."""
+    try:
+        from source import SpaceMouseSource
+
+        source = SpaceMouseSource(
+            path=config.spacemouse.path or None,
+            hid_id=config.spacemouse.hid_id or None,
+            full_scale=config.spacemouse.full_scale,
+            rotation_full_scale=config.spacemouse.rotation_full_scale,
+            source=config.spacemouse.source,
+            sign=config.spacemouse.sign,
+            tare=config.spacemouse.tare,
+        )
+    except (OSError, ImportError) as error:  # a quiet or unreadable device is a report line
+        return None, error
+    try:
+        facts = SourceFacts(
+            path=source.path,
+            tare=source.tare,
+            rest=source.rest,
+            at_rest=np.asarray(source.deflection(), dtype=np.float64).copy(),
+        )
+    finally:
+        source.close()
+    return facts, None
+
+
+def _mouse_report(
+    lines: list[str],
+    failures: int,
+    config: Config,
+    tally: Tally,
+    source: SourceFacts | None,
+    source_error: Exception | None,
+) -> tuple[list[str], int]:
+    """The tallied report, the checks, the scales to copy, and the source's pick, rest and tare."""
+    hi = lines.append
+    lines.extend(_tally_lines(tally))
+    translation = _max_counts(tally, REPORT_TRANSLATION)
+    detail = (
+        "none arrived"
+        if translation is None
+        else f"max |counts| x {translation[0]} y {translation[1]} z {translation[2]}"
+    )
+    failures += _check(
+        lines, translation is not None, f"id {REPORT_TRANSLATION} (translation) reports", detail
+    )
+    rotation = _max_counts(tally, REPORT_ROTATION)
+    if rotation is None:
+        failures += _check(
+            lines, False, f"id {REPORT_ROTATION} (rotation) reports", "none arrived on any node"
+        )
+        hi(
+            "[DIAG] no rotation report arrived on any node: twist each rotation axis to its stop again "
+            "during the 5 s window. The device may report rotation under another id or as the second "
+            "triple of a wider single report; the (id, bytes) tally above shows both, so a pair that is "
+            "not id 1 with 7 bytes — a six-axis report is 13 bytes — is the place to look, and its "
+            "second triple would be the rotation."
+        )
+    else:
+        detail = f"max |counts| x {rotation[0]} y {rotation[1]} z {rotation[2]}"
+        failures += _check(lines, True, f"id {REPORT_ROTATION} (rotation) reports", detail)
+    if translation is not None:
+        hi(f"copy into [spacemouse] full_scale = {max(translation):g}; the shipped 350.0 is unverified")
+    if rotation is not None:
+        hi(f"copy into [spacemouse] rotation_full_scale = {max(rotation):g}; the shipped 350.0 is unverified")
+    source_map, sign = list(config.spacemouse.source), [float(value) for value in config.spacemouse.sign]
+    hi(f"configured source {source_map}, sign {sign}; channels 0 x, 1 y, 2 z, 3 rx, 4 ry, 5 rz")
+    fallback = _rest_from_tally(tally, config)
+    if source is not None:
+        hi(f"source would pick: {source.path}")
+        hi(f"source tare: {'on' if source.tare else 'off'}")
+        if source.rest is not None:
+            hi(
+                f"rest six-vector [x y z rx ry rz]: {_vec(source.rest)} "
+                "(captured at start, after the node reported and the stick settled)"
+            )
+            hi(f"at rest after tare: {_vec(source.at_rest)}")
+        else:
+            hi(f"rest six-vector [x y z rx ry rz]: {_vec(fallback)} (no tare captured; last raw reports)")
+    else:
+        failures += _check(lines, False, "source", _error(source_error))
+        hi(
+            f"rest six-vector [x y z rx ry rz]: {_vec(fallback)} (from the last raw reports; the source is absent)"
+        )
     return lines, failures
 
 
-def spacemouse_section(config: Config) -> Report:
-    """The 3Dconnexion nodes, their reports, the full scales and the rest state."""
+def spacemouse_section(config: Config, lines: list[str] | None = None) -> Report:
+    """The 3Dconnexion nodes and their reports, the tallies, the scales, the source's pick and tare."""
     nodes = hidraw_nodes()
     if not nodes:
-        return _unavailable("no /dev/hidraw* node: the device is read straight from Linux hidraw")
+        return _unavailable(
+            [] if lines is None else lines, "no /dev/hidraw* node: the device is read from Linux hidraw"
+        )
     try:
-        from lerobot.teleoperators.spacemouse import teleop_spacemouse as sm
+        sm = importlib.import_module("lerobot.teleoperators.spacemouse.teleop_spacemouse")
 
-        _is_3dconnexion, find_spacemouse = sm._is_3dconnexion, sm.find_spacemouse
-    except Exception as error:
-        return _unavailable(f"lerobot's spacemouse module is not importable ({_error(error)})")
-    lines, failures = [], 0
+        _is_3dconnexion = sm._is_3dconnexion
+    except (ImportError, OSError) as error:
+        return _unavailable(
+            [] if lines is None else lines,
+            f"lerobot's spacemouse module is not importable ({_error(error)})",
+        )
+    lines = [] if lines is None else lines
+    failures = 0
     hi = lines.append
     spacemice = []
     for node in nodes:
-        try:
-            uevent = (Path("/sys/class/hidraw") / Path(node).name / "device" / "uevent").read_text()
-        except OSError:
-            uevent = ""
-        hid = next((line[7:].strip() for line in uevent.splitlines() if line.startswith("HID_ID=")), "?")
+        uevent = _uevent(node)
         is_mouse = _is_3dconnexion(uevent)
-        hi(f"hidraw {node}: HID_ID {hid} ({'3Dconnexion' if is_mouse else 'other'})")
+        hi(_node_line(node, is_mouse))
         if is_mouse:
             spacemice.append(node)
     if not spacemice:
-        return _unavailable(f"no 3Dconnexion node among the {len(nodes)} hidraw nodes")
-    try:
-        configured = config.spacemouse.path or find_spacemouse(config.spacemouse.hid_id or None)
-        lines.append(f"configured node: {configured!r}")
-    except OSError as error:
-        lines.append(f"[INFO] configured node: {_error(error)}")
+        return _unavailable(lines, f"no 3Dconnexion node among the {len(nodes)} hidraw nodes")
+    mouse = config.spacemouse
+    hi(f"configured [spacemouse]: path {mouse.path!r}, hid_id {mouse.hid_id!r}, tare {mouse.tare}")
     opened = {}
     for node in spacemice:
         try:
@@ -297,26 +550,34 @@ def spacemouse_section(config: Config) -> Report:
         except OSError as error:
             failures += _check(lines, False, f"readable {node}", _error(error))
     if not opened:
-        return _unavailable("no 3Dconnexion node could be opened for reading")
-    ids, seen, peaks, last = (sm.REPORT_TRANSLATION, sm.REPORT_ROTATION, sm.REPORT_BUTTONS), {}, {}, {}
+        return _unavailable(lines, "no 3Dconnexion node could be opened for reading")
+    tally = Tally()
     try:
         print("  push each translation axis to its stop (+x right, +y toward you, +z down), then", flush=True)
         print("  twist each rotation axis to its stop (rx, ry, rz)", flush=True)
         print(f"  reading {len(opened)} node(s) for {SPACEMOUSE_SECONDS:g} s; move the stick now", flush=True)
-        _read_reports(opened, SPACEMOUSE_SECONDS, ids, seen, peaks, last)
+        _read_reports(opened, SPACEMOUSE_SECONDS, tally)
         print("  release the stick and hold it still; reading the rest state", flush=True)
-        _read_reports(opened, REST_WINDOW, ids, seen, peaks, last)
+        _read_reports(opened, REST_WINDOW, tally)
     finally:
         for fd in opened:
             with contextlib.suppress(OSError):
                 os.close(fd)
-    return _mouse_report(lines, failures, config, seen, peaks, last, ids) + (None,)
+    source, source_error = _source_facts(config)
+    lines, failures = _mouse_report(lines, failures, config, tally, source, source_error)
+    return lines, failures, None
 
 
-def policy_section(config: Config, observation) -> Report:
+# ---------------------------------------------------------------- the checkpoint
+
+
+def policy_section(config: Config, observation, lines: list[str] | None = None) -> Report:
     """The checkpoint, the statistics file, and one timed prepare + act."""
     if shutil.which("nvidia-smi") is None:
-        return _unavailable("needs CUDA: no nvidia-smi on PATH; the checkpoint is loaded on the GPU")
+        return _unavailable(
+            [] if lines is None else lines,
+            "needs CUDA: no nvidia-smi on PATH; the checkpoint is loaded on the GPU",
+        )
     try:
         import torch
 
@@ -326,9 +587,13 @@ def policy_section(config: Config, observation) -> Report:
         from lerobot.configs.policies import PreTrainedConfig
 
         ck = PreTrainedConfig.from_pretrained(str(config.policy.path))
-    except Exception as error:
-        return _unavailable(f"needs CUDA and the checkpoint's config ({_error(error)})")
-    lines, failures = [], 0
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
+        return _unavailable(
+            [] if lines is None else lines,
+            f"needs CUDA and the checkpoint's config ({_error(error)})",
+        )
+    lines = [] if lines is None else lines
+    failures = 0
     hi = lines.append
     images = [key for key in (getattr(ck, "input_features", None) or {}) if "image" in key]
     steps = f"n_action_steps {ck.n_action_steps} (config {config.policy.n_action_steps})"
@@ -341,7 +606,9 @@ def policy_section(config: Config, observation) -> Report:
     hi(f"image keys: {', '.join(images) or 'none'}")
     path = Path(config.policy.stats)
     if not path.is_file():
-        return _unavailable(f"statistics file {path} is absent: download openpi's droid/norm_stats.json")
+        return _unavailable(
+            lines, f"statistics file {path} is absent: download openpi's droid/norm_stats.json"
+        )
     try:
         groups = stats._groups(path)
         panels = stats._quantile_pair(groups, "actions", path, stats.STATION_DIMS)
@@ -349,7 +616,7 @@ def policy_section(config: Config, observation) -> Report:
         dims = f"{stats.CHECKPOINT_WIDTH} wide, {stats.STATION_DIMS} meaningful dims"
         hi(f"statistics file: {path}, {dims}")
     except (OSError, ValueError) as error:
-        return _unavailable(f"statistics {path}: {_error(error)}")
+        return _unavailable(lines, f"statistics {path}: {_error(error)}")
     hi(f"action mean (8): {_vec((panels['q01'] + panels['q99']) / 2.0)}")
     hi(f"action std (8): {_vec(np.maximum((panels['q99'] - panels['q01']) / 2.0, 1e-6))}")
     try:
@@ -358,8 +625,8 @@ def policy_section(config: Config, observation) -> Report:
         started = time.monotonic()
         bundle = load_bundle(config)
         load_ms = 1000.0 * (time.monotonic() - started)
-    except Exception as error:
-        return _unavailable(f"load_bundle: {_error(error)}")
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
+        return _unavailable(lines, f"load_bundle: {_error(error)}")
     hi(f"load_bundle: {load_ms:.0f} ms")
     if observation is None:
         frame, arm = np.zeros((480, 640, 3), dtype=np.uint8), config.station.arm
@@ -373,15 +640,12 @@ def policy_section(config: Config, observation) -> Report:
         "third": config.cameras.third,
     }
     batch = observation_batch(observation, arm=config.station.arm, cameras=cameras, task="probe")
-    try:
-        started = time.monotonic()
-        prepared = bundle.prepare(batch)
-        prepare_ms = 1000.0 * (time.monotonic() - started)
-        started = time.monotonic()
-        action = bundle.act(prepared, None)
-        act_ms = 1000.0 * (time.monotonic() - started)
-    except Exception as error:
-        return _unavailable(f"prepare + act: {_error(error)}")
+    started = time.monotonic()
+    prepared = bundle.prepare(batch)  # an unexpected failure here is main's traceback, not a one-liner
+    prepare_ms = 1000.0 * (time.monotonic() - started)
+    started = time.monotonic()
+    action = bundle.act(prepared, None)
+    act_ms = 1000.0 * (time.monotonic() - started)
     tick = 1000.0 / config.station.rate
     hi(
         f"chunk time {prepare_ms + act_ms:.0f} ms (prepare {prepare_ms:.0f} + act {act_ms:.0f}); "
@@ -420,21 +684,29 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         reset_error = error
     builders = (
-        ("configuration", lambda: configuration_section(config, args.config, observation, reset_error)),
-        ("station", lambda: station_section(config, station, observation, reset_error)),
-        ("spacemouse", lambda: spacemouse_section(config)),
-        ("policy", lambda: policy_section(config, observation)),
+        (
+            "configuration",
+            lambda lines: configuration_section(config, args.config, observation, reset_error, lines),
+        ),
+        ("station", lambda lines: station_section(config, station, observation, reset_error, lines)),
+        ("spacemouse", lambda lines: spacemouse_section(config, lines)),
+        ("policy", lambda lines: policy_section(config, observation, lines)),
     )
     passed = 0
     try:
         for index, (title, build) in enumerate(builders, 1):
             print(f"=== {index}/{len(builders)} {title} ===", flush=True)
+            lines: list[str] = []
+            raised: BaseException | None = None
             try:
-                lines, failures, unavailable = build()
+                _, failures, unavailable = build(lines)
             except Exception as error:  # one section's bug must not hide the other three
-                lines, failures, unavailable = [f"[FAIL] the section raised {_error(error)}"], 1, None
+                raised, failures, unavailable = error, 1, None
+                lines.append(f"[FAIL] the section raised {_error(error)} (traceback below)")
             for line in lines:
                 print(f"  {line}", flush=True)
+            if raised is not None:  # a diagnostic must not swallow the stack
+                traceback.print_exception(type(raised), raised, raised.__traceback__)
             status = f"FAIL ({failures} checks failed)" if failures else "PASS"
             if unavailable is not None:
                 status = f"UNAVAILABLE: {unavailable}"

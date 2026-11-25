@@ -354,6 +354,7 @@ def test_the_spacemouse_section_has_the_documented_defaults(tmp_path):
     assert (spacemouse.full_scale, spacemouse.rotation_full_scale) == (350.0, 350.0)
     assert spacemouse.source == (0, 1, 2, 3, 4, 5)
     assert spacemouse.sign == (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    assert spacemouse.tare is True  # the rest offset is a device property: subtract it by default
 
 
 def test_the_spacemouse_section_parses_a_path_mapping_and_scales(tmp_path):
@@ -365,13 +366,15 @@ def test_the_spacemouse_section_parses_a_path_mapping_and_scales(tmp_path):
         "full_scale = 300.0\n"
         "rotation_full_scale = 200.0\n"
         "source = [5, 4, 3, 2, 1, 0]\n"
-        "sign = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]\n",
+        "sign = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]\n"
+        "tare = false\n",
     )
     spacemouse = cfg.spacemouse
     assert (spacemouse.path, spacemouse.hid_id) == ("/dev/hidraw9", "0000046D:0000C62B")
     assert (spacemouse.full_scale, spacemouse.rotation_full_scale) == (300.0, 200.0)
     assert spacemouse.source == (5, 4, 3, 2, 1, 0)
     assert spacemouse.sign == (1.0, -1.0, 1.0, -1.0, 1.0, -1.0)
+    assert spacemouse.tare is False  # false reads the device untared
 
 
 @pytest.mark.parametrize(
@@ -385,6 +388,8 @@ def test_the_spacemouse_section_parses_a_path_mapping_and_scales(tmp_path):
         ('[spacemouse]\nsign = [1.0, 1.0, 1.0, 1.0, 1.0, "up"]\n', "sign"),
         ("[spacemouse]\nfull_scale = 0.0\n", "full_scale"),
         ("[spacemouse]\nrotation_full_scale = -1.0\n", "rotation_full_scale"),
+        ("[spacemouse]\ntare = 1\n", "tare"),
+        ('[spacemouse]\ntare = "yes"\n', "tare"),
         ('[spacemouse]\nbutton = "left"\n', "button"),
     ],
 )

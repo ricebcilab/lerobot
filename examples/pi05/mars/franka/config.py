@@ -255,11 +255,15 @@ class SpaceMouseConfig:
     """The operator's ``[spacemouse]`` table: how the device is found and its six channels mapped.
 
     ``path`` and ``hid_id`` are ``SpaceMouseTwist``'s; the empty string means search (the library's
-    default, ``SPACEMOUSE_HID_ID`` when unset). ``source`` maps the device's six channels
-    (0: x, 1: y, 2: z, 3: rx, 4: ry, 5: rz) onto the twist's axes and ``sign`` flips them. The
-    scales are the device's counts per unit of full deflection. **The defaults are unverified on
-    hardware**: ``rotation_full_scale`` in particular is a guess, and the probe measures the real
-    scales and the channel mapping.
+    default, ``SPACEMOUSE_HID_ID`` when unset). With both empty the source searches the device's
+    hidraw nodes and takes the one that delivers translation reports (one device exposes several
+    nodes and only one carries the motion), never the first by name. ``source`` maps the device's six
+    channels (0: x, 1: y, 2: z, 3: rx, 4: ry, 5: rz) onto the twist's axes and ``sign`` flips them.
+    The scales are the device's counts per unit of full deflection. ``tare`` subtracts the device's
+    rest six-vector, captured once at start after reports arrive and the stick settles, from every
+    later reading; the session measured a non-zero x at rest, and taring is what makes "released"
+    mean a zero command. **The defaults are unverified on hardware**: ``rotation_full_scale`` in
+    particular is a guess, and the probe measures the real scales and the channel mapping.
     """
 
     path: str = ""  # "" = search for the device
@@ -268,6 +272,7 @@ class SpaceMouseConfig:
     rotation_full_scale: float = 350.0
     source: tuple[int, ...] = (0, 1, 2, 3, 4, 5)  # the device channels, in the twist's axis order
     sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    tare: bool = True  # subtract the rest six-vector captured at start (a device property)
 
 
 @dataclass(frozen=True)
@@ -542,6 +547,7 @@ def _spacemouse(table: Any) -> SpaceMouseConfig:
             "rotation_full_scale": _positive,
             "source": _device_channels,
             "sign": _device_signs,
+            "tare": _flag,
         },
         "[spacemouse]",
     )
