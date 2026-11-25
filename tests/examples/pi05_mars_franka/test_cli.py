@@ -206,6 +206,19 @@ def test_the_shipped_config_is_the_study_config():
     assert (config.steering.n_reversal_steps, config.steering.pinned_steps) == (10, 8)
     assert config.spacemouse.source == (0, 1, 2, 3, 4, 5)
     assert config.recording.dir == EXAMPLE_DIR / "outputs" / "mars_franka"
+    # Phase B's tables: the study's calibration session and the trainer's loop
+    assert config.user.states == EXAMPLE_DIR / "assets" / "states" / "pilot"
+    assert config.user.out == EXAMPLE_DIR / "assets" / "user" / "rotz20"
+    assert config.user.checkpoint == EXAMPLE_DIR / "assets" / "user" / "rotz20" / "user.pt"
+    assert (config.user.cues, config.user.sigma) == (3, (0.2, 0.5))
+    assert (config.user.step_rank, config.user.cross_step_rank, config.user.additive) == (None, 0, False)
+    assert (config.training.steps, config.training.batch, config.training.lr) == (3000, 8, 1e-3)
+    assert (config.training.val_frac, config.training.seed, config.training.log_every) == (0.1, 0, 100)
+    assert (config.training.val_depths, config.training.device, config.training.dtype) == (
+        (10, 4),
+        "cuda",
+        "bfloat16",
+    )
 
 
 @pytest.mark.parametrize("command", SHIPPED_COMMANDS)
@@ -361,6 +374,75 @@ def test_a_missing_mode_table_names_it_and_how_to_add_one(command, capsys):
     error = capsys.readouterr().err
     assert f"[modes.{command}]" in error
     assert "add one" in error
+
+
+# ---------------------------------------------------------------- the train-user command
+
+
+def _user_config(tmp_path: Path) -> Path:
+    """A config whose ``[user]`` names a states directory and an output under tmp_path."""
+    return _write(
+        tmp_path,
+        f'[user]\nstates = "{tmp_path}/states/pilot"\nout = "{tmp_path}/user"\n\n[modes.frs]\nmode = "frs"\n',
+    )
+
+
+def test_train_user_requires_a_prompt(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["train-user", "--config", str(SHIPPED)])
+    assert exit.value.code == 2
+    assert "--prompt is required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--steps", "2"], ["--record", "pilot"], ["--record-states", "pilot"], ["--dry-run"], ["--trace"]],
+)
+def test_train_user_takes_no_session_flags(flags, capsys):
+    """``[user]`` names the trainer's input and output; a session flag has no meaning for it."""
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["train-user", "--config", str(SHIPPED), "--prompt", "pick", *flags])
+    assert exit.value.code == 2
+    assert "takes --config and --prompt only" in capsys.readouterr().err
+
+
+def test_train_user_reaches_the_trainer_with_the_configs_values(tmp_path, monkeypatch, capsys):
+    """The command is the trainer's composition root: it hands the trainer the file's ``[user] states``
+    and ``out`` and the session's prompt, and prints the checkpoint the trainer returns."""
+    import train_user
+
+    config_path = _user_config(tmp_path)
+    calls = []
+
+    def fake_train(config, *, prompt, states_path, out, device=None):
+        calls.append({"config": config, "prompt": prompt, "states_path": Path(states_path), "out": Path(out)})
+        return Path(out) / "user.pt"
+
+    monkeypatch.setattr(train_user, "train", fake_train)
+    assert cli.main(["train-user", "--config", str(config_path), "--prompt", "pick the cube"]) == 0
+
+    configured = load_config(config_path)
+    assert configured.user.states == tmp_path / "states" / "pilot"
+    assert calls == [
+        {
+            "config": configured,
+            "prompt": "pick the cube",
+            "states_path": configured.user.states,
+            "out": configured.user.out,
+        }
+    ]
+    assert f"user module: {configured.user.out / 'user.pt'}" in capsys.readouterr().out
+
+
+def test_train_user_reports_a_user_error_as_one_line(tmp_path, monkeypatch, capsys):
+    import train_user
+
+    def refuses(*args, **kwargs):
+        raise ValueError("[user] states: no such states file")
+
+    monkeypatch.setattr(train_user, "train", refuses)
+    assert cli.main(["train-user", "--config", str(_user_config(tmp_path)), "--prompt", "pick"]) == 2
+    assert "[user] states" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------- the config flag and the SpaceMouse

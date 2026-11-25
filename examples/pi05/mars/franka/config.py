@@ -10,8 +10,10 @@ TOML has no ``null``: an absent key means "the built-in default", and the built-
 harmless ones (corruption off, no noise). The explicit offs are the strings ``corruption = "none"``
 (equivalent to the absent default, so a variant file can turn off what it inherits) and
 ``mode = "none"``. Relative paths (``policy.stats``, ``steering.adapter_user``/``adapter_task``,
-``recording.dir``, ``states.dir``) resolve against this example's directory, not the caller's working
-directory.
+``recording.dir``, ``states.dir``, ``user.states``/``out``/``checkpoint``) resolve against this
+example's directory, not the caller's working directory. Phase B's ``[user]`` and ``[training]``
+tables are the user-module trainer's knobs (DESIGN.md, "Phase B"); the ``null`` defaults there
+(``horizon``, ``step_rank``, ``correct_by``) are the absent key, since TOML cannot spell a null.
 """
 
 from __future__ import annotations
@@ -43,10 +45,12 @@ _SECTIONS = frozenset(
         "spacemouse",
         "recording",
         "states",
+        "user",
+        "training",
     }
 )
 """The config file's sections: station, cameras, policy, command, readout, steering, modes,
-spacemouse, recording, states."""
+spacemouse, recording, states, user, training."""
 
 _MODE_KNOBS = {
     "none": frozenset(),
@@ -133,6 +137,47 @@ class StatesConfig:
 
 
 @dataclass(frozen=True)
+class UserConfig:
+    """The `[user]` table: the user-module trainer's input, output and module shape (DESIGN.md, Phase B).
+
+    ``states`` names a states file or the directory holding one (``<dir>/states.npz``, which is what
+    ``--record-states NAME`` writes); ``train-user`` writes ``<out>/user.pt`` and ``<out>/train_log.json``;
+    ``checkpoint`` is where ``validate-user`` and ``[modes.mars-u]`` read the trained module from.
+    ``sigma`` is the readout noise range in action-standard-deviation units (the study's), drawn per cue;
+    ``horizon``, ``step_rank`` and ``correct_by`` are None unless a variant config sets them.
+    """
+
+    states: Path = EXAMPLE_DIR / "assets" / "states" / "pilot"
+    out: Path = EXAMPLE_DIR / "assets" / "user" / "rotz20"
+    checkpoint: Path = EXAMPLE_DIR / "assets" / "user" / "rotz20" / "user.pt"
+    cues: int = 3  # cue draws per state: the calibration session's length
+    sigma: tuple[float, float] = (0.2, 0.5)  # the readout's noise range, in action-std units
+    horizon: int | None = None  # None = the checkpoint's chunk_size
+    d: int = 256  # the module's width
+    tdim: int = 64  # its time embedding's width
+    time_embedding: str = "mars"  # "mars" (sinusoidal) or "pi05" (the policy's own)
+    step_rank: int | None = None  # None = every chunk step's matrix free
+    cross_step_rank: int = 0  # 0 = no coupling between the chunk's steps
+    additive: bool = False  # U v + b: the module supplies a velocity term of its own
+    correct_by: int | None = None  # the reversal step the correction is complete by; None = the last
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """The `[training]` table: the trainer's loop, split, device and precision (DESIGN.md, Phase B)."""
+
+    steps: int = 3000
+    batch: int = 8
+    lr: float = 1e-3
+    val_frac: float = 0.1
+    seed: int = 0
+    log_every: int = 100
+    val_depths: tuple[int, ...] = (10, 4)  # the reversal depths validate-user runs
+    device: str = "cuda"  # where the checkpoint and the module live while training
+    dtype: str = "bfloat16"  # the trainer's mixed precision on a CUDA device
+
+
+@dataclass(frozen=True)
 class SpaceMouseConfig:
     """The operator's ``[spacemouse]`` table: how the device is found and its six channels mapped.
 
@@ -164,6 +209,8 @@ class Config:
     spacemouse: SpaceMouseConfig = field(default_factory=SpaceMouseConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     states: StatesConfig = field(default_factory=StatesConfig)
+    user: UserConfig = field(default_factory=UserConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
 
 # ---------------------------------------------------------------- value checks
@@ -208,6 +255,42 @@ def _fraction(value: Any, where: str) -> float:
     if not 0 < number <= 1:
         raise ValueError(f"{where}: expected a number in (0, 1], got {value!r}")
     return number
+
+
+def _flag(value: Any, where: str) -> bool:
+    """A TOML boolean (``true``/``false``): 1 and 0 are integers, not flags, and are refused."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: expected true or false, got {value!r}")
+    return value
+
+
+def _pair(value: Any, where: str) -> tuple[float, float]:
+    """A ``[low, high]`` range of finite non-negative numbers, low <= high."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{where}: expected a [low, high] pair, got {value!r}")
+    low, high = (_non_negative(item, f"{where}[{index}]") for index, item in enumerate(value))
+    if low > high:
+        raise ValueError(f"{where}: expected low <= high, got {value!r}")
+    return low, high
+
+
+def _time_embedding(value: Any, where: str) -> str:
+    if value not in ("mars", "pi05"):
+        raise ValueError(f"{where}: expected 'mars' or 'pi05', got {value!r}")
+    return value
+
+
+def _dtype(value: Any, where: str) -> str:
+    if value not in ("bfloat16", "float16", "float32"):
+        raise ValueError(f"{where}: expected 'bfloat16', 'float16' or 'float32', got {value!r}")
+    return value
+
+
+def _depths(value: Any, where: str) -> tuple[int, ...]:
+    """A non-empty list of reversal depths (the positive Euler-step counts validate-user runs)."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{where}: expected a non-empty list of reversal depths, got {value!r}")
+    return tuple(_integer(item, f"{where}[{index}]") for index, item in enumerate(value))
 
 
 def _port(value: Any, where: str) -> int:
@@ -373,6 +456,50 @@ def _spacemouse(table: Any) -> SpaceMouseConfig:
     )
 
 
+def _user(table: Any) -> UserConfig:
+    """The `[user]` trainer table: the input, the output and the module's shape and knobs."""
+    return _build(
+        UserConfig,
+        table,
+        {
+            "states": _path,
+            "out": _path,
+            "checkpoint": _path,
+            "cues": _integer,
+            "sigma": _pair,
+            "horizon": _integer,
+            "d": _integer,
+            "tdim": _integer,
+            "time_embedding": _time_embedding,
+            "step_rank": _integer,
+            "cross_step_rank": lambda value, where: _integer(value, where, 0),
+            "additive": _flag,
+            "correct_by": _integer,
+        },
+        "[user]",
+    )
+
+
+def _training(table: Any) -> TrainingConfig:
+    """The `[training]` table: the loop, the split, the device and the precision."""
+    return _build(
+        TrainingConfig,
+        table,
+        {
+            "steps": _integer,
+            "batch": _integer,
+            "lr": _positive,
+            "val_frac": _fraction,
+            "seed": lambda value, where: _integer(value, where, 0),
+            "log_every": _integer,
+            "val_depths": _depths,
+            "device": _text,
+            "dtype": _dtype,
+        },
+        "[training]",
+    )
+
+
 _STEERING_KNOBS = {
     "tau": _integer,
     "lam": _integer,
@@ -450,4 +577,6 @@ def load_config(path: str | Path) -> Config:
         spacemouse=_spacemouse(data.get("spacemouse", {})),
         recording=_build(RecordingConfig, data.get("recording", {}), {"dir": _path}, "[recording]"),
         states=_build(StatesConfig, data.get("states", {}), {"dir": _path}, "[states]"),
+        user=_user(data.get("user", {})),
+        training=_training(data.get("training", {})),
     )
