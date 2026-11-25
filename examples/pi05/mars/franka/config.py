@@ -23,7 +23,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from bridge import ARM_DIMS
+from bridge import ARM_DIMS, TWIST_DIMS
 
 EXAMPLE_DIR = Path(__file__).parent
 """A relative path in a config file means a path beside this file."""
@@ -31,9 +31,10 @@ EXAMPLE_DIR = Path(__file__).parent
 STEERING_MODES = ("none", "flow_control", "frs")
 
 _SECTIONS = frozenset(
-    {"station", "cameras", "policy", "command", "readout", "steering", "modes", "recording"}
+    {"station", "cameras", "policy", "command", "readout", "steering", "modes", "spacemouse", "recording"}
 )
-"""The config file's sections: station, cameras, policy, command, readout, steering, modes, recording."""
+"""The config file's sections: station, cameras, policy, command, readout, steering, modes,
+spacemouse, recording."""
 
 _MODE_KNOBS = {
     "none": frozenset(),
@@ -113,6 +114,26 @@ class RecordingConfig:
 
 
 @dataclass(frozen=True)
+class SpaceMouseConfig:
+    """The operator's ``[spacemouse]`` table: how the device is found and its six channels mapped.
+
+    ``path`` and ``hid_id`` are ``SpaceMouseTwist``'s; the empty string means search (the library's
+    default, ``SPACEMOUSE_HID_ID`` when unset). ``source`` maps the device's six channels
+    (0: x, 1: y, 2: z, 3: rx, 4: ry, 5: rz) onto the twist's axes and ``sign`` flips them. The
+    scales are the device's counts per unit of full deflection. **The defaults are unverified on
+    hardware**: ``rotation_full_scale`` in particular is a guess, and the probe measures the real
+    scales and the channel mapping.
+    """
+
+    path: str = ""  # "" = search for the device
+    hid_id: str = ""  # "" = search; otherwise a HID id such as 0000046D:0000C62B
+    full_scale: float = 350.0
+    rotation_full_scale: float = 350.0
+    source: tuple[int, ...] = (0, 1, 2, 3, 4, 5)  # the device channels, in the twist's axis order
+    sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+@dataclass(frozen=True)
 class Config:
     station: StationConfig = field(default_factory=StationConfig)
     cameras: CameraConfig = field(default_factory=CameraConfig)
@@ -121,6 +142,7 @@ class Config:
     readout: ReadoutConfig = field(default_factory=ReadoutConfig)
     steering: SteeringConfig = field(default_factory=SteeringConfig)
     modes: Mapping[str, SteeringConfig] = field(default_factory=lambda: MappingProxyType({}))
+    spacemouse: SpaceMouseConfig = field(default_factory=SpaceMouseConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
 
 
@@ -224,6 +246,30 @@ def _adapter_matrix(value: Any, where: str) -> str | tuple[tuple[float, ...], ..
     return tuple(tuple(_number(item, where) for item in row) for row in value)
 
 
+def _search_text(value: Any, where: str) -> str:
+    """A device path or HID id as written: the empty string means search for the device."""
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: expected a string ('' = search), got {value!r}")
+    return value
+
+
+def _device_channels(value: Any, where: str) -> tuple[int, ...]:
+    """The six device channels a twist reads, each an index into the device's six channels."""
+    if not isinstance(value, (list, tuple)) or len(value) != TWIST_DIMS:
+        raise ValueError(f"{where}: expected {TWIST_DIMS} device channel indexes, got {value!r}")
+    channels = tuple(_integer(item, f"{where}[{index}]", 0) for index, item in enumerate(value))
+    if any(channel >= TWIST_DIMS for channel in channels):
+        raise ValueError(f"{where}: indexes the device channels 0-{TWIST_DIMS - 1}, got {value!r}")
+    return channels
+
+
+def _device_signs(value: Any, where: str) -> tuple[float, ...]:
+    """One sign per device channel (a negative one flips that axis)."""
+    if not isinstance(value, (list, tuple)) or len(value) != TWIST_DIMS:
+        raise ValueError(f"{where}: expected {TWIST_DIMS} signs, got {value!r}")
+    return tuple(_number(item, f"{where}[{index}]") for index, item in enumerate(value))
+
+
 def _reject_unknown(table: dict, known: set[str] | frozenset[str], where: str) -> None:
     unknown = sorted(set(table) - known)
     if unknown:
@@ -288,6 +334,22 @@ def _readout(table: Any) -> ReadoutConfig:
             "seed": lambda value, where: _integer(value, where, 0),
         },
         "[readout]",
+    )
+
+
+def _spacemouse(table: Any) -> SpaceMouseConfig:
+    return _build(
+        SpaceMouseConfig,
+        table,
+        {
+            "path": _search_text,
+            "hid_id": _search_text,
+            "full_scale": _positive,
+            "rotation_full_scale": _positive,
+            "source": _device_channels,
+            "sign": _device_signs,
+        },
+        "[spacemouse]",
     )
 
 
@@ -365,5 +427,6 @@ def load_config(path: str | Path) -> Config:
         readout=_readout(data.get("readout", {})),
         steering=steering,
         modes=_modes(data.get("modes", {}), steering),
+        spacemouse=_spacemouse(data.get("spacemouse", {})),
         recording=_build(RecordingConfig, data.get("recording", {}), {"dir": _path}, "[recording]"),
     )
