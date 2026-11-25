@@ -114,11 +114,15 @@ def test_the_shipped_schema_parses_to_the_documented_tree(tmp_path):
     assert cfg.policy.stats == EXAMPLE_DIR / "assets/droid/norm_stats.json"
 
 
-def test_an_empty_file_is_the_built_in_defaults(tmp_path):
-    cfg = _load(tmp_path, "")
-    assert cfg == Config()
-    assert cfg.readout.corruption == {"rotation_z_deg": 20.0}  # the study default, not off
-    assert cfg.command.gain == "auto" and cfg.modes == {}
+def test_an_empty_or_minimal_file_has_the_neutral_readout(tmp_path):
+    """A library default must be the harmless one: no corruption, no noise. The shipped study
+    config (a later slice) spells its corruption and noise explicitly."""
+    empty = _load(tmp_path, "")
+    assert empty == Config()
+    assert (empty.readout.corruption, empty.readout.noise, empty.readout.seed) == (None, 0.0, 0)
+    assert empty.command.gain == "auto" and empty.modes == {}
+    minimal = _load(tmp_path, '[station]\nhost = "10.42.0.1"\n')
+    assert (minimal.readout.corruption, minimal.readout.noise) == (None, 0.0)
 
 
 def test_the_modes_inherit_the_steering_defaults(tmp_path):
@@ -206,8 +210,12 @@ def test_relative_paths_resolve_against_the_example_and_absolute_paths_pass_thro
 
 
 def test_the_corruption_off_state_is_the_string_none(tmp_path):
-    """TOML has no null: absent is the built-in default (corrupted), and "none" is the off."""
-    assert _load(tmp_path, '[readout]\ncorruption = "none"\n').readout.corruption == "none"
+    """TOML has no null: absent is the neutral default (off), and the explicit off is "none", which
+    parses to the same None so a variant file can turn off what it inherits."""
+    absent = _load(tmp_path, "")
+    explicit = _load(tmp_path, '[readout]\ncorruption = "none"\n')
+    assert explicit.readout.corruption is None
+    assert explicit.readout == absent.readout
     with pytest.raises(ValueError, match="corruption"):
         _load(tmp_path, '[readout]\ncorruption = "curl"\n')
     with pytest.raises(ValueError, match="corruption"):

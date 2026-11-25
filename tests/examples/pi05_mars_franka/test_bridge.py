@@ -174,14 +174,38 @@ def test_the_operator_command_is_ik_in_action_units():
     np.testing.assert_allclose(twist, np.array([0.011, 0.0, 0.0, 0.0, 0.0, 0.0]), atol=1e-4)
 
 
-@pytest.mark.parametrize("degrees", [20.0, -35.0, 90.0])
-def test_both_rotation_spec_forms_agree_with_the_readout(degrees):
-    """``readout.rotation`` is the 3-D readout's rotation about z; the translation block uses the
-    same map for ``rotation_z_deg`` and for ``rotation_deg`` (the 2-D form's name)."""
+ROWS = [[1.0, 0.2, -0.3], [0.0, 2.0, 0.4], [0.5, 0.0, 1.0]]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"rotation_z_deg": 20.0},
+        {"rotation_z_deg": -35.0},
+        {"scale": [2.0, 0.5, 1.0]},
+        {"M": ROWS},
+        ROWS,
+    ],
+    ids=["rotation+20", "rotation-35", "scale", "M", "bare-rows"],
+)
+def test_the_fixed_forms_are_exactly_the_readouts_numbers(spec):
+    """Contract test, not a shape check: the corruption grammar is ``readout.matrix_spec(spec, 3)``'s,
+    so a spec copied from a LIBERO config must produce exactly the same numbers here (bit-for-bit,
+    ``assert_array_equal``). That equality is why this module may duplicate the two helpers instead
+    of importing the readout (which would pull torch onto the ``--dry-run`` path)."""
+    block = readout_module.matrix_spec(spec, 3)
     expected = np.eye(TWIST_DIMS)
-    expected[:3, :3] = readout_module.rotation(degrees)
-    np.testing.assert_allclose(matrix6_from_spec({"rotation_z_deg": degrees}), expected, atol=1e-15)
-    np.testing.assert_allclose(matrix6_from_spec({"rotation_deg": degrees}), expected, atol=1e-15)
+    expected[:3, :3] = block
+    np.testing.assert_array_equal(matrix6_from_spec(spec), expected)
+
+
+def test_the_two_other_names_are_rejected_naming_the_right_key():
+    """``F`` is the reversal-adapter grammar's key and ``rotation_deg`` the 2-D plane rotation; a spec
+    that mixes them up must say which key this grammar uses."""
+    with pytest.raises(ValueError, match="literal matrix key is 'M'"):
+        matrix6_from_spec({"F": ROWS})
+    with pytest.raises(ValueError, match="rotation_z_deg"):
+        matrix6_from_spec({"rotation_deg": 20.0})
 
 
 def test_scale_is_its_diagonal_and_only_the_translation_block():
@@ -192,14 +216,16 @@ def test_scale_is_its_diagonal_and_only_the_translation_block():
 
 
 def test_a_literal_matrix_fills_the_block_and_the_rest_is_identity():
-    rows = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]]
-    np.testing.assert_array_equal(matrix6_from_spec({"F": rows})[:3, :3], rows)
-    np.testing.assert_array_equal(matrix6_from_spec(rows)[:3, :3], rows)
+    np.testing.assert_array_equal(matrix6_from_spec({"M": ROWS})[:3, :3], ROWS)
+    np.testing.assert_array_equal(matrix6_from_spec(ROWS)[:3, :3], ROWS)
 
 
-def test_the_off_state_is_the_identity():
+def test_the_off_state_is_none_and_the_string_none_is_the_configs_job():
+    """``None`` is the off state; a config's ``corruption = "none"`` is parsed to ``None`` before
+    this call, so the raw string is rejected here rather than silently meaning something else."""
     np.testing.assert_array_equal(matrix6_from_spec(None), np.eye(TWIST_DIMS))
-    np.testing.assert_array_equal(matrix6_from_spec("none"), np.eye(TWIST_DIMS))
+    with pytest.raises(ValueError, match="off state is None"):
+        matrix6_from_spec("none")
 
 
 def test_a_random_family_member_is_reproducible_and_inside_its_ranges():
@@ -220,11 +246,12 @@ def test_a_random_family_member_is_reproducible_and_inside_its_ranges():
     [
         {"curl": 1.5, "tau": 0.1},
         {"quantize": "axes"},
-        {"M": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]},
-        {"rotation_deg": 20, "scale": [1.0, 1.0, 1.0]},
+        {"F": ROWS},
+        {"rotation_deg": 20.0},
+        {"rotation_deg": 20.0, "scale": [1.0, 1.0, 1.0]},
         "spiral",
     ],
-    ids=["curl", "quantize", "M-key", "two-keys", "string"],
+    ids=["curl", "quantize", "F-key", "rotation_deg", "two-keys", "string"],
 )
 def test_a_non_matrix_spec_is_rejected(spec):
     with pytest.raises(ValueError, match="matrix6_from_spec"):

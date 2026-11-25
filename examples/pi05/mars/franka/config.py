@@ -6,10 +6,11 @@ key, a checkpoint, the operator's gains and the mode knobs are read. This module
 and refuses knob combinations a mode cannot read. It is torch-free and c3po-free so a config can be
 checked before a checkpoint, a camera or an arm is anywhere in sight.
 
-TOML has no ``null``: an absent key means "the built-in default", and the explicit offs are the
-strings ``corruption = "none"`` and ``mode = "none"``. Relative paths (``policy.stats``,
-``steering.adapter_user``/``adapter_task``, ``recording.dir``) resolve against this example's
-directory, not the caller's working directory.
+TOML has no ``null``: an absent key means "the built-in default", and the built-in defaults are the
+harmless ones (corruption off, no noise). The explicit offs are the strings ``corruption = "none"``
+(equivalent to the absent default, so a variant file can turn off what it inherits) and
+``mode = "none"``. Relative paths (``policy.stats``, ``steering.adapter_user``/``adapter_task``,
+``recording.dir``) resolve against this example's directory, not the caller's working directory.
 """
 
 from __future__ import annotations
@@ -40,9 +41,6 @@ _MODE_KNOBS = {
     "frs": frozenset({"n_reversal_steps", "pinned_steps", "adapter_matrix", "adapter_user", "adapter_task"}),
 }
 """The knobs each steering mode reads; a mode table may not set another mode's knobs."""
-
-_DEFAULT_CORRUPTION = {"rotation_z_deg": 20.0}
-"""The study's default corruption. The explicit off is the string ``"none"`` (TOML has no null)."""
 
 
 # ---------------------------------------------------------------- the config tree
@@ -84,8 +82,8 @@ class CommandConfig:
 
 @dataclass(frozen=True)
 class ReadoutConfig:
-    corruption: dict[str, Any] | str = field(default_factory=lambda: dict(_DEFAULT_CORRUPTION))
-    noise: float = 0.35  # std per joint, in action-standard-deviation units
+    corruption: dict[str, Any] | None = None  # None = off; the TOML string "none" also parses here
+    noise: float = 0.0  # std per joint, in action-standard-deviation units
     seed: int = 0
 
 
@@ -202,11 +200,12 @@ def _q0(value: Any, where: str) -> tuple[float, ...]:
     return angles
 
 
-def _corruption(value: Any, where: str) -> dict[str, Any] | str:
+def _corruption(value: Any, where: str) -> dict[str, Any] | None:
+    """A matrix/random corruption spec, or None for the explicit off (TOML has no null)."""
     if isinstance(value, str):
         if value != "none":
             raise ValueError(f"{where}: the only string corruption is 'none', got {value!r}")
-        return value
+        return None
     if not isinstance(value, dict) or not value:
         raise ValueError(f"{where}: expected a corruption table or 'none', got {value!r}")
     return dict(value)

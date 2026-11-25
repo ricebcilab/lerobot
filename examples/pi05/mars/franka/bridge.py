@@ -187,7 +187,9 @@ def corruption_lift(matrix6: np.ndarray, q0: np.ndarray, length: float = 0.2) ->
     commanded subspace at ``q0``, makes the distortion a fixed 7x7 on the command: ``M6`` on
     ``range(J+(q0))`` and the identity on its orthogonal complement. Its exact inverse is
     ``lift_inverse``, because ``J J+ == I6`` makes ``(M - I)`` and ``(M^-1 - I)`` cancel on that
-    subspace. That is what makes the MARS learning problem well-posed.
+    subspace. That is what makes the MARS learning problem well-posed. ``J+`` here is the exact
+    (Moore-Penrose) right inverse: the damping stays in ``joint_velocity``, because only
+    ``J J+ == I6`` makes the stated inverse exact.
     """
     matrix6 = _matrix(matrix6, TWIST_DIMS, "matrix6")
     jac = geometric_jacobian(q0)
@@ -201,9 +203,7 @@ def lift_inverse(matrix6: np.ndarray, q0: np.ndarray, length: float = 0.2) -> np
     return corruption_lift(np.linalg.inv(matrix6), q0, length)
 
 
-_SPEC_FORMS = (
-    "{rotation_z_deg: d}, {rotation_deg: d}, {scale: [sx, sy, sz]}, {F: rows}, {random: {...}}, or bare rows"
-)
+_SPEC_FORMS = "{rotation_z_deg: d}, {scale: [sx, sy, sz]}, {M: rows}, {random: {...}}, or bare rows"
 
 
 def _scalar(value: Any, where: str) -> float:
@@ -229,7 +229,7 @@ def _matrix(value: Any, size: int, name: str) -> np.ndarray:
 
 
 def _rotation_z(degrees: float) -> np.ndarray:
-    """3x3 rotation about z: both ``rotation_z_deg`` and ``rotation_deg`` mean this for the block."""
+    """3x3 rotation about z: ``readout.matrix_spec``'s 3-D rotation form, same numbers."""
     cos, sin = np.cos(np.radians(degrees)), np.sin(np.radians(degrees))
     return np.array([[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]])
 
@@ -278,32 +278,46 @@ def _random_matrix(block: Any, rng: np.random.Generator | None, where: str) -> n
 def matrix6_from_spec(spec: Any, rng: np.random.Generator | None = None) -> np.ndarray:
     """(6, 6) corruption matrix: the 3x3 translation block, then the identity on the twist.
 
-    The grammar is LIBERO's on that block: ``{rotation_z_deg: d}`` (or ``{rotation_deg: d}``, the
-    same rotation about z), ``{scale: [sx, sy, sz]}``, ``{F: rows}`` (or bare rows), and
-    ``{random: {...}}``, one draw from the per-trial family. ``None``/``"none"`` is the off state
-    and gives the identity. A curl or a quantize corruption is not a matrix, so it is rejected.
+    The grammar is ``readout.matrix_spec(spec, 3)``'s, so a spec copied from a LIBERO config means
+    here what it means there: ``{rotation_z_deg: d}`` (the 3-D rotation about z; ``rotation_deg``
+    is only the 2-D form), ``{scale: [sx, sy, sz]}``, ``{M: rows}`` (or bare rows), and
+    ``{random: {...}}``, one draw from the per-trial family. ``F`` is the reversal-adapter
+    grammar, not a corruption key. ``None`` is the off state and gives the identity, so a config's
+    explicit ``corruption = "none"`` parses to it before this call. A curl or a quantize
+    corruption is not a matrix, so it is rejected.
     """
-    if spec is None or (isinstance(spec, str) and spec == "none"):
+    if spec is None:
         return np.eye(TWIST_DIMS)
     where = "matrix6_from_spec"
     if isinstance(spec, str):
-        raise ValueError(f"{where}: {spec!r} is not a matrix spec; the off state is 'none' or None")
+        raise ValueError(
+            f"{where}: {spec!r} is not a matrix spec; the off state is None (config parses 'none' to it)"
+        )
     if isinstance(spec, dict):
         keys = set(spec)
         if keys & {"curl", "quantize"}:
             raise ValueError(f"{where}: a curl or quantize corruption has no matrix; got {sorted(keys)}")
         if keys == {"random"}:
             block = _random_matrix(spec["random"], rng, f"{where}.random")
-        elif len(keys) == 1 and next(iter(keys)) in {"rotation_z_deg", "rotation_deg"}:
-            key = next(iter(keys))
-            block = _rotation_z(_scalar(spec[key], f"{where}.{key}"))
+        elif keys == {"F"}:
+            raise ValueError(
+                f"{where}: the corruption grammar's literal matrix key is 'M', not 'F' "
+                f"(F is the reversal-adapter grammar); expected {_SPEC_FORMS}"
+            )
+        elif keys == {"rotation_deg"}:
+            raise ValueError(
+                f"{where}: the 3-D rotation key is 'rotation_z_deg', not 'rotation_deg' "
+                "(rotation_deg is readout.matrix_spec's 2-D plane rotation)"
+            )
+        elif keys == {"rotation_z_deg"}:
+            block = _rotation_z(_scalar(spec["rotation_z_deg"], f"{where}.rotation_z_deg"))
         elif keys == {"scale"}:
             scale = spec["scale"]
             if not isinstance(scale, (list, tuple)) or len(scale) != 3:
                 raise ValueError(f"{where}: scale must be three numbers, got {scale!r}")
             block = np.diag([_scalar(item, f"{where}.scale") for item in scale])
-        elif keys == {"F"}:
-            block = _matrix(spec["F"], 3, f"{where}.F")
+        elif keys == {"M"}:
+            block = _matrix(spec["M"], 3, f"{where}.M")
         else:
             raise ValueError(f"{where}: expected {_SPEC_FORMS}, got {sorted(keys)}")
     else:
