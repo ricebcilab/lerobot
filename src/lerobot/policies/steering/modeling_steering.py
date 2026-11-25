@@ -1490,6 +1490,9 @@ class FlowReversalSteering(_ChunkSteering):
     policy's n_action_steps, i.e. the executed prefix; None = all of it). Everything else is delegated to the
     policy: after the reversal, those latent elements are replaced with the unsteered latent at the same time --
     the chunk's own Gaussian sample for a full reversal, else the unsteered flow integrated N - n steps.
+    `command_dims` is the width of the operator's command in an action space wider than it (None: the 7-D operator
+    space, whose command is its whole width): with `operator_dims` None the dims beyond it are delegated, so a 7-dim
+    joint command on a 32-wide action space leaves the gripper's dim and the padding to the policy.
     Tang et al. (App. D.1) pin fewer steps than they execute: a 5-step reference (`action_repeats`) in a 15-step
     chunk with 10 executed, so the policy fills in half of what runs. The default here pins every executed step;
     for the paper's setting, pin half of n_action_steps.
@@ -1514,6 +1517,7 @@ class FlowReversalSteering(_ChunkSteering):
         reference_fn: Callable | None = None,
         reference_step: float | None = None,
         gripper_reference: float | None = None,
+        command_dims: int | None = None,
     ):
         super().__init__(policy, source, deadband)
         self._adapter = adapter
@@ -1522,6 +1526,7 @@ class FlowReversalSteering(_ChunkSteering):
         self._reference_fn = reference_fn
         self._reference_step = reference_step
         self.n_reversal_steps = n_reversal_steps  # validated by the setter below
+        self._command_dims = command_dims
         self._operator_dims = None if operator_dims is None else tuple(operator_dims)
         # The setter validates the pinned steps and builds the delegation mask (checking operator_dims)
         self.pinned_steps = policy.config.n_action_steps if pinned_steps == -1 else pinned_steps
@@ -1548,16 +1553,23 @@ class FlowReversalSteering(_ChunkSteering):
 
     @staticmethod
     def delegation_mask(
-        chunk_size: int, max_action_dim: int, operator_dims: tuple[str, ...] | None, pinned_steps: int | None
+        chunk_size: int,
+        max_action_dim: int,
+        operator_dims: tuple[str, ...] | None,
+        pinned_steps: int | None,
+        command_dims: int | None = None,
     ) -> torch.Tensor:
         """(chunk_size, max_action_dim) bool mask of the reference elements left to the policy.
 
         True = delegated: the dims outside ``operator_dims`` (names from OPERATOR_DIM_GROUPS; None = every dim is
-        commanded, as on the cursor), the padding dims beyond the env's 7, and every dim of the steps from
-        ``pinned_steps`` on (None = the whole chunk stays pinned).
+        commanded, as on the cursor, and then every dim from ``command_dims`` on when that is given: an action space
+        wider than the operator's command leaves the dims beyond it -- the gripper's and the padding -- to the
+        policy), and every dim of the steps from ``pinned_steps`` on (None = the whole chunk stays pinned).
         """
         if operator_dims is None:
             mask = torch.zeros(chunk_size, max_action_dim, dtype=torch.bool)
+            if command_dims is not None:
+                mask[:, command_dims:] = True
         else:
             SteeringConfig.check_operator_dims(operator_dims)
             mask = torch.ones(chunk_size, max_action_dim, dtype=torch.bool)
@@ -1575,7 +1587,9 @@ class FlowReversalSteering(_ChunkSteering):
     def operator_dims(self, value) -> None:
         cfg = self._policy.config
         dims = None if value is None else tuple(value)
-        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps)
+        self._delegated = self.delegation_mask(
+            cfg.chunk_size, cfg.max_action_dim, dims, self._pinned_steps, self._command_dims
+        )
         self._operator_dims = dims
 
     @property
@@ -1586,7 +1600,9 @@ class FlowReversalSteering(_ChunkSteering):
     def pinned_steps(self, value: int | None) -> None:
         cfg = self._policy.config
         self.check_steps("pinned_steps", value, 1, cfg.chunk_size, "chunk steps", optional=True)
-        self._delegated = self.delegation_mask(cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value)
+        self._delegated = self.delegation_mask(
+            cfg.chunk_size, cfg.max_action_dim, self._operator_dims, value, self._command_dims
+        )
         self._pinned_steps = value
 
     @property
@@ -2024,6 +2040,8 @@ class SteeringPolicy(PreTrainedPolicy):
                     deadband=cfg.deadband,
                     reference_step=step,
                     gripper_reference=cfg.gripper_reference,
+                    # The command covers the first n_dims action dims; anything beyond is the policy's.
+                    command_dims=cfg.n_dims,
                 )
         return self._core
 

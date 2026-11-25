@@ -29,6 +29,7 @@ from lerobot.policies.steering import (
     GRIPPER_OPEN,
     N_ACTION_DIMS,
     FlowControlSteering,
+    FlowReversalSteering,
     SteeringConfig,
     SteeringPolicy,
 )
@@ -144,6 +145,42 @@ def test_a_nonpositive_reference_step_is_refused():
     for bad in (0, -0.5):
         with pytest.raises(ValueError, match="reference_step"):
             SteeringConfig(reference_step=bad)
+
+
+def test_frs_delegates_the_dims_beyond_the_command():
+    """The gripper depends on it: with a 7-wide command on a 32-wide action space, dims 0-6 are pinned for the
+    reference's pinned prefix only, and dim 7 (the gripper) and the padding are the policy's at every step."""
+    base = _Base(chunk_size=15, max_action_dim=32)
+    steering = _policy(
+        SteeringConfig(mode="frs", n_dims=7, operator_dims=None, pinned_steps=8, device="cpu"), base
+    )
+    delegated = steering.core._delegated
+    assert delegated.shape == (15, 32)
+    assert not delegated[:8, :7].any()  # the commanded dims, in the pinned executed prefix
+    assert delegated[8:, :7].all()  # beyond the pinned prefix every dim is the policy's
+    assert delegated[:, 7:].all()  # the gripper's dim and the padding never take the reference's zero
+
+
+def test_command_dims_leaves_the_cursor_and_libero_masks_unchanged():
+    """``command_dims`` only bites where the action space is wider than the command: the cursor's
+    ``max_action_dim == n_dims == 2`` and LIBERO's named translation group build today's masks bit for bit."""
+    cursor = _policy(SteeringConfig(mode="frs", device="cpu"), _Base(chunk_size=15, max_action_dim=2), dims=2)
+    assert torch.equal(cursor.core._delegated, FlowReversalSteering.delegation_mask(15, 2, None, None))
+    libero = _policy(
+        SteeringConfig(mode="frs", n_dims=3, operator_dims=["translation"], pinned_steps=5, device="cpu"),
+        _Base(chunk_size=15, max_action_dim=32),
+    )
+    assert torch.equal(
+        libero.core._delegated, FlowReversalSteering.delegation_mask(15, 32, ("translation",), 5)
+    )
+    assert torch.equal(
+        FlowReversalSteering.delegation_mask(15, 2, None, None, command_dims=2),
+        FlowReversalSteering.delegation_mask(15, 2, None, None),
+    )
+    assert torch.equal(
+        FlowReversalSteering.delegation_mask(15, 32, ("translation",), 5, command_dims=3),
+        FlowReversalSteering.delegation_mask(15, 32, ("translation",), 5),
+    )
 
 
 def test_flow_control_writes_only_the_first_n_dims():
