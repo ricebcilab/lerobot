@@ -405,10 +405,12 @@ mean cosine between the executed translation (the executed joint velocities thro
 twist, for arms `plan`, `none`, `clean`, `ideal`, `F` (the fixed lift), `user` (the trained module). The
 module is worth the study only if `user` moves from `none` toward `clean`.
 
-**Files.** `readout.py` (the session's readout as a value: `F`, gain, σ, `serve`), `cues.py` (draw and serve
-cues; the reference vector; pure), `statefiles.py` (write/read the npz above), `train_user.py` (labels, the
-loss, the loop, `AdapterModules.save_module`), `validate.py` (the offline comparison), and their tests. The
-loop uses `readout.Readout`; the CLI gains `train-user` and `validate-user`.
+**Files.** `readout.py` (the session's readout as a value: `F`, gain, σ, `serve`, `resolve`; the loop uses
+it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their IK'd commands; pure), `statefiles.py`
+(write/read the npz above), `train_user.py` (labels, the loss, the loop, `AdapterModules.save_module`),
+`validate.py` (the offline comparison), and their tests. The reference vector is the *steering core's own*
+`reference_chunk` (`reference_step = 1.0`), not a re-implementation. The CLI gains `--record-states NAME`,
+`train-user` and `validate-user`; `[states] dir` says where a session's states land.
 
 **Config additions.**
 ```toml
