@@ -17,19 +17,21 @@ timestamp, so a collected file can be replayed against the config that produced 
 
 ``teleop`` is the operator alone (no bundle, no steering), ``autonomous`` the policy alone, and
 ``fc``/``frs``/``mars-f``/``mars-u``/``mars-t``/``mars`` read their ``[modes.<command>]`` table
-and steer the policy with it; a missing table is named with how to add it (the shipped config
-ships only the methods whose checkpoints exist). ``--prompt`` is required by every policy
+and steer the policy with it; a missing table is named with how to add it, and a mode whose adapter
+checkpoint is absent names that file (the shipped config ships ``mars-u``, whose checkpoint Phase B's
+``train-user`` writes). ``--prompt`` is required by every policy
 command, optional for teleop and probe. ``teleop`` without ``--corrupted`` uses the **clean**
 readout (no corruption, no noise), the demonstration-collection path; ``teleop --corrupted`` and
 every shared command use the config's ``[readout]``. The loop owns the readout and prints what it
 resolves; this module only chooses the config. ``--record NAME`` switches to
 ``Loop.run_recording`` and prints the dataset path it returns.
 
-``train-user`` (DESIGN.md's Phase B) is the user-module trainer, not a session: it takes
-``--config`` and ``--prompt`` only, reads the states and the output path from ``[user]``, and calls
-``train_user.train``. It loads the checkpoint, so its import is lazy (a dry run never pulls torch);
-the trainer itself prints its split, cue and per-log lines, and this module prints the checkpoint's
-path at the end.
+``train-user`` and ``validate-user`` (DESIGN.md's Phase B) are the user module's trainer and its
+offline validator, not sessions: they take ``--config`` and ``--prompt`` only and read the states, the
+checkpoint and the output path from ``[user]``; ``train-user`` calls ``train_user.train`` and prints
+the checkpoint it writes, ``validate-user`` calls ``validate.validate`` and prints the validation JSON's
+path. Both load the checkpoint, so their imports are lazy (another command's path never pulls torch);
+the trainer and the validator print their own progress and tables.
 
 ``probe`` is a later slice: its import is lazy, and it records nothing, so ``--record`` is
 refused. Ctrl-C is caught here, and only here, after the station and the source are closed; 130 is
@@ -67,15 +69,15 @@ EXAMPLE_DIR = Path(__file__).parent  # the shipped config and every relative ass
 DEFAULT_CONFIG = EXAMPLE_DIR / "configs" / "franka.toml"
 
 STEERED_COMMANDS = ("fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
-NON_SESSION_COMMANDS = ("train-user",)
-"""The commands that are not a control session: no station, no source, no loop (Phase B's trainer)."""
+NON_SESSION_COMMANDS = ("train-user", "validate-user")
+"""The commands that are not a control session: no station, no source, no loop (Phase B's trainer and validator)."""
 COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS, *NON_SESSION_COMMANDS, "probe")
 
 _PROMPT_OPTIONAL = ("teleop", "probe")
 """The commands that run without a task text; every other command requires ``--prompt``."""
 
-_TRAIN_ONLY_FLAGS = ("record", "record_states", "steps", "trace", "corrupted", "dry_run")
-"""The session flags ``train-user`` refuses: ``[user]`` names its input and output, and it loads the real checkpoint."""
+_NON_SESSION_FLAGS = ("record", "record_states", "steps", "trace", "corrupted", "dry_run")
+"""The session flags ``train-user``/``validate-user`` refuse: ``[user]`` names their input and output."""
 
 _DRY_RUN_ACTION_STD = 0.3
 """One stand-in action standard deviation per dim, when a dry run has no statistics file."""
@@ -102,8 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         _print_session(args, config)
-        if args.command in NON_SESSION_COMMANDS:
+        if args.command == "train-user":
             return _train_user(args, config)
+        if args.command == "validate-user":
+            return _validate_user(args, config)
         return _run(args, config)
     except KeyboardInterrupt:  # only here: the run has closed the station and the source on the way out
         print("\nmars-franka: interrupted", file=sys.stderr)
@@ -161,7 +165,7 @@ def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
     if args.command == "probe" and (args.record is not None or args.record_states is not None):
         parser.error("probe records nothing: it prints the station and checkpoint facts and moves nothing")
     if args.command in NON_SESSION_COMMANDS:
-        given = [f"--{name.replace('_', '-')}" for name in _TRAIN_ONLY_FLAGS if getattr(args, name)]
+        given = [f"--{name.replace('_', '-')}" for name in _NON_SESSION_FLAGS if getattr(args, name)]
         if given:
             parser.error(
                 f"{args.command} takes --config and --prompt only ({given[0]} is not one): "
@@ -200,6 +204,22 @@ def _train_user(args: argparse.Namespace, config: Config) -> int:
 
     path = train_user.train(config, prompt=args.prompt, states_path=config.user.states, out=config.user.out)
     print(f"user module: {path}", flush=True)
+    return 0
+
+
+def _validate_user(args: argparse.Namespace, config: Config) -> int:
+    """``validate-user`` over the config's ``[user]`` states and checkpoint; the validator prints its own table.
+
+    Lazy import for the same reason as the trainer's: the validator loads the checkpoint (torch, its
+    processor pipelines), and only this command's path needs it. The output path is ``[user] out``, so
+    ``validation.json`` lands beside the checkpoint its run compares.
+    """
+    import validate
+
+    result = validate.validate(
+        config, prompt=args.prompt, states_path=config.user.states, checkpoint=config.user.checkpoint
+    )
+    print(f"validation: {result['out']}", flush=True)
     return 0
 
 

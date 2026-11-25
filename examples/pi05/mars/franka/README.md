@@ -5,11 +5,12 @@ SpaceMouse. The policy runs on `chopper` (the GPU machine, a 5090); the arm, the
 the Robotiq gripper are on `bb8`, which runs the r2d2 server that c3po talks to at `10.42.0.1:9090`.
 Phase A can do six things: `teleop` (the operator alone, and the demo-recording path), `autonomous`
 (the policy alone), and `fc`, `frs`, `mars-f` (the three methods whose numbers already exist), plus
-`probe` (the read-only bring-up report). It cannot train yet: the user module (`mars-u`), the task
-module (`mars-t`) and the composed `mars` arm need checkpoints from Phases B and C, there is no study
-protocol, success entry or analysis, and `configs/franka.toml` deliberately has no table for the
-three missing arms so a run names the missing table instead of loading nothing. `DESIGN.md` is the
-interface contract; this file is the runbook.
+`probe` (the read-only bring-up report). Phase B adds the learned user module: `--record-states`
+collects the states a session visits, `train-user` calibrates the module on them, `validate-user`
+compares it offline against the fixed methods, and `mars-u` runs it. The task module (`mars-t`) and the
+composed `mars` arm still need Phase C checkpoints, and there is no study protocol, success entry or
+analysis yet; `configs/franka.toml` has no table for those two, so a run names the missing table
+instead of loading nothing. `DESIGN.md` is the interface contract; this file is the runbook.
 
 Everything below runs from the lerobot checkout on `chopper`.
 
@@ -179,7 +180,8 @@ uv run --extra pi mars-franka mars-f --prompt "put the red block in the bowl" --
 
 FRS with the session's corruption lifted into the 7×7 `F` and inverted as the adapter. Push the same
 directions as in step 5 and compare: the corrupted command should be pulled back toward what you
-intended. This is the Phase A method arm; the learned user module and task module are Phase B/C.
+intended. This is the Phase A method arm; the learned user module (`mars-u`) is Phase B, below, and
+the task module is Phase C.
 
 ### 7. Record demonstrations
 
@@ -193,11 +195,123 @@ stops and finalizes the dataset. The station records a LeRobot v3.0 dataset on `
 it when the recording context exits, and the command prints `dataset: <path>`. `--record` works for
 every session command; the probe refuses it because it records nothing.
 
+## Phase B: train and validate the user module
+
+`mars-u` steers with a *learned* user module instead of the fixed lift: it corrects the velocity field
+of FRS's reversal, so the readout's corruption is undone for the operator's own commands. The module is
+calibrated from cues -- random Cartesian pushes at recorded states, through the same bridge the operator
+uses -- never from human labels. It is also calibrated in the study's prompt-conditioned field:
+`train-user` and `validate-user` take the same `--prompt` a session command does, so a checkpoint
+trained under one prompt is refused under another. Do these in order, and do not run `mars-u` in a study
+until `validate-user` shows the module moving the executed heading toward the faithful command.
+
+### 1. Collect the states
+
+`--record-states NAME` writes one row per chunk boundary -- the observation the policy's chunk starts
+from, the joints, the operator's deflection and the served command -- to
+`assets/states/NAME/states.npz`, alongside whatever the station records. It changes no behaviour, and
+it composes with `--record`.
+
+Collect from the study scene, under the study's prompt, with the methods whose field the module will
+correct: a few `frs`/`fc` sessions with the operator pushing, plus an `autonomous` session or two for
+states the policy visits on its own (an operator cannot push into a state the policy never reaches).
+A few hundred states are enough; each one is about 0.3 MB in the file (two 224x224 uint8 images plus
+small arrays), so 300 states are about 90 MB.
+
+```bash
+uv run --extra pi mars-franka frs --prompt "put the red block in the bowl" --record-states pilot
+uv run --extra pi mars-franka autonomous --prompt "put the red block in the bowl" --record-states pilot
+du -sh examples/pi05/mars/franka/assets/states
+```
+
+The config that collected the states must have the same `[readout]` as the config that trains on them:
+the trainer replays the config's corruption and noise at each row's pose and episode, and refuses a
+file whose `states.npz` meta records another corruption, noise level or seed (or a `q0` that a
+configured `[command] q0` does not reproduce). Collect with the study config, not the low-gain bring-up
+copy; a variant file for the study that changes `[readout]` makes its states a different condition.
+
+### 2. Train
+
+`train-user` needs what a session needs -- the checkpoint, openpi's statistics, CUDA, the gated
+tokenizer -- plus the states file. It loads pi0.5 once and runs the study's own velocity field.
+
+```bash
+uv run --extra pi mars-franka train-user --config examples/pi05/mars/franka/configs/franka.toml \
+  --prompt "put the red block in the bowl"
+```
+
+It writes `assets/user/rotz20/user.pt` (the module `[modes.mars-u]` and `[user] checkpoint` name) and
+`train_log.json` (the split, every logged train/held-out loss, and the provenance the checkpoint is
+reproduced against: states, readout, prompt, module shape, seed). The asset is gitignored. Budget tens
+of minutes on the 5090: the first pass encodes every state and reverses `[user] cues` cues through its
+field (a few thousand velocity evaluations), then `[training] steps` batches run. Time the first run
+and record it in the hardware facts table; `steps` is a config key, not a flag.
+
+### 3. Validate, offline
+
+```bash
+uv run --extra pi mars-franka validate-user --config examples/pi05/mars/franka/configs/franka.toml \
+  --prompt "put the red block in the bowl"
+```
+
+No arm, no station, no env: it reads `[user] states` and `[user] checkpoint`, evaluates the trainer's
+own held-out split (the same seed and `val_frac`, so the module never saw those states) with one fresh
+cue per held-out state, at each reversal depth in `[training] val_depths`, and writes
+`assets/user/rotz20/validation.json`. Six arms are compared, all from the same flow noise:
+
+| arm | what it steers |
+| --- | --- |
+| `plan` | the policy's own chunk: no command, the same noise |
+| `none` | FRS on the corrupted command the readout serves |
+| `clean` | FRS on a faithful readout's command, same noise draw (the corruption is the only difference) |
+| `ideal` | FRS on the cue itself: no readout noise |
+| `f` | FRS with the fixed lift `F`: the `mars-f` arm |
+| `user` | FRS with the trained module |
+
+The number is the mean cosine between the executed translation and the cue's intent twist: the
+executed chunk is unnormalized, mapped through `J(q)` to a Cartesian twist and averaged over the
+executed steps, and the cosine is against the intent twist's linear part. `+1` means the executed
+motion heads where the operator meant, `0` perpendicular, `-1` away. The table prints one row per arm
+and one column per depth:
+
+```
+arm           d10        d4
+plan      +0.02     +0.02
+none      +0.45     +0.44
+clean     +0.71     +0.70
+ideal     +0.93     +0.92
+f         +0.55     +0.54
+user      +0.68     +0.66
+```
+
+(the numbers above are illustrative of the shape, not a measurement: run it on chopper and keep the
+JSON). The go/no-go is the reader's and `validate-user` always exits 0 once it has evaluated the
+module: it is a measurement, not a pass/fail. `user` must sit between `none` and `clean` and closer to
+`clean`, i.e. `|user - clean| < |none - clean|` at every depth; the footer prints exactly that
+comparison. A module that does not correct the heading sits at `none` or falls back toward `plan`; one
+that corrects the whole readout lands near `clean`, and `ideal` is the ceiling (`user` above `clean` at
+a depth means the module is not the only difference between the arms -- check the checkpoint and the
+states). If `user` is not closer to `clean` than `none` is, fix the data or the calibration and retrain
+-- do not tune the module on the held-out states.
+
+### 4. Then `mars-u` in a study
+
+```bash
+uv run --extra pi mars-franka mars-u --prompt "put the red block in the bowl" --trace
+```
+
+`[modes.mars-u] adapter_user` is the checkpoint `[user] checkpoint` names, and the command builds the
+same MARS-U arm the LIBERO sessions do: FRS with the learned module in the reversal. Push the same
+directions as in `frs` and compare: the corrupted command should be pulled back toward what you meant.
+The module is a correction of the readout, not a task policy -- if a push still heads wrong, validate
+first rather than adjusting the module by feel.
+
 ## Commands
 
 ```bash
 uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--record NAME]
-                                      [--steps N] [--trace] [--dry-run] [--corrupted]
+                                      [--record-states NAME] [--steps N] [--trace] [--dry-run]
+                                      [--corrupted]
 ```
 
 | command | what it runs |
@@ -207,7 +321,10 @@ uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--recor
 | `fc` | flow control (Kao et al.): the command sets the chunk's initial condition |
 | `frs` | flow reversal steering (Tang et al.): the executed prefix is pinned to the reversed command |
 | `mars-f` | FRS with the fixed corruption adapter (`[modes.mars-f] adapter_matrix = "corruption"`) |
-| `mars-u`, `mars-t`, `mars` | not built: Phase B/C adapters; the command names the missing `[modes.*]` table |
+| `mars-u` | FRS with the learned user module (`[modes.mars-u] adapter_user`, written by `train-user`); a run names the file while it does not exist |
+| `train-user` | Phase B's user-module trainer: reads `[user] states`, writes `[user] out/user.pt` and `train_log.json`; not a session |
+| `validate-user` | Phase B's offline validator: evaluates `[user] checkpoint` on the held-out states and writes `[user] out/validation.json`; no arm, no station |
+| `mars-t`, `mars` | not built: Phase C adapters; the command names the missing `[modes.*]` table |
 | `probe` | the bring-up report; moves nothing and records nothing |
 
 | flag | meaning |
@@ -215,6 +332,7 @@ uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--recor
 | `--config PATH` | the config file; default `examples/pi05/mars/franka/configs/franka.toml` |
 | `--prompt TEXT` | the task text; required by every policy command, optional for `teleop` and `probe` |
 | `--record NAME` | record episodes and print the downloaded dataset path; refused by `probe` |
+| `--record-states NAME` | keep the chunk-boundary states in `<config.states.dir>/NAME/states.npz`; every session command takes it |
 | `--steps N` | stop after N control steps; non-recording runs only |
 | `--trace` | print one line per tick: tick, mode, served command, action, the joints before it, gripper |
 | `--dry-run` | fake station, source and bundle: no c3po, no torch, no checkpoint, no device |
@@ -240,6 +358,10 @@ A variant file overrides individual keys, so a study condition is a file the rep
 | `[modes.fc]` | `mode = "flow_control"`, `tau = 8`, `lam = 1`, `ic_gain = 15.0` |
 | `[modes.frs]` | `mode = "frs"` |
 | `[modes.mars-f]` | `mode = "frs"`, `adapter_matrix = "corruption"` (or `"corruption_inverse"`, or 7×7 rows) |
+| `[modes.mars-u]` | `mode = "frs"`, `adapter_user`: the user module `train-user` writes; absent until then |
+| `[states]` | `dir = "assets/states"`: a session's `--record-states NAME` lands at `<dir>/NAME/states.npz` |
+| `[user]` | `states` (the file or the session directory), `out` (`user.pt`, `train_log.json`, `validation.json`), `checkpoint` (`validate-user` and the study read it), `cues`, `sigma`, and the module's shape (`horizon`, `d`, `tdim`, `time_embedding`, `step_rank`, `cross_step_rank`, `additive`, `correct_by`) |
+| `[training]` | `steps`, `batch`, `lr`, `val_frac`, `seed`, `log_every`, `val_depths`, `device`: the trainer's loop, its held-out split and the depths the validator runs |
 | `[spacemouse]` | `path`, `hid_id`, `full_scale`, `rotation_full_scale`, `source`, `sign` |
 | `[recording]` | `dir = "outputs/mars_franka"`, relative to this folder |
 
@@ -267,6 +389,14 @@ The provenance of the numbers, because the runbook is also the record:
   in the papers sets 8; it is a study choice, and the probe measures the pause it causes.
 - `[spacemouse] full_scale` and `rotation_full_scale` ship as unverified 350.0 defaults. The probe
   replaces them with measured counts; until it does, the stick's deflection is a guess.
+- `[user] cues = 3` and `sigma = [0.2, 0.5]` are the calibration's: three cue draws per state, their
+  readout noise uniform in that action-std range. `validate-user` fixes the noise at the midpoint and
+  draws one fresh cue per held-out state; these are study choices, nothing measures them.
+- `[training] val_frac = 0.1`, `seed = 0` and `val_depths = [10, 4]` are the split and the two reversal
+  depths the validator reports: the full reversal (`n_reversal_steps`) and a partial one. The
+  validator reuses the trainer's split, so the module never saw the evaluated states.
+- `[training] steps = 3000` is a study choice; nothing in the papers sets it. The first training run's
+  wall time belongs in the hardware facts table below.
 
 `[command] q0 = []` means the station's reset pose, captured once at connect. The probe prints that
 pose and the 7×7 `F` it produces; set `q0` to seven joint angles to pin the lift when the station's
@@ -321,4 +451,8 @@ facts the code cannot know.
 | `||F7||2`, auto gain, noise sigma | |
 | chunk time (ms) at `n_action_steps` | |
 | third camera convention | |
+| user module: states file, scene, collecting runs | |
+| `train-user` wall time, final held-out loss | |
+| `validate-user`: per-arm cosines at each depth (paste the table) | |
+| `mars-u` session check (date, what the push did) | |
 | probe output | `examples/pi05/mars/franka/outputs/mars_franka/probe-session.txt` |
