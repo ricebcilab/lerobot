@@ -72,3 +72,29 @@ dir = "outputs/mars_franka" # relative to examples/pi05/mars/franka/
 [states]
 # Where `--record-states NAME` writes: assets/states/NAME/states.npz (Phase B's state collection).
 dir = "assets/states" # relative to examples/pi05/mars/franka/; gitignored
+
+[user]
+# Phase B's user module: `train-user` reads the recorded states and writes <out>/user.pt.
+states = "assets/states/pilot" # a states file, or a directory holding <dir>/states.npz
+out = "assets/user/rotz20" # train-user writes out/user.pt and out/train_log.json (gitignored)
+checkpoint = "assets/user/rotz20/user.pt" # what validate-user and [modes.mars-u] read
+cues = 3 # cue draws per state: the calibration session's length
+sigma = [0.2, 0.5] # the readout's noise range, in action-standard-deviation units (the study's)
+# horizon = ...     # absent = the checkpoint's chunk_size (TOML has no null)
+d = 256 # the module's width
+tdim = 64 # its time embedding's width
+time_embedding = "mars" # "mars" (sinusoidal) or "pi05" (the policy's own)
+# step_rank = ...   # absent = every chunk step's matrix free
+cross_step_rank = 0 # 0 = no coupling between the chunk's steps
+additive = false # true: the module supplies its own velocity term, U v + b
+# correct_by = ...  # absent = the correction is complete by the last reversal step
+
+[training]
+steps = 3000
+batch = 8
+lr = 1e-3 # AdamW, with a cosine schedule over `steps`
+val_frac = 0.1 # held-out share of the states (whole episodes when the file has several)
+seed = 0 # the split, the cues, the noise draws and the reversal steps all derive from it
+log_every = 100
+val_depths = [10, 4] # the reversal depths validate-user runs (Phase B's validator)
+device = "cuda" # where the checkpoint and the module live while training

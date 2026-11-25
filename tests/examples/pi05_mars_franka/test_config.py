@@ -148,6 +148,8 @@ def test_the_modes_inherit_the_steering_defaults(tmp_path):
         ('[steering]\nmode = "frs"\n', "steering", "mode"),
         ('[recording]\nout = "x"\n', "recording", "out"),
         ('[states]\nout = "x"\n', "states", "out"),
+        ('[user]\nstates_dir = "x"\n', "user", "states_dir"),
+        ("[training]\nepochs = 3\n", "training", "epochs"),
     ],
 )
 def test_an_unknown_key_names_its_section_and_key(tmp_path, text, where, key):
@@ -334,3 +336,107 @@ def test_the_states_section_defaults_to_the_assets_states_dir(tmp_path):
 def test_the_states_section_parses_its_dir_beside_the_example(tmp_path):
     cfg = _load(tmp_path, '[states]\ndir = "assets/states/pilot"\n')
     assert cfg.states.dir == EXAMPLE_DIR / "assets" / "states" / "pilot"
+
+
+# ---------------------------------------------------------------- Phase B: the user module's tables
+
+
+def test_the_user_section_has_the_phase_b_defaults(tmp_path):
+    """An absent ``[user]`` is the study's own calibration session: three cues, the measured noise
+    range, a 256-wide module on the checkpoint's chunk, and no per-step or cross-step sharing."""
+    user = _load(tmp_path, "").user
+    assert user == config_module.UserConfig()
+    assert user.states == EXAMPLE_DIR / "assets" / "states" / "pilot"
+    assert user.out == EXAMPLE_DIR / "assets" / "user" / "rotz20"
+    assert user.checkpoint == EXAMPLE_DIR / "assets" / "user" / "rotz20" / "user.pt"
+    assert (user.cues, user.sigma) == (3, (0.2, 0.5))
+    assert (user.horizon, user.step_rank, user.correct_by) == (None, None, None)
+    assert (user.d, user.tdim, user.time_embedding) == (256, 64, "mars")
+    assert (user.cross_step_rank, user.additive) == (0, False)
+
+
+def test_the_user_section_parses_the_trainers_knobs(tmp_path):
+    cfg = _load(
+        tmp_path,
+        "[user]\n"
+        'states = "assets/states/pilot"\n'
+        'out = "assets/user/rotz20"\n'
+        'checkpoint = "assets/user/rotz20/user.pt"\n'
+        "cues = 5\n"
+        "sigma = [0.1, 0.4]\n"
+        "horizon = 10\n"
+        "d = 128\n"
+        "tdim = 32\n"
+        'time_embedding = "pi05"\n'
+        "step_rank = 3\n"
+        "cross_step_rank = 2\n"
+        "additive = true\n"
+        "correct_by = 4\n",
+    )
+    user = cfg.user
+    assert user.states == EXAMPLE_DIR / "assets" / "states" / "pilot"
+    assert user.out == EXAMPLE_DIR / "assets" / "user" / "rotz20"
+    assert user.checkpoint == EXAMPLE_DIR / "assets" / "user" / "rotz20" / "user.pt"
+    assert (user.cues, user.sigma) == (5, (0.1, 0.4))
+    assert (user.horizon, user.step_rank, user.correct_by) == (10, 3, 4)
+    assert (user.d, user.tdim, user.time_embedding) == (128, 32, "pi05")
+    assert (user.cross_step_rank, user.additive) == (2, True)
+
+
+def test_the_training_section_has_the_phase_b_defaults(tmp_path):
+    training = _load(tmp_path, "").training
+    assert training == config_module.TrainingConfig()
+    assert (training.steps, training.batch, training.lr) == (3000, 8, 1e-3)
+    assert (training.val_frac, training.seed, training.log_every) == (0.1, 0, 100)
+    assert (training.val_depths, training.device) == ((10, 4), "cuda")
+
+
+def test_the_training_section_parses_the_loop_and_the_device(tmp_path):
+    cfg = _load(
+        tmp_path,
+        "[training]\n"
+        "steps = 10\n"
+        "batch = 2\n"
+        "lr = 0.5\n"
+        "val_frac = 0.25\n"
+        "seed = 7\n"
+        "log_every = 2\n"
+        "val_depths = [3, 6]\n"
+        'device = "cpu"\n',
+    )
+    training = cfg.training
+    assert (training.steps, training.batch, training.lr) == (10, 2, 0.5)
+    assert (training.val_frac, training.seed, training.log_every) == (0.25, 7, 2)
+    assert training.val_depths == (3, 6)
+    assert training.device == "cpu"
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("[user]\nsigma = [0.5, 0.2]\n", "sigma"),  # low > high
+        ("[user]\nsigma = [0.2]\n", "sigma"),  # not a pair
+        ("[user]\nsigma = [-0.1, 0.5]\n", "sigma"),  # negative noise
+        ("[user]\nsigma = [0.2, 0.5, 0.7]\n", "sigma"),
+        ("[user]\ncues = 0\n", "cues"),
+        ("[user]\nstep_rank = 0\n", "step_rank"),
+        ("[user]\nhorizon = 0\n", "horizon"),
+        ("[user]\ncorrect_by = 0\n", "correct_by"),
+        ("[user]\nd = 0\n", "d"),
+        ('[user]\ntime_embedding = "siren"\n', "time_embedding"),
+        ("[user]\nadditive = 1\n", "additive"),
+        ("[user]\ncross_step_rank = -1\n", "cross_step_rank"),
+        ("[training]\nsteps = 0\n", "steps"),
+        ("[training]\nbatch = 0\n", "batch"),
+        ("[training]\nlr = 0.0\n", "lr"),
+        ("[training]\nval_frac = 0.0\n", "val_frac"),
+        ("[training]\nval_frac = 1.5\n", "val_frac"),
+        ("[training]\nseed = -1\n", "seed"),
+        ("[training]\nlog_every = 0\n", "log_every"),
+        ("[training]\nval_depths = []\n", "val_depths"),
+        ("[training]\nval_depths = [0]\n", "val_depths"),
+    ],
+)
+def test_the_phase_b_values_are_checked_and_named(tmp_path, text, key):
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, text)
