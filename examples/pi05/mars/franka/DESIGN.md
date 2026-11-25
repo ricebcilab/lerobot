@@ -140,6 +140,8 @@ class Station(Protocol):
     def reset(self) -> dict[str, NDArray]
     def step(self, action8: NDArray) -> dict[str, NDArray]
     def close(self) -> None
+    def cancel_episode(self) -> None                  # the recording loop's re-record
+
 
 class C3poStation:      # lazily imports c3po in __init__, so tests never need it
     def __init__(self, host: str, port: int, rate: float)
@@ -166,7 +168,9 @@ class Bundle:
     policy; preprocessor; postprocessor          # the real objects on the configured device
     mean: NDArray | None; std: NDArray | None    # action statistics, 8-wide raw units; None without a stats file
     deadband: float                              # the operator's deadband, action units
-    def action(self, raw_batch: dict, command7: NDArray | None) -> NDArray   # (8,) action units
+    def prepare(self, raw_batch: dict) -> dict   # the pre-processor: once per chunk, the expensive half
+    def act(self, batch: dict, command7: NDArray | None) -> NDArray   # (8,) action units, no preprocessing
+    def action(self, raw_batch, command7) -> NDArray                  # act(prepare(...)), the one-shot form
     def reset(self) -> None                      # a new episode: the base policy and the steering policy
 def load_bundle(cfg) -> Bundle                   # checkpoint, processors, statistics; device and bf16 from cfg
 def make_steering(bundle: Bundle, steering) -> SteeringPolicy   # once per session; knob-checked on build
@@ -189,14 +193,21 @@ def fake_bundle() -> Bundle                      # numpy-only stand-in for --dry
 ### `loop.py`
 
 ```python
-class Source:            # the operator's device: SpaceMouse 6 axes + gripper button
-    def twist(self) -> NDArray     # (6,): [lin (m/s) x3, ang (rad/s) x3]
-    def gripper(self) -> bool      # True = close
+class DeflectionSource(Protocol):
+    def deflection(self) -> NDArray   # (6,) in [-1, 1], device axes [x, y, z, rx, ry, rz]
+    def gripper(self) -> bool         # True = closed (a latched toggle)
+    def close(self) -> None
+class SpaceMouseSource:               # wraps SpaceMouseTwist; the lerobot import is inside __init__
+class FakeSource:                     # tests and --dry-run
 class Loop:
-    def __init__(self, cfg, station, source, policy_bundle=None, steering=None, adapter=None)
-    def run(self, *, prompt: str, max_steps: int | None, trace: bool) -> None
-    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool) -> Path
+    def __init__(self, *, config, station, mode: str, source=None, bundle=None, steering=None,
+                 adapter_from_corruption: str | None = None)   # mode: teleop | autonomous | steered
+    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False) -> None
+    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False) -> Path
 ```
+The loop owns the readout, not the caller: it resolves the corruption spec and `q0` at the first episode,
+applies gain/noise, and redraws a per-trial `random` family at every episode — including the `mars-f` adapter
+matrix, because that matrix *is* the session's corruption.
 - The command is read **once per chunk** in the shared modes (`tick % n_action_steps == 0`) and **every
   tick** in teleop; the steering core reads the batch's command only when its queue is empty, so a
   per-tick read would change nothing.
