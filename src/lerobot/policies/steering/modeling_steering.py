@@ -645,18 +645,23 @@ class LearnedTaskModule(nn.Module):
         n_dims: int,
     ) -> tuple[torch.Tensor, dict]:
         """The task module's flow matching through the adapted field, in the t = 0 noise convention: on the
-        policy's interpolation x_t = (1 - t) z + t a (``chunk`` a, normalized (B, H, n); t (B,)),
+        policy's interpolation x_t = (1 - t) z + t a (``chunk`` a, normalized, at the caller's field width
+        (B, H, >= ``n_dims``); t (B,)),
 
             L = || A v + b - (a - z) ||^2 + lambda_id (||A - I||^2 + ||b||^2),   v = velocity(x_t, t) (no grad),
 
-        ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. Returns the loss and its
-        two parts (``fm``, ``identity``) as detached tensors (the caller converts them when it logs: no host sync
-        per step here)."""
+        ``task(x_t, t, v) -> (A, b)`` the bound task module, I the ``n_dims`` identity. The field may be wider
+        than the module (pi0.5's ``max_action_dim``, 32): the caller passes a field-width ``chunk``/``z``, and
+        the module acts on the first ``n_dims`` dims of ``v``, fit against the first ``n_dims`` dims of
+        ``a - z`` -- exactly the dims ``AdaptedField.adapt`` applies it to at inference. Returns the loss and
+        its two parts (``fm``, ``identity``) as detached tensors (the caller converts them when it logs: no host
+        sync per step here)."""
         x = (1 - t[:, None, None]) * z + t[:, None, None] * chunk
         with torch.no_grad():
             v = velocity(x, t)
-        mat, b = task(x, t, v)
-        fm = ((torch.einsum("bsij,bsj->bsi", mat, v) + b - (chunk - z)) ** 2).mean()
+        head = v[..., :n_dims]
+        mat, b = task(x, t, head)
+        fm = ((torch.einsum("bsij,bsj->bsi", mat, head) + b - (chunk - z)[..., :n_dims]) ** 2).mean()
         identity = ((mat - torch.eye(n_dims, device=x.device)) ** 2).mean() + (b**2).mean()
         return fm + lambda_id * identity, {"fm": fm.detach(), "identity": identity.detach()}
 
@@ -675,17 +680,34 @@ class AdaptedField:
     """Applies MARS modules to a velocity: task (both directions), then user (backward only, through
     ``LearnedUserModule.apply_correction``: a learned module's ``velocity``, any other callable's per-step matrices).
     Only the first n action dims are touched; the padding dims pass through. ``matrix`` is a fixed
-    (n, n) F or one per trial, (B, n, n). A module acts on its ``n_dims`` attribute's dims
-    (``N_ACTION_DIMS`` when it has none) unless ``n_dims`` is given, which overrides both."""
+    (n, n) F or one per trial, (B, n, n). A module acts on its own ``n_dims`` attribute's dims when it has one
+    (so an 8-dim task module in a 7-wide holder acts on 8 dims), on the holder's ``n_dims`` when it has none,
+    and on ``N_ACTION_DIMS`` when neither does; an explicit ``n_dims`` passed to this constructor overrides
+    all three."""
 
     def __init__(
-        self, matrix: torch.Tensor | None, user_module=None, task_module=None, n_dims: int | None = None
+        self,
+        matrix: torch.Tensor | None,
+        user_module=None,
+        task_module=None,
+        n_dims: int | None = None,
+        holder_n_dims: int | None = None,
     ):
         self.matrix, self.user_module, self.task_module = matrix, user_module, task_module
-        self.n_dims = n_dims
+        self._explicit_n_dims, self._holder_n_dims = n_dims, holder_n_dims
+
+    @property
+    def n_dims(self) -> int | None:
+        """The width this field falls back to for a module without its own ``n_dims``: the explicit ``n_dims``,
+        else the holder's (``AdapterModules.field``)."""
+        return self._explicit_n_dims if self._explicit_n_dims is not None else self._holder_n_dims
 
     def _dims(self, module) -> int:
-        return self.n_dims if self.n_dims is not None else getattr(module, "n_dims", N_ACTION_DIMS)
+        """The dims ``module`` acts on: an explicit ``n_dims`` when one was given, else the module's own
+        ``n_dims``, else the holder's, else ``N_ACTION_DIMS``."""
+        if self._explicit_n_dims is not None:
+            return self._explicit_n_dims
+        return getattr(module, "n_dims", None) or self._holder_n_dims or N_ACTION_DIMS
 
     def adapt(
         self, x_t: torch.Tensor, t: float | torch.Tensor, v: torch.Tensor, backward: bool
@@ -730,9 +752,10 @@ class AdapterModules(nn.Module):
     checked on assignment (``readout.checked_matrix`` at ``n_dims``, or ``N_ACTION_DIMS`` when ``n_dims`` is
     None). ``normalized_matrix(std)`` is it in the policy's normalized coordinates, S^-1 F S, by the postprocessor's
     action statistics; ``field`` is the ``AdaptedField`` the flows apply, that matrix (normalized when given ``std``)
-    as a tensor. The modules act on ``n_dims`` dims (2 on the cursor); ``n_dims=None`` lets each act on its own
-    ``n_dims`` (``N_ACTION_DIMS`` for a callable without one) and checks the matrix at ``N_ACTION_DIMS``: the
-    7-D holder of the pi0.5 cores and the LIBERO session (``AdapterModules(n_dims=None)``). ``label``, ``user_label``
+    as a tensor. Each module acts on its own ``n_dims`` dims when it has one (2 on the cursor), else on the
+    holder's ``n_dims`` (``N_ACTION_DIMS`` when that is None too): the 7-D holder of the pi0.5 cores and the
+    LIBERO session is ``AdapterModules(n_dims=None)``, and an 8-dim task module in a 7-wide holder still acts on
+    8, its own first 8 action dims (a pi0.5 field is ``max_action_dim`` wide). ``label``, ``user_label``
     and ``task_label`` name the parts for display (``describe``); ``load_modules`` reads checkpoints into the slots,
     ``load`` one module into a new holder, ``save_module`` writes one."""
 
@@ -851,7 +874,7 @@ class AdapterModules(nn.Module):
         task = self.task
         if obs is not None and task is not None and hasattr(task, "bind"):
             task = task.bind(obs)
-        return AdaptedField(tensor, self.user, task, n_dims=self.n_dims)
+        return AdaptedField(tensor, self.user, task, holder_n_dims=self.n_dims)
 
     def adapt(self, obs: dict, x: torch.Tensor, t, v: torch.Tensor, backward: bool) -> torch.Tensor:
         field = self.field(obs)
@@ -2123,14 +2146,22 @@ class SteeringPolicy(PreTrainedPolicy):
             if self.adapter.task is None:
                 raise ValueError("a task batch needs a task module")
             chunk = self._normalized_chunk(batch["chunk"])
+            # The base policy's field is ``max_action_dim`` wide (pi0.5's 32; the cursor's 2): pad the
+            # normalized chunk in the model's own padding convention (zeros) so the field sees it that wide,
+            # and draw z at the same width. A base already as wide as the chunk (the cursor) is unchanged.
+            width = self.base_policy.config.max_action_dim
+            if chunk.shape[-1] < width:
+                chunk = nn.functional.pad(chunk, (0, width - chunk.shape[-1]))
             z = batch.get("noise")
-            z = torch.randn_like(chunk) if z is None else z
+            if z is None:
+                z = torch.randn_like(chunk)
+            elif z.shape[-1] < chunk.shape[-1]:  # a caller's noise at the chunk's own width: same padding
+                z = nn.functional.pad(z, (0, chunk.shape[-1] - z.shape[-1]))
             t = batch.get("time")
             t = torch.rand(len(chunk), device=chunk.device) if t is None else t
             task = self.adapter.task.bind(view)
-            loss, parts = LearnedTaskModule.field_loss(
-                task, velocity, chunk, z, t, self.config.lambda_id, self.config.n_dims
-            )
+            n = getattr(task, "n_dims", self.config.n_dims)  # the module's own: the identity term matches A
+            loss, parts = LearnedTaskModule.field_loss(task, velocity, chunk, z, t, self.config.lambda_id, n)
             return loss, {k: v.item() for k, v in parts.items()}
         if kind == "user":
             if self.adapter.user is None:
