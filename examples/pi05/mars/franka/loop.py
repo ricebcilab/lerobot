@@ -9,10 +9,10 @@ The chain is ``bridge.py``'s, in DESIGN.md's order: the operator's 6-axis deflec
 scaled to a twist (``command.translation_gain`` m/s and ``command.rotation_gain`` rad/s at full
 deflection) -> ``bridge.operator_command`` (IK of the twist at the current pose, in action units) ->
 ``bridge.readout`` through the corruption lift ``F`` and the noise -> the served 7-wide command ->
-the method -> the 8-wide station action. The command is read every tick in teleop and once per chunk
-(``tick % n_action_steps == 0``) in the shared modes, where it is held for the chunk: the steering
-core reads a batch's command only when its action queue is empty, so a per-tick read would change
-nothing.
+the method -> the 8-wide station action. In teleop the whole chain runs every tick; in the shared
+modes it runs once per chunk (at ``tick % n_action_steps == 0``) and the *served* command is held for
+the chunk: the steering core reads a batch's command only when its action queue is empty, so a
+mid-chunk re-read would change nothing the policy sees and would only re-draw the readout's noise.
 
 The station's raw batch is built once per chunk (``bundle.prepare``) and reused for the
 ``n_action_steps - 1`` mid-chunk ticks (``bundle.act``): the pre-processor (two images, the
@@ -28,9 +28,9 @@ steering policy's ``adapter.matrix`` in sync with the episode's ``F`` (or its ex
 per-trial redraw would otherwise leave stale.
 
 ``trace`` prints one flushed line per tick: tick, mode, the served command, the action, the joint
-positions and the gripper bit. The joint positions are the observation the action was computed from,
-i.e. the state *before* that row's action. ``run`` catches nothing: Ctrl-C propagates and the caller
-closes the station. ``run_recording`` follows c3po's documented ``recording()`` pattern (``n``/``r``/
+positions and the gripper bit (``-`` in the shared modes: the gripper there is the policy's). The
+joint positions are the observation the action was computed from, i.e. the state *before* that row's
+action. ``run`` catches nothing: Ctrl-C propagates and the caller closes the station. ``run_recording`` follows c3po's documented ``recording()`` pattern (``n``/``r``/
 ``q`` flags, ``cancel_episode``), downloads the dataset before the caller closes the station, and
 returns its local path.
 """
@@ -111,7 +111,7 @@ class Loop:
         self._q0: NDArray | None = None  # the corruption's nominal pose, captured at the first episode
         self._fixed_readout: _Readout | None = None  # a fixed corruption, resolved once
         self._readout: _Readout | None = None  # the episode's readout in force
-        self._held_deflection: NDArray | None = None  # the shared modes' per-chunk command
+        self._held_served: NDArray | None = None  # the shared modes' per-chunk command, in force
         self._batch: dict | None = None  # the chunk's prepared batch, reused mid-chunk
 
     # ------------------------------------------------------------ the run
@@ -168,7 +168,7 @@ class Loop:
             self._bundle.reset()
         if self._source is not None:  # autonomous has no operator device
             self._source.reset()
-        self._held_deflection = None
+        self._held_served = None
         self._batch = None
         # autonomous has no operator command, so there is nothing to corrupt: no readout is drawn
         self._readout = None if self._mode == "autonomous" else self._resolve_readout(obs)
@@ -177,31 +177,36 @@ class Loop:
         self._episode += 1
 
     def _tick(self, obs: dict[str, NDArray], *, prompt: str, tick: int, trace: bool) -> NDArray:
-        """One control step: the command, the action; the station's next observation is the caller's."""
+        """One control step: the command, the action; the station's next observation is the caller's.
+
+        In teleop the operator's whole chain runs every tick. In the shared modes it runs once per
+        chunk, at the boundary observation, and the served command is held for the chunk's ticks
+        (a mid-chunk read is not what the steering core consumes, and it would redraw the noise).
+        """
+        chunk_start = tick % self._n_action_steps == 0
         if self._mode == "teleop":
-            self._held_deflection = self._source.deflection()  # every tick: the operator is the loop
-        elif self._mode == "steered" and tick % self._n_action_steps == 0:
-            self._held_deflection = self._source.deflection()  # once per chunk, held for the chunk
-        if self._mode != "teleop" and tick % self._n_action_steps == 0:
+            self._held_served = self._command(obs)  # every tick: the operator is the loop
+        elif self._mode == "steered" and chunk_start:
+            self._held_served = self._command(obs)  # once per chunk: the core reads it at the boundary
+        if self._mode != "teleop" and chunk_start:
             self._batch = self._bundle.prepare(self._raw_batch(obs, prompt))
-        served = None if self._mode == "autonomous" else self._served(obs)
         if self._mode == "teleop":
+            served = self._held_served
             action = teleop_action(served, self._source.gripper())
         else:
+            served = None if self._mode == "autonomous" else self._held_served
             action = self._bundle.act(self._batch, served)
         if trace:
             self._trace(tick, served, action, obs)
         return action
 
-    def _served(self, obs: dict[str, NDArray]) -> NDArray:
-        """The operator's command through the bridge: deflection -> twist -> IK -> F, gain, noise."""
-        if self._held_deflection is None:
-            raise RuntimeError("the loop has no deflection: read the source before serving a command")
-        twist = _twist(self._held_deflection, self._config.command)
-        intent = bridge.operator_command(twist, bridge.nominal_pose(obs, self._arm), self._length)
+    def _command(self, obs: dict[str, NDArray]) -> NDArray:
+        """The operator's served command: deflection -> twist -> IK -> F, gain, one noise draw."""
         if self._readout is None:
             raise RuntimeError("the episode's readout is not resolved: call run() to begin an episode")
         readout = self._readout
+        twist = _twist(self._source.deflection(), self._config.command)
+        intent = bridge.operator_command(twist, bridge.nominal_pose(obs, self._arm), self._length)
         return bridge.readout(intent, readout.matrix7, readout.sigma7, readout.gain, self._noise_rng)
 
     def _raw_batch(self, obs: dict[str, NDArray], prompt: str) -> dict:
@@ -289,11 +294,15 @@ class Loop:
     # ------------------------------------------------------------ the trace
 
     def _trace(self, tick: int, served: NDArray | None, action: NDArray, obs: dict[str, NDArray]) -> None:
-        """One flushed line: tick, mode, the served command, the action, the state before it, gripper."""
+        """One flushed line: tick, mode, the served command, the action, the state before it, gripper.
+
+        The gripper column is the operator's button only in teleop; in the shared modes the gripper is
+        the policy's, so the column is ``-`` rather than a button state nobody acts on.
+        """
         command = "policy" if served is None else " ".join(f"{value:+.3f}" for value in served)
         executed = " ".join(f"{value:+.3f}" for value in action)
         joints = " ".join(f"{value:+.3f}" for value in bridge.nominal_pose(obs, self._arm))
-        gripper = 1 if action[ARM_DIMS] > 0.5 else 0
+        gripper = ("1" if action[ARM_DIMS] > 0.5 else "0") if self._mode == "teleop" else "-"
         print(
             f"{tick:6d} {self._mode:10s} cmd[{command}] act[{executed}] q[{joints}] grip {gripper}",
             flush=True,
