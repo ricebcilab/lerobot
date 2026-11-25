@@ -83,6 +83,7 @@ examples/pi05/mars/franka/
   bridge.py          pure numpy: Jacobian, IK, units, corruption lift, readout   (no c3po, no torch)
   station.py         c3po port + fake: reset/step/close/record/download, obs -> raw batch dict, action dict
   policy.py          pi0.5 loading, normalization-statistics install, SteeringPolicy per mode, teleop action
+  source.py          the operator's device: the DeflectionSource port, the SpaceMouse and a fake
   loop.py            the one control loop, the record loop, the per-tick trace line
   cli.py             `mars-franka <command>`: argument parsing, config load, composition root
   probe.py           prints what the station and the checkpoint actually are; moves nothing
@@ -137,10 +138,14 @@ class StationManifest: arms: tuple[str, ...]; cameras: tuple[str, ...]; action_k
 
 class Station(Protocol):
     manifest: StationManifest
+    arm: str                                          # the single arm, validated
     def reset(self) -> dict[str, NDArray]
     def step(self, action8: NDArray) -> dict[str, NDArray]
     def close(self) -> None
     def cancel_episode(self) -> None                  # the recording loop's re-record
+class RecordingStation(Station, Protocol):            # C3poStation; FakeStation is not one
+    def record(self, name: str)                       # c3po's recording context manager
+    def download(self, name: str, dest: Path) -> Path
 
 
 class C3poStation:      # lazily imports c3po in __init__, so tests never need it
@@ -166,7 +171,8 @@ def resize_with_pad(image: NDArray, size: int = 224) -> NDArray   # openpi's let
 @dataclass(frozen=True)
 class Bundle:
     policy; preprocessor; postprocessor          # the real objects on the configured device
-    mean: NDArray | None; std: NDArray | None    # action statistics, 8-wide raw units; None without a stats file
+    mean: NDArray | None; std: NDArray | None    # action statistics, 8-wide raw units; None without a stats
+                                                 # file (fake_bundle carries a stand-in std so dry runs exercise noise)
     deadband: float                              # the operator's deadband, action units
     def prepare(self, raw_batch: dict) -> dict   # the pre-processor: once per chunk, the expensive half
     def act(self, batch: dict, command7: NDArray | None) -> NDArray   # (8,) action units, no preprocessing
@@ -196,6 +202,7 @@ def fake_bundle() -> Bundle                      # numpy-only stand-in for --dry
 class DeflectionSource(Protocol):
     def deflection(self) -> NDArray   # (6,) in [-1, 1], device axes [x, y, z, rx, ry, rz]
     def gripper(self) -> bool         # True = closed (a latched toggle)
+    def reset(self) -> None           # a new episode: clear the latch
     def close(self) -> None
 class SpaceMouseSource:               # wraps SpaceMouseTwist; the lerobot import is inside __init__
 class FakeSource:                     # tests and --dry-run
@@ -212,7 +219,12 @@ matrix, because that matrix *is* the session's corruption.
   tick** in teleop; the steering core reads the batch's command only when its queue is empty, so a
   per-tick read would change nothing.
 - `run_recording` follows c3po's documented `recording()` pattern (`n`/`r`/`q` flags, `cancel_episode`),
-  downloads the dataset with `Station.download` before `close`, and returns its local path.
+  takes a `RecordingStation`, downloads the dataset with its `download` after the recording context exits and
+  before `close`, and returns its local path.
+- The loop owns the readout and the adapter sync: it resolves the corruption spec and `q0` at the first
+  episode, applies `gain = 1/||F7||2` (`auto`) and `sigma = readout.noise * action_std[:7]`, and redraws a
+  per-trial `random` family (F7, gain and the `mars-f` adapter matrix) at every episode. It prints the resolved
+  corruption, `q0`, `F7` and gain once, when it first resolves them.
 - No sleeps, no counters of station ticks. `trace` prints one line per tick: tick, command, action, q,
   gripper, chosen method.
 
@@ -269,6 +281,9 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 [modes.mars-u]  mode = "frs" ; adapter_user = "assets/user/<condition>/user.pt"
 [modes.mars-t]  mode = "frs" ; adapter_task = "assets/task/<task>/task.pt"
 [modes.mars]    mode = "frs" ; adapter_user = ... ; adapter_task = ...
+[spacemouse] path = "" ; hid_id = "" ; full_scale = 350.0 ; rotation_full_scale = 350.0
+             source = [0, 1, 2, 3, 4, 5] ; sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+             # rotation_full_scale is a guess until the probe measures it; empty path/hid_id = search
 [recording] dir = "outputs/mars_franka"
 ```
 Unknown keys are rejected. Values are the method's own defaults unless the file sets them: FC's `tau=8`,
