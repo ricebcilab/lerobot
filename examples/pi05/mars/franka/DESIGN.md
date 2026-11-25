@@ -362,3 +362,70 @@ and leaves the gripper (dim 7) and the padding to the policy.
 7. Phase C: task module on teleop demonstrations, `n_dims = 8` (the gripper is dim 7), `vlm_image` scene
    tokens first.
 8. Branch `mars-franka-v2` off `origin/main`; `origin/mars-franka` stays as the archive of the old attempt.
+
+---
+
+# Phase B: the MARS user module
+
+Status: interface freeze, no implementation yet. Everything above stays as it is; Phase B adds files and
+two commands (`train-user`, `validate-user`) and never changes the control loop's semantics.
+
+**What is learned.** `LearnedUserModule` (main's) corrects the velocity field of the *reversal* only:
+`x += h U(x_t, t) v`, so it changes the latent the forward flow starts from, not the executed policy. Its
+inputs are the reversal state `x_t` and flow time `t`; it cannot see `q` or the image. That is why the
+corruption lives in command space (§"Units and the signal chain"): a stick-space corruption is 18-38%
+un-representable by a pose-blind module on this arm (measured on the 835-cycle trace), a command-space one is
+exact. The module models the *readout*, not a person: it is trained from cues, never from human labels.
+
+**The recipe (the lab's cue-based target-command calibration).** For each state `s` and each of `cues` draws:
+1. a cue: a random Cartesian twist at the state's `q` (direction uniform on the sphere, magnitude from the
+   pilot's measured deflection distribution), through the operator's bridge → an intent command `c` in action
+   units (7,);
+2. `served = readout(c)` with the session's corruption, auto gain and a noise draw (the study's σ range);
+3. `a_bci = reference(served)` — the constant 7-vector chunk FRS steers toward, `(served - mean)/std` over
+   dims 0-6, zeros beyond (the core's `reference_chunk` rule, `reference_step = 1.0`);
+4. `path = reversal of reference(intent)` through the **goal-free** velocity field (prompt `do something`,
+   `Flow.reverse`, `num_inference_steps` steps) — where plain FRS would take a faithful command;
+5. at a random reversal step `k`, target the straight-line closure
+   `U(x,t) P(x,t) = (path[k+1] - path[k] - (left-after)(a_bci - path[0])) * N` with
+   `left = (1 - k/N)`, `after = (1 - (k+1)/N)` (the old LIBERO trainer's `command_target`), on all **7**
+   dims (our operator commands every joint; LIBERO's translation-only loss is not ours).
+A faithful command leaves `U` the identity: a zero-initialised module is plain FRS.
+
+**State collection.** `mars-franka <any session command> --record-states NAME` writes chunk-boundary states
+(the same `prepare` boundary the loop already has) to `assets/states/NAME/states.npz`, alongside whatever the
+station records. It adds no control behaviour. Format (frozen; numpy, no pickle):
+`image_exterior`/`image_wrist` `(N,3,224,224) uint8`, `joint_position` `(N,7)`, `gripper` `(N,1)`,
+`deflection` `(N,6)`, `served` `(N,7)`, `q0` `(7,)`, `episode`/`tick` `(N,)`, `prompt`/`mode` `(N,)` str,
+`meta` (JSON: policy path, stats path, station, corruption spec, config digest, timestamp).
+
+**Validation (offline, no arm, no env).** On held-out states, for each FRS depth in `val_depths`: what
+steering would execute (`FlowReversalSteering` with the reference pinned) against the cue's intent, as the
+mean cosine between the executed translation (the executed joint velocities through `J(q)`) and the intent
+twist, for arms `plan`, `none`, `clean`, `ideal`, `F` (the fixed lift), `user` (the trained module). The
+module is worth the study only if `user` moves from `none` toward `clean`.
+
+**Files.** `readout.py` (the session's readout as a value: `F`, gain, σ, `serve`), `cues.py` (draw and serve
+cues; the reference vector; pure), `statefiles.py` (write/read the npz above), `train_user.py` (labels, the
+loss, the loop, `AdapterModules.save_module`), `validate.py` (the offline comparison), and their tests. The
+loop uses `readout.Readout`; the CLI gains `train-user` and `validate-user`.
+
+**Config additions.**
+```toml
+[policy]  prompt_generic = "do something"          # the goal-free field's prompt, for the trainer
+[user]    states = "assets/states/pilot"           # a states file, or a directory sharing the format
+          out = "assets/user/rotz20"               # train-user writes <out>/user.pt and train_log.json
+          checkpoint = "assets/user/rotz20/user.pt"  # validate-user and [modes.mars-u] read this
+          cues = 3 ; sigma = [0.2, 0.5]            # noise range in action-std units, as the study's
+          horizon = null                           # null = the checkpoint's chunk_size
+          d = 256 ; tdim = 64 ; time_embedding = "mars"
+          step_rank = null ; cross_step_rank = 0 ; additive = false
+          correct_by = null
+[training] steps = 3000 ; batch = 8 ; lr = 1e-3 ; val_frac = 0.1 ; seed = 0 ; log_every = 100
+          val_depths = [10, 4] ; device = "cuda" ; dtype = "bfloat16"
+[modes.mars-u]  mode = "frs" ; adapter_user = "assets/user/rotz20/user.pt"
+```
+
+**Slices.** B1 readout extraction + cues (pure); B2 state recording; B3 the trainer; B4 validation + the
+`mars-u` mode. Each offline suite must run without CUDA, without a checkpoint and without the station; the
+real velocity field, the real statistics and a real session are verification on chopper only.
