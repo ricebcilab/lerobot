@@ -1,10 +1,10 @@
-"""The probe's pure and offline parts: its report formatters, the action contract, the raw-report
-tally, the configuration numbers, and ``main`` reporting an absent station instead of crashing.
+"""The probe's pure and offline parts: the station report and action contract, the raw-report tally
+and its summary, the configuration numbers, and main reporting an absent station instead of crashing.
 
-No c3po, no torch, no checkpoint, no SpaceMouse. The hardware sections are replaced where a test has
-to reach them (the station opener, the CUDA gate, the hidraw enumeration), and the one test that runs
-``main`` also asserts that the import path stayed torch-free. The SpaceMouse bytes the tests feed the
-tally are synthetic reports in the module's layout: three int16 counts after the report id.
+No c3po, no torch, no checkpoint, no SpaceMouse. A fake station supplies the manifest that c3po's
+describe handshake would give, the tally is fed synthetic reports in the module's layout (three int16
+counts after the report id), and main's hardware gates are patched, so every test is deterministic on
+a machine with a device and on one without.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import bridge
 import numpy as np
 import probe
-import pytest
 import stats as stats_module
 from config import load_config
 from station import StationManifest
@@ -47,24 +47,17 @@ def _write(tmp_path: Path, text: str) -> Path:
 
 
 def _stats_file(tmp_path: Path) -> Path:
-    """A hermetic ``norm_stats.json``: 32 wide, meaningful in the eight station dims, zeros after."""
-    q01 = np.zeros(CHECKPOINT_WIDTH)
-    q99 = np.zeros(CHECKPOINT_WIDTH)
+    """A hermetic norm_stats.json: 32 wide, meaningful in the eight station dims, zeros after."""
+    q01, q99 = np.zeros(CHECKPOINT_WIDTH), np.zeros(CHECKPOINT_WIDTH)
     q01[:8] = [-0.5, -0.7, -0.4, -0.9, -0.6, -0.6, -0.7, 0.0]
     q99[:8] = [0.5, 0.8, 0.4, 0.8, 0.6, 0.7, 0.7, 1.0]
     group = {"mean": [0.0] * CHECKPOINT_WIDTH, "std": [1.0] * CHECKPOINT_WIDTH}
     path = tmp_path / "norm_stats.json"
-    path.write_text(
-        json.dumps(
-            {
-                "norm_stats": {
-                    "state": {**group, "q01": q01.tolist(), "q99": q99.tolist()},
-                    "actions": {**group, "q01": q01.tolist(), "q99": q99.tolist()},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = {
+        "state": {**group, "q01": q01.tolist(), "q99": q99.tolist()},
+        "actions": {**group, "q01": q01.tolist(), "q99": q99.tolist()},
+    }
+    path.write_text(json.dumps({"norm_stats": payload}), encoding="utf-8")
     return path
 
 
@@ -105,188 +98,188 @@ ic_gain = 7.0
 """
 
 
-# ---------------------------------------------------------------- the report formatting
+def _observation() -> dict[str, np.ndarray]:
+    """The reset observation c3po's describe-derived keys imply for the shipped config."""
+    frame = np.full((8, 8, 3), 40, dtype=np.uint8)
+    return {
+        f"{ARM}/joint_position": np.zeros(7),
+        f"{ARM}/gripper_position": np.zeros(1),
+        "scene_zed": frame.copy(),
+        "wrist_zed": frame.copy(),
+    }
 
 
-def test_the_manifest_report_names_the_stations_four_facts():
-    """A fake manifest formats as the four lines c3po's describe handshake exposes, plus joint names."""
+def _fake_station(*, action_keys=ACTION_KEYS, native: float = 15.0, command_mode: str = "joint_velocity"):
+    """A c3po Robot stand-in: the manifest c3po would build, and its read-only step(None)."""
+    raw = {
+        "station_model": "franka",
+        "api_version": "1.0",
+        "arms": [{"name": ARM, "command_mode": command_mode}],
+    }
+    robot = SimpleNamespace(
+        _manifest=raw,
+        joint_names={ARM: ["panda_joint1"]},
+        step=lambda action=None: {key: value.copy() for key, value in _observation().items()},
+    )
     manifest = StationManifest(
-        arms=("follower",),
-        cameras=("front_rgb", "wrist_rgb"),
-        action_keys=ACTION_KEYS,
-        control_rate=15.0,
+        arms=(ARM,), cameras=("scene_zed", "wrist_zed"), action_keys=action_keys, control_rate=native
     )
-    assert probe.format_manifest(manifest) == [
-        "arms: follower",
-        "cameras: front_rgb, wrist_rgb",
-        f"action keys: {', '.join(ACTION_KEYS)}",
-        "control rate: 15 Hz (the station's native rate)",
-    ]
-    named = probe.format_manifest(manifest, {"follower": ["panda_joint1", "panda_joint2"]})
-    assert named[-1] == "joint names for follower: panda_joint1, panda_joint2"
-    assert (
-        probe.format_manifest(manifest, {"follower": []})[-1] == "joint names for follower: none advertised"
+    return SimpleNamespace(manifest=manifest, _robot=robot)
+
+
+def _tally(data: bytes, ids=(1, 2, 3), seen=None, peaks=None, last=None):
+    seen, peaks, last = (
+        seen if seen is not None else {},
+        peaks if peaks is not None else {},
+        last if last is not None else {},
     )
+    probe._tally("/dev/hidraw0", data, ids, seen, peaks, last)
+    return seen, peaks, last
 
 
-# ---------------------------------------------------------------- the action contract
+# ---------------------------------------------------------------- the station report
 
 
-def test_the_contract_passes_when_the_manifest_advertises_the_two_action_keys():
-    checks = probe.action_contract(ARM, ACTION_KEYS, "joint_velocity")
-    assert [(check.label, check.status) for check in checks] == [
-        (f"{ARM}/joint_velocity", "PASS"),
-        (f"{ARM}/gripper_position", "PASS"),
-        ("command mode", "PASS"),
-    ]
-    assert "joint_velocity" in checks[2].detail
+def test_the_station_report_names_the_manifest_and_checks_the_contract(monkeypatch):
+    """One reset, its keys/shapes/dtypes, the reset pose, the camera feeds, the hold window and the
+    two action keys: the facts the first teleop run depends on, each with a PASS/FAIL line."""
+    monkeypatch.setattr(probe, "HOLD_SECONDS", 0.01)
+    lines, failures, unavailable = probe.station_section(
+        load_config(SHIPPED), _fake_station(), _observation(), None
+    )
+    text = "\n".join(lines)
+    assert unavailable is None and failures == 0, text
+    assert f"manifest: arms ['{ARM}'], cameras ['scene_zed', 'wrist_zed']" in text
+    assert f"action keys {list(ACTION_KEYS)}, native rate 15 Hz" in text
+    assert f"{ARM}/joint_position: (7,) float64" in text
+    assert "reset pose q: [+0.000 +0.000 +0.000 +0.000 +0.000 +0.000 +0.000]" in text
+    assert "scene_zed: (8, 8, 3) uint8, mean 40.0/255" in text
+    assert "camera third: omitted" in text
+    assert "[PASS] holds without a command: max |dq| 0.0000 rad" in text
+    assert f"[PASS] {ARM}/joint_velocity: joint velocities" in text
+    assert f"[PASS] {ARM}/gripper_position: gripper bit" in text
+    assert "[PASS] command mode: advertised 'joint_velocity'" in text
 
 
-@pytest.mark.parametrize(
-    ("action_keys", "failed"),
-    [
-        ((f"{ARM}/gripper_position",), f"{ARM}/joint_velocity"),
-        ((f"{ARM}/joint_velocity",), f"{ARM}/gripper_position"),
-    ],
-)
-def test_the_contract_fails_a_missing_action_key_and_names_it(action_keys, failed):
-    """The loop sends two keys; a manifest without one refuses every ``step`` (c3po raises)."""
-    checks = probe.action_contract(ARM, action_keys, "joint_velocity")
-    missing = [check for check in checks if check.label == failed][0]
-    assert missing.status == "FAIL"
-    assert "action_keys" in missing.detail
-    assert sum(check.status == "FAIL" for check in checks) == 1
+def test_the_contract_fails_a_missing_key_and_names_it(monkeypatch):
+    monkeypatch.setattr(probe, "HOLD_SECONDS", 0.01)
+    station = _fake_station(action_keys=(f"{ARM}/gripper_position",), native=10.0)
+    lines, failures, _ = probe.station_section(load_config(SHIPPED), station, _observation(), None)
+    text = "\n".join(lines)
+    assert failures == 2  # the missing velocity key and the native rate below the requested 15 Hz
+    assert f"[FAIL] {ARM}/joint_velocity: not in action_keys ['{ARM}/gripper_position']" in text
+    assert "[FAIL] rate: native 10 vs requested 15 Hz" in text
 
 
-def test_the_contract_fails_both_keys_when_the_manifest_advertises_neither():
-    """An empty action-key list is the clearest failure: both keys the loop writes are refused."""
-    checks = probe.action_contract(ARM, (), None)
-    assert [check.status for check in checks] == ["FAIL", "FAIL", "INFO"]
+def test_a_position_command_mode_is_refused(monkeypatch):
+    monkeypatch.setattr(probe, "HOLD_SECONDS", 0.01)
+    lines, failures, _ = probe.station_section(
+        load_config(SHIPPED), _fake_station(command_mode="joint_position"), _observation(), None
+    )
+    assert failures == 1
+    assert "[FAIL] command mode: advertised 'joint_position'" in "\n".join(lines)
 
 
-def test_the_contract_refuses_a_position_command_mode():
-    """An arm table that advertises joint_position would read the loop's velocities as positions."""
-    checks = probe.action_contract(ARM, ACTION_KEYS, "joint_position")
-    assert checks[2].status == "FAIL"
-    assert "joint_position" in checks[2].detail
-
-
-def test_a_manifest_without_a_command_mode_is_information_not_a_failure():
-    """libraries older than the arm-table mode do not publish it; the action key is still the contract."""
-    checks = probe.action_contract(ARM, ACTION_KEYS, None)
-    assert [check.status for check in checks] == ["PASS", "PASS", "INFO"]
-    assert "action key" in checks[2].detail
+def test_an_absent_station_is_one_unavailable_line():
+    lines, failures, unavailable = probe.station_section(
+        load_config(SHIPPED), None, None, ImportError("no c3po")
+    )
+    assert unavailable == "ImportError: no c3po"
+    assert lines == ["[UNAVAILABLE] ImportError: no c3po"] and failures == 0
 
 
 # ---------------------------------------------------------------- the raw-report tally
 
 
 def test_the_tally_counts_report_ids_per_node_and_keeps_the_peak_counts():
-    """id 1/id 2 carry three int16 counts; the tally keeps the largest |count| per axis, per id."""
-    tally = probe.ReportTally()
-    tally.add("/dev/hidraw0", _report(probe.TRANSLATION_REPORT, 350, -40, 12))
-    tally.add("/dev/hidraw0", _report(probe.TRANSLATION_REPORT, 300, 45, -5))
-    tally.add("/dev/hidraw1", _report(probe.ROTATION_REPORT, -300, 210, 55))
-    tally.add("/dev/hidraw1", bytes([probe.BUTTON_REPORT, 1, 0, 0, 0]))
-    tally.add("/dev/hidraw0", b"")  # an empty read is not a report
-
-    assert tally.ids("/dev/hidraw0") == {probe.TRANSLATION_REPORT: 2}
-    assert tally.ids_by_report(probe.TRANSLATION_REPORT) == {"/dev/hidraw0": 2}
-    assert tally.peaks[probe.TRANSLATION_REPORT] == (350, 45, 12)
-    assert tally.peaks[probe.ROTATION_REPORT] == (300, 210, 55)
-    assert tally.suggestion() == (350.0, 300.0)
-    assert tally.reports == 4
-    lines = tally.summary()
-    assert lines[0] == f"/dev/hidraw0: id {probe.TRANSLATION_REPORT} x 2"
-    assert f"/dev/hidraw1: id {probe.ROTATION_REPORT} x 1, id {probe.BUTTON_REPORT} x 1" in lines
-    assert f"peak |counts| id {probe.ROTATION_REPORT} (rotation): x 300, y 210, z 55" in lines
+    seen, peaks, last = {}, {}, {}
+    probe._tally("/dev/hidraw0", _report(1, 350, -40, 12), (1, 2, 3), seen, peaks, last)
+    probe._tally("/dev/hidraw0", _report(1, 300, 45, -5), (1, 2, 3), seen, peaks, last)
+    probe._tally("/dev/hidraw1", _report(2, -300, 210, 55), (1, 2, 3), seen, peaks, last)
+    probe._tally("/dev/hidraw1", bytes([3, 1, 0, 0, 0]), (1, 2, 3), seen, peaks, last)
+    assert seen == {"/dev/hidraw0": {1: 2}, "/dev/hidraw1": {2: 1, 3: 1}}
+    assert peaks == {1: (350, 45, 12), 2: (300, 210, 55)}  # |−40| < 45; |−5| < 12
+    assert last == {1: (300, 45, -5), 2: (-300, 210, 55)}
 
 
-def test_a_short_report_still_counts_toward_its_id_but_cannot_move_a_peak():
-    """Which ids arrive is the finding, so a truncated report is counted; its counts are only usable
-    when the three int16s are all there."""
-    tally = probe.ReportTally()
-    tally.add("/dev/hidraw0", bytes([probe.ROTATION_REPORT, 3]))
-    assert tally.ids("/dev/hidraw0") == {probe.ROTATION_REPORT: 1}
-    assert tally.peaks == {}
-    assert tally.summary()[1] == f"peak |counts| id {probe.TRANSLATION_REPORT} (translation): no reports"
+def test_a_short_report_counts_toward_its_id_but_cannot_move_a_peak():
+    """Which ids arrive is the finding, so a truncated report is counted; its counts only exist when
+    the three int16s are all there."""
+    seen, peaks, last = _tally(bytes([2, 3]))
+    assert seen == {"/dev/hidraw0": {2: 1}} and peaks == {} and last == {}
 
 
-def test_the_rest_vector_is_the_last_counts_through_the_configured_mapping():
-    """At rest the device sends a zeroing report; the vector is mapped and scaled like the twist."""
-    tally = probe.ReportTally()
-    tally.add("/dev/hidraw0", _report(probe.TRANSLATION_REPORT, 100, -50, 0))
-    tally.add("/dev/hidraw0", _report(probe.ROTATION_REPORT, 0, 0, 20))
-    rest = tally.rest_vector(
-        source=[0, 1, 2, 3, 4, 5],
-        sign=[1.0, 1.0, 1.0, 1.0, 1.0, -1.0],
-        full_scale=350.0,
-        rotation_full_scale=350.0,
-    )
-    np.testing.assert_allclose(rest, np.array([100, -50, 0, 0, 0, -20]) / 350.0)
+def test_the_mouse_summary_prints_the_max_counts_and_the_scales_to_copy():
+    """The summary lines are the artifact: max |counts| per axis, the two full scales to write into
+    [spacemouse], the configured mapping and the rest six-vector."""
+    seen, peaks, last = {}, {}, {}
+    probe._tally("/dev/hidraw0", _report(1, 350, -40, 12), (1, 2, 3), seen, peaks, last)
+    probe._tally("/dev/hidraw1", _report(2, -300, 210, 55), (1, 2, 3), seen, peaks, last)
+    lines, failures = probe._mouse_report([], 0, load_config(SHIPPED), seen, peaks, last, (1, 2, 3))
+    text = "\n".join(lines)
+    assert failures == 0
+    assert "/dev/hidraw0: id 1 x 1" in text and "/dev/hidraw1: id 2 x 1" in text
+    assert "max |counts| x 350 y 40 z 12" in text
+    assert "max |counts| x 300 y 210 z 55" in text
+    assert "copy into [spacemouse] full_scale = 350" in text
+    assert "copy into [spacemouse] rotation_full_scale = 300" in text
+    assert "configured source [0, 1, 2, 3, 4, 5]" in text
+    assert "rest-state six-vector [x y z rx ry rz]" in text
 
-    tally.add("/dev/hidraw0", _report(probe.TRANSLATION_REPORT, 0, 0, 0))
-    tally.add("/dev/hidraw0", _report(probe.ROTATION_REPORT, 0, 0, 0))
-    np.testing.assert_allclose(tally.rest_vector([0, 1, 2, 3, 4, 5], [1.0] * 6, 350.0, 350.0), np.zeros(6))
+
+def test_no_rotation_reports_is_a_failed_check():
+    seen, peaks, last = {}, {}, {}
+    probe._tally("/dev/hidraw0", _report(1, 350, 0, 0), (1, 2, 3), seen, peaks, last)
+    lines, failures = probe._mouse_report([], 0, load_config(SHIPPED), seen, peaks, last, (1, 2, 3))
+    assert failures == 1
+    assert "[FAIL] id 2 (rotation) reports: none arrived" in "\n".join(lines)
 
 
 # ---------------------------------------------------------------- the configuration section
 
 
 def test_the_configuration_section_prints_its_numbers_from_a_temp_config(tmp_path):
-    """The section's channel: the config tree, the resolved q0/F7/gain, and the noise sigma from the
+    """The section's channel: the config tree, the resolved q0/F7/gain, the noise sigma from the
     statistics file — computed with bridge.py and stats.py, never re-derived here."""
     stats_path = _stats_file(tmp_path)
     path = _write(tmp_path, _config_text(stats_path))
     config = load_config(path)
-
-    section = probe.configuration_section(config, path=path)
-
-    assert section.status == "PASS", "\n".join(section.lines)
-    text = "\n".join(section.lines)
-    assert "127.0.0.1:4242" in text and "rate 10 Hz" in text
-    assert "exterior 'cam_a', wrist 'cam_b', third 'cam_c'" in text
-    assert "q0: [+0.100 -0.200 +0.300 -0.400 +0.500 -0.600 +0.700] (from [command] q0)" in text
-    assert "fc: flow_control, tau 4, lam 2, ic_gain 7" in text
-    assert "noise 0.2 sigma" in text
-
+    lines, failures, unavailable = probe.configuration_section(config, path, None, None)
+    text = "\n".join(lines)
+    assert unavailable is None and failures == 0, text
+    assert "127.0.0.1:4242, rate 10 Hz" in text
+    assert "exterior 'cam_a', wrist 'cam_b', third cam_c" in text
+    assert "fc=flow_control(tau 4, lam 2, ic_gain 7)" in text
+    assert "[command] q0" in text
     q0 = np.asarray(config.command.q0, dtype=np.float64)
     matrix7 = bridge.corruption_lift(
         bridge.matrix6_from_spec(config.readout.corruption), q0, config.command.twist_length
     )
     norm = float(np.linalg.norm(matrix7, 2))
     assert f"||F7||2 = {norm:.4f}" in text
-    assert f"gain: {1.0 / norm:.4f}" in text
+    assert f"gain: {1.0 / norm:.4f} (auto = 1/||F7||2)" in text
     sigma = config.readout.noise * stats_module.action_std(config.policy.stats)
-    assert probe._vector_text(sigma) in text
+    assert f"noise sigma (7, action units): {probe._vec(sigma)}" in text
 
 
 def test_the_lift_falls_back_to_the_station_reset_pose_when_q0_is_empty(tmp_path):
-    """[command] q0 = [] means the loop captures the pose at connect; the section can read it from a
-    reset observation, which is what a hardware session has."""
     path = _write(tmp_path, _config_text(q0="[]"))
     config = load_config(path)
     observation = {f"{ARM}/joint_position": np.arange(7, dtype=np.float64) / 10.0}
-
-    section = probe.configuration_section(config, path=path, reset_observation=observation)
-
-    text = "\n".join(section.lines)
-    assert section.status == "PASS"
-    assert "q0: [+0.000 +0.100 +0.200 +0.300 +0.400 +0.500 +0.600] (the station's reset pose)" in text
+    lines, failures, _ = probe.configuration_section(config, path, observation, None)
+    text = "\n".join(lines)
+    assert failures == 0
+    assert "q0: [+0.000 +0.100 +0.200 +0.300 +0.400 +0.500 +0.600] (the station reset pose)" in text
     assert "||F7||2 = " in text
 
 
-def test_an_unresolvable_corruption_is_reported_as_information_not_as_an_identity(tmp_path):
-    """Without a station and without a configured q0 the lift cannot be evaluated: the section says so
-    instead of printing the identity, which is not this session's corruption."""
+def test_an_unresolvable_corruption_is_reported_as_information_not_an_identity(tmp_path):
     path = _write(tmp_path, _config_text(q0="[]"))
-    config = load_config(path)
-
-    section = probe.configuration_section(config, path=path)
-
-    text = "\n".join(section.lines)
-    assert section.status == "PASS"
-    assert "[INFO] F7: not resolved" in text
+    lines, failures, _ = probe.configuration_section(load_config(path), path, None, ImportError("no c3po"))
+    text = "\n".join(lines)
+    assert failures == 0
+    assert "[INFO] q0: the reset pose is unavailable (ImportError: no c3po)" in text
+    assert "[INFO] F7, gain: unresolved without q0" in text
     assert "F7 (7x7" not in text
 
 
@@ -295,22 +288,20 @@ def test_an_unresolvable_corruption_is_reported_as_information_not_as_an_identit
 
 def test_main_reports_an_unavailable_station_and_exits_non_zero(tmp_path, monkeypatch, capsys):
     """No c3po here: the station section says unavailable and the probe continues, then exits non-zero.
-    The CUDA gate and the hidraw enumeration are patched as well so this test is deterministic on a
-    CUDA machine and never opens a real device."""
+    The CUDA gate and the hidraw enumeration are patched too, so this never touches a real device."""
     path = _write(tmp_path, _config_text(q0="[]"))
+    import station as station_module
 
-    def no_c3po(config):
+    def no_c3po(*args, **kwargs):
         raise ImportError("c3po is not installed; from the lerobot checkout run `uv pip install -e ../c3po`")
 
-    monkeypatch.setattr(probe, "_open_station", no_c3po)
-    monkeypatch.setattr(probe, "_cuda_available", lambda: False)
+    monkeypatch.setattr(station_module, "C3poStation", no_c3po)
     monkeypatch.setattr(probe, "hidraw_nodes", lambda: [])
-
+    monkeypatch.setattr(probe.shutil, "which", lambda name: None)
     assert probe.main(["--config", str(path)]) == 1
     output = capsys.readouterr().out
     assert "=== 1/4 configuration ===" in output
-    assert "=== 2/4 station ===" in output
-    assert "UNAVAILABLE" in output
+    assert "=== 2/4 station ===" in output and "UNAVAILABLE" in output
     assert "c3po is not installed" in output
     assert "=== 4/4 policy ===" in output
     assert "probe: 1/4 sections passed" in output
@@ -329,7 +320,7 @@ def test_importing_the_probe_needs_neither_torch_nor_c3po_nor_lerobot():
         "assert 'torch' not in sys.modules, 'probe imported torch'; "
         "assert 'c3po' not in sys.modules, 'probe imported c3po'; "
         "assert 'lerobot' not in sys.modules, 'probe imported lerobot'; "
-        "assert hasattr(probe, 'main') and hasattr(probe, 'ReportTally')"
+        "assert hasattr(probe, 'main') and hasattr(probe, '_tally')"
     )
     subprocess.run(
         [sys.executable, "-c", code],

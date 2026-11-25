@@ -20,9 +20,10 @@ uv sync --extra pi
 uv pip install -e ../c3po
 ```
 
-`c3po` is not on PyPI: clone it beside the lerobot checkout and install it editable. Every command in
-this folder repeats `--extra pi` because `uv run` syncs the project's extra set from the command line;
-leaving it off would run the base install without the π0.5 dependencies.
+`c3po` is not on PyPI: clone it beside the lerobot checkout and install it editable. The shorthand
+`uv run mars-franka <command>` works after that `uv sync --extra pi`; every command in this folder
+passes `--extra pi` explicitly, the form that does not depend on which extras the environment was last
+synced with.
 
 The checkpoint needs openpi's DROID statistics, which it does not ship. Download them once, exactly as
 [`assets/README.md`](assets/README.md) records:
