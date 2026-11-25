@@ -8,32 +8,33 @@ its cached pre/post-processor JSONs declare the features empty and the ``normali
 ``assets/droid/norm_stats.json`` and be installed here before the pipelines mean anything
 (``DESIGN.md``, "What the checkpoint's own code settles").
 
-This module is the only place torch meets the checkpoint in the example. ``load_bundle`` builds the
-policy and its two pipelines on the configured device (weights and the gated PaliGemma tokenizer are
-needed for a real one: the probe on the station is that [V]); ``install_stats`` puts the statistics on
-the steps whose ``QUANTILES`` mode reads them; ``make_steering`` wraps the loaded policy in the mode's
-``SteeringPolicy``; ``Bundle.action`` is the one call a control tick makes, with or without the
-operator's 7-dim command; and ``teleop_action`` is the no-policy path's 8-wide action. ``fake_bundle``
-is the numpy-only stand-in ``--dry-run`` uses, so importing this module and driving it must not need
-torch, the checkpoint or the tokenizer: every lerobot import is inside the function that needs it.
+This module is the policy half of that: ``load_bundle`` builds the checkpoint and its two pipelines on
+the configured device (weights and the gated PaliGemma tokenizer are needed for a real one: the probe on
+the station is that [V]); ``make_steering`` wraps the loaded policy in the mode's ``SteeringPolicy``;
+``Bundle.action`` is the one call a control tick makes, with or without the operator's 7-dim command;
+and ``teleop_action`` is the no-policy path's 8-wide action. The statistics half lives in ``stats.py``
+(``install_stats``, with the ``normalize_processor.py`` lines it follows in that module's docstring).
+``fake_bundle`` is the numpy-only stand-in ``--dry-run`` uses, so importing this module and driving it
+must not need torch, the checkpoint or the tokenizer: every lerobot import is inside the function that
+needs it, and ``stats`` is numpy-only at import.
 
 Where the 8 dims are sliced: **after** the post-processor, never before. The model works in normalized
 space over the 32-wide padded action, and the unnormalizer's QUANTILES map is a per-dim affine map
 (``q01``/``q99``); the station's action units are that map's output, so the first 8 dims are taken from
 its result. Slicing the normalized action before it would hand the station numbers in [-1, 1] with no
-physical meaning, and the steering cores' statistics (``FlowControlSteering.action_mean_std``) are the
-affine form of the same quantile map.
+physical meaning, and the statistics ``install_stats`` returns for the steering cores are the affine
+form of the same quantile map.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
+from stats import STATION_DIMS, install_stats
 
 if TYPE_CHECKING:
     from config import Config, SteeringConfig
@@ -42,12 +43,6 @@ if TYPE_CHECKING:
 
 ARM_DIMS = 7
 """The Franka's joints: the steering command's width, and dims 0-6 of the action."""
-
-STATION_DIMS = 8
-"""The station's action width: the seven joints and the gripper (dim 7)."""
-
-CHECKPOINT_WIDTH = 32
-"""pi0.5-DROID's padded state/action width; the statistics are installed at this width."""
 
 DEFAULT_DEADBAND = 0.02
 """The operator's idle threshold in action units (DESIGN's ``[command] deadband`` default)."""
@@ -188,103 +183,6 @@ def load_bundle(cfg: Config, device: str | None = None) -> Bundle:
         std=std,
         deadband=float(getattr(command, "deadband", DEFAULT_DEADBAND)),
     )
-
-
-def install_stats(
-    preprocessor: Any, postprocessor: Any, stats_path: Path, dims: int = STATION_DIMS
-) -> tuple[NDArray, NDArray]:
-    """Install openpi's DROID statistics on the steps that read them; return the 8-wide action (mean, std).
-
-    ``stats_path`` is ``assets/droid/norm_stats.json``: ``{"norm_stats": {"state": {...}, "actions":
-    {...}}}``, each group ``mean``/``std``/``q01``/``q99`` 32 wide, meaningful (not q01 == q99 == 0) in
-    the first ``dims`` dims and zero after. The checkpoint's ``normalization_mapping`` is ``QUANTILES``
-    for STATE and ACTION, so a ``NormalizerProcessorStep``/``UnnormalizerProcessorStep`` reads the
-    group's **q01/q99** (never mean/std) for the keys it sees: the pre-processor's normalizer gets both
-    ``observation.state`` and ``action``, the post-processor's unnormalizer gets ``action``. A step only
-    touches the keys in its ``features`` dict (and the ACTION key through ``stats`` alone), and the
-    checkpoint's JSONs ship ``features: {}``, so the feature entries are added too and the step's tensor
-    statistics are rebuilt.
-
-    The ``(mean, std)`` returned for the steering cores is the affine form of that same quantile map,
-    ``(q01 + q99) / 2`` and ``(q99 - q01) / 2`` (the cores' own conversion,
-    ``FlowControlSteering.action_mean_std``, is what computes it; this does not re-derive the map).
-    """
-    path = Path(stats_path)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{path}: {error}") from error
-    groups = data.get("norm_stats") if isinstance(data, dict) else None
-    if not isinstance(groups, dict):
-        raise ValueError(f"{path}: expected a 'norm_stats' table, got {type(groups).__name__}")
-
-    state = _quantile_pair(groups, "state", path, dims)
-    actions = _quantile_pair(groups, "actions", path, dims)
-
-    from lerobot.configs import FeatureType, PolicyFeature
-    from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
-
-    stats = {
-        "observation.state": {"q01": state["q01"], "q99": state["q99"]},
-        "action": {"q01": actions["q01"], "q99": actions["q99"]},
-    }
-    # The state is normalized through the normalizer's features dict; the action is reached by its
-    # stats key, but declaring both keeps each step's feature set the checkpoint's 32-wide one.
-    features = {
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(CHECKPOINT_WIDTH,)),
-        "action": PolicyFeature(type=FeatureType.ACTION, shape=(CHECKPOINT_WIDTH,)),
-    }
-    normalizers = [step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep)]
-    unnormalizers = [step for step in postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)]
-    if not normalizers:
-        raise ValueError(f"{path}: the pre-processor has no NormalizerProcessorStep to install statistics on")
-    if not unnormalizers:
-        raise ValueError(
-            f"{path}: the post-processor has no UnnormalizerProcessorStep to install statistics on"
-        )
-    for step in (*normalizers, *unnormalizers):
-        _install_on(step, stats, features)
-
-    from lerobot.policies.steering import FlowControlSteering
-
-    mean, std = FlowControlSteering.action_mean_std(postprocessor)
-    return mean[:dims], std[:dims]
-
-
-def _quantile_pair(groups: dict, name: str, path: Path, dims: int) -> dict[str, NDArray]:
-    """One group of ``norm_stats`` (``state`` or ``actions``): its 32-wide q01/q99, width-checked."""
-    group = groups.get(name)
-    if not isinstance(group, dict):
-        raise ValueError(f"{path}: expected a 'norm_stats.{name}' table, got {type(group).__name__}")
-    keys = ("mean", "std", "q01", "q99")
-    missing = [key for key in keys if key not in group]
-    if missing:
-        raise ValueError(f"{path}: norm_stats.{name} is missing {', '.join(missing)}")
-    arrays = {key: np.asarray(group[key], dtype=np.float64).reshape(-1) for key in keys}
-    widths = sorted({array.shape[0] for array in arrays.values()})
-    if widths != [CHECKPOINT_WIDTH]:
-        raise ValueError(
-            f"{path}: norm_stats.{name} must be {CHECKPOINT_WIDTH} wide, got widths {widths} "
-            "(pi0.5-DROID's padded state and action vectors)"
-        )
-    q01, q99 = arrays["q01"], arrays["q99"]
-    # DESIGN.md: dims 0-7 meaningful, zero after. "Meaningful" is the first index where both quantiles
-    # are exactly zero (the pad dims), and nothing beyond it may be non-zero.
-    zero = (q01 == 0) & (q99 == 0)
-    meaningful = int(np.argmax(zero)) if zero.any() else CHECKPOINT_WIDTH
-    if meaningful != dims or bool((~zero[dims:]).any()):
-        raise ValueError(
-            f"{path}: norm_stats.{name} is meaningful in {meaningful} dims (zeros from index {meaningful}); "
-            f"expected {dims} meaningful dims and zeros beyond"
-        )
-    return {"q01": q01, "q99": q99}
-
-
-def _install_on(step: Any, stats: dict, features: dict) -> None:
-    """Merge the two keys into a normalization step and rebuild its tensor statistics from them."""
-    step.stats = {**(step.stats or {}), **stats}
-    step.features = {**(step.features or {}), **features}
-    step.to()  # _NormalizationMixin.to: re-derives _tensor_stats from .stats
 
 
 # ---------------------------------------------------------------- the steering modes
