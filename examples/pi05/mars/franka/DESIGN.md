@@ -450,3 +450,61 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
 `mars-u` mode. `train-user`/`validate-user` require `--prompt` (the field's prompt, the study's), `--config`,
 and read `[user]`.  Each offline suite must run without CUDA, without a checkpoint and without the station; the
 real velocity field, the real statistics and a real session are verification on chopper only.
+
+---
+
+# Phase C: the MARS task module
+
+Status: interface freeze. Adds `demos.py`, `scene.py`, `train_task.py`, the modes `mars-t` and `mars`, the
+command `train-task`, and a `[task]` config section. Nothing in Phase A/B changes meaning.
+
+**What it is.** `LearnedTaskModule` (main's) is `A(x_t, t, scene) v + b` per chunk step, applied in **both**
+flow directions, so it reshapes every chunk the frozen policy produces. It is trained by flow matching through
+the field on **demonstrations**: `||A v + b - (a - z)||^2 + lambda_id (||A - I||^2 + ||b||^2)`, `a` the
+demonstrated chunk in action units (normalized by the postprocessor's statistics), `v` the policy's velocity.
+A fresh module is the identity. The method is the model's own: this folder supplies the data, the scene tokens
+and the wiring. MARS is `user ∘ task`: `forward task(v)`, `backward user(task(v))`.
+
+**Demonstrations.** `teleop --record NAME` (Phase A) writes a LeRobot v3 dataset through c3po and downloads it
+to `[recording] dir/NAME`. `[task] demos` names one; the trainer reads it. The loader **discovers** the
+station's feature names from the dataset metadata (an arm's `joint_position`/`gripper_position` observation, the
+action keys, the cameras) and refuses anything it cannot map, naming the missing feature: the exact schema is
+r2d2's and is verified on the first session, not assumed. A sample is (observation raw batch, action chunk):
+the action chunk is the next `chunk_size` recorded actions (7 joint velocities in action units + the gripper),
+starting at every chunk boundary of the episode and clamped at its end.
+
+**Scene tokens.** The task module's `token_source` is recorded in its checkpoint (`vlm_image` only for now —
+the `cnn`/`discs`/`vlm_prefix`/`vlm_views` sources are out of scope). The inference batch therefore carries
+`observation.scene_images` — the scene camera (ZED2), letterboxed to `render_size`, uint8 channel-first — which
+`SteeringSceneTokensProcessorStep` encodes into `observation.scene_tokens` before the base pre-processor's
+normalizer. That step needs `lerobot/pi05_base` (about 14 GB) for its `SceneEncoder`: a **second VLM resident
+in the process** at train and at inference time. `load_bundle(config, task=<checkpoint>)` builds it from the
+task checkpoint's own recorded config; the loop includes the scene image iff the bundle has a scene step.
+`SceneEncoder` is injectable, which is how the offline tests exercise the step without the weights.
+
+**Training.** Batches are the prepared observation (with the scene step) plus `kind="task"`, the normalized
+chunk, noise and time; `SteeringPolicy.forward` computes the loss main wrote. AdamW + cosine + skip-non-finite
+and `AdapterModules.save_module(..., kind="task")`, as Phase B. `[task]` names the token source, the render
+size, the demos and the output; `[training]` is shared with the user module.
+
+**Arms and S2.** `mars-t` = FRS + the task module; `mars` = FRS + both modules (the composed method). Both are
+policy-level adaptations, so a study block holds the task module constant across its arms and compares it
+against the same arms without it (`autonomous+task`, `frs+task`, `mars-t`, `mars`); S2's verdict is task
+success on the robot — there is no simulation-free proxy for it. The offline gate is the held-out flow-matching
+loss and the same heading table `validate-user` prints, with the task module in the field.
+
+**Config additions.**
+```toml
+[task]   demos = "assets/demos/<name>"     # a downloaded `teleop --record` dataset
+         out = "assets/task/<name>"        # train-task writes <out>/task.pt and train_log.json
+         checkpoint = "assets/task/<name>/task.pt"
+         token_source = "vlm_image" ; render_size = 224 ; scene_rank = null
+         lambda_id = 1e-3
+[modes.mars-t] mode = "frs" ; adapter_task = "assets/task/<name>/task.pt"
+[modes.mars]   mode = "frs" ; adapter_user = "assets/user/<name>/user.pt" ; adapter_task = "assets/task/<name>/task.pt"
+```
+
+**Slices.** C1 the demonstration loader (pure mapping + a lazy `LeRobotDataset` open); C2 the scene step and
+the bundle's task wiring; C3 the task trainer; C4 `mars-t`/`mars`, the S2 plan in the runbook, and the final
+gate. Hardware-only throughout: the real dataset schema, the real `pi05_base` tokens, a real training run, and
+every S2 number.
