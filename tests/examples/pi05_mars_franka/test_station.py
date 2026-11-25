@@ -17,6 +17,7 @@ import pytest
 from bridge import ARM_DIMS
 from station import (
     IMAGE_SIZE,
+    SCENE_IMAGES,
     STATE_DIMS,
     C3poStation,
     FakeStation,
@@ -203,6 +204,54 @@ def test_the_third_image_is_omitted_until_a_feed_is_named():
     assert named.shape == (3, IMAGE_SIZE, IMAGE_SIZE) and named.dtype == np.float32
     expected = np.moveaxis(resize_with_pad(obs["extra_rgb"]).astype(np.float32) / 255.0, -1, 0)
     np.testing.assert_array_equal(named, expected)
+
+
+# ---------------------------------------------------------------- the scene picture
+
+
+def _scene_batch(obs: dict[str, np.ndarray], scene, scene_size: int | None = 112) -> dict:
+    return observation_batch(
+        obs,
+        arm="follower",
+        cameras=CAMERAS,
+        task="pick the cube",
+        scene=scene,
+        scene_size=scene_size,
+    )
+
+
+def test_the_batch_has_no_scene_picture_unless_one_is_given():
+    """A bundle without a scene step has nothing to encode: the raw batch is exactly the policy's."""
+    assert SCENE_IMAGES not in _batch(_observation())
+
+
+def test_the_scene_picture_is_the_letterboxed_scene_camera_channel_first():
+    """The scene step takes uint8 pictures, so the scene camera's frame is letterboxed and channel-first
+    but not scaled to [0, 1] as the policy's own images are."""
+    obs = _observation()
+    pictures = _scene_batch(obs, obs["scene_rgb"])[SCENE_IMAGES]
+    assert pictures.shape == (3, 112, 112) and pictures.dtype == np.uint8
+    np.testing.assert_array_equal(pictures, np.moveaxis(resize_with_pad(obs["scene_rgb"], 112), -1, 0))
+    assert set(_scene_batch(obs, obs["scene_rgb"])) == {
+        "observation.images.base_0_rgb",
+        "observation.images.left_wrist_0_rgb",
+        "observation.state",
+        "task",
+        SCENE_IMAGES,
+    }
+
+
+def test_the_batch_takes_scene_pictures_already_letterboxed():
+    """``scene.scene_images`` makes the picture the loop passes in; the batch adds it as it is."""
+    pictures = np.full((3, 112, 112), 7, dtype=np.uint8)
+    batch = _scene_batch(_observation(), pictures)
+    np.testing.assert_array_equal(batch[SCENE_IMAGES], pictures)
+    assert batch[SCENE_IMAGES].dtype == np.uint8
+
+
+def test_scene_pictures_need_their_render_size():
+    with pytest.raises(ValueError, match="scene_size"):
+        _scene_batch(_observation(), _observation()["scene_rgb"], scene_size=None)
 
 
 # ---------------------------------------------------------------- the state
