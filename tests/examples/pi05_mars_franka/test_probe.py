@@ -256,6 +256,7 @@ def test_the_configuration_section_prints_its_numbers_from_a_temp_config(tmp_pat
         bridge.matrix6_from_spec(config.readout.corruption), q0, config.command.twist_length
     )
     norm = float(np.linalg.norm(matrix7, 2))
+    assert sum(line.startswith("  [") for line in lines) == 7  # the seven rows: the session's F7
     assert f"||F7||2 = {norm:.4f}" in text
     assert f"gain: {1.0 / norm:.4f} (auto = 1/||F7||2)" in text
     sigma = config.readout.noise * stats_module.action_std(config.policy.stats)

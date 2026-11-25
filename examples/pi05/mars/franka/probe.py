@@ -104,7 +104,10 @@ def configuration_section(config: Config, path, observation, reset_error) -> Rep
         random = isinstance(spec, dict) and set(spec) == {"random"}
         rng = np.random.default_rng([int(ro.seed), 0]) if random else None
         matrix7 = bridge.corruption_lift(bridge.matrix6_from_spec(spec, rng), q0, cmd.twist_length)
-        hi(f"F7 (7x7, ||F7||2 = {float(np.linalg.norm(matrix7, 2)):.4f}; rows omitted)")
+        hi("F7 (7x7, the corruption lift the loop applies):")
+        for row in matrix7:
+            hi("  " + _vec(row))
+        hi(f"||F7||2 = {float(np.linalg.norm(matrix7, 2)):.4f}")
         if rng is not None:
             hi("  one draw for episode 0: a {random} family is redrawn every episode")
     if cmd.gain != "auto":
