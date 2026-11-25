@@ -26,6 +26,7 @@ from config import CommandConfig, Config, ReadoutConfig
 from loop import Loop
 from policy import STATION_DIMS, fake_bundle, teleop_action
 from source import FakeSource
+from statefiles import Recorder, load
 from station import FakeStation, observation_batch
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
@@ -996,6 +997,68 @@ def test_run_recording_records_every_episode_and_numbers_them_from_zero(tmp_path
     assert [(call["episode"], call["tick"]) for call in recorder.calls] == [(0, 0), (0, 1), (1, 0)]
     assert {call["mode"] for call in recorder.calls} == {"teleop"}
     assert station.steps == 3
+
+
+RERECORD_SCHEDULE = [(0, 1, "done"), (0, 1, "rerecord"), (1, 1, "stop")]
+"""Two takes: the first ends re-recorded, the second stops. With ``n_action_steps = 1`` each take
+contributes one row at tick 0."""
+
+
+class _DropLog(Recorder):
+    """The real recorder, plus a log of every drop the loop asked it for."""
+
+    def __init__(self, meta: dict) -> None:
+        super().__init__(meta)
+        self.drops: list[tuple[int, int]] = []
+
+    def drop_episode(self, episode: int) -> int:
+        removed = super().drop_episode(episode)
+        self.drops.append((episode, removed))
+        return removed
+
+
+def test_a_re_recorded_take_leaves_no_states_behind(tmp_path):
+    """c3po's ``r`` discards the take's dataset; the recorder drops the same take's rows, so the saved
+    file holds only the takes the operator kept."""
+    recorder = _DropLog({"session": "test"})
+    station = _RecordingStation(_observations(), RERECORD_SCHEDULE)
+    loop = Loop(
+        config=_config(n_action_steps=1),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run_recording(name="pilot", dest=tmp_path / "dropped", prompt="pick", states=recorder)
+
+    assert recorder.drops == [(0, 1)]  # the rejected first take's one boundary row
+    assert station.cancels == 1
+    arrays, _ = load(recorder.save(tmp_path / "states.npz"))
+    assert len(arrays["episode"]) == 1
+    assert arrays["episode"].tolist() == [1]  # only the kept take
+    assert arrays["tick"].tolist() == [0]
+
+
+def test_a_re_recorded_take_changes_no_actions(tmp_path):
+    """Dropping the rejected take's states is observation only: the actions are the same either way."""
+
+    def actions(states, dest) -> list[np.ndarray]:
+        station = _RecordingStation(_observations(), RERECORD_SCHEDULE)
+        loop = Loop(
+            config=_config(n_action_steps=1),
+            station=station,
+            mode="teleop",
+            source=FakeSource(deflection=DEFLECTION),
+        )
+        loop.run_recording(name="pilot", dest=dest, prompt="pick", states=states)
+        return station.actions
+
+    without = actions(None, tmp_path / "without")
+    with_states = actions(_DropLog({"session": "test"}), tmp_path / "with")
+
+    assert len(without) == len(with_states) == 2  # one action per take
+    for one, two in zip(without, with_states, strict=True):
+        np.testing.assert_array_equal(one, two)
 
 
 # ---------------------------------------------------------------- construction
