@@ -1,5 +1,0 @@
-# The policy alone: a study's floor with the arm's prompt, its ceiling with --set prompt=task.
-extends: base_rotz20.yaml
-control:
-  mode: policy
-  corruption: null

@@ -5,10 +5,9 @@ import experiment
 import numpy as np
 import pytest
 import torch
-import yaml
 from config import ExperimentSettings, SessionSettings, load_experiment_settings
 from experiment import TrialRecorder, build_schedule, expand_blocks, prompt_for
-from reproducibility import trial_specs
+from reproducibility import TrialSpec
 from session import TELEOP_MAX_STEPS, RolloutResult, Session
 from teleop import KeyboardReader, PolicyOperator, PolicyOperatorSettings, TeleopChain
 
@@ -76,14 +75,14 @@ def test_build_schedule_orders():
 
 def test_trial_specs_match_across_task_order_and_use_seeded_state_permutations():
     counts = {1: 50, 2: 50}
-    a = trial_specs([1, 2, 1], "libero_goal", seed=7, state_counts=counts)
-    b = trial_specs([1, 1, 2], "libero_goal", seed=7, state_counts=counts)
+    a = TrialSpec.for_schedule([1, 2, 1], "libero_goal", seed=7, state_counts=counts)
+    b = TrialSpec.for_schedule([1, 1, 2], "libero_goal", seed=7, state_counts=counts)
     assert [s.metadata() for s in a] == [b[i].metadata() for i in [0, 2, 1]]
     assert a[0].init_state_id != a[2].init_state_id
     assert len({s.metadata()["pair_id"] for s in a}) == 3
-    other_seed = trial_specs([1, 2, 1], "libero_goal", seed=8, state_counts=counts)
+    other_seed = TrialSpec.for_schedule([1, 2, 1], "libero_goal", seed=8, state_counts=counts)
     assert [s.init_state_id for s in a] != [s.init_state_id for s in other_seed]
-    extended = trial_specs([1] * 100, "libero_goal", seed=7, state_counts=counts)
+    extended = TrialSpec.for_schedule([1] * 100, "libero_goal", seed=7, state_counts=counts)
     assert extended[:2] == [a[0], a[2]]
     assert {s.init_state_id for s in extended[:50]} == set(range(50))
     assert {s.init_state_id for s in extended[50:]} == set(range(50))
@@ -126,7 +125,7 @@ def test_show_scene_passes_explicit_reset_without_consuming_another_state():
     session = Session.__new__(Session)
     session.vec_env = SimpleNamespace(reset=reset)
     session.view = SimpleNamespace(stream=SimpleNamespace(publish=published.append))
-    spec = trial_specs([0], "libero_goal", seed=7, state_counts={0: 50})[0]
+    spec = TrialSpec.for_schedule([0], "libero_goal", seed=7, state_counts={0: 50})[0]
     assert session.show_scene(spec) is observation
     assert calls == [{"seed": spec.env_seed, "options": {"init_state_id": spec.init_state_id}}]
     np.testing.assert_array_equal(published[0], observation["pixels"]["image"][0][::-1, ::-1])
@@ -141,7 +140,7 @@ def test_rollout_keeps_preview_state_and_separates_operator_policy_randomness(
 
     preview = {"pixels": {"image": np.zeros((1, 2, 2, 3), dtype=np.uint8)}}
     monkeypatch.setattr(session_module, "preprocess_observation", lambda obs: dict(obs))
-    spec = trial_specs([0], "libero_goal", seed=7, state_counts={0: 50})[0]
+    spec = TrialSpec.for_schedule([0], "libero_goal", seed=7, state_counts={0: 50})[0]
 
     def run(operator_draws):
         actions = []
@@ -268,6 +267,78 @@ def test_the_operator_lets_go_unless_it_drives_the_robot_alone(monkeypatch, mode
     )  # the chunk it meant, kept for calibration
 
 
+def test_the_target_user_reads_the_scene_and_pushes_at_the_tasks_object(monkeypatch):
+    """`policy_operator.intent: target`: the synthetic operator's intent is a straight push from the gripper at the
+    task's object (`PolicyOperator.target_push` on the scene's points), not the task-prompted policy's plan; the
+    operator keeps where the object started, the session the push as a held chunk in the policy's normalized space."""
+    session = Session.__new__(Session)
+    session.settings = SessionSettings(
+        n_action_steps=2, operator="policy", policy_operator=PolicyOperatorSettings(intent="target")
+    )
+    session.mode = "shared_flow_reversal_steering"
+    session.operator = PolicyOperator(2, session.settings.policy_operator)
+    session.policy_chunk = lambda observation, prompt: pytest.fail("the target user does not ask the policy")
+    points = {
+        "eef": np.array([0.0, 0.0, 1.0]),
+        "object": np.array([0.3, 0.0, 0.6]),
+        "destination": np.array([0.0, 0.4, 0.6]),
+    }
+    session.task_points = lambda: points
+    session.operator_mean, session.operator_std = np.full(7, 0.1), np.full(7, 0.2)
+    session._refresh_operator(observation=None, step=0)
+    np.testing.assert_allclose(session.operator.translation, [0.6, 0.0, -0.8])  # unit length, at the object
+    np.testing.assert_allclose(session.operator.object_start, points["object"])
+    assert session.operator_chunk.shape == (2, 7)
+    np.testing.assert_allclose(session.operator_chunk[0, :3], (np.array([0.6, 0.0, -0.8]) - 0.1) / 0.2)
+    # the object lifted and with the gripper: now toward the hover point above the destination
+    points.update(eef=np.array([0.0, 0.0, 0.8]), object=np.array([0.0, 0.0, 0.75]))
+    session._refresh_operator(observation=None, step=2)
+    np.testing.assert_allclose(
+        session.operator.object_start, [0.3, 0.0, 0.6]
+    )  # kept from the first refresh of the rollout
+    push = session.operator.oracle_translation
+    assert push[1] > 0.9 and abs(push[0]) < 1e-9
+    with pytest.raises(ValueError, match="intent"):
+        PolicyOperatorSettings(intent="guess")
+
+
+def test_task_points_come_from_the_tasks_goal():
+    """The scene's points for the target user: the gripper, the goal's object (a fixture's button for `turnon`) and
+    its destination, a region's site or another object; a goal of another shape is refused by name."""
+    xpos = {"bowl_main": [0.1, 0.2, 0.9], "plate_main": [0.3, 0.0, 0.9], "stove_button": [-0.4, 0.2, 0.9]}
+    sites = {"gripper0_grip_site": [0.0, 0.0, 1.2], "stove_cook_region": [-0.3, 0.2, 0.9]}
+
+    def domain(goal):
+        model = SimpleNamespace(body_name2id=lambda name: name, site_names=list(sites), body_names=list(xpos))
+        data = SimpleNamespace(body_xpos=xpos, get_site_xpos=lambda name: np.array(sites[name]))
+        return SimpleNamespace(
+            parsed_problem={"goal_state": goal},
+            objects_dict={
+                "bowl": SimpleNamespace(root_body="bowl_main"),
+                "plate": SimpleNamespace(root_body="plate_main"),
+            },
+            fixtures_dict={"stove": SimpleNamespace(root_body="stove_main")},
+            sim=SimpleNamespace(model=model, data=data),
+        )
+
+    session = Session.__new__(Session)
+    for goal, obj, dest in (
+        ([["on", "bowl", "stove_cook_region"]], xpos["bowl_main"], sites["stove_cook_region"]),
+        ([["on", "bowl", "plate"]], xpos["bowl_main"], xpos["plate_main"]),
+        ([["turnon", "stove"]], xpos["stove_button"], None),
+    ):
+        session._sim = lambda goal=goal: domain(goal)
+        points = session.task_points()
+        np.testing.assert_allclose(points["eef"], sites["gripper0_grip_site"])
+        np.testing.assert_allclose(points["object"], obj)
+        assert (points["destination"] is None) == (dest is None)
+        if dest is not None:
+            np.testing.assert_allclose(points["destination"], dest)
+    session._sim = lambda: domain([["open", "cabinet_top_region"]])
+    with pytest.raises(ValueError, match="open"):
+        session.task_points()
+
+
 def test_prompt_for():
     assert prompt_for("do something", "pick up the bowl") == "do something"
     assert prompt_for("task", "pick up the bowl") == "pick up the bowl"
@@ -313,15 +384,15 @@ def test_trial_recorder_rows_and_per_trial_reads(tmp_path):
 
 
 def test_expand_blocks_names_and_sets():
-    [single] = expand_blocks("flow_control_rotz20", [], None)
-    assert single.name == "flow_control_rotz20" and single.sets == []
-    [one] = expand_blocks("flow_control_rotz20", ["control.corruption=null"], None)
-    assert one.name == "flow_control_rotz20_corruption-null"
-    blocks = expand_blocks("flow_reversal_rotz20", ["experiment.seed=1"], "control.n_reversal_steps=2, 4,10")
+    [single] = expand_blocks("study_goal", [], None)
+    assert single.name == "study_goal" and single.sets == []
+    [one] = expand_blocks("study_goal", ["control.corruption=null"], None)
+    assert one.name == "study_goal_corruption-null"
+    blocks = expand_blocks("study_goal_lag", ["experiment.seed=1"], "control.n_reversal_steps=2, 4,10")
     assert [b.name for b in blocks] == [
-        "flow_reversal_rotz20_seed-1_n_reversal_steps-2",
-        "flow_reversal_rotz20_seed-1_n_reversal_steps-4",
-        "flow_reversal_rotz20_seed-1_n_reversal_steps-10",
+        "study_goal_lag_seed-1_n_reversal_steps-2",
+        "study_goal_lag_seed-1_n_reversal_steps-4",
+        "study_goal_lag_seed-1_n_reversal_steps-10",
     ]
     assert blocks[0].sets == ["experiment.seed=1", "control.n_reversal_steps=2"]
     with pytest.raises(ValueError, match="--sweep"):
@@ -377,7 +448,7 @@ def test_trial_recorder_keeps_scene_rows_and_saves_them(tmp_path):
 
 # ---------------------------------------------------------------- per-trial corruption and translation gain
 
-RANDOM = "corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}, translation_gain: auto"
+GAINS = "corruption: {scale: [4, 1, 2]}, translation_gain: auto"  # the largest safe gain is 0.25
 ADAPTED = (
     "mode: shared_flow_reversal_steering, n_reversal_steps: 1, reversal_adapter: {translation: corruption}"
 )
@@ -507,37 +578,8 @@ def test_teleop_executes_the_operators_whole_command_and_override_only_its_trans
     assert session._rollout_kwargs()["max_steps"] == TELEOP_MAX_STEPS
 
 
-def test_every_method_draws_the_same_corruption_on_a_trial_and_the_adapter_follows_it(tmp_path):
-    fc = _settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control
-    adapted = _settings(tmp_path, f"{ADAPTED}, {RANDOM}").session.control
-    specs = trial_specs([4] * 6, "libero_goal", seed=4, state_counts={4: 50})
-    drawn = []
-    for spec in specs:
-        a, b = experiment.trial_matrices(fc, spec), experiment.trial_matrices(adapted, spec)
-        np.testing.assert_array_equal(a.corruption, b.corruption)  # matched across methods
-        assert a.adapter is None
-        np.testing.assert_array_equal(b.adapter[:3, :3], b.corruption)  # F = M
-        np.testing.assert_array_equal(b.adapter[3:, 3:], np.eye(4))
-        assert 30 <= a.draw.rotation_deg <= 90
-        drawn.append(a.corruption)
-    assert len({m.tobytes() for m in drawn}) == len(specs)  # a fresh draw on every trial
-    np.testing.assert_array_equal(experiment.trial_matrices(fc, specs[0]).corruption, drawn[0])
-    other_seed = trial_specs([4], "libero_goal", seed=5, state_counts={4: 50})[0]
-    assert not np.array_equal(experiment.trial_matrices(fc, other_seed).corruption, drawn[0])
-
-
-def test_a_fixed_corruption_is_the_same_on_every_trial(tmp_path):
-    control = _settings(tmp_path, f"{ADAPTED}, corruption: {{rotation_z_deg: 40}}").session.control
-    for spec in trial_specs([4] * 2, "libero_goal", seed=4, state_counts={4: 50}):
-        matrices = experiment.trial_matrices(control, spec)
-        # cos 40 and sin 40 degrees: a push along x comes out turned towards y
-        np.testing.assert_allclose(matrices.corruption @ [1, 0, 0], [0.76604444, 0.64278761, 0])
-        np.testing.assert_array_equal(matrices.adapter[:3, :3], matrices.corruption)
-        assert matrices.draw is None and matrices.record()["corruption_parameters"] is None
-
-
-def test_run_block_puts_each_trial_s_corruption_in_force_and_records_it(tmp_path, run_block):
-    settings = _settings(tmp_path, f"{ADAPTED}, {RANDOM}")
+def test_run_block_puts_the_corruption_in_force_and_records_it(tmp_path, run_block):
+    settings = _settings(tmp_path, f"{ADAPTED}, {GAINS}")
     in_force, saved = _run_block_recording_what_is_in_force(tmp_path, run_block, settings)
     assert len(in_force) == len(saved) == 3
     for trial, ((corruption, adapter), record) in enumerate(zip(in_force, saved, strict=True)):
@@ -547,13 +589,12 @@ def test_run_block_puts_each_trial_s_corruption_in_force_and_records_it(tmp_path
         # the record and the step file hold what was in force while the trial ran
         np.testing.assert_allclose(record["corruption_matrix"], corruption)
         np.testing.assert_allclose(record["reversal_adapter_matrix"], adapter)
-        assert set(record["corruption_parameters"]) == {"rotation_axis", "rotation_deg", "scale"}
         assert record["translation_gain"] == 0.25
         with np.load(tmp_path / f"trial_{trial:03d}.npz") as z:
             np.testing.assert_allclose(z["corruption_matrix"], corruption)
             np.testing.assert_allclose(z["reversal_adapter_matrix"], adapter)
             assert float(z["translation_gain"]) == 0.25
-    assert not np.allclose(in_force[0][0], in_force[1][0])  # and it changed from one trial to the next
+    np.testing.assert_array_equal(in_force[0][0], np.diag([4.0, 1.0, 2.0]))
 
 
 def test_run_block_records_empty_matrices_when_nothing_is_in_force(tmp_path, run_block):
@@ -562,16 +603,16 @@ def test_run_block_records_empty_matrices_when_nothing_is_in_force(tmp_path, run
     assert in_force == [(None, None)]
     record = saved[0]
     assert record["corruption_matrix"] is None and record["reversal_adapter_matrix"] is None
-    assert record["corruption_parameters"] is None and record["translation_gain"] is None
+    assert record["translation_gain"] is None
     with np.load(tmp_path / "trial_000.npz") as z:  # loadable without pickle: NaN stands for "off"
         assert z["corruption_matrix"].shape == (3, 3) and np.isnan(z["corruption_matrix"]).all()
         assert z["reversal_adapter_matrix"].shape == (7, 7) and np.isnan(z["translation_gain"])
 
 
 def test_apply_control_turns_the_translation_gain_on_and_off_with_the_block(tmp_path):
-    session = _bare_session(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}").session.control)
+    session = _bare_session(_settings(tmp_path, f"mode: shared_flow_control, {GAINS}").session.control)
     assert session.chain.gain.gain == 0.25
-    assert session.chain.readout.matrix is None  # nothing is in force until a trial draws it
+    np.testing.assert_array_equal(session.chain.readout.matrix, np.diag([4.0, 1.0, 2.0]))
     fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
     session.apply_control(fixed.session.control)
     assert session.chain.gain.gain is None
@@ -601,39 +642,21 @@ def test_an_auto_gain_follows_a_live_corruption_change_but_a_number_does_not(tmp
     assert "0.2" in session.refresh_translation_gain() and session.chain.gain.gain == 0.2
 
 
-def test_a_random_block_s_config_lists_every_trial_s_corruption_in_plain_yaml(tmp_path):
-    settings = _settings(tmp_path, f"mode: shared_flow_control, {RANDOM}")
-    specs = trial_specs([4] * 3, "libero_goal", seed=settings.seed, state_counts={4: 50})
-    session = SimpleNamespace(
-        resolved_matrices=lambda: {"corruption_matrix": None, "reversal_adapter_matrix": None}
-    )
-    resolved = experiment._provenance(settings, experiment.Block("block", []), [4, 4, 4], specs, session)
-    written = yaml.safe_load(yaml.safe_dump(resolved))  # what lands in config.yaml
-    assert written["translation_gain"] == "auto" and written["resolved_translation_gain"] == 0.25
-    assert len(written["trial_corruptions"]) == 3
-    for spec, entry in zip(specs, written["trial_corruptions"], strict=True):
-        in_trial = experiment.trial_matrices(settings.session.control, spec).corruption
-        np.testing.assert_allclose(entry["corruption_matrix"], in_trial)
-        assert 30 <= entry["corruption_parameters"]["rotation_deg"] <= 90
-    fixed = _settings(tmp_path, "mode: shared_flow_control, corruption: {rotation_z_deg: 20}")
-    assert "trial_corruptions" not in experiment._provenance(
-        fixed, experiment.Block("block", []), [4], specs[:1], session
-    )
-
-
-def test_the_dry_run_description_states_the_family_and_the_gain_in_force(tmp_path):
-    text = experiment._describe_block(_settings(tmp_path, f"mode: shared_flow_control, {RANDOM}"))
-    assert "random(rotation_deg=30..90, scale=1..4)" in text
+def test_the_dry_run_description_states_the_corruption_and_the_gain_in_force(tmp_path):
+    text = experiment._describe_block(_settings(tmp_path, f"mode: shared_flow_control, {GAINS}"))
+    assert "corruption M = scale=literal" in text
     assert "translation gain: 0.25" in text
 
 
 def test_first_occurrence_continues_a_tasks_states_where_a_shorter_run_stopped(tmp_path):
     counts = {0: 7, 1: 7}
-    long = trial_specs([0, 1] * 12, "libero_object", seed=3, state_counts=counts)
-    later = trial_specs([0, 1] * 7, "libero_object", seed=3, state_counts=counts, first_occurrence=5)
+    long = TrialSpec.for_schedule([0, 1] * 12, "libero_object", seed=3, state_counts=counts)
+    later = TrialSpec.for_schedule(
+        [0, 1] * 7, "libero_object", seed=3, state_counts=counts, first_occurrence=5
+    )
     # each task's occurrences 5 to 11 of the long run, past the reshuffle at 7: same states, same seeds
     assert later == long[10:24]
-    first = trial_specs([0, 1] * 5, "libero_object", seed=3, state_counts=counts)
+    first = TrialSpec.for_schedule([0, 1] * 5, "libero_object", seed=3, state_counts=counts)
     assert first == long[:10]  # the default is unchanged
     assert not {s.metadata()["pair_id"] for s in first} & {s.metadata()["pair_id"] for s in later}
     assert {s.init_state_id for s in first[::2]}.isdisjoint(

@@ -5,8 +5,7 @@ server) into dataclasses. A file may say `extends: other.yaml` (relative to
 itself) to overlay on another; a key set to null keeps the built-in default,
 and unknown keys are rejected. Matrix specs under `control` are resolved here
 into arrays (the forms: `lerobot.teleoperators.readout.matrix_spec` for a
-matrix, `SteeringConfig.from_spec` for a reversal adapter); a `{random: ...}`
-corruption becomes a family that each trial draws from instead.
+matrix, `SteeringConfig.from_spec` for a reversal adapter).
 """
 
 import copy
@@ -19,10 +18,8 @@ import yaml
 from teleop import (
     Curl,
     PolicyOperatorSettings,
-    RandomCorruption,
-    build_corruption,
-    build_curl,
-    check_translation_gain,
+    ReadoutReader,
+    TranslationGain,
 )
 
 from lerobot.policies.steering import OPERATOR_DIM_GROUPS, SteeringConfig
@@ -59,10 +56,9 @@ class ControlSettings:
     # FRS: the gripper value the reference holds at every chunk (-1 open, 1 closed; Tang et al. on LIBERO: 0);
     # None = the model's last executed gripper command
     gripper_reference: float | None = None
-    # Resolved from the specs above, not settings; with a random corruption each trial draws its own matrices.
+    # Resolved from the specs above, not settings.
     corruption_matrix: np.ndarray | None = field(default=None, repr=False)
     reversal_adapter_matrix: np.ndarray | None = field(default=None, repr=False)
-    corruption_family: RandomCorruption | None = field(default=None, repr=False)
     corruption_curl: Curl | None = field(default=None, repr=False)
     corruption_quantize: bool = field(default=False, repr=False)  # the keypad readout, {quantize: axes}
     reversal_adapter_user_path: str | None = field(default=None, repr=False)  # learned MARS user module
@@ -105,7 +101,6 @@ class ExperimentSettings:
 _RESOLVED = (
     "corruption_matrix",
     "reversal_adapter_matrix",
-    "corruption_family",
     "corruption_curl",
     "corruption_quantize",
     "reversal_adapter_user_path",
@@ -115,7 +110,6 @@ _RESOLVED = (
 # `lambda` is the YAML key of the `lam` field (a Python keyword); `n_guided_steps` is its old name.
 _CONTROL_SCHEMA = {k: k for k in ControlSettings.__dataclass_fields__ if k not in _RESOLVED and k != "lam"}
 _CONTROL_SCHEMA.update({"lambda": "lam", "n_guided_steps": "lam"})
-_RANDOM_SCHEMA = {k: k for k in RandomCorruption.__dataclass_fields__}  # the `random:` block of a corruption
 _POLICY_SCHEMA = {"path": "policy_path", "n_action_steps": "n_action_steps", "compile": "compile"}
 _OPERATOR_SCHEMA = {k: k for k in PolicyOperatorSettings.__dataclass_fields__}
 
@@ -157,6 +151,15 @@ def read_yaml(path: str | Path) -> dict:
         return {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping at the top level, got {type(data).__name__}")
+    return data
+
+
+def read_matrix_spec(path: str | Path):
+    """Read a matrix spec from a YAML file (for the REPL's live `corruption` / `adapter` commands)."""
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        raise ValueError(f"{path}: empty file")
     return data
 
 
@@ -217,9 +220,6 @@ def spec_label(spec) -> str | None:
     """Short display form of a matrix spec, e.g. 'rotation_z_deg=20' (None for no spec)."""
     if spec is None:
         return None
-    if isinstance(spec, dict) and isinstance(spec.get("random"), dict):
-        ranges = (f"{key}={'..'.join(f'{v:g}' for v in value)}" for key, value in spec["random"].items())
-        return f"random({', '.join(ranges)})"
     if isinstance(spec, dict):
         parts = []
         for key, value in spec.items():
@@ -240,19 +240,6 @@ def _fields_from_flat(cls, flat: dict, exclude: tuple[str, ...] = ()) -> dict:
     return {k: flat[k] for k in cls.__dataclass_fields__ if k in flat and k not in exclude}
 
 
-def corruption_family(spec, where: str) -> RandomCorruption | None:
-    """The family a `{random: {...}}` corruption spec describes; None for a fixed corruption."""
-    if not isinstance(spec, dict) or "random" not in spec:
-        return None
-    others = [key for key in spec if key != "random"]
-    if others:
-        _fail(where, f"random cannot be combined with other keys (got {', '.join(others)})")
-    try:
-        return RandomCorruption(**flatten(spec, {"random": _RANDOM_SCHEMA}, where))
-    except ValueError as e:
-        _fail(where, str(e))
-
-
 def gain_that_cannot_clip(largest_gain: float) -> float:
     """The largest translation gain that keeps a corruption of at most `largest_gain` from clipping."""
     return 1.0 if largest_gain <= 1.0 else 1.0 / largest_gain
@@ -263,8 +250,6 @@ def largest_gain(control: ControlSettings) -> float:
     never lengthens a push)."""
     if control.corruption_curl is not None or control.corruption_quantize:
         return 1.0
-    if control.corruption_family is not None:
-        return control.corruption_family.max_gain
     if control.corruption_matrix is None:
         return 1.0
     return float(np.linalg.norm(control.corruption_matrix, 2))
@@ -280,7 +265,7 @@ def resolve_translation_gain(control: ControlSettings, where: str) -> float | No
     if spec == "auto":
         return safe
     try:
-        gain = check_translation_gain(spec)
+        gain = TranslationGain.check(spec)
     except (TypeError, ValueError) as e:
         _fail(where, f"control.translation_gain: {e} (or auto)")
     if gain > safe * (1 + 1e-9):
@@ -358,23 +343,21 @@ def build_control(flat: dict, where: str) -> ControlSettings:
         )
     control.corruption_quantize = readout.quantize_spec(control.corruption, f"{where}: control.corruption")
     if not control.corruption_quantize:
-        control.corruption_curl = build_curl(control.corruption, f"{where}: control.corruption")
+        control.corruption_curl = Curl.from_spec(control.corruption, f"{where}: control.corruption")
     if control.corruption_quantize:  # a keypad: no matrix to build a fixed adapter from
         basis = np.eye(3)
     elif control.corruption_curl is not None:  # a curl field: no matrix; its steady-state map stands in for M
         basis = control.corruption_curl.steady_state()
     else:
-        control.corruption_family = corruption_family(control.corruption, f"{where}: control.corruption")
-        if control.corruption_family is None:
-            control.corruption_matrix = build_corruption(control.corruption, f"{where}: control.corruption")
-            basis = control.corruption_matrix
-        else:  # each trial draws its corruption, and the fixed adapter with it: only check the spec here
-            basis = np.eye(3)
+        control.corruption_matrix = ReadoutReader.matrix_from_spec(
+            control.corruption, f"{where}: control.corruption"
+        )
+        basis = control.corruption_matrix
     # the spec is read for its adapter fields alone, so the config is a CPU one
     adapter = SteeringConfig.from_spec(
         control.reversal_adapter, basis, f"{where}: control.reversal_adapter", device="cpu"
     )
-    control.reversal_adapter_matrix = None if control.corruption_family is not None else adapter.fixed_matrix
+    control.reversal_adapter_matrix = adapter.fixed_matrix
     # Module checkpoints are loaded (and their existence checked) by the session, so a condition file
     # can be inspected (--dry-run, tests) before its modules are trained.
     control.reversal_adapter_user_path, control.reversal_adapter_task_path = (
@@ -410,13 +393,7 @@ def load_interactive_settings(path: str | Path | None, overrides: dict) -> Sessi
     where = str(path) if path is not None else "command line"
     flat = flatten(load_yaml_with_extends(path), INTERACTIVE_SCHEMA, where) if path is not None else {}
     flat.update({k: v for k, v in overrides.items() if v is not None})
-    session = _session_from_flat(flat, where)
-    if session.control.corruption_family is not None:
-        _fail(
-            where,
-            "control.corruption: a random corruption draws one per trial, so it needs `run.sh experiment`",
-        )
-    return session
+    return _session_from_flat(flat, where)
 
 
 def parse_set(item: str) -> tuple[list[str], object]:

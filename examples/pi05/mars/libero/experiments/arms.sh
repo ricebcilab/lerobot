@@ -8,42 +8,56 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Sourced by the study scripts. `run_arm <arm> <depths> [flags...]` runs one arm as a depth sweep
-# (one block per depth), or one block for the policy-only anchors:
+# Sourced by the pilot scripts. `run_arm <arm> <depths> [flags...]` runs one arm as a depth sweep (one block per
+# depth), or one block for the policy-only anchors. Every arm is configs/experiment/base.yaml plus its settings:
 #
-#   fc       flow_control_<C>.yaml         --sweep control.n_guided_steps=<depths>
-#   frs      flow_reversal_<C>.yaml        --sweep control.n_reversal_steps=<depths>
-#   frs_ra   flow_reversal_ra_<C>.yaml     --sweep control.n_reversal_steps=<depths>
-#   floor    policy_anchor.yaml            the policy alone, with the arm's prompt
-#   ceiling  policy_anchor.yaml            the policy alone, with the scene's instruction
+#   fc            control.mode=shared_flow_control, the corruption           --sweep control.tau=<depths>
+#   frs           the corruption                                             --sweep control.n_reversal_steps=<depths>
+#   mars, frs_ra  the corruption and the fixed adapter F = M                 --sweep control.n_reversal_steps=<depths>
+#   mars_learned  the corruption and outputs/user_modules/<C>/user.pt        --sweep control.n_reversal_steps=<depths>
+#   floor         control.mode=policy: the policy alone, with the arm's prompt
+#   ceiling       the same, with the scene's instruction
 #
-# <C> is CORRUPTION: rotz20 (default), scale, or random (a new corruption on every trial).
+# <C> is CORRUPTION: rotz20 (default, {rotation_z_deg: 20}) or scale ({scale: [2, 1, 1]}); a later
+# --set control.corruption=... among the flags replaces it.
 
 ARMS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUN="${ARMS_DIR}/../run.sh"
 CORRUPTION="${CORRUPTION:-rotz20}"
+case "${CORRUPTION}" in
+    rotz20) ARM_CORRUPTION='{rotation_z_deg: 20}' ;;
+    scale) ARM_CORRUPTION='{scale: [2, 1, 1]}' ;;
+    *)
+        echo "Unknown CORRUPTION: ${CORRUPTION}; use rotz20 or scale" >&2
+        exit 2
+        ;;
+esac
+ARM_ADAPTER='{translation: corruption, orientation: identity, gripper: identity}'
 
 run_arm() {
     local arm=$1 depths=$2
     shift 2
+    local steered=("${RUN}" experiment --config base.yaml --set "control.corruption=${ARM_CORRUPTION}")
     case "${arm}" in
         fc)
-            "${RUN}" experiment --config "flow_control_${CORRUPTION}.yaml" "$@" --sweep "control.tau=${depths}"
+            "${steered[@]}" --set control.mode=shared_flow_control "$@" --sweep "control.tau=${depths}"
             ;;
         frs)
-            "${RUN}" experiment --config "flow_reversal_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
+            "${steered[@]}" "$@" --sweep "control.n_reversal_steps=${depths}"
             ;;
         mars | frs_ra)
-            "${RUN}" experiment --config "mars_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
+            "${steered[@]}" --set "control.reversal_adapter=${ARM_ADAPTER}" "$@" \
+                --sweep "control.n_reversal_steps=${depths}"
             ;;
         mars_learned)
-            "${RUN}" experiment --config "mars_learned_${CORRUPTION}.yaml" "$@" --sweep "control.n_reversal_steps=${depths}"
+            "${steered[@]}" --set "control.reversal_adapter={learned: outputs/user_modules/${CORRUPTION}/user.pt}" "$@" \
+                --sweep "control.n_reversal_steps=${depths}"
             ;;
         floor)
-            "${RUN}" experiment --config policy_anchor.yaml "$@"
+            "${RUN}" experiment --config base.yaml --set control.mode=policy "$@"
             ;;
         ceiling)
-            "${RUN}" experiment --config policy_anchor.yaml "$@" --set prompt=task
+            "${RUN}" experiment --config base.yaml --set control.mode=policy "$@" --set prompt=task
             ;;
         *)
             echo "Unknown arm: ${arm}; use fc, frs, mars, mars_learned, floor, ceiling" >&2

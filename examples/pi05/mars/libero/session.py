@@ -20,7 +20,7 @@ import torch
 from config import MODES, ControlSettings, SessionSettings, gain_that_cannot_clip, matrix_list, spec_label
 from live_view import HeadlessView, LiveView
 from reproducibility import TrialSpec
-from teleop import KeyboardReader, PolicyOperator, TeleopChain
+from teleop import GRIPPER_OPEN, KeyboardReader, PolicyOperator, TeleopChain
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs import (
@@ -74,42 +74,6 @@ class _ZeroPolicy:
         return torch.zeros(1, N_ACTION_DIMS)
 
 
-def _identity(x):
-    return x
-
-
-def build_view(settings, keyboard, status_extra: Callable[[], dict]):
-    """The session's view, not yet started: the live page on `settings.port`, or with `settings.headless` a view
-    that serves nothing (no page, no frame encoding, no browser tab)."""
-    if settings.headless:
-        return HeadlessView()
-    return LiveView(settings.port, keyboard, status_extra)
-
-
-def _frame(observation) -> np.ndarray:
-    """The agentview image of a (vectorised) observation, oriented like LiberoEnv.render().
-
-    Read from the observation rather than render(): the sub-env auto-resets on
-    termination, so after a final step render() would show the next fresh scene.
-    """
-    return observation["pixels"]["image"][0][::-1, ::-1]
-
-
-def _teleop_hook(source, full: bool) -> Callable[[np.ndarray], np.ndarray]:
-    """Paste the teleop command into the env action: its translation (shared override), or the whole of it,
-    translation, rotation and gripper (`full`, teleop mode: nothing of the action is the policy's)."""
-
-    def hook(action: np.ndarray) -> np.ndarray:
-        action = action.copy()
-        action[0, :3] = source.translation
-        if full:
-            action[0, 3:6] = source.rotation
-            action[0, GRIPPER_DIM] = source.gripper
-        return action
-
-    return hook
-
-
 class Session:
     def __init__(self, settings: SessionSettings):
         self.settings = settings
@@ -126,7 +90,7 @@ class Session:
             self.operator = PolicyOperator(settings.n_action_steps, settings.policy_operator)
             self.chain.attach_operator(self.operator)
         self.adapter = AdapterModules(n_dims=None)  # the 7-D holder: each module on its own dims
-        self.view = build_view(settings, self.keyboard, self._status_extra)
+        self.view = self.build_view(settings, self.keyboard, self._status_extra)
         self.view.start()
         if self.view.url is not None:
             print(f"\nLive view: {self.view.url}  (VSCode should auto-forward the port)\n")
@@ -265,7 +229,7 @@ class Session:
             else {"seed": trial_spec.env_seed, "options": {"init_state_id": trial_spec.init_state_id}}
         )
         observation, _ = self.vec_env.reset(**kwargs)
-        self.view.stream.publish(_frame(observation))
+        self.view.stream.publish(self._frame(observation))
         return observation
 
     def initial_state_hash(self) -> str:
@@ -442,11 +406,11 @@ class Session:
         if self.mode == "teleop":
             return {
                 "policy": self._zero_policy,
-                "env_preprocessor": _identity,
-                "env_postprocessor": _identity,
-                "preprocessor": _identity,
-                "postprocessor": _identity,
-                "action_hook": _teleop_hook(source, full=True),
+                "env_preprocessor": self._identity,
+                "env_postprocessor": self._identity,
+                "preprocessor": self._identity,
+                "postprocessor": self._identity,
+                "action_hook": self._teleop_hook(source, full=True),
                 # a person gets teleop's longer limit; a synthetic operator the suite's, as in every other arm
                 "max_steps": TELEOP_MAX_STEPS if self.operator is None else None,
             }
@@ -460,7 +424,7 @@ class Session:
             "max_steps": None,
         }
         if self.mode == "shared_override":
-            kwargs["action_hook"] = _teleop_hook(source, full=False)
+            kwargs["action_hook"] = self._teleop_hook(source, full=False)
         elif self.mode in STEERING_MODES:
             kwargs["policy"] = self.steering_policy()
         return kwargs
@@ -575,7 +539,7 @@ class Session:
         if trial_spec is not None:
             self.chain.readout.rng = np.random.default_rng(trial_spec.input_noise_seed)
         max_steps = max_steps or k["max_steps"] or int(vec_env.call("_max_episode_steps")[0])
-        frames = [_frame(observation)]  # what show_scene has already published
+        frames = [self._frame(observation)]  # what show_scene has already published
         stream.set_status(
             prompt=prompt, step=0, max_steps=max_steps, state="running", action=None, mode=self.mode_label()
         )
@@ -644,7 +608,7 @@ class Session:
                 is_success = info["is_success"]
                 success = bool(is_success[0] if hasattr(is_success, "__len__") else is_success)
 
-            frames.append(_frame(observation))
+            frames.append(self._frame(observation))
             stream.publish(frames[-1])
             if terminated[0] or truncated[0]:
                 break
@@ -678,17 +642,87 @@ class Session:
         ]
         return np.stack([a.to("cpu").numpy()[0] for a in steps])
 
+    def task_points(self) -> dict:
+        """The scene's points a person pointing at the task's target looks at, in world coordinates: `eef` (the
+        gripper), `object` (the goal's object; for `turnon` the fixture's button) and `destination` (the region's
+        site or the other object it goes on or in; None when the goal has none). One goal predicate of `on`, `in`
+        or `turnon`; anything else is refused by name."""
+        domain = self._sim()
+        sim, goal = domain.sim, domain.parsed_problem["goal_state"]
+        things = {**domain.objects_dict, **domain.fixtures_dict}
+
+        def position(name: str) -> np.ndarray:
+            if name in things:
+                return np.asarray(
+                    sim.data.body_xpos[sim.model.body_name2id(things[name].root_body)], dtype=float
+                )
+            if name in sim.model.site_names:
+                return np.asarray(sim.data.get_site_xpos(name), dtype=float)
+            raise ValueError(f"the target user finds no object or region named {name!r} in the scene")
+
+        if len(goal) != 1 or goal[0][0] not in ("on", "in", "turnon"):
+            raise ValueError(f"the target user handles one goal of on, in or turnon, got {goal}")
+        predicate, *names = goal[0]
+        eef = np.asarray(sim.data.get_site_xpos("gripper0_grip_site"), dtype=float)
+        if predicate == "turnon":
+            button = np.asarray(sim.data.body_xpos[sim.model.body_name2id(f"{names[0]}_button")], dtype=float)
+            return {"eef": eef, "object": button, "destination": None}
+        return {"eef": eef, "object": position(names[0]), "destination": position(names[1])}
+
     def _refresh_operator(self, observation, step: int = 0) -> None:
-        """Ask the policy, prompted with the scene's real task, what it would do; hand that to the operator. It may
-        let go unless it drives the robot alone (teleop, override): under a steering arm, or watching the policy
-        alone, the robot moves without it."""
-        chunk = self.policy_chunk(observation, self.task_description)
-        chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
-        self.operator_chunk = chunk  # normalized: what the operator means, a calibration's label
-        self.operator.refresh(  # env units
-            chunk * self.operator_std + self.operator_mean, step=step, may_rest=self.mode not in DIRECT_MODES
-        )
+        """Hand the operator its intent: what the policy, prompted with the scene's real task, would do
+        (`policy_operator.intent: plan`), or a straight push at the task's target from the scene's positions
+        (`target`: `PolicyOperator.target_push`, held over the chunk, rotation zero and the gripper left open, both the
+        policy's under a steering arm). It may let go unless it drives the robot alone (teleop, override): under a
+        steering arm, or watching the policy alone, the robot moves without it."""
+        if self.settings.policy_operator.intent == "target":
+            points = self.task_points()
+            push = self.operator.target_push(points["eef"], points["object"], points["destination"])
+            env_chunk = np.tile([*push, 0.0, 0.0, 0.0, GRIPPER_OPEN], (self.settings.n_action_steps, 1))
+            self.operator_chunk = (env_chunk - self.operator_mean) / self.operator_std
+        else:
+            chunk = self.policy_chunk(observation, self.task_description)
+            self.operator_chunk = chunk[0, :, : self.operator_mean.shape[0]].float().cpu().numpy()
+            env_chunk = self.operator_chunk * self.operator_std + self.operator_mean
+        # operator_chunk: normalized, what the operator means, a calibration's label; the operator takes env units
+        self.operator.refresh(env_chunk, step=step, may_rest=self.mode not in DIRECT_MODES)
 
     def close(self) -> None:
         close_envs(self.envs_dict)
         self.view.close()
+
+    @staticmethod
+    def _identity(x):
+        return x
+
+    @staticmethod
+    def build_view(settings, keyboard, status_extra: Callable[[], dict]):
+        """The session's view, not yet started: the live page on `settings.port`, or with `settings.headless` a view
+        that serves nothing (no page, no frame encoding, no browser tab)."""
+        if settings.headless:
+            return HeadlessView()
+        return LiveView(settings.port, keyboard, status_extra)
+
+    @staticmethod
+    def _frame(observation) -> np.ndarray:
+        """The agentview image of a (vectorised) observation, oriented like LiberoEnv.render().
+
+        Read from the observation rather than render(): the sub-env auto-resets on
+        termination, so after a final step render() would show the next fresh scene.
+        """
+        return observation["pixels"]["image"][0][::-1, ::-1]
+
+    @staticmethod
+    def _teleop_hook(source, full: bool) -> Callable[[np.ndarray], np.ndarray]:
+        """Paste the teleop command into the env action: its translation (shared override), or the whole of it,
+        translation, rotation and gripper (`full`, teleop mode: nothing of the action is the policy's)."""
+
+        def hook(action: np.ndarray) -> np.ndarray:
+            action = action.copy()
+            action[0, :3] = source.translation
+            if full:
+                action[0, 3:6] = source.rotation
+                action[0, GRIPPER_DIM] = source.gripper
+            return action
+
+        return hook

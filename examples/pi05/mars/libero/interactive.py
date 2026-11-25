@@ -54,9 +54,9 @@ import re
 import time
 from pathlib import Path
 
-from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings, spec_label
+from config import DEFAULT_INTERACTIVE_CONFIG, MODES, load_interactive_settings, read_matrix_spec, spec_label
 from session import VIDEO_FPS, Session
-from teleop import build_corruption, build_curl, read_matrix_spec
+from teleop import Curl, ReadoutReader
 
 from lerobot.policies.steering import SteeringConfig
 from lerobot.utils.io_utils import write_video
@@ -236,7 +236,7 @@ def _cmd_matrix(session: Session, tokens: list[str], name: str, holder, build) -
 def cmd_corruption(session: Session, tokens: list[str]) -> None:
     corruption = session.chain.readout
     if len(tokens) == 2 and tokens[1] != "off" and Path(tokens[1]).is_file():
-        curl = build_curl(read_matrix_spec(tokens[1]))
+        curl = Curl.from_spec(read_matrix_spec(tokens[1]))
         if curl is not None:  # a curl field replaces any matrix
             corruption.matrix = None
             corruption.curl = curl
@@ -245,7 +245,7 @@ def cmd_corruption(session: Session, tokens: list[str]) -> None:
             print(session.refresh_translation_gain())
             return
     corruption.curl = None
-    _cmd_matrix(session, tokens, "corruption", corruption, build_corruption)
+    _cmd_matrix(session, tokens, "corruption", corruption, ReadoutReader.matrix_from_spec)
     print(session.refresh_translation_gain())  # an `auto` gain follows the corruption in force
 
 

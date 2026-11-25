@@ -2,7 +2,7 @@
 # told "do something" and the operator's command says which object goes in the basket. This file is the clean
 # readout (U0) under the immediate synthetic operator; the user files extend it with a corruption, and
 # experiments/user_study.sh picks the arm with --set control.mode=... and its depth with --sweep.
-extends: base_rotz20.yaml
+extends: base.yaml
 experiment:
   n_trials: 50                # 5 per task with task_order sequential: the development split
   task_order: sequential
@@ -19,5 +19,3 @@ policy_operator:              # the immediate operator: a new intent at every ch
   let_go_cosine: 0.5          # under a steering arm the operator rests (zero command; the readout's noise stays) for the
                               # next chunk once the robot's executed motion heads with its intent at cosine >= 0.5;
                               # under teleop it keeps pushing (nothing else moves the robot)
-control:
-  corruption: null

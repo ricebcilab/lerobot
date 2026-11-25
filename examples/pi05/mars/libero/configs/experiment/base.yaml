@@ -1,4 +1,4 @@
-# Shared settings for the arms in this folder; an arm file `extends:` it. `--set KEY=VALUE` overrides
+# The shared settings of every experiment config: a study file `extends:` it. `--set KEY=VALUE` overrides
 # any key, `--sweep KEY=V1,V2,...` runs one block per value, and null keeps the built-in default.
 
 experiment:
@@ -27,9 +27,8 @@ control:
   translation_noise: 0.0
   translation_gain: auto            # scale the command so the corruption cannot clip it (null = off)
   max_steps: null             # null = the suite's own episode length
-  # A fresh draw on every trial, the same one for every arm: a rotation about a random axis times per-axis gains.
-  corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}
-  reversal_adapter: null      # the MARS arm sets F = M
+  corruption: null            # the robot gets M @ the command, e.g. {rotation_z_deg: 20} or {scale: [2, 1, 1]}
+  reversal_adapter: null      # MARS's F, e.g. {translation: corruption} for F = M, or {learned: <user.pt>}
 
 server:
   port: 8765

@@ -32,10 +32,8 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import yaml
 
 from lerobot.policies.steering import (
     DEADBAND,
@@ -50,7 +48,6 @@ from lerobot.teleoperators.spacemouse.teleop_spacemouse import (
     SpaceMouseAxes,
     parse_report,
 )
-from lerobot.utils.rotation import Rotation
 
 # re-exported for readers of this module
 __all__ = ["DEADBAND", "GRIPPER_CLOSE", "GRIPPER_OPEN", "parse_report"]
@@ -191,17 +188,38 @@ class CombinedReader:
         return GRIPPER_CLOSE if n_closed % 2 else GRIPPER_OPEN
 
 
+OPERATOR_INTENTS = ("plan", "target")
+# The target user (`PolicyOperator.target_push`), in metres
+TARGET_SLOW = 0.12  # nearer its point than this, the push shrinks in proportion
+TARGET_NEAR = 0.06  # horizontally nearer than this, and under TARGET_ABOVE over it: it is there, and rests
+TARGET_ABOVE = (
+    0.10  # over the object's position (its base); an open gripper on a bowl's rim sits 0.055 over it
+)
+TARGET_MOVED = 0.03  # from where the object started: it has been taken (or pushed)
+TARGET_LIFTED = 0.02  # above where it started: it is carried, not pushed along the table
+TARGET_HELD = 0.12  # between gripper and object: the object is with the gripper
+TARGET_HOVER = 0.15  # above the destination: where a carried object is brought (it hangs below the gripper)
+
+
 @dataclass
 class PolicyOperatorSettings:
-    """Simulated intent-update timing, measured in environment steps, not wall time."""
+    """The synthetic operator: where its intent comes from, and its intent-update timing in environment steps (not
+    wall time)."""
 
     update_every_steps: int | None = None  # None = the executing policy's chunk interval
     delay_steps: int = 0
     # The operator lets go (zero translation and rotation) until its next update when the robot's mean executed
     # translation since its last update heads with its new intent at this cosine or more; None = always pushes.
     let_go_cosine: float | None = None
+    # plan: the task-prompted policy's own plan (its executed prefix's mean); target: a straight push at the
+    # task's object and then its destination, from the scene's positions (`PolicyOperator.target_push`)
+    intent: str = "plan"
 
     def __post_init__(self):
+        if self.intent not in OPERATOR_INTENTS:
+            raise ValueError(
+                f"policy_operator.intent must be one of {', '.join(OPERATOR_INTENTS)}, got {self.intent!r}"
+            )
         if self.update_every_steps is not None and (
             type(self.update_every_steps) is not int or self.update_every_steps < 1
         ):
@@ -251,6 +269,42 @@ class PolicyOperator:
         self._generated_at: int | None = None
         self._step = 0
         self.refreshes = 0
+        self.object_start: np.ndarray | None = (
+            None  # where the task's object was at `target_push`'s first call
+        )
+
+    def target_push(self, eef, obj, dest) -> np.ndarray:
+        """The translation a user who pushes straight at the task's target would give (3,): unit length far from
+        its point, shrinking inside TARGET_SLOW, in the simulator's world axes (the action's translation axes). The
+        user steers and the policy manipulates:
+
+        - toward the object (`obj`, its position now) until the gripper (`eef`) is over it, within TARGET_NEAR
+          horizontally and less than TARGET_ABOVE above, then nothing: the grasp is the policy's;
+        - once the object has moved TARGET_MOVED from where it started (its position at the first call since
+          `reset`) and is within TARGET_HELD of the gripper, toward the point TARGET_HOVER above the destination
+          `dest`, or level with the gripper while the object is not lifted (a push along the table);
+        - nothing once the object is within TARGET_NEAR of the destination horizontally: the release is the
+          policy's;
+        - toward the object again if it was moved and is no longer with the gripper (dropped).
+
+        `dest` None is a target with no destination (a button): nothing once the gripper is there."""
+        eef, obj = (np.asarray(p, dtype=np.float64) for p in (eef, obj))
+        if self.object_start is None:
+            self.object_start = obj.copy()
+        start, point = self.object_start, obj
+        if dest is not None:
+            dest = np.asarray(dest, dtype=np.float64)
+            if np.linalg.norm((obj - dest)[:2]) < TARGET_NEAR:
+                return np.zeros(3)
+            held = np.linalg.norm(obj - start) > TARGET_MOVED and np.linalg.norm(obj - eef) < TARGET_HELD
+            if held:
+                lifted = obj[2] - start[2] > TARGET_LIFTED
+                point = np.array([dest[0], dest[1], dest[2] + TARGET_HOVER if lifted else eef[2]])
+        gap = point - eef
+        if point is obj and np.linalg.norm(gap[:2]) < TARGET_NEAR and -gap[2] < TARGET_ABOVE:
+            return np.zeros(3)
+        distance = np.linalg.norm(gap)
+        return gap / max(distance, 1e-9) * min(1.0, distance / TARGET_SLOW)
 
     def should_refresh(self, step: int) -> bool:
         return step % self.update_every_steps == 0
@@ -344,21 +398,14 @@ class Curl:
             f"clockwise, slowed to {100 / np.sqrt(1 + k**2):.0f}%)"
         )
 
-
-def build_curl(spec, where: str = "corruption") -> Curl | None:
-    """The `Curl` a `{curl: b, tau: s[, dt: d]}` spec describes (``readout.corruption_spec`` in 3-D); None for any
-    other (matrix) spec."""
-    if not isinstance(spec, dict) or "curl" not in spec:
-        return None
-    _, curl = readout.corruption_spec(spec, where, n_dims=3)
-    return Curl(curl["curl"], curl["tau"], curl.get("dt", CONTROL_DT))
-
-
-def _noise_level(value, name: str) -> float:
-    value = float(value)
-    if not np.isfinite(value) or value < 0:
-        raise ValueError(f"{name}: a noise must be >= 0, got {value}")
-    return value
+    @classmethod
+    def from_spec(cls, spec, where: str = "corruption") -> "Curl | None":
+        """The `Curl` a `{curl: b, tau: s[, dt: d]}` spec describes (``readout.corruption_spec`` in 3-D); None for any
+        other (matrix) spec."""
+        if not isinstance(spec, dict) or "curl" not in spec:
+            return None
+        _, curl = readout.corruption_spec(spec, where, n_dims=3)
+        return cls(curl["curl"], curl["tau"], curl.get("dt", CONTROL_DT))
 
 
 class ReadoutReader:
@@ -510,7 +557,7 @@ class ReadoutReader:
 
     @rotation_noise.setter
     def rotation_noise(self, value: float) -> None:
-        self._rotation_noise = _noise_level(value, "rotation_noise")
+        self._rotation_noise = self._noise_level(value, "rotation_noise")
 
     @property
     def gripper_noise(self) -> float:
@@ -518,7 +565,7 @@ class ReadoutReader:
 
     @gripper_noise.setter
     def gripper_noise(self, value: float) -> None:
-        self._gripper_noise = _noise_level(value, "gripper_noise")
+        self._gripper_noise = self._noise_level(value, "gripper_noise")
 
     @property
     def rotation(self) -> np.ndarray:
@@ -545,84 +592,18 @@ class ReadoutReader:
             f"Command corruption: x/y/z -> M @ x/y/z while you command, M = {self.label} = {self.format()}."
         )
 
+    @staticmethod
+    def _noise_level(value, name: str) -> float:
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name}: a noise must be >= 0, got {value}")
+        return value
 
-def build_corruption(spec, where: str = "corruption") -> np.ndarray | None:
-    """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows; ``readout.matrix_spec``) or
-    None."""
-    return readout.matrix_spec(spec, 3, where)
-
-
-def read_matrix_spec(path: str | Path):
-    """Read a matrix spec from a YAML file (for the REPL's live `corruption` / `adapter` commands)."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    if data is None:
-        raise ValueError(f"{path}: empty file")
-    return data
-
-
-@dataclass(frozen=True)
-class CorruptionDraw:
-    """One corruption drawn from a `RandomCorruption`: the matrix and what it was built from."""
-
-    matrix: np.ndarray  # 3x3: rotation @ diag(scale)
-    rotation_axis: np.ndarray  # unit vector
-    rotation_deg: float
-    scale: np.ndarray  # the gain of each operator axis
-
-    def parameters(self) -> dict:
-        """The draw as plain numbers, for a trial record."""
-        return {
-            "rotation_axis": self.rotation_axis.tolist(),
-            "rotation_deg": float(self.rotation_deg),
-            "scale": self.scale.tolist(),
-        }
-
-
-def _range(value, name: str, low: float, high: float, low_open: bool = False) -> tuple[float, float]:
-    """`value` as an ordered (lo, hi) pair of finite numbers inside [low, high] (or (low, high])."""
-    try:
-        lo, hi = (float(v) for v in value)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{name} must be a [low, high] pair of numbers, got {value!r}") from e
-    inside = (low < lo if low_open else low <= lo) and hi <= high
-    if isinstance(value, str) or not (np.isfinite(lo) and np.isfinite(hi) and lo <= hi and inside):
-        bounds = f"{'(' if low_open else '['}{low:g}, {high:g}]"
-        raise ValueError(f"{name} must be a [low, high] pair with low <= high inside {bounds}, got {value!r}")
-    return lo, hi
-
-
-@dataclass(frozen=True)
-class RandomCorruption:
-    """A family to draw one corruption per trial from: M = R @ diag(gains), the gains log-uniform
-    in `scale` and the rotation uniform in `rotation_deg` about a uniformly random axis."""
-
-    rotation_deg: tuple[float, float] = (0.0, 0.0)
-    scale: tuple[float, float] = (1.0, 1.0)
-
-    def __post_init__(self):
-        object.__setattr__(self, "rotation_deg", _range(self.rotation_deg, "rotation_deg", 0.0, 180.0))
-        object.__setattr__(self, "scale", _range(self.scale, "scale", 0.0, np.inf, low_open=True))
-
-    @property
-    def max_gain(self) -> float:
-        """The most any draw can lengthen a command: a rotation keeps lengths, so the largest gain."""
-        return self.scale[1]
-
-    def sample(self, rng: np.random.Generator) -> CorruptionDraw:
-        axis = rng.normal(size=3)
-        axis /= np.linalg.norm(axis)
-        angle = float(rng.uniform(*self.rotation_deg))
-        scale = np.exp(rng.uniform(np.log(self.scale[0]), np.log(self.scale[1]), size=3))
-        rotation = Rotation.from_rotvec(axis * np.radians(angle)).as_matrix()
-        return CorruptionDraw(rotation @ np.diag(scale), axis, angle, scale)
-
-
-def check_translation_gain(value) -> float:
-    """`value` as an translation gain, a number in (0, 1]; raises ValueError otherwise (bool, str, NaN included)."""
-    if isinstance(value, bool | str) or not 0.0 < float(value) <= 1.0:
-        raise ValueError(f"translation gain must be a number in (0, 1] or null, got {value!r}")
-    return float(value)
+    @staticmethod
+    def matrix_from_spec(spec, where: str = "corruption") -> np.ndarray | None:
+        """3x3 M from a spec ({rotation_z_deg: d}, {scale: [...]}, {M: rows}, bare rows; ``readout.matrix_spec``) or
+        None."""
+        return readout.matrix_spec(spec, 3, where)
 
 
 class TranslationGain:
@@ -642,7 +623,7 @@ class TranslationGain:
 
     @gain.setter
     def gain(self, value: float | None) -> None:
-        self._gain = None if value is None else check_translation_gain(value)
+        self._gain = None if value is None else self.check(value)
 
     @property
     def translation(self) -> np.ndarray:
@@ -658,6 +639,13 @@ class TranslationGain:
     @property
     def gripper(self) -> float:
         return self.source.gripper
+
+    @staticmethod
+    def check(value) -> float:
+        """`value` as an translation gain, a number in (0, 1]; raises ValueError otherwise (bool, str, NaN included)."""
+        if isinstance(value, bool | str) or not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"translation gain must be a number in (0, 1] or null, got {value!r}")
+        return float(value)
 
 
 class RecordingReader:

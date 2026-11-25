@@ -106,9 +106,13 @@ def _check_shipped_condition(name):
     assert control.resolved_translation_gain * largest_gain(control) <= 1.0
 
 
-def test_arm_files_resolve():
-    mars = load_experiment_settings(CONFIG_DIR / "experiment" / "mars_rotz20.yaml", {})
-    c = mars.session.control
+def test_the_base_with_an_arms_settings_resolves():
+    """An arm is the base file plus its settings (experiments/arms.sh's flags): MARS with F = M, FRS, flow control
+    and a learned user module."""
+    base = CONFIG_DIR / "experiment" / "base.yaml"
+    turned = "control.corruption={rotation_z_deg: 20}"
+    adapter = "control.reversal_adapter={translation: corruption, orientation: identity, gripper: identity}"
+    c = load_experiment_settings(base, {}, sets=[turned, adapter]).session.control
     assert c.mode == "shared_flow_reversal_steering" and c.n_reversal_steps is None
     np.testing.assert_allclose(c.corruption_matrix, readout.rotation(20))
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, :3], readout.rotation(20))
@@ -116,14 +120,13 @@ def test_arm_files_resolve():
     np.testing.assert_allclose(c.reversal_adapter_matrix[:3, 3:], 0)
     np.testing.assert_allclose(c.reversal_adapter_matrix[3:, :3], 0)
     assert spec_label(c.corruption) == "rotation_z_deg=20"
-    native = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml", {})
-    assert native.session.control.reversal_adapter_matrix is None
-    np.testing.assert_allclose(native.session.control.corruption_matrix, readout.rotation(20))
-    fc = load_experiment_settings(CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml", {})
-    assert fc.session.control.mode == "shared_flow_control"
-    assert (fc.session.control.tau, fc.session.control.lam, fc.session.control.ic_gain) == (None, 1, "action")
+    native = load_experiment_settings(base, {}, sets=[turned]).session.control
+    assert native.reversal_adapter_matrix is None
+    np.testing.assert_allclose(native.corruption_matrix, readout.rotation(20))
+    fc = load_experiment_settings(base, {}, sets=["control.mode=shared_flow_control"]).session.control
+    assert fc.mode == "shared_flow_control" and (fc.tau, fc.lam, fc.ic_gain) == (None, 1, "action")
     learned = load_experiment_settings(
-        CONFIG_DIR / "experiment" / "mars_learned_rotz20.yaml", {}
+        base, {}, sets=["control.reversal_adapter={learned: outputs/user_modules/rotz20/user.pt}"]
     ).session.control
     assert learned.reversal_adapter_user_path.endswith("user.pt") and learned.reversal_adapter_matrix is None
 
@@ -196,9 +199,7 @@ def test_curl_corruption_resolves():
         c = load_experiment_settings(path, {}).session.control
     finally:
         path.unlink()
-    assert (
-        c.corruption_curl == Curl(20.0, 0.1) and c.corruption_matrix is None and c.corruption_family is None
-    )
+    assert c.corruption_curl == Curl(20.0, 0.1) and c.corruption_matrix is None
     assert c.resolved_translation_gain == 1.0  # a curl never lengthens a push
     np.testing.assert_allclose(
         c.reversal_adapter_matrix[:3, :3], np.linalg.inv(Curl(20.0, 0.1).steady_state())
@@ -227,7 +228,8 @@ def test_parse_set_and_tree():
 
 
 def test_sets_override_the_file_and_are_validated():
-    path = CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml"
+    path = CONFIG_DIR / "experiment" / "study_goal_rotation.yaml"
+    assert load_experiment_settings(path, {}).session.control.corruption_matrix is not None
     s = load_experiment_settings(path, {}, sets=["control.n_guided_steps=4", "control.corruption=null"])
     assert s.session.control.lam == 4 and s.session.control.corruption_matrix is None  # the old key is lambda
     s = load_experiment_settings(
@@ -241,7 +243,7 @@ def test_sets_override_the_file_and_are_validated():
 
 
 def test_policy_operator_timing_overrides_and_defaults():
-    path = CONFIG_DIR / "experiment" / "flow_control_rotz20.yaml"
+    path = CONFIG_DIR / "experiment" / "base.yaml"
     default = load_experiment_settings(path, {}, sets=["operator=policy"])
     assert default.session.policy_operator.update_every_steps is None
     assert default.session.policy_operator.delay_steps == 0
@@ -249,6 +251,9 @@ def test_policy_operator_timing_overrides_and_defaults():
     settings = load_experiment_settings(path, {}, sets=["operator=policy", *sets])
     assert settings.session.policy_operator.update_every_steps == 20
     assert settings.session.policy_operator.delay_steps == 4
+    assert default.session.policy_operator.intent == "plan"
+    pointing = load_experiment_settings(path, {}, sets=["operator=policy", "policy_operator.intent=target"])
+    assert pointing.session.policy_operator.intent == "target"
     with pytest.raises(ValueError, match="require operator=policy"):
         load_experiment_settings(path, {}, sets=sets)
     with pytest.raises(ValueError, match="positive integer"):
@@ -291,13 +296,13 @@ def test_experiment_cli_overrides(tmp_path):
     assert s.output_dir == Path("o") and s.prompt == "task"
 
 
-def test_base_rotz20_yaml_matches_dataclass_defaults():
-    data = yaml.safe_load((CONFIG_DIR / "experiment" / "base_rotz20.yaml").read_text())
+def test_base_yaml_matches_dataclass_defaults():
+    data = yaml.safe_load((CONFIG_DIR / "experiment" / "base.yaml").read_text())
     assert set(data) == {"experiment", "scene", "prompt", "policy", "control", "server"}
 
 
 def test_operator_settings():
-    path = CONFIG_DIR / "experiment" / "flow_reversal_rotz20.yaml"
+    path = CONFIG_DIR / "experiment" / "base.yaml"
     default = load_experiment_settings(path, {})
     assert default.session.operator == "human"
     assert default.session.control.operator_dims == ["translation"]
@@ -314,49 +319,13 @@ def test_operator_settings():
         load_experiment_settings(path, {}, sets=["control.operator_dims=translation"])
 
 
-# ---------------------------------------------------------------- random corruption and translation gain
-
-
-def test_random_corruption_spec_becomes_a_family_and_leaves_the_matrices_to_each_trial(tmp_path):
-    from teleop import RandomCorruption
-
-    control = _load(
-        tmp_path,
-        "control: {mode: shared_flow_reversal_steering, reversal_adapter: {translation: corruption},"
-        " corruption: {random: {rotation_deg: [30, 90], scale: [1, 4]}}}",
-    )
-    assert control.corruption_family == RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
-    assert control.corruption_matrix is None and control.reversal_adapter_matrix is None
-    assert spec_label(control.corruption) == "random(rotation_deg=30..90, scale=1..4)"
-    # either part may be left out, and a fixed corruption has no family
-    only_rotation = _load(tmp_path, "control: {corruption: {random: {rotation_deg: [0, 45]}}}")
-    assert only_rotation.corruption_family == RandomCorruption(rotation_deg=(0, 45))
-    assert _load(tmp_path, "control: {corruption: {rotation_z_deg: 20}}").corruption_family is None
-
-
-@pytest.mark.parametrize(
-    "corruption,complaint",
-    [
-        ("{random: {angle_deg: [0, 30]}}", "angle_deg"),  # unknown key, named
-        ("{random: {scale: [1, 2]}, rotation_z_deg: 20}", "cannot be combined"),  # mixed with a fixed form
-    ],
-)
-def test_random_corruption_spec_errors_name_the_setting_and_the_problem(tmp_path, corruption, complaint):
-    with pytest.raises(ValueError, match=f"control.corruption.*{complaint}"):
-        _load(tmp_path, f"control: {{corruption: {corruption}}}")
-
-
-def test_a_random_corruption_needs_trials_so_the_interactive_runner_rejects_it(tmp_path):
-    path = tmp_path / "i.yaml"
-    path.write_text("control: {corruption: {random: {scale: [1, 2]}}}")
-    with pytest.raises(ValueError, match="control.corruption.*one per trial"):
-        load_interactive_settings(path, {})
+# ---------------------------------------------------------------- translation gain
 
 
 @pytest.mark.parametrize(
     "corruption,largest_safe_gain",
     [
-        ("{random: {rotation_deg: [30, 90], scale: [1, 4]}}", 0.25),
+        ("{scale: [4, 1, 2]}", 0.25),  # 1 / the most it can lengthen a command
         ("{scale: [0.5, 0.5, 0.5]}", 1.0),  # a corruption that only shrinks: the gain never exceeds 1
     ],
 )
@@ -376,22 +345,13 @@ def test_translation_gain_is_off_by_default_and_a_number_is_checked_against_the_
             _load(tmp_path, f"control: {{translation_gain: {bad}}}")
 
 
-@pytest.mark.parametrize("arm", ["mars"])
-def test_the_shipped_random_family_cannot_clip_and_only_the_adapted_arm_has_an_adapter(arm):
-    control = load_experiment_settings(CONFIG_DIR / "experiment" / f"{arm}_random.yaml", {}).session.control
-    assert control.corruption_family is not None
-    # the gain in force times the most the family can lengthen a command stays inside the unit cube
-    assert control.resolved_translation_gain * control.corruption_family.max_gain <= 1.0
-    assert (control.reversal_adapter is not None) == (arm == "mars")
-
-
 def test_quantize_and_singular_corruptions_resolve(tmp_path):
     keypad = _load(
         tmp_path,
         "control:\n  mode: shared_flow_reversal_steering\n  translation_gain: auto\n  corruption: {quantize: axes}\n",
     )
     assert keypad.corruption_quantize is True and keypad.corruption_matrix is None
-    assert keypad.corruption_curl is None and keypad.corruption_family is None
+    assert keypad.corruption_curl is None
     assert keypad.resolved_translation_gain == 1.0  # a snap is never clipped
     stick = _load(
         tmp_path,
@@ -403,15 +363,22 @@ def test_quantize_and_singular_corruptions_resolve(tmp_path):
     assert stick.corruption_quantize is False and stick.resolved_translation_gain == 1.0
 
 
-def test_the_study_rotation_is_the_recorded_draw():
-    from teleop import RandomCorruption
+def test_the_study_rotation_is_the_recorded_draw(tmp_path):
+    from lerobot.utils.rotation import Rotation
 
-    draw = RandomCorruption(rotation_deg=(60, 60)).sample(np.random.default_rng(0))
+    axis = np.random.default_rng(0).normal(
+        size=3
+    )  # the draw the study recorded: 60 degrees about a random axis
+    drawn = Rotation.from_rotvec(axis / np.linalg.norm(axis) * np.radians(60.0)).as_matrix()
     for suite in ("object", "goal"):
         control = load_experiment_settings(
             CONFIG_DIR / "experiment" / f"study_{suite}_rotation.yaml", {}
         ).session.control
-        np.testing.assert_array_equal(control.corruption_matrix, draw.matrix)  # one 60 degree draw, seed 0
+        np.testing.assert_array_equal(control.corruption_matrix, drawn)  # one 60 degree draw, seed 0
+    with pytest.raises(
+        ValueError, match="control.corruption"
+    ):  # a corruption drawn per trial is no longer a form
+        _load(tmp_path, "control: {corruption: {random: {scale: [1, 2]}}}")
     goal = load_experiment_settings(CONFIG_DIR / "experiment" / "study_goal_keypad.yaml", {})
     assert goal.session.suite == "libero_goal" and goal.task_ids == [1, 4, 5, 6, 7, 8] and goal.n_trials == 30
     assert goal.session.control.corruption_quantize and goal.session.operator == "policy"
@@ -423,12 +390,12 @@ def test_study_runs_are_headless_and_a_human_cannot_be(tmp_path):
     """`server.headless`: no page, no frame stream, no browser tab (the study's runs: a synthetic operator); a
     human operator needs the page, so the pair is refused."""
     from live_view import HeadlessView
-    from session import build_view
+    from session import Session
     from teleop import KeyboardReader
 
     study = load_experiment_settings(CONFIG_DIR / "experiment" / "study_goal_rotation.yaml", {}).session
     assert study.headless and not load_interactive_settings(DEFAULT_INTERACTIVE_CONFIG, {}).headless
-    view = build_view(study, KeyboardReader(), dict)
+    view = Session.build_view(study, KeyboardReader(), dict)
     assert isinstance(view, HeadlessView) and view.url is None
     view.start()  # binds nothing
     view.stream.publish(np.zeros((4, 4, 3), np.uint8))  # encodes nothing

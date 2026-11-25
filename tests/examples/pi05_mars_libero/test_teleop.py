@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import teleop
+from config import read_matrix_spec
 from teleop import (
     DEADBAND,
     GRIPPER_CLOSE,
@@ -12,8 +13,6 @@ from teleop import (
     ReadoutReader,
     RecordingReader,
     TeleopChain,
-    build_corruption,
-    read_matrix_spec,
 )
 
 
@@ -78,18 +77,18 @@ def test_command_corruption_applies_only_when_commanding():
         corrupted.matrix = np.eye(2)
 
 
-def test_build_corruption_and_read_matrix_spec(tmp_path):
-    assert build_corruption(None) is None
-    np.testing.assert_allclose(build_corruption({"rotation_z_deg": 0}), np.eye(3))
+def test_a_corruption_matrix_from_a_spec_and_from_a_spec_file(tmp_path):
+    assert ReadoutReader.matrix_from_spec(None) is None
+    np.testing.assert_allclose(ReadoutReader.matrix_from_spec({"rotation_z_deg": 0}), np.eye(3))
     path = tmp_path / "m.yaml"
     path.write_text("rotation_z_deg: 90\n")
-    m = build_corruption(read_matrix_spec(path))
+    m = ReadoutReader.matrix_from_spec(read_matrix_spec(path))
     np.testing.assert_allclose(m @ np.array([1.0, 0, 0]), [0, 1, 0], atol=1e-12)
     path.write_text("M:\n  - [1, 0, 0]\n  - [0, 1, 0]\n  - [0, 0, 1]\n")
-    np.testing.assert_allclose(build_corruption(read_matrix_spec(path)), np.eye(3))
+    np.testing.assert_allclose(ReadoutReader.matrix_from_spec(read_matrix_spec(path)), np.eye(3))
     path.write_text("- 1\n")
     with pytest.raises(ValueError):
-        build_corruption(read_matrix_spec(path))
+        ReadoutReader.matrix_from_spec(read_matrix_spec(path))
 
 
 def test_noisy_reader_is_seeded_and_noises_an_idle_push_too():
@@ -270,87 +269,6 @@ def test_operator_rejects_invalid_step_counts(settings):
         teleop.PolicyOperatorSettings(**settings)
 
 
-# ---------------------------------------------------------------- random corruption
-
-
-def _rotation_and_gains(matrix):
-    """Split M = R @ diag(gains) back into its parts: the column lengths are the gains."""
-    gains = np.linalg.norm(matrix, axis=0)
-    return matrix / gains, gains
-
-
-def _angle_deg(rotation):
-    """The angle of a rotation matrix, from its trace."""
-    return np.degrees(np.arccos((np.trace(rotation) - 1) / 2))
-
-
-def test_random_corruption_draws_a_rotation_times_per_axis_gains_inside_the_ranges():
-    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
-    angles, all_gains, axes = [], [], []
-    for seed in range(200):
-        draw = family.sample(np.random.default_rng(seed))
-        rotation, gains = _rotation_and_gains(draw.matrix)
-        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-9)  # a rotation ...
-        assert np.linalg.det(rotation) == pytest.approx(1.0)  # ... not a reflection
-        angle = _angle_deg(rotation)
-        assert 30 - 1e-6 <= angle <= 90 + 1e-6
-        assert np.all((gains >= 1 - 1e-9) & (gains <= 4 + 1e-9))
-        # the draw reports the parameters the matrix was built from
-        assert draw.rotation_deg == pytest.approx(angle)
-        np.testing.assert_allclose(draw.scale, gains)
-        np.testing.assert_allclose(rotation @ draw.rotation_axis, draw.rotation_axis, atol=1e-9)
-        assert np.linalg.norm(draw.rotation_axis) == pytest.approx(1.0)
-        angles.append(angle)
-        all_gains.append(gains)
-        axes.append(draw.rotation_axis)
-    # the ranges are actually covered, each axis gets its own gain, and the rotation axis is not fixed
-    assert min(angles) < 40 and max(angles) > 80
-    assert np.min(all_gains) < 1.3 and np.max(all_gains) > 3.0
-    assert np.ptp(all_gains, axis=1).mean() > 0.5
-    assert np.linalg.norm(np.mean(axes, axis=0)) < 0.2
-
-
-def test_random_corruption_is_reproducible_from_its_generator():
-    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
-    first = family.sample(np.random.default_rng(7)).matrix
-    np.testing.assert_array_equal(first, family.sample(np.random.default_rng(7)).matrix)
-    assert not np.allclose(first, family.sample(np.random.default_rng(8)).matrix)
-
-
-def test_random_corruption_parts_can_be_switched_off():
-    rng = np.random.default_rng(3)
-    np.testing.assert_allclose(teleop.RandomCorruption().sample(rng).matrix, np.eye(3), atol=1e-12)
-    only_gains = teleop.RandomCorruption(scale=(2, 3)).sample(rng).matrix
-    np.testing.assert_allclose(only_gains, np.diag(np.diag(only_gains)), atol=1e-12)
-    assert np.all((np.diag(only_gains) >= 2) & (np.diag(only_gains) <= 3))
-    only_rotation = teleop.RandomCorruption(rotation_deg=(45, 45)).sample(rng).matrix
-    np.testing.assert_allclose(np.linalg.norm(only_rotation, axis=0), 1.0)
-    assert _angle_deg(only_rotation) == pytest.approx(45)
-
-
-def test_random_corruption_never_grows_a_command_by_more_than_max_gain():
-    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
-    largest = [
-        np.linalg.svd(family.sample(np.random.default_rng(seed)).matrix, compute_uv=False)[0]
-        for seed in range(200)
-    ]
-    assert max(largest) <= family.max_gain + 1e-9
-    assert max(largest) > 0.9 * family.max_gain  # and the bound is not loose
-
-
-@pytest.mark.parametrize(
-    "ranges",
-    [
-        {"rotation_deg": (90, 30)},
-        {"scale": (0, 2)},
-        {"scale": "1-4"},
-    ],
-)
-def test_random_corruption_rejects_impossible_ranges(ranges):
-    with pytest.raises(ValueError, match="rotation_deg|scale"):
-        teleop.RandomCorruption(**ranges)
-
-
 # ---------------------------------------------------------------- translation gain: no clipping
 
 
@@ -373,18 +291,19 @@ def test_translation_gain_rejects_values_outside_zero_to_one(gain):
         teleop.TranslationGain(Source(), gain=gain)
 
 
-def test_chain_with_translation_gain_never_clips_a_corruption_from_the_family():
-    family = teleop.RandomCorruption(rotation_deg=(30, 90), scale=(1, 4))
+def test_chain_with_translation_gain_never_clips_a_corruption():
     stick = Source()
     chain = TeleopChain(KeyboardReader(clock=lambda: 0.0))
     chain.combined.sources.insert(0, stick)
-    chain.gain.gain = 1 / family.max_gain
     rng = np.random.default_rng(0)
     corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
     pushes = rng.uniform(-1, 1, size=(200, 3))
     pushes = pushes[np.linalg.norm(pushes, axis=1) >= 0.5]  # clearly commanding, not idle
-    for seed in range(40):
-        chain.readout.matrix = family.sample(np.random.default_rng(seed)).matrix
+    turned = ReadoutReader.matrix_from_spec({"rotation_z_deg": 40}) @ np.diag([1.0, 3.0, 1.0])
+    for matrix in (np.diag([4.0, 1.0, 2.0]), turned):
+        longest = np.linalg.norm(matrix, 2)  # the most the corruption can lengthen a command
+        chain.gain.gain = 1 / longest
+        chain.readout.matrix = matrix
         for push in np.vstack([corners, np.eye(3), pushes]):
             stick.translation = push
             served = chain.source.translation
@@ -393,13 +312,13 @@ def test_chain_with_translation_gain_never_clips_a_corruption_from_the_family():
             # what the policy is served is exactly M @ what was recorded as the operator's command
             np.testing.assert_allclose(served, chain.readout.matrix @ raw, atol=1e-12)
             # and that recorded command is the push itself, only shorter
-            assert np.linalg.norm(raw) <= 0.25 + 1e-12
+            assert np.linalg.norm(raw) <= 1 / longest + 1e-12
             assert raw @ push == pytest.approx(np.linalg.norm(raw) * np.linalg.norm(push))
 
 
 # ---------------------------------------------------------------- curl corruption
 
-from teleop import Curl, build_curl  # noqa: E402
+from teleop import Curl  # noqa: E402
 
 
 def test_curl_corruption_integrates_on_the_clock_and_idle_stays_idle():
@@ -436,10 +355,10 @@ def test_curl_corruption_integrates_on_the_clock_and_idle_stays_idle():
 
 
 def test_build_curl_spec():
-    curl = build_curl({"curl": 20, "tau": 0.1})
+    curl = Curl.from_spec({"curl": 20, "tau": 0.1})
     assert curl == Curl(20.0, 0.1) and curl.dt == teleop.CONTROL_DT
-    assert build_curl({"curl": 5, "tau": 0.2, "dt": 0.02}).dt == 0.02
-    assert build_curl({"rotation_z_deg": 20}) is None and build_curl(None) is None
+    assert Curl.from_spec({"curl": 5, "tau": 0.2, "dt": 0.02}).dt == 0.02
+    assert Curl.from_spec({"rotation_z_deg": 20}) is None and Curl.from_spec(None) is None
     for bad in (
         {"curl": 20},
         {"curl": 20, "tau": 0.1, "axis": "z"},
@@ -447,7 +366,7 @@ def test_build_curl_spec():
         {"curl": "x", "tau": 0.1},
     ):
         with pytest.raises(ValueError):
-            build_curl(bad)
+            Curl.from_spec(bad)
 
 
 def test_teleop_chain_advances_and_resets_the_curl():
@@ -476,3 +395,42 @@ def test_a_keypad_readout_snaps_and_a_dropped_axis_goes_idle():
     np.testing.assert_array_equal(keypad.translation, [0.3, -0.7, 0.2])
     stick = ReadoutReader(Source((0.0, 0.0, 0.8)), matrix=np.diag([1.0, 1.0, 0.0]))
     assert np.max(np.abs(stick.translation)) < DEADBAND  # a purely vertical push through a two-axis device
+
+
+def test_the_target_user_approaches_rests_for_the_grasp_carries_and_recovers():
+    """`PolicyOperator.target_push`: a straight push at the task's object (unit length far away, shrinking inside
+    TARGET_SLOW); over it (within TARGET_NEAR sideways and TARGET_ABOVE above) it rests and leaves the grasp to the
+    policy; once the object has moved from where the operator first saw it and is with the gripper it pushes toward
+    a point TARGET_HOVER above the destination (level with the gripper while the object is not lifted: a push
+    task) and rests above it; a dropped object is approached again; a reset forgets where the object started."""
+    start, dest = np.array([0.3, 0.0, 0.6]), np.array([0.0, 0.4, 0.6])
+    user = PolicyOperator(2)
+    np.testing.assert_allclose(user.target_push([0.0, 0.0, 1.0], start, dest), [0.6, 0.0, -0.8])
+    np.testing.assert_allclose(user.object_start, start)
+    closer = start + [0.75 * teleop.TARGET_SLOW, 0.0, 0.0]
+    np.testing.assert_allclose(user.target_push(closer, start, dest), [-0.75, 0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(
+        user.target_push(start + [0.0, 0.0, 0.2], start, dest), [0.0, 0.0, -1.0]
+    )  # too high
+    over_it = start + [teleop.TARGET_NEAR / 2, 0.0, 0.9 * teleop.TARGET_ABOVE]
+    np.testing.assert_allclose(user.target_push(over_it, start, dest), 0.0)  # the grasp is the policy's
+    held = np.array([0.3, 0.0, 0.8])  # the object lifted 0.2 with the gripper just above it
+    carry = user.target_push(held + [0.0, 0.0, 0.05], held, dest)
+    aim = dest + [0.0, 0.0, teleop.TARGET_HOVER] - (held + [0.0, 0.0, 0.05])
+    np.testing.assert_allclose(carry, aim / np.linalg.norm(aim))
+    slid = start + [0.05, 0.0, 0.0]  # moved along the table, not lifted: a push, level with the gripper
+    level = user.target_push(slid + [0.0, 0.0, 0.04], slid, dest)
+    assert level[2] == 0.0 and level[1] > 0.0
+    over = np.array([0.0, 0.4, 0.9])
+    np.testing.assert_allclose(
+        user.target_push(over, over - [0.0, 0.0, 0.05], dest), 0.0
+    )  # the policy places
+    dropped = np.array([0.2, 0.2, 0.6])
+    back = user.target_push([0.0, 0.4, 0.9], dropped, dest)
+    np.testing.assert_allclose(back, (dropped - [0.0, 0.4, 0.9]) / np.linalg.norm(dropped - [0.0, 0.4, 0.9]))
+    user.reset()  # a new trial: the dropped place is now where the object starts, and it is approached, not carried
+    assert user.object_start is None
+    np.testing.assert_allclose(
+        user.target_push(dropped + [0.0, 0.0, 0.03], dropped, None), 0.0
+    )  # a button: done
+    np.testing.assert_allclose(user.object_start, dropped)
