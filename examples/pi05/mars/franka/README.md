@@ -85,6 +85,15 @@ each translation axis to its stop in turn (+x right, +y toward you, +z down), tw
 axis to its stop in turn (rx, ry, rz), then release the stick and hold it still for the half-second
 rest read. Push every axis fully: a peak short of the stop is a lower bound on the scale.
 
+One 3Dconnexion device can expose several hidraw nodes and only one carries the reports: the session
+saw five nodes for one mouse and translation reports on `/dev/hidraw8` only, so the source searches
+for the node that reports instead of taking the first by name. The section prints, per 3Dconnexion
+node, its `HID_NAME` and report-descriptor size, then tallies every `(report id, byte length)` pair
+and the max `|int16|` of the triple at offset 1 and — for a payload of 12 bytes or more — the second
+triple at offset 7. That is how a six-axis single report, or a rotation report under another id, shows
+up even when id 2 never arrives. Finally it prints which node the real source picks, the rest
+six-vector it captures and whether it tared.
+
 The first probe run downloads and loads the checkpoint, so the policy section can take minutes. Its
 `chunk time` is the number that decides whether the chunk pause fits the control loop, so record it.
 
@@ -95,14 +104,14 @@ Copy the report's hardware facts into the config while the report is fresh:
 | station native rate | `control rate: the loop asks for X Hz; the station's native rate is Y Hz` | `[station] rate`, if the rate check failed |
 | arms and action keys | `arms:`, `action keys:` | nothing, unless the action-contract checks fail: that is a plumbing bug |
 | camera feeds | `cameras:` | `[cameras] exterior`, `wrist`, and `third` when a third feed is wired |
-| SpaceMouse node and HID id | `hidraw /dev/hidrawN: HID_ID ... (3Dconnexion)` | `[spacemouse] path` and `hid_id` in the session record; leave `""` to search |
+| SpaceMouse node and HID id | `hidraw /dev/hidrawN: HID_ID ... (3Dconnexion), HID_NAME ..., report descriptor N bytes` and `source would pick: /dev/hidrawN` | `[spacemouse] path` and `hid_id` in the session record; leave `""` to search (the source keeps the node that reports) |
 | translation full scale | `copy the measured translation peak into [spacemouse] full_scale = N` | `[spacemouse] full_scale` |
 | rotation full scale | `copy the measured rotation peak into [spacemouse] rotation_full_scale = N` | `[spacemouse] rotation_full_scale` |
 | source and sign | `configured source [...] and sign [...]` | `[spacemouse] source`/`sign`, after a jog confirms a direction |
-| rest-state six-vector | `rest-state six-vector [x y z rx ry rz]` | the session record; a non-zero axis is a held stick or a device that is not re-zeroing |
-| reset pose | `reset pose q (...)` | the session record; `[command] q0` pins it for later runs |
+| rest six-vector | `rest six-vector [x y z rx ry rz]` and `at rest after tare` | the session record; the captured offset is a device property (the session measured `x = +0.154`), so `[spacemouse] tare = true` subtracts it |
+| reset pose | `reset pose q (...)` | `[command] q0` is pinned to the measured session pose; `[]` would take the station's reset pose each session |
 | the lift and the gain | `q0:`, `F7 (7x7, ...)`, `gain:` | the session record; these are the readout the shared modes run |
-| noise sigma | `noise sigma (7, action units)` | check it against `[readout] noise` |
+| noise sigma | `noise sigma (8 dims: 7 command dims + gripper; the loop's noise is the first 7)` | check it against `[readout] noise`; the loop's command is 7 wide, the gripper is not noised |
 | gripper ends | by hand at the first teleop: which `gripper_position` value closes the jaws | the session record; `1.0` is the closed end in `station.action_dict` |
 | third image | `third camera: omitted ...` or `present` | `[cameras] third` |
 | checkpoint facts | `type:`, `chunk_size:`, `n_action_steps:`, `num_inference_steps:`, `dims`, `dtype`, `use_relative_actions`, `image keys` | the session record; the config overrides `n_action_steps` and `dtype` |
@@ -131,7 +140,10 @@ uv run --extra pi mars-franka teleop --config /tmp/mars-franka-bringup.toml
 ```
 
 The arm should follow the stick gently and stop when you let go. The gripper toggles on a button
-press. If an axis moves the wrong way, fix `[spacemouse] source` or `sign` and run it again; if the arm jerks, saturates or runs away, stop: that is plumbing (the station rate, the
+press. The header's `source:` line names the hidraw node the source picked and its tare; if no
+3Dconnexion node delivers a translation report the run stops with the list of nodes it tried (each
+device exposes several nodes and only one reports, so a silent node is a wrong node, not a dead
+device). If an axis moves the wrong way, fix `[spacemouse] source` or `sign` and run it again; if the arm jerks, saturates or runs away, stop: that is plumbing (the station rate, the
 action keys or the action units), not the policy, and no later step can fix it. Ctrl-C ends the run
 and closes the devices.
 
@@ -625,7 +637,7 @@ A variant file overrides individual keys, so a study condition is a file the rep
 | `[task]` | `demos` (the downloaded `teleop --record` dataset), `out` (`task.pt`, `train_log.json`), `checkpoint` (`[modes.mars-t]`/`[modes.mars]` read it), `token_source = "vlm_image"`, `render_size = 224`, `scene_rank`, `d`, `tdim`, `lambda_id` |
 | `[training]` | `steps`, `batch`, `lr`, `val_frac`, `seed`, `log_every`, `val_depths`, `device`: the trainer's loop, its held-out split and the depths the validator runs |
 | `[study]` | Phase D's block: `arms` (command names and `[modes.<name>]` tables, each must resolve), `trials` (the rounds: every arm once per round), `order = "shuffled"` or `"blocked"`, `max_steps` (a trial's cap, then the outcome question), `out` (the run-directory parent), `seed` (the shuffled order's) |
-| `[spacemouse]` | `path`, `hid_id`, `full_scale`, `rotation_full_scale`, `source`, `sign` |
+| `[spacemouse]` | `path`, `hid_id`, `full_scale`, `rotation_full_scale`, `source`, `sign`, `tare` |
 | `[recording]` | `dir = "outputs/mars_franka"`, relative to this folder |
 
 The provenance of the numbers, because the runbook is also the record:
@@ -652,6 +664,10 @@ The provenance of the numbers, because the runbook is also the record:
   in the papers sets 8; it is a study choice, and the probe measures the pause it causes.
 - `[spacemouse] full_scale` and `rotation_full_scale` ship as unverified 350.0 defaults. The probe
   replaces them with measured counts; until it does, the stick's deflection is a guess.
+- `[spacemouse] tare = true` subtracts the device's rest six-vector, captured at start after the
+  node's reports arrive and the stick settles. It is on because the session measured `x = +0.154` at
+  rest: without the offset a released stick commands a slow drift. The offset is the sensor's, not
+  the session's, so it should repeat; the probe prints it.
 - `[user] cues = 3` and `sigma = [0.2, 0.5]` are the calibration's: three cue draws per state, their
   readout noise uniform in that action-std range. `validate-user` fixes the noise at the midpoint and
   draws one fresh cue per held-out state; these are study choices, nothing measures them.
@@ -679,9 +695,10 @@ The provenance of the numbers, because the runbook is also the record:
   check first (is the scene reproducible, do the digests pair, do the anchors move) and a study
   second.
 
-`[command] q0 = []` means the station's reset pose, captured once at connect. The probe prints that
-pose and the 7×7 `F` it produces; set `q0` to seven joint angles to pin the lift when the station's
-reset pose must not be trusted.
+`[command] q0` is the session's measured reset pose, pinned so the corruption lift `F7`, the
+`mars-f` adapter and the trainer's replay are the same 7×7 across sessions; `[]` would capture the
+station's reset pose at connect, and a station whose reset pose drifts would move `F7` between
+sessions. The probe prints both the pose and the 7×7 `F` it produces.
 
 ## Troubleshooting
 
@@ -742,8 +759,10 @@ reset pose must not be trusted.
 - **The SpaceMouse is not found, or its axes are wrong** — the probe's SpaceMouse section lists every
   hidraw node with its `HID_ID` and marks the 3Dconnexion ones: no node means the device or the udev
   rule, a silent node means the stick or the wrong interface, and a missing id 2 means rotation is
-  not arriving. Fix the direction with `[spacemouse] source`/`sign` after a low-gain jog; the probe
-  cannot see a sign because that needs motion.
+  not arriving. The probe names the node the source picks (`source would pick:`) and tallies
+  `(id, byte length)` pairs: if id 2 never arrives, twist again and look for a wider report whose
+  second triple (offset 7) is the rotation. Fix the direction with `[spacemouse] source`/`sign` after
+  a low-gain jog; the probe cannot see a sign because that needs motion.
 - **A pause every chunk** — expected in Phase A. The probe's `chunk time` is how long the
   pre-processor plus one denoising pass takes; when it exceeds one control period you get a pause
   every `n_action_steps` actions. The loop does not hide it (no prefetch, no compile, no real-time

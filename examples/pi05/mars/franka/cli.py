@@ -429,7 +429,13 @@ def _run(args: argparse.Namespace, config: Config) -> int:
     with ExitStack() as stack:
         source = None
         if arm.loop_mode != "autonomous":  # autonomous is the policy alone: no operator device
+            if not args.dry_run and config.spacemouse.tare:
+                print(
+                    "spacemouse: leave the stick at rest while the source opens (it captures the tare)",
+                    flush=True,
+                )
             source = stack.enter_context(closing(open_source(config, args.dry_run)))
+            print_source(source)
         station = stack.enter_context(closing(open_station(config, args.dry_run)))
         loop_config = arm.loop_config
         if args.dry_run:
@@ -565,7 +571,19 @@ def open_source(config: Config, dry_run: bool = False) -> Any:
         rotation_full_scale=mouse.rotation_full_scale,
         source=mouse.source,
         sign=mouse.sign,
+        tare=mouse.tare,
     )
+
+
+def print_source(source: Any) -> None:
+    """The run header's device line: the node the source took and whether it tared (a fake names none).
+
+    The chosen node is only known after the search has opened the device, so this prints once the
+    source exists; the rest of the header is printed before the devices are opened.
+    """
+    describe = getattr(source, "describe", None)
+    if describe is not None:
+        print(f"source: {describe()}", flush=True)
 
 
 def open_station(config: Config, dry_run: bool = False) -> Any:

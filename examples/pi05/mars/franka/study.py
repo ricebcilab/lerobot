@@ -254,6 +254,8 @@ def run(
             flush=True,
         )
         print(f"study: run directory {run_dir}", flush=True)
+        if source is not None:  # the run header names the node the block reads and whether it tared
+            cli.print_source(source)
         trial = _Trial(
             config=config,
             prompt=prompt,
