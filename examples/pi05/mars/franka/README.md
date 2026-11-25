@@ -11,7 +11,9 @@ compares it offline against the fixed methods, and `mars-u` runs it. Phase C add
 module: `teleop --record` records demonstrations, `train-task` trains the module on them, and `mars-t`
 (FRS with the task module) and the composed `mars` (FRS with both learned modules) run it; S2's
 verdict is task success on the robot, and the design of that block is in the Phase C section.
-`DESIGN.md` is the interface contract; this file is the runbook.
+Phase D runs that verdict: `study` is a block of trials over the config's arms, with a scene reset and
+one y/n outcome per trial, and `analyse` reads the block's records and prints the per-arm table and
+the paired tests. `DESIGN.md` is the interface contract; this file is the runbook.
 
 Everything below runs from the lerobot checkout on `chopper`.
 
@@ -414,8 +416,8 @@ constant across its arms and compares each arm with the same arm without it:
 The point of the pairing is that the only difference inside a row is the task module: the base policy,
 the operator's readout and the prompt stay fixed. `mars-t` and `mars` are shipped commands.
 `autonomous+task` is the task module on the base-policy anchor, and `frs+task` is the `mars-t`
-composition under the block's name. The protocol that runs the whole block -- trial count, success
-entry, analysis -- is not in this repository yet; until it is, the block is the design, not a command.
+composition under the block's name. Phase D, below, runs the whole block: `[study]` names its arms,
+`study` runs the trials and the success entry, and `analyse` prints the tables.
 
 **S2's verdict is task success on the robot.** There is no simulation-free proxy for it: the question
 is whether the arm performs the task more often with the task module than without it. The offline
@@ -423,12 +425,142 @@ number is the held-out flow-matching loss in `train_log.json` and nothing else -
 fit the held-out demonstrations, not that the policy solves the task, so it gates a run (a module that
 did not fit is not worth a block) but it is not the verdict.
 
+## Phase D: running a study
+
+A **study** is a block of trials. A trial is one **arm** (a command name: `autonomous`, `teleop`,
+`fc`, `frs`, `mars-f`, `mars-u`, `mars-t`, `mars`, or any `[modes.<name>]` table) on one scene setup.
+Rounds organise the block: round `r` runs every arm once, so the round number is the pairing key. The
+operator resets the scene between trials and ends the trial; after each trial the operator answers one
+question on the terminal -- did the task succeed? That y/n entry is the only human label the study
+needs. The numbers are the apparatus check first and a study second: see "How to read the tables".
+
+### The two blocks
+
+`[study]` in the shipped config names S2's first row (`arms = ["frs", "mars-t"]`). S1 and the other S2
+rows are variant configs -- copy the shipped file and edit `[study] arms`:
+
+| block | arms | what a row compares |
+| --- | --- | --- |
+| S1: de-corruption | `frs`, `mars-f`, `mars-u` and the anchors (`autonomous`, `teleop`) | the same corrupted readout handled three ways: plain FRS, the fixed lift `F`, the learned user module |
+| S2: task module, row 1 | `frs`, `mars-t` | FRS with and without the task module; the shipped block |
+| S2: task module, row 2 | `mars-u`, `mars` | FRS+user with and without the task module |
+| S2: the policy anchor | `autonomous`, and a `[modes.<name>]` table with `mode = "none"` and `adapter_task` | the base policy's own chunk with and without the task module; the table is how "policy + task module, no steering" runs without new code |
+
+A `[modes.<name>]` arm is composed exactly as the command of that name would be: the same
+`[readout]`, the same mode's adapter strings, and the `mars-f` table's `adapter_matrix` resolved by
+the loop. Nothing about an arm is study-specific; the block only decides who runs when.
+
+### Running one
+
+The command takes the config and the task text; everything else is the `[study]` table's:
+
+```bash
+uv run --extra pi mars-franka study --config examples/pi05/mars/franka/configs/franka.toml \
+  --prompt "put the red block in the bowl"
+```
+
+Before the first trial it loads each arm's checkpoint once (so a two-arm block holds two modules
+resident) and opens the station and the SpaceMouse once. Then, for each trial in the round order:
+
+1. it prints `trial k/n: arm <arm>, pair <r>`;
+2. it resets the station and digests the reset observation;
+3. the arm runs for `[study] max_steps` control steps under the prompt;
+4. it asks `success? [y = yes, n/blank = no, q = stop]`.
+
+`y`/`yes` records a success, anything else -- a blank line included -- a failure. `q`, Ctrl-C or
+Ctrl-D stops the block: the trials whose outcome was entered stay recorded, the trial that was running
+or unanswered is not, and the command exits 130. There is no `--steps`, `--record`, `--trace`,
+`--dry-run` or `--corrupted`: the block comes from `[study]` and a study runs the configured sessions.
+
+`round` is 0-based (`pair = 0` is the first round). `order = "shuffled"` draws each round's arm order
+from `[study] seed`; `order = "blocked"` runs every trial of one arm before the next arm -- useful
+for the apparatus check, where the operator wants to change one thing at a time.
+
+**The scene resets between trials, not between arms.** The station's `reset()` is the episode signal,
+and whether it physically restores the objects is a probe fact, not a promise: on a station whose
+reset leaves the scene where the last trial put it, two trials that should pair do not. That is why
+every trial records a scene digest and the analysis pairs only equal digests.
+
+### What the records are
+
+The block writes one run directory, `<[study] out>/<timestamp>_<config stem>/`:
+
+```
+outputs/mars_franka/study/20261125T101500Z_franka/
+  trials.jsonl            one line per completed trial
+  trials/frs-0.npz        one npz per trial: executed (T,8), plan (T,8), served (T,7), q (T,7)
+  config.toml             the block's config file, byte for byte
+  run.json                git HEAD and dirty flag, timestamp, arms, rounds, order, seed,
+                          the config path and SHA-256, and at the end the recorded/aborted counts
+```
+
+Each `trials.jsonl` line has `run` (the run directory's name), `arm`, `pair`, `prompt`, `success`,
+`steps`, `duration_s`, `authority`, `engaged_fraction`, `mean_r`, `q0` (the reset pose), `scene_hash`,
+`config`, `config_sha256` and `timestamp`. A number the mode cannot measure is JSON `null`: a teleop
+trial has no policy plan, so its authority is null; an autonomous trial has no command, so its
+`mean_r` and authority are null, and its `engaged_fraction` is 0. In the npz, a value the mode does not
+have is NaN in its array -- the shapes stay `(T, 8)/(T, 7)`, so a re-analysis can tell "not measured"
+from a measured zero.
+
+**Authority** is the study's one continuous metric: with `a` the executed action, `p` the base
+policy's own chunk step for that tick and `r` the served command, all in action units,
+`clip(<a-p, r-p> / ||r-p||^2, 0, 1)` on dims 0-6, over the steps where the command is above
+`[command] deadband` (the operator was pushing). It is the fraction of the distance from the policy's
+plan to the operator's command that the executed action actually travelled; 1 means the method
+delivered the operator's command, 0 means it stayed with the policy. `engaged_fraction` is the share
+of steps the operator was above the deadband, and `mean_r` the mean command magnitude over those
+steps.
+
+**Pairing** uses `(pair, scene_hash)`: two trials of different arms pair only if they ran the same
+round and their reset observations digested the same. The digest is a SHA-256 of the rounded reset
+joint angles and a 32x32 uint8 downsample of the exterior camera's frame, so a scene the station did
+not restore is a different digest. The analysis reports the trials it could not match instead of
+pairing them by round alone; that unmatched count is the honesty of the test, not a nuisance to hide.
+
+### How to read the tables
+
+```bash
+uv run --extra pi mars-franka analyse --run examples/pi05/mars/franka/outputs/mars_franka/study/<run>
+```
+
+`--run` is repeatable and also takes a directory of runs (`--run .../study` reads every run under it);
+the CSVs (`per_arm.csv`, `paired.csv`) land beside the runs unless `--out DIR` says otherwise.
+
+The per-arm table is one row per (run, arm):
+
+| column | meaning |
+| --- | --- |
+| `n`, `successes`, `success_rate` | the trials of that arm, how many succeeded, and the rate |
+| `wilson_low`, `wilson_high` | the **Wilson score 95% interval** for that rate. Not the textbook normal interval: Wilson stays inside [0, 1] and does not collapse when an arm wins (or loses) every trial, which small blocks do |
+| `n_authority`, `mean_authority`, `authority_se` | the mean authority over the trials with an engaged step and its standard error; `n_authority` says how many trials that mean is over |
+
+The paired table compares every pair of arms **within a run**, on the matched `(pair, scene_hash)`
+trials only, and says its `n_matched` and `unmatched`:
+
+| column | meaning |
+| --- | --- |
+| `n_matched`, `unmatched` | how many trials paired (both arms started from the same round and scene) and how many did not; every other number in the row is over the matched trials |
+| `success_a`, `success_b` | the two arms' success rates over the matched trials |
+| `a_only`, `b_only`, `discordant` | the 2x2 table's discordant cells: trials where `a` succeeded and `b` did not, and the reverse. Only these carry information about a difference |
+| `mcnemar_p` | **McNemar's exact two-sided test** (the binomial on the discordant pairs; no normal approximation, no scipy). `p = 2 * P(X <= min(a_only, b_only))` under the fair coin, conditioned on the discordant count; capped at 1, and no discordant pair is `p = 1` |
+| `authority_diff` | mean paired difference (`b - a`) over the matched trials where both arms have an authority |
+| `wilcoxon_p` | the **Wilcoxon signed-rank test** on those paired authorities: exact for at most 20 nonzero differences, otherwise the normal approximation with a continuity and a tie correction |
+
+Neither test is a verdict. A Wilson interval at `n = 10` spans most of [0, 1], and McNemar only sees
+the pairs where the arms disagreed, so a block's table tells you whether a difference is worth a
+bigger block, not whether MARS works. Every number is **one operator's** -- the operator drives the
+study arms and enters the outcomes -- and a handful of trials: read the block as an **apparatus check
+first** (does the arm move at all, is the scene reproducible, are the digests pairing) and a study
+second. A block where the anchors behave as expected and the digests pair is worth pooling into a
+larger one; a block with a broken reset or a failed arm is a bring-up fact, not a result.
+
 ## Commands
 
 ```bash
 uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--record NAME]
                                       [--record-states NAME] [--steps N] [--trace] [--dry-run]
                                       [--corrupted]
+uv run --extra pi mars-franka analyse --run DIR [--run DIR ...] [--out DIR]
 ```
 
 | command | what it runs |
@@ -444,6 +576,8 @@ uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--recor
 | `train-user` | Phase B's user-module trainer: reads `[user] states`, writes `[user] out/user.pt` and `train_log.json`; not a session |
 | `validate-user` | Phase B's offline validator: evaluates `[user] checkpoint` on the held-out states and writes `[user] out/validation.json`; no arm, no station |
 | `train-task` | Phase C's task-module trainer: reads `[task] demos`, writes `[task] out/task.pt` and `train_log.json`; not a session |
+| `study` | Phase D's block runner: the `[study]` arms x rounds, the scene resets, the y/n outcome, and the run's records |
+| `analyse` | Phase D's analysis: reads the runs' `trials.jsonl` and prints and writes the per-arm and paired tables; no config, no station |
 | `probe` | the bring-up report; moves nothing and records nothing |
 
 | flag | meaning |
@@ -456,9 +590,15 @@ uv run --extra pi mars-franka <command> [--config PATH] [--prompt TEXT] [--recor
 | `--trace` | print one line per tick: tick, mode, served command, action, the joints before it, gripper |
 | `--dry-run` | fake station, source and bundle: no c3po, no torch, no checkpoint, no device |
 | `--corrupted` | `teleop` only; the shared commands always apply `[readout]` |
+| `--run DIR` | `analyse` only, repeatable: a run directory, or a directory holding run directories |
+| `--out DIR` | `analyse` only: where `per_arm.csv` and `paired.csv` go (default: beside the runs) |
 
-Ctrl-C ends a run and closes the station and the source; the exit status is 130. A user error (config,
-missing device, missing asset, missing c3po) prints one line to stderr and exits 2.
+Ctrl-C ends a run and closes the station and the source; the exit status is 130 (`study` also returns
+130 when the operator stops a block, with the finished trials recorded). A user error (config, missing
+device, missing asset, missing c3po) prints one line to stderr and exits 2. `study`, `analyse` and the
+trainers are not sessions: they refuse `--steps`, `--record`, `--record-states`, `--trace`, `--dry-run`
+and `--corrupted`, and `analyse` also refuses `--config` and `--prompt` because it reads only the
+records.
 
 ## Configuration
 
@@ -484,6 +624,7 @@ A variant file overrides individual keys, so a study condition is a file the rep
 | `[user]` | `states` (the file or the session directory), `out` (`user.pt`, `train_log.json`, `validation.json`), `checkpoint` (`validate-user` and the study read it), `cues`, `sigma`, and the module's shape (`horizon`, `d`, `tdim`, `time_embedding`, `step_rank`, `cross_step_rank`, `additive`, `correct_by`) |
 | `[task]` | `demos` (the downloaded `teleop --record` dataset), `out` (`task.pt`, `train_log.json`), `checkpoint` (`[modes.mars-t]`/`[modes.mars]` read it), `token_source = "vlm_image"`, `render_size = 224`, `scene_rank`, `d`, `tdim`, `lambda_id` |
 | `[training]` | `steps`, `batch`, `lr`, `val_frac`, `seed`, `log_every`, `val_depths`, `device`: the trainer's loop, its held-out split and the depths the validator runs |
+| `[study]` | Phase D's block: `arms` (command names and `[modes.<name>]` tables, each must resolve), `trials` (the rounds: every arm once per round), `order = "shuffled"` or `"blocked"`, `max_steps` (a trial's cap, then the outcome question), `out` (the run-directory parent), `seed` (the shuffled order's) |
 | `[spacemouse]` | `path`, `hid_id`, `full_scale`, `rotation_full_scale`, `source`, `sign` |
 | `[recording]` | `dir = "outputs/mars_franka"`, relative to this folder |
 
@@ -526,6 +667,17 @@ The provenance of the numbers, because the runbook is also the record:
   holds out the demonstrations with the same rule (whole episodes when there are several).
 - `[training] steps = 3000` is a study choice; nothing in the papers sets it. The first training run's
   wall time belongs in the hardware facts table below.
+- `[study] trials = 10`, `max_steps = 600` and the S1/S2 arm lists are study choices; nothing measures
+  them. `order = "shuffled"` with `seed = 0` fixes the block's run order (each round is the seed's
+  permutation of the arms), so a variant config re-running a block has the same order; `"blocked"`
+  runs arm by arm for the apparatus check. The authority metric is DESIGN.md's formula, computed by
+  the study from the executed actions, the policy's plans and the served commands it records -- it is
+  a measurement of the delivered command, not a label.
+- **Every study number is one operator's and a small block's.** The operator drives every arm and
+  enters every outcome, so the per-arm rates are that person's; the Wilson intervals, McNemar and
+  Wilcoxon are there to keep a small n honest, not to make it large. Read a block as an apparatus
+  check first (is the scene reproducible, do the digests pair, do the anchors move) and a study
+  second.
 
 `[command] q0 = []` means the station's reset pose, captured once at connect. The probe prints that
 pose and the 7×7 `F` it produces; set `q0` to seven joint angles to pin the lift when the station's
@@ -567,6 +719,22 @@ reset pose must not be trusted.
   prompt-conditioned field, so the checkpoint records the prompt it was trained with and `train-task`
   refuses to overwrite a module recorded under another one. Point `[task] out`/`checkpoint` elsewhere
   for a different task, or move the module.
+- **`study` refuses a session flag** — `study` takes `--config` and `--prompt` only: the block's
+  arms, rounds, order, cap and output parent come from `[study]`. If the flag you want is a trial
+  count, set `[study] trials`; if it is a step cap, `[study] max_steps`.
+- **`analyse` refuses a record field** — the analysis reads the Phase D record and refuses a legacy
+  or foreign one by name rather than dropping the column. A `trials.jsonl` written by an older
+  protocol (the LIBERO study's fields, or a draft's `mean_|r|`) is not this block's; point `--run` at
+  the run directory `study` wrote.
+- **The analysis reports unmatched trials** — the two trials of a pair did not start from the same
+  scene: `pair` matches (the round) but `scene_hash` does not, which is `reset()` not restoring the
+  objects, a moved camera, or a scene the operator changed between trials. Fix the scene reset or
+  read the matched tables only; do not pair by round alone.
+- **`study` shows the GPU out of memory at the second arm** — each arm's checkpoint is loaded once
+  for the whole block and held, so a two-arm block with the task module resident (S2) holds two
+  models. A 5090 fits the shipped blocks; if one does not, run the arms as two one-arm blocks and
+  analyse the two run directories together (`--run` is repeatable), accepting that they no longer
+  pair.
 - **`teleop --corrupted` refuses to start with a missing statistics file** — the readout's noise is
   in action-standard-deviation units and the std comes from `assets/droid/norm_stats.json`. Plain
   `teleop` is clean and does not need it; `--corrupted` and every shared command do. Download the
@@ -615,4 +783,8 @@ facts the code cannot know.
 | `lerobot/pi05_base` cache location and size (the scene encoder) | |
 | `train-task` wall time, final held-out flow-matching loss (`train_log.json`) | |
 | `mars-t` / `mars` session check (date, what the task module changed) | |
+| study block: date, arms, rounds, order, the run directory (`run.json`'s `run`, `git_head`, `git_dirty`) | |
+| study block: operator (who drove every arm and entered every outcome; the numbers are per-operator) | |
+| study block: scene reset -- does `reset()` restore the objects? (matched vs unmatched counts per pair) | |
+| study block: what the per-arm and paired tables said (paste the two tables or the CSVs' paths) | |
 | probe output | `examples/pi05/mars/franka/outputs/mars_franka/probe-session.txt` |

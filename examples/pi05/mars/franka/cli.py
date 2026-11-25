@@ -44,6 +44,17 @@ their input, output and checkpoint paths from their own table (``[user]`` or ``[
 so their imports are lazy (another command's path never pulls torch); they print their own progress,
 and ``validate-user`` its table.
 
+Phase D adds the two commands that read a block instead of running one session. ``study`` runs what
+``[study]`` describes: rounds of trials over its arms, a scene reset and a y/n outcome question per
+trial, and the run's records under ``<[study] out>/<timestamp>_<config stem>/`` (``trials.jsonl``, one
+``trials/<arm>-<pair>.npz`` per trial, the config copy and ``run.json``). ``study.main`` builds every
+arm here (:func:`compose_arm`), so an arm is a fixed session command or a ``[modes.<name>]`` table and
+nothing new; a new ``Loop`` per trial reuses the arm's bundle. ``analyse`` reads one or more run
+directories (or a directory holding them) and prints and writes the per-arm table and the paired
+tests; it needs no config, so its only flag is its own repeatable ``--run``. Neither command is a
+session: ``--steps``, ``--record``, ``--record-states``, ``--trace``, ``--dry-run`` and ``--corrupted``
+are refused (the block comes from ``[study]``, the runs from ``--run``), and their imports are lazy.
+
 ``probe`` is a later slice: its import is lazy, and it records nothing, so ``--record`` is
 refused. Ctrl-C is caught here, and only here, after the station and the source are closed; 130 is
 returned. A user-facing failure (config, composition, a missing device/asset, missing c3po) prints one
@@ -81,13 +92,22 @@ DEFAULT_CONFIG = EXAMPLE_DIR / "configs" / "franka.toml"
 
 NON_SESSION_COMMANDS = ("train-user", "validate-user", "train-task")
 """The commands that are not a control session: no station, no source, no loop (the Phase B/C trainers and validator)."""
-COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS, *NON_SESSION_COMMANDS, "probe")
+COMMANDS = (
+    "autonomous",
+    "teleop",
+    *STEERED_COMMANDS,
+    *NON_SESSION_COMMANDS,
+    "study",
+    "analyse",
+    "probe",
+)
+"""Every fixed command: the sessions, the Phase B/C tools, the Phase D block and analysis, and ``probe``."""
 
-_PROMPT_OPTIONAL = ("teleop", "probe")
+_PROMPT_OPTIONAL = ("teleop", "probe", "analyse")
 """The commands that run without a task text; every other command requires ``--prompt``."""
 
-_NON_SESSION_FLAGS = ("record", "record_states", "steps", "trace", "corrupted", "dry_run")
-"""The session flags the trainers and the validator refuse: their table names their input and output."""
+_SESSION_FLAGS = ("record", "record_states", "steps", "trace", "corrupted", "dry_run")
+"""The flags a session's run reads; every command that is not a session refuses them."""
 
 _NON_SESSION_SECTION = {"train-task": "[task]"}
 """The config table a non-session command's input and output come from (``[user]`` when not named)."""
@@ -112,9 +132,13 @@ class _Method:
 def main(argv: list[str] | None = None) -> int:
     """Run one command; 0 on success, 2 for a user error, 130 after Ctrl-C."""
     parser, args = _parse_args(argv)
-    if args.command == "probe":
-        return _probe(args)
     try:
+        if args.command == "analyse":
+            return _analyse(args)
+        if args.command == "probe":
+            return _probe(args)
+        if args.command == "study":
+            return _study(args)
         config = load_config(args.config)
         _check_command(args, config, parser)
         _print_session(args, config)
@@ -146,7 +170,7 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.ArgumentParser, argpar
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
+        default=None,
         metavar="PATH",
         help=f"the config file (default: {DEFAULT_CONFIG})",
     )
@@ -171,7 +195,24 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.ArgumentParser, argpar
         action="store_true",
         help="teleop only: apply [readout]; plain teleop commands a clean readout",
     )
+    parser.add_argument(
+        "--run",
+        action="append",
+        type=Path,
+        metavar="DIR",
+        help="analyse only: a run directory or a directory of them (repeatable)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        metavar="DIR",
+        help="analyse only: the directory the CSVs are written to (default: beside the run directories)",
+    )
     args = parser.parse_args(argv)
+    # The default config is filled in here, but whether the flag was given is kept: analyse takes none.
+    args.config_explicit = args.config is not None
+    if args.config is None:
+        args.config = DEFAULT_CONFIG
     _check_args(args, parser)
     return parser, args
 
@@ -182,20 +223,44 @@ def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
     The prompt rule covers the fixed commands here; a generic ``[modes.<name>]`` name is checked once
     the config is read (``_check_command``), because only the file says whether it is a mode at all.
     """
+    if args.run is not None and args.command != "analyse":
+        parser.error("--run is analyse only: it names the run directories the analysis reads")
+    if args.out is not None and args.command != "analyse":
+        parser.error("--out is analyse only: it names the directory the analysis writes its CSVs to")
     if args.command in COMMANDS and args.command not in _PROMPT_OPTIONAL and args.prompt is None:
         parser.error(f"--prompt is required for {args.command!r}")
-    if args.corrupted and args.command != "teleop":
-        parser.error("--corrupted is teleop only: the shared modes always apply [readout]")
-    if args.command == "probe" and (args.record is not None or args.record_states is not None):
-        parser.error("probe records nothing: it prints the station and checkpoint facts and moves nothing")
     if args.command in NON_SESSION_COMMANDS:
-        given = [f"--{name.replace('_', '-')}" for name in _NON_SESSION_FLAGS if getattr(args, name)]
+        given = [f"--{name.replace('_', '-')}" for name in _SESSION_FLAGS if getattr(args, name)]
         if given:
             section = _NON_SESSION_SECTION.get(args.command, "[user]")
             parser.error(
                 f"{args.command} takes --config and --prompt only ({given[0]} is not one): "
                 f"{section} names its input and its output"
             )
+    if args.command == "study":
+        given = [f"--{name.replace('_', '-')}" for name in _SESSION_FLAGS if getattr(args, name)]
+        if given:
+            parser.error(
+                f"study takes --config and --prompt only ({given[0]} is not one): [study] names the "
+                f"block, its rounds and its cap"
+            )
+    if args.command == "analyse":
+        given = [f"--{name.replace('_', '-')}" for name in _SESSION_FLAGS if getattr(args, name)]
+        if args.config_explicit:
+            given.insert(0, "--config")
+        if args.prompt is not None:
+            given.append("--prompt")
+        if given:
+            parser.error(
+                f"analyse takes --run DIR only ({given[0]} is not one): it reads the run records, "
+                f"not a config or a session"
+            )
+        if not args.run:
+            parser.error("analyse needs --run DIR (repeatable): the run directories to read")
+    if args.corrupted and args.command != "teleop":
+        parser.error("--corrupted is teleop only: the shared modes always apply [readout]")
+    if args.command == "probe" and (args.record is not None or args.record_states is not None):
+        parser.error("probe records nothing: it prints the station and checkpoint facts and moves nothing")
 
 
 def _check_command(args: argparse.Namespace, config: Config, parser: argparse.ArgumentParser) -> None:
@@ -281,31 +346,103 @@ def _train_task(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def _study(args: argparse.Namespace) -> int:
+    """``study``: run the block ``[study]`` describes and print the run directory.
+
+    Phase D's runner is its own module (``study.py``): the block, the outcome entry and the records are
+    not a session's concerns, and its import is lazy so only this command's path pulls it. The command
+    hands it the same config file and prompt the session commands take; everything else -- the arms,
+    the round count, the cap, the output parent -- is the ``[study]`` table's. The runner returns 130
+    when the operator stopped the block early (its records are complete for the trials it finished).
+    """
+    import study
+
+    return study.main(["--config", str(args.config), "--prompt", args.prompt])
+
+
+def _analyse(args: argparse.Namespace) -> int:
+    """``analyse``: read the runs' records and print (and write) the tables.
+
+    No config and no station: ``analysis.py`` reads only the ``trials.jsonl`` files under the ``--run``
+    directories (or under a directory holding them). Lazy import, so no session's path pulls it.
+    """
+    import analysis
+
+    argv = [argument for run in args.run for argument in ("--run", str(run))]
+    if args.out is not None:
+        argv += ["--out", str(args.out)]
+    return analysis.main(argv)
+
+
 # ---------------------------------------------------------------- composition
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One command composed as the loop runs it: the loop's mode, its config, and its policy pieces.
+
+    ``loop_config`` is the config the loop runs under (plain teleop's clean readout, everything else
+    the file's), ``adapter_from_corruption`` the name a ``mars-f`` table's 7x7 is resolved by, and
+    ``bundle``/``steering`` the policy objects (None for teleop, None steering for autonomous). The CLI
+    builds one arm per run; the study builds each arm once and runs a new ``Loop`` over it per trial.
+    """
+
+    command: str
+    loop_mode: str
+    loop_config: Config
+    bundle: Any = None
+    steering: Any = None
+    adapter_from_corruption: str | None = None
+
+
+def compose_arm(
+    command: str,
+    config: Config,
+    config_path: Path = DEFAULT_CONFIG,
+    *,
+    dry_run: bool = False,
+    corrupted: bool = False,
+) -> Arm:
+    """The command's whole composition, in one place: what a session and a study arm both run.
+
+    A study's arm is a command name, and DESIGN.md freezes that it is "composed exactly as the CLI
+    composes it"; this function is that sentence. ``dry_run`` builds the fake bundle and steering and
+    never touches a checkpoint (the CLI's dry runs); a study never asks for it. ``corrupted`` is
+    teleop's clean-readout choice: a session's flag, and the study's arms are always the file's readout.
+    """
+    method = _method(command, config, config_path)
+    bundle, steering = _policy(method, config, dry_run=dry_run, command=command)
+    return Arm(
+        command=command,
+        loop_mode=method.loop_mode,
+        loop_config=_loop_config(command, corrupted=corrupted, config=config),
+        bundle=bundle,
+        steering=steering,
+        adapter_from_corruption=method.adapter,
+    )
 
 
 def _run(args: argparse.Namespace, config: Config) -> int:
     """Build the command's objects, close the devices whichever way the run ends, and print the dataset."""
-    method = _method(args.command, config, args.config)
-    bundle, steering = _policy(method, config, dry_run=args.dry_run, command=args.command)
+    arm = compose_arm(args.command, config, args.config, dry_run=args.dry_run, corrupted=args.corrupted)
     prompt = "" if args.prompt is None else args.prompt
     with ExitStack() as stack:
         source = None
-        if method.loop_mode != "autonomous":  # autonomous is the policy alone: no operator device
-            source = stack.enter_context(closing(_source(config, args.dry_run)))
-        station = stack.enter_context(closing(_station(config, args.dry_run)))
-        loop_config = _loop_config(args.command, args.corrupted, config)
+        if arm.loop_mode != "autonomous":  # autonomous is the policy alone: no operator device
+            source = stack.enter_context(closing(open_source(config, args.dry_run)))
+        station = stack.enter_context(closing(open_station(config, args.dry_run)))
+        loop_config = arm.loop_config
         if args.dry_run:
-            loop_config = _dry_run_statistics(stack, loop_config, method.loop_mode)
+            loop_config = _dry_run_statistics(stack, loop_config, arm.loop_mode)
         states = _recorder(args, config, loop_config)
         loop = Loop(
             config=loop_config,
             station=station,
-            mode=method.loop_mode,
+            mode=arm.loop_mode,
             source=source,
-            bundle=bundle,
-            steering=steering,
-            adapter_from_corruption=method.adapter,
+            bundle=arm.bundle,
+            steering=arm.steering,
+            adapter_from_corruption=arm.adapter_from_corruption,
         )
         if args.record is not None:
             path = loop.run_recording(
@@ -412,8 +549,12 @@ class _DrySteering:
         self.adapter = SimpleNamespace(matrix=None)
 
 
-def _source(config: Config, dry_run: bool) -> Any:
-    """The operator's device: a fake for a dry run, the configured SpaceMouse otherwise ("" = search)."""
+def open_source(config: Config, dry_run: bool = False) -> Any:
+    """The operator's device: a fake for a dry run, the configured SpaceMouse otherwise ("" = search).
+
+    Public because the study builds one source for its whole block (the loop resets the latch per
+    episode); a session builds one for its single run.
+    """
     if dry_run:
         return FakeSource()
     mouse = config.spacemouse
@@ -427,8 +568,12 @@ def _source(config: Config, dry_run: bool) -> Any:
     )
 
 
-def _station(config: Config, dry_run: bool) -> Any:
-    """The station: the fake for a dry run, c3po otherwise (the single optional hardware dependency)."""
+def open_station(config: Config, dry_run: bool = False) -> Any:
+    """The station: the fake for a dry run, c3po otherwise (the single optional hardware dependency).
+
+    Public for the same reason as :func:`open_source`: a study resets one station for every trial of the
+    block, so it opens one.
+    """
     if dry_run:
         return FakeStation(_dry_observations(config), config.station.rate)
     return C3poStation(config.station.host, config.station.port, config.station.rate)
