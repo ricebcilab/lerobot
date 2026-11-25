@@ -144,11 +144,11 @@ class C3poStation:      # lazily imports c3po in __init__, so tests never need i
 class FakeStation:      # deterministic, for tests and --dry-run; records the actions it was sent
 def action_dict(action8: NDArray, arm: str) -> dict[str, NDArray]
 def observation_batch(obs: dict, *, arm: str, cameras: dict, task: str) -> dict
-    # {"observation.images.base_0_rgb": uint8 (224,224,3) exterior letterboxed,
+    # {"observation.images.base_0_rgb": float32 (3,224,224) in [0,1], exterior letterboxed,
     #  "observation.images.left_wrist_0_rgb": ... wrist ...,
-    #  "observation.images.right_wrist_0_rgb": zeros unless cameras["third"] names a feed,
     #  "observation.state": float32 (32,) = concat(joint_position (7,), gripper (1,)) then zeros,
     #  "task": task}
+    # "observation.images.right_wrist_0_rgb" is OMITTED unless cameras["third"] names a feed.
 def resize_with_pad(image: NDArray, size: int = 224) -> NDArray   # openpi's letterbox, PIL bilinear
 ```
 
@@ -161,10 +161,11 @@ class Bundle:
     mean: NDArray; std: NDArray          # action statistics, 8-wide after install_stats
 
 def load_bundle(cfg) -> Bundle           # pi05_droid on cfg.device, dtype bf16; no weights needed to test
-def install_stats(preprocessor, postprocessor, stats_path: Path, action_dim: int = 8) -> tuple[NDArray, NDArray]
-    # openpi's assets/droid/norm_stats.json (32-wide, q01/q99, dims >= 8 all zero) -> LeRobot's MEAN_STD
-    # statistics on both pipelines' normalizer/unnormalizer steps; returns (mean, std) 8-wide; refuses a
-    # file whose meaningful width is not action_dim
+def install_stats(preprocessor, postprocessor, stats_path: Path, dims: int = 8) -> tuple[NDArray, NDArray]
+    # openpi's assets/droid/norm_stats.json (state and actions, 32-wide q01/q99, dims >= 8 zero) -> the
+    # q01/q99 statistics the QUANTILES norm_map reads, on the pre-processor's normalizer (state and action)
+    # and the post-processor's unnormalizer (action); returns the action (mean, std) 8-wide for the steering
+    # cores; refuses a file whose meaningful width is not `dims`
 def make_steering(bundle, steering_cfg, adapter=None) -> SteeringPolicy
 def steering_batch(bundle, raw_batch: dict) -> dict      # preprocessor(raw_batch), on the policy's device
 def policy_action(bundle, policy, batch, command7: NDArray | None, task: str) -> NDArray   # (8,) action units
@@ -204,11 +205,34 @@ demonstration-collection path. `teleop --corrupted` applies `[readout]`. Every s
 `[readout]`. `--dry-run` uses `FakeStation` and never imports c3po or torch, and prints every action.
 `--config` defaults to `examples/pi05/mars/franka/configs/franka.toml`.
 
+### What the checkpoint's own code settles (read from the artifact, [V])
+
+These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/post-processor JSONs, and
+`modeling_pi05.py`; a slice may not re-open them by assumption:
+
+- **Images**: the model does `img = img * 2.0 - 1.0` for SigLIP and then resizes with padding, so a batch
+  image must be **float in [0,1]** (uint8 would be multiplied as 0-255 and destroyed). It accepts either
+  channel order, and a client-side letterbox to 224 skips its resize. We send float32 `(3,224,224)`.
+- **A missing image key is legal**: `PI05Policy.prepare_images` fills absent `config.image_features` keys with
+  an image of -1 and a **zero mask**. That is why the third slot is *omitted*, not filled with zeros — a
+  zeros image would carry mask 1 and be a different input. `cameras.third` can name a feed to include it
+  instead; the probe prints which convention a session ran.
+- **State**: `observation.state` is declared `(32,)` and is **not** padded by the model, while the prompt's
+  state tokens are the discretized values of every dim of it. So the station sends the 32-wide vector
+  (8 real dims, zeros beyond), and the state statistics must be installed 32 wide.
+- **Statistics**: `assets/droid/norm_stats.json` has **both** `state` and `actions`, each 32 wide with
+  `q01`/`q99`/`mean`/`std`, meaningful in dims 0-7 and zero beyond. The checkpoint's `normalization_mapping`
+  is `QUANTILES` for STATE and ACTION, and `NormalizerProcessorStep`/`UnnormalizerProcessorStep` read the
+  stats named by that mode, so the install puts `q01` and `q99` on the pre-processor's normalizer and on the
+  post-processor's unnormalizer for `action` and `observation.state` — not `mean`/`std`. `action_mean_std`
+  (which the steering cores use) converts quantiles to its affine form itself.
+- Actions are padded by the model (`pad_vector(batch[ACTION], max_action_dim)`), so the station sends 8 wide.
+
 ## Config schema (`configs/franka.toml`)
 
 ```toml
 [station]   host = "10.42.0.1" ; port = 9090 ; arm = "follower" ; rate = 15.0
-[cameras]   exterior = "scene_zed" ; wrist = "wrist_zed"        # third = null: the third slot is zeros
+[cameras]   exterior = "scene_zed" ; wrist = "wrist_zed"        # third: absent = omit the third image key
 [policy]    path = "lerobot/pi05_droid" ; stats = "assets/droid/norm_stats.json" ; device = "cuda"
             n_action_steps = 8 ; dtype = "bfloat16"
 [command]   translation_gain = 0.11 ; rotation_gain = 0.5 ; twist_length = 0.2
@@ -248,7 +272,7 @@ That is all. FRS with a 7-wide command and `reference_step = 1.0` then builds `(
 | A2 SpaceMouse rotation | `src/lerobot/teleoperators/spacemouse/teleop_spacemouse.py`, `tests/teleoperators/test_spacemouse.py` | report id 2 parses to `(rx, ry, rz)`; `SpaceMouseReader.rotation`; 6-axis mapping class; additive (existing tests untouched and green) |
 | A3 config + bridge | `examples/.../config.py`, `bridge.py`, `tests/.../test_config.py`, `test_bridge.py` | config loads the shipped TOML, rejects unknown keys; Jacobian reproduces the reference implementation's numbers at a known `q`; `lift_inverse(F) @ F == I` for the three families; IK round-trips a small twist; readout clips |
 | A4 station | `examples/.../station.py`, `tests/.../test_station.py` | fake station round-trip; `observation_batch` keys/shapes/dtypes and the 32-wide state padding; `action_dict` clip/binarize; c3po never imported at module level |
-| A5 policy | `examples/.../policy.py`, `tests/.../test_policy.py` | `install_stats` on the real `norm_stats.json` gives 8-wide mean/std and installs on both pipeline configs; test skips when the gated PaliGemma tokenizer is not cached |
+| A5 policy | `examples/.../policy.py`, `tests/.../test_policy.py` | `install_stats` on the real `norm_stats.json` installs 32-wide `q01`/`q99` for `action` and `observation.state` on the right steps and returns the 8-wide action mean/std; a real `NormalizerProcessorStep`/`UnnormalizerProcessorStep` round-trip an 8-wide action through them; the full end-to-end pipeline test is skipped when the gated PaliGemma tokenizer is not cached (it runs on chopper) |
 | A6 integration | `examples/.../loop.py`, `cli.py`, `probe.py`, `configs/franka.toml`, `README.md`, `src/lerobot/scripts/mars_franka.py`, `pyproject.toml` | loop drives a fake station and a fake sampler with exactly one `step` per action and no sleeps; every command and every mode reaches the right composition; `--dry-run` runs offline |
 
 ## Verification gates
