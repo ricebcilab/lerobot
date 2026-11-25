@@ -214,11 +214,7 @@ def test_the_shipped_config_is_the_study_config():
     assert (config.user.step_rank, config.user.cross_step_rank, config.user.additive) == (None, 0, False)
     assert (config.training.steps, config.training.batch, config.training.lr) == (3000, 8, 1e-3)
     assert (config.training.val_frac, config.training.seed, config.training.log_every) == (0.1, 0, 100)
-    assert (config.training.val_depths, config.training.device, config.training.dtype) == (
-        (10, 4),
-        "cuda",
-        "bfloat16",
-    )
+    assert (config.training.val_depths, config.training.device) == ((10, 4), "cuda")
 
 
 @pytest.mark.parametrize("command", SHIPPED_COMMANDS)

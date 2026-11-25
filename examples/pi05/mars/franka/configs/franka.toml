@@ -98,4 +98,3 @@ seed = 0 # the split, the cues, the noise draws and the reversal steps all deriv
 log_every = 100
 val_depths = [10, 4] # the reversal depths validate-user runs (Phase B's validator)
 device = "cuda" # where the checkpoint and the module live while training
-dtype = "bfloat16" # the trainer's mixed precision on a CUDA device

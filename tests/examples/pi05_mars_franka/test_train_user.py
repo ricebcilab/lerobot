@@ -8,6 +8,7 @@ real statistics and a real session are verification on the station (chopper) onl
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from hashlib import sha256
 from pathlib import Path
@@ -31,6 +32,8 @@ GRIPPER = np.array([1.0])
 DEFLECTION = np.array([0.8, -0.7, 0.6, 0.0, 0.0, 0.0])  # a pilot push, past the readout's deadband
 SERVED = np.linspace(-0.4, 0.6, ARM_DIMS)
 PROMPT = "pick the cube"
+READOUT_META = {"corruption": {"rotation_z_deg": 20}, "noise": 0.35, "seed": 0}
+"""The readout provenance the CLI writes into a states file: this file's config's [readout]."""
 N_STEPS = 5
 HORIZON = 3
 WIDTH = 32  # the checkpoint's padded chunk width
@@ -294,9 +297,17 @@ def _bundle() -> Bundle:
     )
 
 
-def _states(path: Path, episodes: tuple[int, ...] = (0, 1)) -> Path:
-    """A two-row (or n-row) states file: one chunk boundary per episode, written by the real recorder."""
-    recorder = Recorder({"config": "test.toml", "timestamp": "2026-11-25T00:00:00+00:00"})
+def _states(path: Path, episodes: tuple[int, ...] = (0, 1), meta: dict | None = None) -> Path:
+    """A states file of ``len(episodes)`` chunk boundaries, written by the real recorder.
+
+    Its meta carries the readout provenance the CLI records (``READOUT_META``), so the trainer's check
+    passes; ``meta`` replaces the whole meta for a file collected under another readout or without one.
+    """
+    recorder = Recorder(
+        {"config": "test.toml", "timestamp": "2026-11-25T00:00:00+00:00", **READOUT_META}
+        if meta is None
+        else {"config": "test.toml", "timestamp": "2026-11-25T00:00:00+00:00", **meta}
+    )
     image = np.zeros((3, 224, 224), dtype=np.float32)
     batch = {"observation.images.base_0_rgb": image, "observation.images.left_wrist_0_rgb": image}
     for index, episode in enumerate(episodes):
@@ -348,6 +359,7 @@ def test_train_writes_a_loadable_checkpoint_and_a_log(tmp_path, monkeypatch):
     assert meta["cues"] == 1 and meta["module"]["step_rank"] is None and meta["module"]["additive"] is False
     assert meta["training"]["seed"] == 0 and meta["training"]["device"] == "cpu"
     assert meta["session"]["config"] == "test.toml"
+    assert meta["readout"]["checked"] is True
 
     written = json.loads((out / "train_log.json").read_text(encoding="utf-8"))
     assert written["meta"] == meta
@@ -378,6 +390,89 @@ def test_a_correct_by_past_the_checkpoints_schedule_is_named(tmp_path):
     config = _config(tmp_path / "states" / "pilot", tmp_path / "user", correct_by=99)
     with pytest.raises(ValueError, match="correct_by"):
         train_user._run(config, _bundle(), prompt=PROMPT, device="cpu", q0=Q0)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("corruption", {"rotation_z_deg": 30}), ("noise", 0.5), ("seed", 7)],
+)
+def test_a_states_file_from_another_readout_is_refused_naming_both(tmp_path, key, value):
+    """The trainer replays the config's [readout]; a file collected under another corruption, noise
+    level or seed is refused before the checkpoint is loaded, with both sides in the message."""
+    meta = {**READOUT_META, key: value}
+    states = _states(tmp_path / "states" / "pilot" / "states.npz", meta=meta)
+    config = _config(states, tmp_path / "user")
+    with pytest.raises(ValueError, match="different readout") as error:
+        train_user.train(config, prompt=PROMPT, states_path=states, out=tmp_path / "user", device="cpu")
+    message = str(error.value)
+    assert f"{value!r} in the file" in message
+    assert f"{getattr(config.readout, key)!r} in the config" in message
+
+
+def test_a_configured_q0_must_match_the_files_and_a_matching_one_trains(tmp_path, monkeypatch):
+    """The file's q0 is the corruption's lift pose; a configured [command] q0 must reproduce it."""
+    states = _states(tmp_path / "states" / "pilot" / "states.npz")
+    out = tmp_path / "user"
+    config = _config(states, out)
+    _fake_bundle(monkeypatch)
+    matching = dataclasses.replace(
+        config, command=dataclasses.replace(config.command, q0=tuple(float(value) for value in Q0))
+    )
+    assert (
+        train_user.train(matching, prompt=PROMPT, states_path=states, out=out, device="cpu")
+        == out / "user.pt"
+    )
+    other = dataclasses.replace(
+        config, command=dataclasses.replace(config.command, q0=tuple(float(value) for value in Q0 + 1.0))
+    )
+    with pytest.raises(ValueError, match="q0") as error:
+        train_user.train(other, prompt=PROMPT, states_path=states, out=tmp_path / "other", device="cpu")
+    assert "in the file" in str(error.value) and "as [command] q0" in str(error.value)
+
+
+def test_a_states_file_without_readout_provenance_warns_once_and_trains(tmp_path, monkeypatch, capsys):
+    """A hand-built or older file cannot be compared with the config: its readout is the config's,
+    unchecked, and the run says so once."""
+    states = _states(tmp_path / "states" / "pilot" / "states.npz", meta={"config": "old.toml"})
+    out = tmp_path / "user"
+    config = _config(states, out)
+    _fake_bundle(monkeypatch)
+
+    train_user.train(config, prompt=PROMPT, states_path=states, out=out, device="cpu")
+
+    assert capsys.readouterr().out.count("records no readout provenance") == 1
+    assert AdapterModules.load_module(out / "user.pt")[2]["readout"]["checked"] is False
+
+
+def test_the_weight_is_the_loops_deadband_not_the_readout_modules_default(tmp_path):
+    """A cue served at 0.04 is a cue for the loop ([command] deadband 0.02) and idle for the readout
+    module's default (0.05): weighting it out would calibrate on a different active set than the one the
+    module must correct."""
+    config = _config(tmp_path / "states" / "pilot", tmp_path / "user")
+    run = train_user._run(config, _bundle(), prompt=PROMPT, device="cpu", q0=Q0)
+    user = LearnedUserModule(run.chunk_size, ARM_DIMS, d=8, tdim=8)
+    served = np.full(ARM_DIMS, 0.04)
+    assert not bool(train_user.readout.is_active(served))  # the readout module's default: idle
+    assert bool(train_user.readout.is_active(served, config.command.deadband))  # the loop's: active
+    intent = served + 0.2  # the intent's reference is another command: the target is not the plain field
+    path = train_user.reversal_path(
+        Flow(_linear(0.25)), run.core.reference_chunk(intent[None]), run.num_steps
+    )
+    row = {
+        "image_exterior": np.zeros((3, 224, 224), dtype=np.uint8),
+        "image_wrist": np.zeros((3, 224, 224), dtype=np.uint8),
+        "joint_position": JOINT,
+        "gripper": GRIPPER,
+        "served": served[None].copy(),
+        "paths": path.float().cpu(),
+    }
+    k, draws = torch.zeros(1, dtype=torch.long), np.zeros(1, dtype=int)
+
+    loss = train_user._loss(run, user, [row], draws, k)
+    assert float(loss.detach()) > 0.0  # the loop's deadband keeps the cue in the regression
+    idle = dataclasses.replace(config, command=dataclasses.replace(config.command, deadband=0.05))
+    idle_run = train_user._run(idle, _bundle(), prompt=PROMPT, device="cpu", q0=Q0)
+    assert float(train_user._loss(idle_run, user, [row], draws, k).detach()) == 0.0  # the default drops it
 
 
 def test_main_trains_from_the_config_and_lets_the_flags_override_the_paths(tmp_path, monkeypatch):

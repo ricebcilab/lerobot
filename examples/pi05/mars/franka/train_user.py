@@ -16,18 +16,18 @@ DESIGN.md's "Phase B" recipe, in the order ``train`` runs it:
    prompted one. ``reversal_path`` unrolls ``Flow.reverse``'s Euler steps so every point is kept;
 5. at a random reversal step ``k`` the adapted reversal is fitted to the straight-line closure
    (``command_target``): ``U(x, t) P(x, t) = target`` on **all seven** dims, ``U`` the
-   ``LearnedUserModule`` and ``P`` the frozen policy's field, weighted by the readout-active rows
-   (an idle cue is not a cue). A faithful command leaves ``U`` the identity: a zero-initialised
-   module is plain FRS.
+   ``LearnedUserModule`` and ``P`` the frozen policy's field, weighted by the rows the loop's
+   ``[command] deadband`` counts as active (an idle cue is not a cue). A faithful command leaves ``U``
+   the identity: a zero-initialised module is plain FRS.
 
 Where the per-step field comes from. ``P`` is the policy's velocity field for one observation, which
 ``bundle.policy.velocity_field`` returns as a closure over the encoded prefix (the images and tokens on
 the device). It is evaluated in the checkpoint's own loaded dtype (``[policy] dtype``) and without a
-mixed-precision context, exactly as the control loop evaluates it: ``[training] dtype`` is recorded in
-the checkpoint's meta but does not wrap the field, because a context the loop does not use would
-calibrate the module in a field the study never steers. The trainer keeps per state only the small arrays the regression reads -- the served cue
-commands, (cues, 7), and their intent reversal paths, (cues, N + 1, H, 32), a few tens of kB each -- and
-a step re-prepares its ``batch`` sampled rows from the npz (``bundle.prepare``, one row at a time
+mixed-precision context, exactly as the control loop evaluates it; that dtype is recorded in the
+checkpoint's meta and nothing else changes the field's precision, so the module is calibrated in the
+field it corrects. The trainer keeps per state only the small arrays the regression reads -- the served
+cue commands, (cues, 7), and their intent reversal paths, (cues, N + 1, H, 32), a few tens of kB each --
+and a step re-prepares its ``batch`` sampled rows from the npz (``bundle.prepare``, one row at a time
 exactly as the control loop does) and stacks them into one batch. Caching every state's prepared device
 batch instead would hoard about 1.2 MB of images per state (hundreds of MB on the GPU) to save at most
 ``batch`` preprocessor calls a step; each state's velocity field is discarded once its paths are
@@ -37,7 +37,10 @@ on the state's pose and its path on the state's field.
 The readout is the config's ``[readout]`` replayed from the file: the states carry the session's ``q0``
 (the lift's pose) and ``episode`` (a ``{random: ...}`` corruption's draw), and the noise is the study's
 ``[user] sigma`` range, so the calibration is against the readout the module will correct, not against a
-cleaner one.
+cleaner one. The file's ``meta`` records the readout its session resolved (the CLI writes it), and
+``_check_readout`` compares that with the config: a different corruption, noise, seed or configured ``q0``
+is refused, because replaying another readout would train another condition's inverse; a file without
+that provenance cannot be compared, and the run says so once before using the config's readout.
 ``[user] correct_by`` completes the closure early instead of at the last reversal step; ``None`` (the
 default) uses all of them, FRS's own schedule.
 
@@ -127,7 +130,7 @@ def command_loss(user, velocity: Callable, x: torch.Tensor, t, target: torch.Ten
     (``apply_correction``: its cross-step coupling and additive term included). ``target`` is the
     straight-line closure's velocity (B, H, D); the module's first ``n_dims`` dims and its ``horizon``
     chunk steps are the compared ones. ``weight`` (B,) averages the per-sample errors, as in
-    ``LearnedUserModule.field_loss``: the readout-active rows.
+    ``LearnedUserModule.field_loss``: the rows the control loop counts as active.
     """
     with torch.no_grad():
         v = velocity(x, t).float()
@@ -279,6 +282,46 @@ def _rows(arrays: dict[str, NDArray]) -> list[dict]:
     ]
 
 
+_READOUT_KEYS = ("corruption", "noise", "seed")
+"""The readout provenance a states file's meta carries: the effective ``[readout]`` and its seed."""
+
+
+def _check_readout(config: Config, path: Path, session: dict, q0: NDArray) -> bool:
+    """Raise unless the states file's recorded readout is this config's; return whether it could be checked.
+
+    The trainer replays the config's ``[readout]`` at the file's ``q0`` and each row's episode, so a file
+    collected under another readout would train the wrong condition's inverse: a different corruption,
+    noise level or noise seed draws different served commands, and a different nominal pose moves the
+    corruption's lift. The CLI records the effective ``[readout]`` and its seed in the npz's meta, and the
+    lift's pose is the file's own ``q0``, which a configured ``[command] q0`` must reproduce. A file
+    without that provenance (hand-built, or older) cannot be compared: the config's readout is used and
+    the caller says so once, because the alternative would be a second, file-side override nobody asked
+    for -- an experiment is run with the config that matches its data.
+    """
+    if not all(key in session for key in _READOUT_KEYS):
+        return False
+    problems = []
+    if session["corruption"] != config.readout.corruption:
+        problems.append(
+            f"corruption {session['corruption']!r} in the file vs {config.readout.corruption!r} in the config"
+        )
+    if float(session["noise"]) != float(config.readout.noise):
+        problems.append(f"noise {session['noise']!r} in the file vs {config.readout.noise!r} in the config")
+    if int(session["seed"]) != int(config.readout.seed):
+        problems.append(f"seed {session['seed']!r} in the file vs {config.readout.seed!r} in the config")
+    pose = np.asarray(config.command.q0, dtype=np.float64)
+    if pose.size and not np.array_equal(q0, pose):
+        problems.append(f"q0 {q0.tolist()} in the file vs {list(config.command.q0)} as [command] q0")
+    if problems:
+        raise ValueError(
+            f"states: {path} was collected under a different readout than this config -- "
+            + "; ".join(problems)
+            + ". The trainer replays the config's [readout], so these states would train another "
+            "condition's inverse: run an experiment whose config matches the data it trains on"
+        )
+    return True
+
+
 def _raw_batch(row: dict, prompt: str) -> dict:
     """A state as the model-ready raw batch ``station.observation_batch`` builds at a chunk boundary.
 
@@ -364,7 +407,7 @@ def _loss(run: _Run, user, rows: list[dict], draws: NDArray, k: torch.Tensor) ->
     path = torch.stack([row["paths"][int(draw)] for row, draw in zip(rows, draws, strict=True)])
     reference = run.core.reference_chunk(served).float().to(run.device)
     x, target = command_target(path.to(run.device), reference, k, run.config.user.correct_by)
-    active = torch.as_tensor(readout.is_active(served), device=run.device)
+    active = torch.as_tensor(readout.is_active(served, run.config.command.deadband), device=run.device)
     velocity = _field(run, rows)
     return command_loss(user, velocity, x, (k / run.num_steps).float(), target, weight=active)
 
@@ -463,7 +506,9 @@ def _module(config: Config, run: _Run) -> LearnedUserModule:
     )
 
 
-def _meta(run: _Run, user: LearnedUserModule, states_path: Path, session: dict, counts: dict) -> dict:
+def _meta(
+    run: _Run, user: LearnedUserModule, states_path: Path, session: dict, counts: dict, checked: bool
+) -> dict:
     """The checkpoint's provenance: what replaying this run has to be reproduced against."""
     config = run.config
     return {
@@ -476,7 +521,7 @@ def _meta(run: _Run, user: LearnedUserModule, states_path: Path, session: dict, 
         "session": session,
         "policy": str(config.policy.path),
         "corruption": config.readout.corruption,
-        "readout": {"noise": config.readout.noise, "seed": config.readout.seed},
+        "readout": {"noise": config.readout.noise, "seed": config.readout.seed, "checked": checked},
         "command": {
             "translation_gain": config.command.translation_gain,
             "twist_length": config.command.twist_length,
@@ -486,6 +531,7 @@ def _meta(run: _Run, user: LearnedUserModule, states_path: Path, session: dict, 
             "max_action_dim": run.max_action_dim,
             "num_inference_steps": run.num_steps,
             "n_action_steps": getattr(run.bundle.policy.config, "n_action_steps", None),
+            "dtype": getattr(run.bundle.policy.config, "dtype", None),  # the field's loaded precision
         },
         "module": {
             "horizon": user.horizon,
@@ -508,7 +554,6 @@ def _meta(run: _Run, user: LearnedUserModule, states_path: Path, session: dict, 
             "seed": config.training.seed,
             "log_every": config.training.log_every,
             "device": run.device,
-            "dtype": config.training.dtype,
         },
     }
 
@@ -524,6 +569,12 @@ def train(config: Config, *, prompt: str, states_path: Path, out: Path, device: 
     path = _states_file(states_path)
     arrays, session = statefiles.load(path)
     rows = _rows(arrays)
+    checked = _check_readout(config, path, session, arrays["q0"])
+    if not checked:
+        print(
+            f"warning: {path} records no readout provenance; its readout is the config's [readout], unchecked",
+            flush=True,
+        )
     device = str(config.training.device if device is None else device)
     torch.manual_seed(config.training.seed)
     split_rng = np.random.default_rng([config.training.seed, 0])
@@ -557,7 +608,7 @@ def train(config: Config, *, prompt: str, states_path: Path, out: Path, device: 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     counts = {"rows": len(rows), "train": len(train_rows), "val": len(val_rows)}
-    meta = _meta(run, user, path, session, counts)
+    meta = _meta(run, user, path, session, counts, checked)
     module_path = AdapterModules.save_module(user.cpu(), out / "user.pt", kind="user", meta=meta)
     (out / "train_log.json").write_text(json.dumps({"meta": meta, "log": log}, indent=1), encoding="utf-8")
     return module_path

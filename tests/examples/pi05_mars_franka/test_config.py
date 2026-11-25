@@ -388,7 +388,7 @@ def test_the_training_section_has_the_phase_b_defaults(tmp_path):
     assert training == config_module.TrainingConfig()
     assert (training.steps, training.batch, training.lr) == (3000, 8, 1e-3)
     assert (training.val_frac, training.seed, training.log_every) == (0.1, 0, 100)
-    assert (training.val_depths, training.device, training.dtype) == ((10, 4), "cuda", "bfloat16")
+    assert (training.val_depths, training.device) == ((10, 4), "cuda")
 
 
 def test_the_training_section_parses_the_loop_and_the_device(tmp_path):
@@ -402,14 +402,13 @@ def test_the_training_section_parses_the_loop_and_the_device(tmp_path):
         "seed = 7\n"
         "log_every = 2\n"
         "val_depths = [3, 6]\n"
-        'device = "cpu"\n'
-        'dtype = "float32"\n',
+        'device = "cpu"\n',
     )
     training = cfg.training
     assert (training.steps, training.batch, training.lr) == (10, 2, 0.5)
     assert (training.val_frac, training.seed, training.log_every) == (0.25, 7, 2)
     assert training.val_depths == (3, 6)
-    assert (training.device, training.dtype) == ("cpu", "float32")
+    assert training.device == "cpu"
 
 
 @pytest.mark.parametrize(
@@ -436,7 +435,6 @@ def test_the_training_section_parses_the_loop_and_the_device(tmp_path):
         ("[training]\nlog_every = 0\n", "log_every"),
         ("[training]\nval_depths = []\n", "val_depths"),
         ("[training]\nval_depths = [0]\n", "val_depths"),
-        ('[training]\ndtype = "int8"\n', "dtype"),
     ],
 )
 def test_the_phase_b_values_are_checked_and_named(tmp_path, text, key):

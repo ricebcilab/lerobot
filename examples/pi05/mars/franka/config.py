@@ -164,7 +164,7 @@ class UserConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """The `[training]` table: the trainer's loop, split, device and precision (DESIGN.md, Phase B)."""
+    """The `[training]` table: the trainer's loop, split and device (DESIGN.md, Phase B)."""
 
     steps: int = 3000
     batch: int = 8
@@ -174,7 +174,6 @@ class TrainingConfig:
     log_every: int = 100
     val_depths: tuple[int, ...] = (10, 4)  # the reversal depths validate-user runs
     device: str = "cuda"  # where the checkpoint and the module live while training
-    dtype: str = "bfloat16"  # the trainer's mixed precision on a CUDA device
 
 
 @dataclass(frozen=True)
@@ -277,12 +276,6 @@ def _pair(value: Any, where: str) -> tuple[float, float]:
 def _time_embedding(value: Any, where: str) -> str:
     if value not in ("mars", "pi05"):
         raise ValueError(f"{where}: expected 'mars' or 'pi05', got {value!r}")
-    return value
-
-
-def _dtype(value: Any, where: str) -> str:
-    if value not in ("bfloat16", "float16", "float32"):
-        raise ValueError(f"{where}: expected 'bfloat16', 'float16' or 'float32', got {value!r}")
     return value
 
 
@@ -481,7 +474,7 @@ def _user(table: Any) -> UserConfig:
 
 
 def _training(table: Any) -> TrainingConfig:
-    """The `[training]` table: the loop, the split, the device and the precision."""
+    """The `[training]` table: the loop, the split and the device."""
     return _build(
         TrainingConfig,
         table,
@@ -494,7 +487,6 @@ def _training(table: Any) -> TrainingConfig:
             "log_every": _integer,
             "val_depths": _depths,
             "device": _text,
-            "dtype": _dtype,
         },
         "[training]",
     )
