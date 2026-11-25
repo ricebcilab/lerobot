@@ -21,6 +21,7 @@ from .teleop_spacemouse import (
     SpaceMouseTeleop,
     SpaceMouseTwist,
     find_spacemouse,
+    parse_motion,
     parse_report,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "SpaceMouseTeleop",
     "SpaceMouseTwist",
     "find_spacemouse",
+    "parse_motion",
     "parse_report",
 ]

@@ -1,6 +1,7 @@
 """The probe's pure and offline parts: the station report and action contract, the raw-report tally
-with its (report id, byte length) pairs and both int16 triples, the configuration numbers, the
-lines-on-failure/traceback rules, and main reporting an absent station instead of crashing.
+with its (report id, byte length) pairs and both int16 triples, the SpaceMouse verdict over both
+device layouts, the configuration numbers, the steered-mode chunk timing, the lines-on-failure/
+traceback rules, and main reporting an absent station instead of crashing.
 
 No c3po, no torch, no checkpoint, no SpaceMouse. A fake station supplies the manifest that c3po's
 describe handshake would give, the tally is fed synthetic reports in the module's layout (the report
@@ -267,7 +268,10 @@ def test_a_six_axis_report_shows_its_second_triple_at_offset_seven():
 def test_the_second_triple_is_not_printed_for_a_seven_byte_report():
     tally = _tally(_report(1, 350, -40, 12))
     lines = probe._tally_lines(tally)
-    assert any("offset 1 [+350 +40 +12]" in line and "offset 7" not in line for line in lines)
+    assert any(
+        "translation (offset 1) [+350 +40 +12]" in line and "rotation (offset 7)" not in line
+        for line in lines
+    )
 
 
 def test_the_tally_lines_print_every_pair_and_its_maxima():
@@ -275,24 +279,65 @@ def test_the_tally_lines_print_every_pair_and_its_maxima():
     _tally(_report6(1, 12, -350, 4, 3, 4, -5), tally, "/dev/hidraw8")
     text = "\n".join(probe._tally_lines(tally))
     assert "/dev/hidraw8 reports: id 1 (7 bytes) x 1, id 1 (13 bytes) x 1" in text
-    assert "/dev/hidraw8 id 1 (7 bytes): max |int16| offset 1 [+350 +40 +12]" in text
-    assert "/dev/hidraw8 id 1 (13 bytes): max |int16| offset 1 [+12 +350 +4], offset 7 [+3 +4 +5]" in text
+    assert "/dev/hidraw8 id 1 (7 bytes): max |int16| translation (offset 1) [+350 +40 +12]" in text
+    assert (
+        "/dev/hidraw8 id 1 (13 bytes): max |int16| translation (offset 1) [+12 +350 +4], "
+        "rotation (offset 7) [+3 +4 +5]" in text
+    )
 
 
 # ---------------------------------------------------------------- the SpaceMouse report
 
 
 def test_translation_passes_and_missing_rotation_fails_with_the_diagnosis():
-    """The session's shape: translation arrived on hidraw8; no id 2 anywhere, so rotation is a FAIL
-    whose diagnosis says to twist again and that the tally is where another id/shape would show."""
+    """The session's shape: translation arrived on hidraw8; no id 2 and no six-axis second triple, so
+    rotation is a FAIL whose diagnosis says to twist again and that the tally is where another
+    id/shape would show."""
     lines, failures = _mouse_report(_mouse_tally(), source=_source_facts())
     text = "\n".join(lines)
     assert failures == 1
     assert "[PASS] id 1 (translation) reports: max |counts| x 350 y 45 z 12" in text
     assert "[FAIL] id 2 (rotation) reports: none arrived on any node" in text
-    assert "[DIAG] no rotation report arrived on any node" in text
+    assert "[DIAG] no rotation motion arrived in either layout" in text
     assert "twist each rotation axis to its stop again" in text
     assert "second triple" in text and "13 bytes" in text
+
+
+def test_a_combined_six_axis_report_passes_rotation_and_reports_its_scale():
+    """The finding: no id 2 ever arrives, but the id 1 report's second triple carries the rotation, so
+    rotation is present and its observed peak is the scale to copy."""
+    tally = _mouse_tally()
+    _tally(_report6(1, 350, -40, 12, 350, -249, 100), tally, "/dev/hidraw8")
+    lines, failures = _mouse_report(tally, source=_source_facts())
+    text = "\n".join(lines)
+    assert failures == 0
+    assert "[PASS] rotation in the combined report: max |counts| x 350 y 249 z 100" in text
+    assert "[DIAG]" not in text
+    assert "copy into [spacemouse] rotation_full_scale = 350" in text
+    assert "the observed peak: the id 1 second triple" in text
+
+
+def test_a_six_axis_second_triple_at_rest_is_not_rotation_motion():
+    """A combined-layout device sends its translation reports under id 1 whether or not the stick is
+    twisted, so a second triple within the noise floor is not rotation: the FAIL/DIAG path stays."""
+    tally = _mouse_tally()
+    _tally(_report6(1, 350, -40, 12, 3, -4, 5), tally, "/dev/hidraw8")
+    lines, failures = _mouse_report(tally, source=_source_facts())
+    text = "\n".join(lines)
+    assert failures == 1
+    assert "[FAIL] id 2 (rotation) reports: none arrived on any node" in text
+    assert "[DIAG] no rotation motion arrived in either layout" in text
+    assert "+5 counts" in text
+
+
+def test_the_rest_vector_uses_the_combined_layouts_second_triple():
+    """The fallback rest six-vector (no source, or no tare) reads rotation from the newest id 1
+    six-axis report when no id 2 arrived."""
+    tally = _tally(_report6(1, 0, 0, 0, 175, 0, -70), node="/dev/hidraw8")
+    rest = probe._rest_from_tally(tally, load_config(SHIPPED))
+    assert rest[3] == pytest.approx(0.5)  # 175 counts / the default rotation full scale 350
+    assert rest[4] == pytest.approx(0.0)
+    assert rest[5] == pytest.approx(-0.2)
 
 
 def test_a_rotation_report_passes_the_check():
@@ -593,6 +638,106 @@ def test_the_policy_section_prints_its_checkpoint_facts_before_a_failing_prepare
     assert "Traceback (most recent call last)" in captured.err
     assert "TypeError: 'numpy.int64' object is not iterable" in captured.err
     assert "probe: 1/4 sections passed" in captured.out
+
+
+# ---------------------------------------------------------------- the steered timing
+
+
+def test_the_chunk_line_prints_the_pause_only_when_the_chunk_overruns():
+    """``chunk_ms - n_action_steps * 1000/rate``, when positive: the number that decides whether the
+    15 Hz loop stalls."""
+    config = load_config(SHIPPED)
+    overrun = probe._chunk_line("fc", "flow_control", 2000.0, config)
+    assert overrun == ("steered chunk time fc (flow_control): 2000 ms; pause at n_action_steps 8: 1467 ms")
+    assert probe._chunk_line("frs", "frs", 500.0, config) == "steered chunk time frs (frs): 500 ms"
+
+
+class _TimedBundle:
+    """A bundle stand-in: ``act`` records the command, ``reset`` counts the chunk resets, no model."""
+
+    def __init__(self):
+        self.commands = []
+        self.resets = 0
+
+    def act(self, batch, command=None):
+        self.commands.append(np.array(command, dtype=np.float64))
+        return np.zeros(8)
+
+    def reset(self):
+        self.resets += 1
+
+
+def test_the_steered_timing_times_each_modes_chunk_act_with_a_nonzero_command(monkeypatch):
+    """The autonomous chunk says nothing about FRS's reversal: the probe builds each steered mode and
+    times one act with a dummy command above the deadband, so the reversal path is what it times."""
+    import policy as policy_module
+
+    config = load_config(SHIPPED)  # ships [modes.fc] and [modes.frs]
+    bundle = _TimedBundle()
+    built = []
+
+    def fake_make_steering(a_bundle, table):
+        built.append(table.mode)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(policy_module, "make_steering", fake_make_steering)
+    clock = iter([0.0, 2.0, 5.0, 9.0])  # two chunk acts: 2 s for fc, 4 s for frs
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    lines = []
+    probe._steered_timing(config, {"batch": True}, 6.0, bundle, lines)
+    text = "\n".join(lines)
+    assert built == ["flow_control", "frs"]  # each mode's own table reached make_steering
+    assert (
+        "steered chunk time fc (flow_control): 2006 ms (prepare 6 + act 2000); "
+        "pause at n_action_steps 8: 1473 ms" in text
+    )
+    assert (
+        "steered chunk time frs (frs): 4006 ms (prepare 6 + act 4000); "
+        "pause at n_action_steps 8: 3473 ms" in text
+    )
+    # The dummy command crosses the deadband in dims 0-2 and nowhere else, so FRS takes its reversal
+    # path (an all-zero command would take the unsteered one and time the base policy again).
+    np.testing.assert_array_equal(bundle.commands[0], [0.05, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0])
+    assert np.max(np.abs(bundle.commands[0])) > config.command.deadband
+    assert bundle.resets == 4  # before each mode's act and after it
+
+
+def test_the_steered_timing_names_a_missing_mode_and_times_the_rest(tmp_path, monkeypatch):
+    """A config without one of the two tables is not a failure: the probe says which is missing and
+    still times the other."""
+    import policy as policy_module
+
+    config = load_config(_write(tmp_path, _config_text(_stats_file(tmp_path))))
+    bundle = _TimedBundle()
+    monkeypatch.setattr(policy_module, "make_steering", lambda a_bundle, table: SimpleNamespace())
+    monkeypatch.setattr(probe.time, "monotonic", lambda: 0.0)
+    lines = []
+    probe._steered_timing(config, {}, 0.0, bundle, lines)
+    text = "\n".join(lines)
+    assert "[INFO] steered timing frs: the config has no [modes.frs] table" in text
+    assert "steered chunk time fc" in text
+
+
+def test_a_steering_policy_that_cannot_build_is_an_information_line(monkeypatch):
+    """A mode whose checkpoint is absent must not take the whole policy section down: the probe says
+    which mode did not build and times the next."""
+    import policy as policy_module
+
+    config = load_config(SHIPPED)
+    bundle = _TimedBundle()
+
+    def make_steering(a_bundle, table):
+        if table.mode == "flow_control":
+            raise ValueError("the checkpoint's action statistics are not installed")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(policy_module, "make_steering", make_steering)
+    monkeypatch.setattr(probe.time, "monotonic", lambda: 0.0)
+    lines = []
+    probe._steered_timing(config, {}, 0.0, bundle, lines)
+    text = "\n".join(lines)
+    assert "[INFO] steered timing fc (flow_control) did not run: ValueError" in text
+    assert "steered chunk time frs (frs)" in text
 
 
 def test_an_unreadable_config_is_a_user_error(tmp_path, capsys):
