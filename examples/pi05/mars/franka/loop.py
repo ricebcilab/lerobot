@@ -45,7 +45,8 @@ returns its local path.
 ``station.step``, as ``on_tick(tick, action8, plan8, served7, q7)`` -- the executed action, the base
 policy's own chunk step for the tick (``Bundle.plan8``; None under teleop), the served command (None
 under ``autonomous``) and the joint positions the action was computed from. Without a hook the loop is
-unchanged.
+unchanged. They also take ``initial_obs``: an episode that starts from the caller's observation
+instead of ``station.reset()``, which is how the study digests the same reset the trial begins from.
 """
 
 from __future__ import annotations
@@ -140,6 +141,7 @@ class Loop:
         trace: bool = False,
         states: Recorder | None = None,
         on_tick: TickHook | None = None,
+        initial_obs: dict[str, NDArray] | None = None,
     ) -> None:
         """Drive one episode: ``max_steps`` ticks, or until interrupted (Ctrl-C propagates).
 
@@ -153,10 +155,16 @@ class Loop:
         chunk step for it (``Bundle.plan8``; None under teleop), the served command (None under
         autonomous) and the observation's joint positions the action was computed from. The caller
         closes the station.
+
+        ``initial_obs`` starts the episode from the caller's observation instead of calling
+        ``station.reset()``: the study resets once, digests that observation for its pairing key and
+        hands the same one here, so the digest describes the scene the first action was computed on.
+        Everything else a new episode does (the bundle's queues, the operator's latch, the readout's
+        resolution) still happens; with ``None`` the loop is exactly a reset-then-run.
         """
         self._states = states
         self._on_tick = on_tick
-        obs = self._station.reset()
+        obs = self._station.reset() if initial_obs is None else initial_obs
         self._begin_episode(obs)
         tick = 0
         while max_steps is None or tick < max_steps:
@@ -172,6 +180,7 @@ class Loop:
         trace: bool = False,
         states: Recorder | None = None,
         on_tick: TickHook | None = None,
+        initial_obs: dict[str, NDArray] | None = None,
     ) -> Path:
         """Record episodes with c3po's keyboard flags, download the dataset, return its local path.
 
@@ -183,7 +192,8 @@ class Loop:
         recorder ``run`` takes; it collects rows from every episode, and a ``r`` re-record retracts the
         discarded take's rows (``Recorder.drop_episode``) together with c3po's dataset cancel, so only
         takes the operator kept reach the file. ``on_tick`` is ``run``'s per-tick hook, called the same
-        way in every episode.
+        way in every episode. ``initial_obs`` is ``run``'s injected first observation: it starts the
+        first episode without a reset and is not reused, so the later episodes reset as usual.
         """
         station = self._station
         if not isinstance(station, RecordingStation):
@@ -195,9 +205,11 @@ class Loop:
         destination.mkdir(parents=True, exist_ok=True)
         self._states = states
         self._on_tick = on_tick
+        initial = initial_obs  # consumed by the first episode; later episodes reset as usual
         with station.record(name) as rec:
             while not rec.stop:
-                obs = station.reset()
+                obs = station.reset() if initial is None else initial
+                initial = None
                 self._begin_episode(obs)
                 tick = 0
                 while not rec.stop and not rec.done:

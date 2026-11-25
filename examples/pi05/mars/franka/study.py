@@ -16,10 +16,13 @@ built **once per block** and reused; a new :class:`loop.Loop` is built per trial
 gives the trial a fresh episode (the base policy's queues, the operator's latch, the readout's draw).
 
 A trial is: ``station.reset()``, a digest of that reset observation (the pairing key with ``pair``),
-``Loop.run(prompt=..., max_steps=[study] max_steps, on_tick=rows)``, the outcome question, and the
-records. The loop's hook is the per-tick record, called before ``station.step``: the executed action,
-the base policy's own chunk step (``Bundle.plan8``), the served command and the joint positions the
-action came from.
+``Loop.run(prompt=..., max_steps=[study] max_steps, on_tick=rows, initial_obs=observation)``, the
+outcome question, and the records. The reset happens **once**: the loop starts the episode from that
+same observation instead of resetting again, so the digest and the record's ``q0`` describe exactly
+the scene the trial's first action was computed on -- which matters because a station's ``reset()``
+is not known to be idempotent. The loop's hook is the per-tick record, called before
+``station.step``: the executed action, the base policy's own chunk step (``Bundle.plan8``), the
+served command and the joint positions the action came from.
 
 **Authority** (DESIGN.md's formula, the number the depth knobs are supposed to buy): with ``a`` the
 executed action, ``p`` the policy's plan and ``r`` the served command, all in action units,
@@ -309,9 +312,9 @@ class _Trial:
     def run(self, pair: int, arm: str) -> dict:
         """Run one trial and return its ``trials.jsonl`` record; raises ``_AbortedError`` at the outcome.
 
-        The station is reset here for the scene digest, and ``Loop.run`` resets it again for the
-        episode: the digest describes the reset the trial's first action is computed from, as DESIGN.md
-        specifies, and a station whose ``reset()`` is not idempotent shows it in an unpaired trial.
+        The station resets here, once: its observation is the trial's start, digested for the pairing
+        key, recorded as ``q0`` and handed to ``Loop.run`` as ``initial_obs``, so the loop does not
+        reset again and the digest describes the scene the first action was computed from.
         """
         pieces = self.arms[arm]
         started = time.monotonic()
@@ -328,7 +331,12 @@ class _Trial:
             steering=pieces.steering,
             adapter_from_corruption=pieces.adapter_from_corruption,
         )
-        loop.run(prompt=self.prompt, max_steps=self.config.study.max_steps, on_tick=rows)
+        loop.run(
+            prompt=self.prompt,
+            max_steps=self.config.study.max_steps,
+            on_tick=rows,
+            initial_obs=observation,
+        )
         duration = time.monotonic() - started
         success = _ask_outcome(arm, pair)
         arrays = rows.arrays()

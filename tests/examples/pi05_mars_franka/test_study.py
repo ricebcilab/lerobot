@@ -67,6 +67,30 @@ class _Station:
         pass
 
 
+class _ChangingStation(_Station):
+    """A station whose every reset is a different scene, so a trial's digest can be tied to its reset.
+
+    ``reset()`` returns the pose ``JOINT + 0.01 * reset count`` on frame ``reset count``; ``step()``
+    returns the steady observation (``JOINT``, frame 0), so the first control step of a trial is the
+    only one computed from the reset observation.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.observed: list[dict[str, np.ndarray]] = []
+
+    def reset(self) -> dict[str, np.ndarray]:
+        self.resets += 1
+        observation = _observation(self.resets)
+        observation["follower/joint_position"] = JOINT + 0.01 * self.resets
+        self.observed.append(observation)
+        return observation
+
+    def step(self, action: np.ndarray) -> dict[str, np.ndarray]:
+        self.actions.append(np.array(action, copy=True))
+        return _observation()
+
+
 def _observation(frame_value: int = 0) -> dict[str, np.ndarray]:
     return {
         "follower/joint_position": JOINT.copy(),
@@ -316,8 +340,8 @@ def test_a_trial_records_one_jsonl_line_one_npz_and_the_run_provenance(tmp_path,
 def test_the_arm_bundle_and_steering_are_built_once_and_a_new_loop_per_trial(tmp_path, rig, monkeypatch):
     """Two rounds reuse one bundle and one steering policy per arm; the trial's loops are separate.
 
-    The station is reset twice per trial: once by the runner for the scene digest (DESIGN.md's order)
-    and once by ``Loop.run`` for the episode the actions come from.
+    The station is reset once per trial: the runner digests that observation and the loop starts the
+    episode from it (``initial_obs``), so no trial resets the scene twice.
     """
     path = _config(tmp_path, ["autonomous", "frs"], trials=3)
     _operator(monkeypatch, *(["y"] * 6))
@@ -327,7 +351,7 @@ def test_the_arm_bundle_and_steering_are_built_once_and_a_new_loop_per_trial(tmp
     assert len(rig.loads) == 2  # autonomous's bundle and frs's, once each
     assert len(rig.bundles) == 2 and len(rig.made) == 1  # only frs has a steering policy
     assert len(_records(run_dir)) == 6
-    assert rig.station.resets == 2 * 6
+    assert rig.station.resets == 6
     assert len(rig.station.actions) == 2 * 6
 
 
@@ -373,6 +397,27 @@ def test_a_mode_arm_is_composed_exactly_as_the_session_is(tmp_path, rig, monkeyp
     # The steering policy's holder gets F (the identity for a clean readout) every episode.
     assert len(rig.steerings[0].adapter.matrices) == 0  # plain frs has no adapter sync
     assert len(rig.steerings[1].adapter.matrices) == 1  # one episode: one matrix
+
+
+def test_a_trial_resets_once_and_its_digest_is_the_scene_the_first_action_saw(tmp_path, rig, monkeypatch):
+    """One reset per trial, and the record's ``q0``/``scene_hash`` are that observation: the digest is
+    the scene the trial's first action was computed on, which a second ``reset()`` could change."""
+    station = _ChangingStation()
+    monkeypatch.setattr(cli, "C3poStation", lambda *args: station)
+    path = _config(tmp_path, ["autonomous", "frs"], trials=1, max_steps=2)
+    _operator(monkeypatch, "y", "y")
+
+    run_dir = study.run(load_config(path), prompt="pick", config_path=path)
+
+    records = _records(run_dir)
+    assert station.resets == len(records) == 2  # exactly one reset per trial
+    for record, observation in zip(records, station.observed, strict=True):
+        assert record["q0"] == observation["follower/joint_position"].tolist()
+        assert record["scene_hash"] == study.scene_digest(observation, "scene_zed")
+        arrays = _npz(run_dir, record["arm"], record["pair"])
+        # Tick 0's action was computed from the reset observation; tick 1's from the station's step.
+        np.testing.assert_array_equal(arrays["q"][0], observation["follower/joint_position"])
+        np.testing.assert_array_equal(arrays["q"][1], JOINT)
 
 
 def test_a_task_arm_hands_its_checkpoint_to_the_bundle_and_the_steering_policy(tmp_path, rig, monkeypatch):
@@ -463,7 +508,7 @@ def test_an_aborted_block_still_writes_the_trials_it_finished(tmp_path, rig, mon
     provenance = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert (provenance["completed"], provenance["aborted"]) == (1, True)
     assert rig.station.closed
-    assert rig.station.resets == 2 * 2  # the second trial ran before its outcome was asked
+    assert rig.station.resets == 2  # the second trial ran before its outcome was asked
 
 
 def test_eof_at_the_outcome_stops_the_block_before_the_first_record(tmp_path, rig, monkeypatch):

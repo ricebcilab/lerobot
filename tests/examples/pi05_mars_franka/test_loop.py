@@ -639,6 +639,46 @@ def test_the_hook_changes_no_action():
     np.testing.assert_array_equal(np.stack(plain.actions), np.stack(hooked.actions))
 
 
+# ---------------------------------------------------------------- the injected first observation
+
+
+def test_an_injected_observation_starts_the_episode_without_a_reset():
+    """The study resets once and hands the loop that observation: the injected one starts the episode,
+    the loop calls no ``station.reset``, and the first action is computed from it -- teleop's IK uses
+    the pose, so the first served action is the injected pose's, not the canned one's."""
+    calls = []
+    station = _Station(_observations())
+    injected_pose = JOINT + 0.1
+    injected = _observations(count=1, joint=injected_pose)[0]
+    loop = Loop(config=_config(), station=station, mode="teleop", source=FakeSource(deflection=DEFLECTION))
+
+    loop.run(prompt="pick", max_steps=2, on_tick=_hook(calls), initial_obs=injected)
+
+    assert station.resets == 0
+    np.testing.assert_array_equal(calls[0][4], injected_pose)  # the first tick's pose
+    np.testing.assert_array_equal(calls[1][4], JOINT)  # then the station's own observation
+    np.testing.assert_allclose(
+        station.actions[0], teleop_action(_expected_served(DEFLECTION, injected_pose), False)
+    )
+    assert not np.allclose(station.actions[0], teleop_action(_expected_served(DEFLECTION, JOINT), False))
+
+
+def test_an_injected_observation_starts_only_the_first_recorded_episode(tmp_path):
+    """``run_recording`` consumes ``initial_obs`` for the first episode -- no reset before it -- and
+    the later episodes reset as usual."""
+    station = _RecordingStation(_observations(), SCHEDULE)
+    injected_pose = JOINT + 0.1
+    injected = _observations(count=1, joint=injected_pose)[0]
+    loop = Loop(config=_config(), station=station, mode="teleop", source=FakeSource(deflection=DEFLECTION))
+
+    loop.run_recording(name="pilot", dest=tmp_path, prompt="pick", initial_obs=injected)
+
+    assert station.resets == 2  # three episodes; the first starts from the injected observation
+    np.testing.assert_allclose(
+        station.actions[0], teleop_action(_expected_served(DEFLECTION, injected_pose), False)
+    )
+
+
 def test_run_recording_calls_the_hook_once_per_step(tmp_path):
     """The recording path takes the same hook: one call per control step, before each station step."""
     calls = []
