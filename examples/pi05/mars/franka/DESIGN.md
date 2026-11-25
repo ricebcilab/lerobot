@@ -515,3 +515,56 @@ width: the loss slices the field to the module's dims, `forward` pads the normal
 `max_action_dim`, and `AdaptedField` prefers a module's own `n_dims`); C4 `mars-t`/`mars`, the S2 plan in the
 runbook, and the final gate. Hardware-only throughout: the real dataset schema, the real `pi05_base` tokens, a
 real training run, and every S2 number.
+
+---
+
+# Phase D: running a study (S1 and S2)
+
+Status: interface freeze. Adds `study.py`, `analysis.py`, the `study` command and a `[study]` section; gives the
+loop a per-tick hook and the CLI a generic mode dispatch. No control behaviour changes.
+
+**What a study is.** A block of trials: each trial is one **arm** (a command name: `autonomous`, `fc`, `frs`,
+`mars-f`, `mars-u`, `mars-t`, `mars`, or any `[modes.<name>]` table, e.g. a `policy+task` anchor) on one scene
+setup. Rounds organise them: round `r` runs every arm once in a seeded random order, so `pair_id = r` is the
+pairing key. Between trials the operator resets the scene and ends the trial; after each trial the operator
+enters the outcome (`y`/`n` on the terminal), which is the only human label the study needs.
+
+**Pairing.** A trial records a digest of its reset observation — the seven joint angles and a downsampled
+exterior frame — so the analysis pairs arms only where the two trials started from the same state, and reports
+the unpaired remainder. This is the LIBERO analysis's rule and it is the honest one: a real station's `reset()`
+may not restore the scene.
+
+**Per-tick record (the loop's hook).** `Loop.run(..., on_tick=callback)` calls
+`callback(tick, action8, plan8 | None, served7 | None, q7)` once per control step, before `station.step`. `plan8`
+is the base policy's own chunk step for that tick, unnormalized (`Bundle.plan`), or None under teleop; `served7`
+is the command in force (None under autonomous). Nothing else in the loop changes. The study writes those rows to
+`<out>/<run>/trials/<arm>-<pair>.npz` (`executed` (T,8), `plan` (T,8), `served` (T,7), `q` (T,7)).
+
+**Authority.** Per step, with `a` the executed action, `p` the policy's plan and `r` the served command, all in
+action units:
+`authority = clip(<a - p, r - p> / ||r - p||^2, 0, 1)` on the steps where the command is above the deadband
+(0 where it is idle). Phase A's command is the same 7 numbers the operator's stick produced, so this needs no
+Cartesian mapping. A trial reports the mean over its engaged steps: the measured authority the depth knobs are
+supposed to buy.
+
+**Records.** `<out>/<run>/trials.jsonl`, one line per trial: `run, arm, pair, prompt, success, steps,
+duration_s, authority, engaged_fraction, mean_|r|, q0, scene_hash, config, timestamp`;
+`<out>/<run>/config.json` and `run.json` (config path + digest, git HEAD and working-tree dirty flag, timestamp);
+the per-tick npz above; and `<out>/<run>/trials/` holds them.
+
+**Analysis.** `analysis.py` reads one or more run directories and prints (and writes as CSV):
+the per-arm table — `n`, the success rate with a Wilson 95% interval, mean authority; and the paired tests on
+matched `(pair, scene_hash)` trials — McNemar's exact test for success, the Wilcoxon signed-rank test for
+authority — between every pair of arms. It is a library plus a `mars-franka analyse` command? No: it is a
+`python -m …`-free command, `mars-franka analyse --run <dir> [--run <dir>...]`, printing the tables.
+
+**Config.**
+```toml
+[study] arms = ["frs", "mars-t"]          # command names; each must resolve
+        trials = 10                        # per arm (the number of rounds)
+        order = "shuffled"                 # "shuffled" (seeded) or "blocked" (arm by arm)
+        max_steps = 600                    # a trial's cap, then the outcome question
+        out = "outputs/mars_franka/study"  # run directory parent
+        seed = 0
+```
+`--prompt` is required, as for every session command.
