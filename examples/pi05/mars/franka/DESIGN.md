@@ -334,8 +334,8 @@ and leaves the gripper (dim 7) and the padding to the policy.
 ## Verification gates
 
 - **Offline (me, before every merge):** `pytest tests/examples/pi05_mars_franka tests/policies/steering
-  tests/teleoperators/test_spacemouse.py -q`, `ruff check`, `ruff format --check`, `mars-franka all
-  --dry-run`. [V]
+  tests/teleoperators/test_spacemouse.py -q`, `ruff check`, `ruff format --check`, and `mars-franka <each
+  shipped command> --dry-run --steps 4 --prompt ...`. [V]
 - **Hardware (you, chopper), in this order:** `probe` -> `autonomous --prompt ...` -> `teleop` (6-DoF, low
   gain) -> `teleop --corrupted` -> `fc` -> `frs` -> `mars-f`; then `teleop --record <name>` for demos.
   The probe prints the station manifest, `q0`, `F`, the checkpoint facts, the action statistics, the chunk
