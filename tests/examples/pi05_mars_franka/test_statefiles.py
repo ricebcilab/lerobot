@@ -324,6 +324,49 @@ def test_add_refuses_a_row_that_does_not_fit_and_names_it():
         _add(Recorder(META), tick=True)
 
 
+def test_drop_episode_removes_only_that_takes_rows_and_returns_the_count(tmp_path):
+    """c3po's ``r`` retracts a rejected take: its rows go, the kept rows stay contiguous and unchanged."""
+    recorder = Recorder(META)
+    _add(recorder, episode=0, tick=0)
+    _add(recorder, episode=1, tick=0, batch=_batch(offset=1), served=-SERVED)
+    _add(recorder, episode=0, tick=1, batch=_batch(offset=2), joint_position=JOINT + 2.0)
+    _add(recorder, episode=2, tick=0, batch=_batch(offset=3))
+    assert len(recorder) == 4
+
+    assert recorder.drop_episode(0) == 2
+
+    assert len(recorder) == 2
+    arrays, _ = load(recorder.save(tmp_path / "states.npz"))
+    assert arrays["episode"].dtype == np.int32 and arrays["episode"].tolist() == [1, 2]
+    assert arrays["tick"].tolist() == [0, 0]
+    expected = Recorder(META)
+    _add(expected, episode=1, tick=0, batch=_batch(offset=1), served=-SERVED)
+    _add(expected, episode=2, tick=0, batch=_batch(offset=3))
+    reference, _ = load(expected.save(tmp_path / "reference.npz"))
+    for name in arrays:
+        assert arrays[name].dtype == reference[name].dtype and arrays[name].shape == reference[name].shape
+        np.testing.assert_array_equal(arrays[name], reference[name])
+
+
+def test_drop_episode_for_a_take_that_contributed_nothing_is_a_no_op():
+    recorder = Recorder(META)
+    _add(recorder, episode=0)
+    assert recorder.drop_episode(7) == 0
+    assert recorder.drop_episode(0) == 1
+    assert recorder.drop_episode(0) == 0  # already gone
+    assert Recorder(META).drop_episode(0) == 0  # nothing was ever added
+
+
+def test_dropping_every_take_leaves_the_empty_file_an_unused_recorder_writes(tmp_path):
+    recorder = Recorder(META)
+    _add(recorder, episode=0)
+    assert recorder.drop_episode(0) == 1
+    assert len(recorder) == 0
+    arrays, _ = load(recorder.save(tmp_path / "states.npz"))
+    assert arrays["joint_position"].shape == (0, ARM_DIMS)
+    np.testing.assert_array_equal(arrays["q0"], np.zeros(ARM_DIMS))
+
+
 def test_a_refused_row_leaves_the_buffer_untouched(tmp_path):
     """A row is validated before anything is appended: one bad add cannot leave a half-recorded file."""
     recorder = Recorder(META)

@@ -6,7 +6,8 @@ raw observation the policy's chunk starts from (the model-ready images and the a
 operator's deflection, the *served* command the method would steer, and the nominal pose ``q0`` the
 corruption lift was taken at. This module freezes exactly that row, once per chunk boundary, in a plain
 ``numpy.savez`` archive -- no pickle, so a file can be read without any of the session's objects, its
-config or the station.
+config or the station. A take the operator rejects (c3po's ``r`` re-record) is retracted from the
+buffer before the file is written, so only kept takes reach the trainer.
 
 The format is the frozen one from DESIGN.md's "Phase B" (``format_version`` 1):
 
@@ -106,9 +107,10 @@ class Recorder:
 
     ``meta`` is the session's provenance mapping (JSON-serializable); it is checked here so a bad
     value fails at construction rather than after a run. ``add`` appends one boundary row; the loop
-    calls it once per chunk in every mode, with the *pre-action* observation, and ``save`` writes the
-    whole buffer as one ``np.savez`` file. ``save`` is the caller's job (the CLI's, like the dataset
-    download): a recorder never writes on its own, so a run killed mid-episode leaves no partial file.
+    calls it once per chunk in every mode, with the *pre-action* observation. ``drop_episode`` retracts
+    a take the operator rejected (c3po's ``r``), and ``save`` writes the whole buffer as one
+    ``numpy.savez`` file. ``save`` is the caller's job (the CLI's, like the dataset download): a
+    recorder never writes on its own, so a run killed mid-episode leaves no partial file.
 
     The buffer is one 300 kB image pair per state; a few hundred states is a few tens of MB of RAM,
     which is the reason the format stores images as uint8.
@@ -185,6 +187,32 @@ class Recorder:
             self._images[name].append(image)
         for name, value in row.items():
             self._columns[name].append(value)
+
+    def drop_episode(self, episode: int) -> int:
+        """Remove one episode's rows from the buffer and return how many were removed.
+
+        c3po's ``r`` flag discards the take the operator just rejected: the recording loop calls this
+        before starting the next take, so the discarded take's states never reach the file. ``0`` for
+        an episode that contributed no row (or contributed none yet): a drop is not an error. The
+        remaining rows stay contiguous and keep the format's dtypes -- the arrays are built only at
+        ``save`` -- and if the drop empties the buffer the recorder is again the empty one ``save``
+        writes (``q0`` of zeros: no row is left to replay).
+        """
+        index = _index(episode, "episode")
+        keep = [position for position, value in enumerate(self._columns["episode"]) if value != index]
+        dropped = len(self._columns["episode"]) - len(keep)
+        if not dropped:
+            return 0
+        for name in _ROW_TAILS:
+            rows = self._images[name] if name in _IMAGE_FEEDS else self._columns[name]
+            kept = [rows[position] for position in keep]
+            if name in _IMAGE_FEEDS:
+                self._images[name] = kept
+            else:
+                self._columns[name] = kept
+        if not self._columns["episode"]:
+            self._q0 = None
+        return dropped
 
     def __len__(self) -> int:
         return len(self._columns["episode"])

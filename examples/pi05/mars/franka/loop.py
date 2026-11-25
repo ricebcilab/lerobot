@@ -154,8 +154,9 @@ class Loop:
         pattern: ``q`` stops, ``n`` ends an episode, ``r`` discards the episode that just ended
         (``station.cancel_episode()``) before it is re-recorded. ``dest`` is created if absent; the
         returned path is the station's (``dest / name`` for c3po). ``states`` is the same optional
-        recorder ``run`` takes; it collects rows from every episode, and a ``r`` re-record does not
-        retract the states the discarded episode visited (c3po's cancel discards its dataset).
+        recorder ``run`` takes; it collects rows from every episode, and a ``r`` re-record retracts the
+        discarded take's rows (``Recorder.drop_episode``) together with c3po's dataset cancel, so only
+        takes the operator kept reach the file.
         """
         station = self._station
         if not isinstance(station, RecordingStation):
@@ -175,7 +176,9 @@ class Loop:
                     obs = station.step(self._tick(obs, prompt=prompt, tick=tick, trace=trace))
                     tick += 1
                 if rec.rerecord:
-                    station.cancel_episode()
+                    station.cancel_episode()  # c3po discards the take's dataset ...
+                    if self._states is not None:
+                        self._states.drop_episode(self._episode - 1)  # ... and its states
                 rec.clear()
         return station.download(name, destination)
 
