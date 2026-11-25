@@ -17,14 +17,18 @@
 """A 3Dconnexion SpaceMouse read straight from Linux /dev/hidraw (no driver or package needed).
 
 The device sends a translation report (id 1: three int16 counts x, y, z) whenever the stick
-moves, including a zeroing report on release, and a button report (id 3: a bitmask) whenever a
-button changes. Device channels: x is a push to the right (+), y a pull toward you (+), z a
-press down (+). Rotation reports (id 2) are ignored.
+moves, including a zeroing report on release, a rotation report (id 2: three int16 counts
+rx, ry, rz) whenever it is twisted, and a button report (id 3: a bitmask) whenever a button
+changes. Device channels: x is a push to the right (+), y a pull toward you (+), z a press down
+(+); the rotation channels are the device's own rx, ry, rz order. The rotation full scale is not
+known yet (the probe measures it), so `rotation` divides by `FULL_SCALE` unless
+`SPACEMOUSE_ROTATION_FULL_SCALE` overrides it.
 
 `SpaceMouseReader` keeps the latest state in a background thread; `SpaceMouseTeleop` wraps it
 as a LeRobot teleoperator. `SpaceMouseAxes` is a reader mapped onto an application's axes (which
 device channel feeds each axis, and with which sign), found and scaled from the
 `SPACEMOUSE_HID_ID` and `SPACEMOUSE_FULL_SCALE` environment variables unless told otherwise.
+`SpaceMouseTwist` is the same mapping over all six channels, the three translations first.
 """
 
 import os
@@ -49,10 +53,16 @@ LOGITECH_3DCONNEXION_PRODUCT_PREFIX = "C6"
 # SPACEMOUSE_HID_ID environment variable takes to pin one device.
 SPACEMOUSE_PRO_HID_ID = "0000046D:0000C62B"
 FULL_SCALE = 350.0  # raw counts at full deflection (SPACEMOUSE_FULL_SCALE's default)
+# Raw counts at full rotation: a guess until the probe measures the hardware, so the translation's
+# full scale stands in until SPACEMOUSE_ROTATION_FULL_SCALE overrides it.
+ROTATION_FULL_SCALE = FULL_SCALE
 
 REPORT_TRANSLATION = 1
+REPORT_ROTATION = 2
 REPORT_BUTTONS = 3
 READ_SIZE = 64
+
+TWIST_DIMS = 6  # device channels in twist order: x, y, z (translation) then rx, ry, rz (rotation)
 
 
 def _is_3dconnexion(uevent: str) -> bool:
@@ -92,11 +102,13 @@ def find_spacemouse(hid_id: str | None = None, sysfs: Path = Path("/sys/class/hi
 def parse_report(data: bytes) -> tuple[str, tuple[int, int, int] | int | None]:
     """Parse one raw hidraw report (report id is the first byte).
 
-    Returns ("translation", (x, y, z)) with raw int16 counts, ("buttons", bitmask), or
-    ("other", None).
+    Returns ("translation", (x, y, z)) or ("rotation", (rx, ry, rz)) with raw int16 counts,
+    ("buttons", bitmask), or ("other", None).
     """
     if len(data) >= 7 and data[0] == REPORT_TRANSLATION:
         return "translation", struct.unpack_from("<hhh", data, 1)
+    if len(data) >= 7 and data[0] == REPORT_ROTATION:
+        return "rotation", struct.unpack_from("<hhh", data, 1)
     if len(data) >= 2 and data[0] == REPORT_BUTTONS:
         return "buttons", int.from_bytes(data[1:5], "little")
     return "other", None
@@ -106,18 +118,28 @@ class SpaceMouseReader:
     """Reads a SpaceMouse hidraw node in a background thread.
 
     `axes` is the latest device (x, y, z) divided by `full_scale` and clipped to [-1, 1];
-    `buttons` the latest bitmask; `presses` counts new presses (a bit going from up to down) and
-    `take_press()` is True once per press since the last call. When the device is unplugged or
-    closed the thread ends and `connected` turns False; `axes` and `buttons` keep their last
-    values. The node is only read, never written.
+    `rotation` the latest device (rx, ry, rz) divided by `rotation_full_scale` and clipped to
+    [-1, 1]; `buttons` the latest bitmask; `presses` counts new presses (a bit going from up to
+    down) and `take_press()` is True once per press since the last call. When the device is
+    unplugged or closed the thread ends and `connected` turns False; `axes`, `rotation` and
+    `buttons` keep their last values. The node is only read, never written.
     """
 
-    def __init__(self, path: str, full_scale: float = 350.0):
+    def __init__(
+        self,
+        path: str,
+        full_scale: float = 350.0,
+        rotation_full_scale: float | None = None,
+    ):
         self.path = path
         self.full_scale = float(full_scale)
+        self.rotation_full_scale = (
+            float(rotation_full_scale) if rotation_full_scale is not None else env_rotation_full_scale()
+        )
         self._file = open(path, "rb", buffering=0)  # noqa: SIM115
         self._lock = threading.Lock()
         self._axes: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._buttons = 0
         self._presses = 0
         self._pressed = False
@@ -145,6 +167,9 @@ class SpaceMouseReader:
                 scaled = np.clip(np.array(value, dtype=np.float64) / self.full_scale, -1.0, 1.0)
                 self._axes = (float(scaled[0]), float(scaled[1]), float(scaled[2]))
                 self._motion_reports += 1
+            elif kind == "rotation":
+                scaled = np.clip(np.array(value, dtype=np.float64) / self.rotation_full_scale, -1.0, 1.0)
+                self._rotation = (float(scaled[0]), float(scaled[1]), float(scaled[2]))
             elif kind == "buttons":
                 if value & ~self._buttons:  # a new press
                     self._presses += 1
@@ -156,6 +181,11 @@ class SpaceMouseReader:
     def axes(self) -> tuple[float, float, float]:
         with self._lock:
             return self._axes
+
+    @property
+    def rotation(self) -> tuple[float, float, float]:
+        with self._lock:
+            return self._rotation
 
     @property
     def buttons(self) -> int:
@@ -200,6 +230,16 @@ def env_full_scale() -> float:
     return float(os.environ.get("SPACEMOUSE_FULL_SCALE") or FULL_SCALE)
 
 
+def env_rotation_full_scale() -> float:
+    """The `SPACEMOUSE_ROTATION_FULL_SCALE` environment variable (raw counts at full rotation), default
+    `ROTATION_FULL_SCALE`: a guess, since the rotation full scale has not been measured on the hardware yet.
+
+    It is separate from `SPACEMOUSE_FULL_SCALE` because the translation and rotation reports are scaled
+    independently by the device.
+    """
+    return float(os.environ.get("SPACEMOUSE_ROTATION_FULL_SCALE") or ROTATION_FULL_SCALE)
+
+
 class SpaceMouseAxes:
     """A SpaceMouse mapped onto an application's axes: axis i is `sign[i]` times the device channel
     `source[i]` (0: x, a push to the right; 1: y, a pull toward you; 2: z, a press down), in [-1, 1].
@@ -238,6 +278,58 @@ class SpaceMouseAxes:
     @property
     def translation(self) -> np.ndarray:
         return self.map(self.reader.axes)
+
+    def close(self) -> None:
+        self.reader.close()
+
+
+class SpaceMouseTwist:
+    """A SpaceMouse's six channels as one 6-D twist: the three translations, then the three rotations.
+
+    Axis i of `twist` is `sign[i]` times device channel `source[i]`, over the concatenated device
+    channels (0: x, 1: y, 2: z, 3: rx, 4: ry, 5: rz), each in [-1, 1]; `[x, y, z, rx, ry, rz]` with
+    the translation axes first. The rotation full scale is a guess (see `SpaceMouseReader.rotation`).
+
+    Without `path` the device is searched for by `hid_id` (default: the SPACEMOUSE_HID_ID environment
+    variable, unset = any 3Dconnexion device); `full_scale` defaults to SPACEMOUSE_FULL_SCALE (unset =
+    `FULL_SCALE`) and the rotation scale to SPACEMOUSE_ROTATION_FULL_SCALE (unset = `ROTATION_FULL_SCALE`).
+    `reader` is the `SpaceMouseReader` underneath (buttons, presses, report counts); like it, `twist`
+    keeps its last value when the device is unplugged.
+    """
+
+    def __init__(
+        self,
+        source,
+        sign,
+        path: str | None = None,
+        hid_id: str | None = None,
+        full_scale: float | None = None,
+    ):
+        self.source = np.asarray(source, dtype=np.intp)
+        self.sign = np.asarray(sign, dtype=np.float64)
+        if self.source.shape != self.sign.shape or self.source.ndim != 1:
+            raise ValueError(f"source and sign must be two lists of one length, got {source!r} and {sign!r}")
+        if self.source.size != TWIST_DIMS:
+            raise ValueError(f"a twist maps all {TWIST_DIMS} device channels, got {source!r}")
+        if np.any((self.source < 0) | (self.source >= TWIST_DIMS)):
+            raise ValueError(f"source indexes the device channels 0-{TWIST_DIMS - 1}, got {source!r}")
+        self.path = path or find_spacemouse(hid_id if hid_id is not None else env_hid_id())
+        self.reader = SpaceMouseReader(
+            self.path, full_scale=full_scale if full_scale is not None else env_full_scale()
+        )
+
+    def map(self, device_xyzrot) -> np.ndarray:
+        """Device (x, y, z, rx, ry, rz) onto the twist's six axes."""
+        return np.asarray(device_xyzrot, dtype=np.float64)[self.source] * self.sign
+
+    @property
+    def connected(self) -> bool:
+        return self.reader.connected
+
+    @property
+    def twist(self) -> np.ndarray:
+        """The six mapped channels in [-1, 1], the translations first: [x, y, z, rx, ry, rz]."""
+        return self.map((*self.reader.axes, *self.reader.rotation))
 
     def close(self) -> None:
         self.reader.close()
