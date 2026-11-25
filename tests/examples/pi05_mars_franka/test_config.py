@@ -270,3 +270,50 @@ def test_the_config_is_frozen(tmp_path):
         cfg.station.host = "other"
     with pytest.raises(TypeError):
         cfg.modes["fc"] = cfg.modes["frs"]
+
+
+def test_the_spacemouse_section_has_the_documented_defaults(tmp_path):
+    """An absent section is the search defaults, which the probe is what verifies on hardware."""
+    spacemouse = _load(tmp_path, "").spacemouse
+    assert spacemouse == config_module.SpaceMouseConfig()
+    assert (spacemouse.path, spacemouse.hid_id) == ("", "")
+    assert (spacemouse.full_scale, spacemouse.rotation_full_scale) == (350.0, 350.0)
+    assert spacemouse.source == (0, 1, 2, 3, 4, 5)
+    assert spacemouse.sign == (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+def test_the_spacemouse_section_parses_a_path_mapping_and_scales(tmp_path):
+    cfg = _load(
+        tmp_path,
+        "[spacemouse]\n"
+        'path = "/dev/hidraw9"\n'
+        'hid_id = "0000046D:0000C62B"\n'
+        "full_scale = 300.0\n"
+        "rotation_full_scale = 200.0\n"
+        "source = [5, 4, 3, 2, 1, 0]\n"
+        "sign = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]\n",
+    )
+    spacemouse = cfg.spacemouse
+    assert (spacemouse.path, spacemouse.hid_id) == ("/dev/hidraw9", "0000046D:0000C62B")
+    assert (spacemouse.full_scale, spacemouse.rotation_full_scale) == (300.0, 200.0)
+    assert spacemouse.source == (5, 4, 3, 2, 1, 0)
+    assert spacemouse.sign == (1.0, -1.0, 1.0, -1.0, 1.0, -1.0)
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("[spacemouse]\nsource = [0, 1, 2, 3, 4]\n", "source"),
+        ("[spacemouse]\nsource = [0, 1, 2, 3, 4, 6]\n", "source"),
+        ("[spacemouse]\nsource = [0, 1, 2, 3, 4, -1]\n", "source"),
+        ("[spacemouse]\nsource = [0, 1, 2, 3, 4, 5.0]\n", "source"),
+        ("[spacemouse]\nsign = [1.0, 1.0, 1.0]\n", "sign"),
+        ('[spacemouse]\nsign = [1.0, 1.0, 1.0, 1.0, 1.0, "up"]\n', "sign"),
+        ("[spacemouse]\nfull_scale = 0.0\n", "full_scale"),
+        ("[spacemouse]\nrotation_full_scale = -1.0\n", "rotation_full_scale"),
+        ('[spacemouse]\nbutton = "left"\n', "button"),
+    ],
+)
+def test_the_spacemouse_section_validates_its_fields(tmp_path, text, key):
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, text)

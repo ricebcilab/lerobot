@@ -129,7 +129,12 @@ class C3poStation:
     """The real station through c3po. c3po is imported here, not at module level."""
 
     def __init__(self, host: str, port: int, rate: float) -> None:
-        from c3po import Robot
+        try:
+            from c3po import Robot
+        except ImportError as error:  # the example's one optional hardware dependency
+            raise ImportError(
+                "c3po is not installed; from the lerobot checkout run `uv pip install -e ../c3po`"
+            ) from error
 
         self._robot = Robot(host=host, port=port, rate=rate)
         self._manifest = _manifest_from_robot(self._robot)
