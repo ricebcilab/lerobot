@@ -54,9 +54,10 @@ PROTOCOL_DEFAULTS = {
     "trial": {"ready_hold_s": 0.3, "feedback_s": 0.6},
     "expert": {"lag": 0, "slow_radius": 0.15, "clearance": 0.05, "margin": 0.03},
     "display": {"blind": True, "cues": True},  # cues: the served command, the planned path and the STEERING label
-    # --calibrate: the reaches the cursor plays by itself before the visit, and the steps the participant's own user
-    # module is trained on them (the shared modules' recipe: 100 reaches, 500 steps)
-    "calibration": {"reaches": 100, "practice": 5, "steps": 500},
+    # --calibrate: the reaches the cursor plays by itself before the visit (straight, each step over `slow` frames, so
+    # 50 reaches record about as many commands as the shared modules' 100 simulated ones), and the steps the
+    # participant's own user module is trained on them (the shared modules' 500)
+    "calibration": {"reaches": 50, "practice": 5, "steps": 500, "slow": 2},
 }
 CELLS_KEYS = ("methods", "grid", "settings")  # a protocol's cells must give, beside the rest of a sweep and task_order
 
@@ -182,7 +183,7 @@ def load_protocol(path):
     settings.yaml for this protocol gives them), and task_order, latin_square (the first task first, the others
     counterbalanced) or listed. The sweep's keys are checked where it is built (run_sweep.load_sweep). `calibration`
     sizes a visit's own user module (run_experiment.py --calibrate): the reaches the cursor plays by itself, the
-    practice ones before them, and the training steps."""
+    practice ones before them, the training steps, and `slow`, the frames each recorded step is played over."""
     path = resolve(path)
     data = yaml.safe_load(path.read_text()) or {}
     unknown = set(data) - {"name", "study", "cells"} - set(PROTOCOL_DEFAULTS)

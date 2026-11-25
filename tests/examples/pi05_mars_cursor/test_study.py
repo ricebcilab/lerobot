@@ -221,9 +221,10 @@ def test_a_calibrated_visit_plays_mars_with_the_participants_own_module(tmp_path
     monkeypatch.setattr(train_adapter, "train_calibrated_user", small)
     (tmp_path / "tiny.yaml").write_text(CALIBRATED)
     assert config.load_protocol("study_short_U1.yaml")["calibration"] == {
-        "reaches": 100,
+        "reaches": 50,
         "practice": 5,
         "steps": 500,
+        "slow": 2,
     }
     argv = ["--protocol", str(tmp_path / "tiny.yaml"), "--participant", "sim", "--cpu", "--calibrate"]
     argv += ["--results", str(tmp_path / "results")]
@@ -238,6 +239,17 @@ def test_a_calibrated_visit_plays_mars_with_the_participants_own_module(tmp_path
         assert (r["outcome"], r["user"], r["task"]) == ("hit", "U3", "calibration")
         assert (r["corruption"], r["input_noise"], r["obstacle"]) == ({"rotation_deg": 60}, 0.5, None)
         assert len(r["served_commands"]) == len(r["path"]) - 1 == round(r["duration_s"] / 0.02)
+        path, start, goal = np.array(r["path"]), np.array(r["start"]), np.array(r["targets"][r["goal"]])
+        along = (goal - start) / np.linalg.norm(goal - start)
+        offset = path - start
+        assert (
+            np.abs(offset[:, 0] * along[1] - offset[:, 1] * along[0]).max() < 2e-3
+        )  # a straight line to the goal
+        assert (np.diff(offset @ along) > -1e-3).all()  # that never turns back: no overshoot and correction
+        steps = np.diff(path, axis=0)[: 2 * ((len(path) - 1) // 2)].reshape(-1, 2, 2)
+        np.testing.assert_allclose(
+            steps[:, 0], steps[:, 1], atol=2e-3
+        )  # at half speed: every step over two frames
     name = "participants/tiny/sim/tiny_s1"
     path = tmp_path / "adapters" / name / "adapter.pt"
     assert AdapterModules.load(path).kind == "user"
@@ -337,6 +349,11 @@ def test_the_renderer_hides_the_assist_cues_and_the_arm(monkeypatch):
     shown, hidden = colours(True), colours(False)
     assert window.COMMAND in shown and window.PLAN in shown
     assert window.COMMAND not in hidden and window.PLAN not in hidden and window.CURSOR in hidden
+    assert window.GUIDE not in shown
+    ctl = session.Playback(
+        np.full((1, 30, 2), 0.01), slow=2, start=env.pos
+    )  # a calibration reach: its whole path
+    assert window.GUIDE in colours(False)
 
     def hud_text(blind):
         screen, said = window.Renderer(blind=blind), []

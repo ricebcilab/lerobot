@@ -18,7 +18,7 @@ import cursor_sa.steering
 from cursor_sa.policy import CursorFlowPolicy, FlowPolicy
 from cursor_sa.session import load_checkpoints, run_trials
 from cursor_sa.steering import SharedController, steered_chunk
-from lerobot.policies.steering import AdapterModules, LearnedTaskModule
+from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 import run_sweep
 from run_sweep import (attach_scene, cell_groups, cell_key, load_sweep, main as sweep_main, method_arm, settings_for, with_module_seed,
                        with_setting)
@@ -159,14 +159,15 @@ def test_tune_lists_each_modes_knobs(tmp_path):
             load_sweep(tmp_path / "bad.yaml")
 
 
-def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path):
+def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path, monkeypatch):
     """`tune` tunes every combination of a mode's knobs, records the best as {knob: value}, and --fixed-settings replays
     a settings file (settings.yaml's format) on the same test trials without tuning; a cell or method it leaves out is
     an error rather than a guess."""
+    _user_adapter(tmp_path, monkeypatch)
     (tmp_path / "jt.yaml").write_text(
         "name: jt\nmethods:\n  teleop: {mode: teleop, time_limit_s: 1}\n  flow_control: {mode: flow_control, time_limit_s: 1}\n"
         "  frs: {mode: frs, time_limit_s: 1}\n"
-        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
+        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: u}}\n"
         "tune: {flow_control: {tau: [8, 16], lambda: [1, 2]}, frs: {n_reverse_steps: [10], pinned_steps: [2, 16]}}\n"
         "grid: {family: gain, levels: [0.25], noises: [1.25]}\nfocus: mars\n")
     common = ["--sweep", str(tmp_path / "jt.yaml"), "--tune-trials", "2", "--test-trials", "4", "--cpu", "--results", str(tmp_path)]
@@ -196,7 +197,7 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path):
         sweep_main(common + ["--fixed-settings", str(tmp_path / "short.yaml"), "--out", "short"])
 
 
-def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path):
+def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path, monkeypatch):
     (tmp_path / "ax.yaml").write_text(
         "name: ax\nmethods:\n  teleop: {mode: teleop}\n  frs: {mode: frs}\n"
         "grid:\n  family: gain\n  levels: [0.25]\n  noises: [0.5, 1]\n  axes: {targets: [[2, 2], [4, 4]], dwell_s: [0.3, 0.5]}\n")
@@ -219,9 +220,10 @@ def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path):
     (tmp_path / "bad.yaml").write_text("methods: {teleop: {mode: teleop}}\ngrid: {noises: [1], axes: {tau: [1, 2]}}\n")
     with pytest.raises(ValueError, match="grid.axes"):
         load_sweep(tmp_path / "bad.yaml")
+    _user_adapter(tmp_path, monkeypatch)
     (tmp_path / "run.yaml").write_text(
         "name: ax\nmethods:\n  teleop: {mode: teleop, time_limit_s: 1}\n"
-        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: learned_adapter/gain025y_free}}\n"
+        "  mars: {mode: frs, time_limit_s: 1, reversal_adapter: {learned: u}}\n"
         "grid:\n  family: gain\n  levels: [0.25]\n  noises: [1.25]\n"
         "  axes: {targets: [[2, 2], [3, 3]], min_target_sep: [0.12, 1.5]}\n"  # 1.5 apart does not fit the screen
         "tune: {frs: {n_reverse_steps: [2, 10]}}\n")
@@ -257,6 +259,15 @@ def _image_adapter(tmp_path, monkeypatch, name="image/t_cnn", geometry="absolute
         tmp_path / "ckpt" / "adapters" / name / "adapter.pt",
         "task",
     )
+    return name
+
+
+def _user_adapter(tmp_path, monkeypatch, name="u"):
+    """A fresh user module in a temp adapters folder, which the sweep reads in place of the shipped ones."""
+    import cursor_sa.session as session_mod
+
+    monkeypatch.setattr(session_mod, "adapter_path", lambda n: tmp_path / "ckpt" / "adapters" / n / "adapter.pt")
+    AdapterModules.save_module(LearnedUserModule(16, n_dims=2), tmp_path / "ckpt" / "adapters" / name / "adapter.pt", "user")
     return name
 
 

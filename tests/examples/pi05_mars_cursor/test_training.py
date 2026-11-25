@@ -197,12 +197,13 @@ def test_the_user_modules_loss_counts_every_read(trained, monkeypatch):
 
 def test_a_recorded_calibration_trains_on_the_commands_it_served(monkeypatch):
     """`train_calibrated_user` (a session's --calibrate): the user module's open-loop recipe on a recording. At every
-    step of the demonstrations the cursor played, the command is the one the readout served there, held over the
-    chunk as the controller holds it; nothing is drawn anew, as a recording has one command per step."""
+    step of the demonstrations the cursor played, the command is one the readout served while that step played
+    (a slowed calibration plays a step over several frames, so it has a command per frame), held over the chunk as
+    the controller holds it; nothing is drawn anew. The chunk it is trained toward stays at the policy's own speed."""
     policy, task, rng = _base_policy(), TaskConfig(min_reach=0.35, max_reach=0.5), np.random.default_rng(0)
     layouts = sample_layouts(rng, 8, (4, 4), task)
     actions, lengths = make_demos(rng, layouts, task)
-    served = np.clip(rng.normal(0, 0.5, actions.shape), -1, 1)  # any recording, one command per step
+    served = np.clip(rng.normal(0, 0.5, (*actions.shape[:2], 2, 2)), -1, 1)  # any recording, two frames a step
     seen, real = [], train_adapter.field_loss
     monkeypatch.setattr(train_adapter, "field_loss", lambda *a: seen.append(a[5]) or real(*a))
     user, log = train_adapter.train_calibrated_user(

@@ -21,9 +21,10 @@ study_long), with the arms for the user's cell at their tuned settings.
 
 --calibrate trains the user module in the session, on the participant's own
 commands: before the first block the cursor plays demonstration reaches by
-itself while the person pushes as if steering it (protocol.calibration: 100
-reaches after 5 practice ones, about 3 minutes), a user module is trained on
-what the readout served (the shared modules' recipe, 500 steps), and it takes
+itself while the person pushes as if steering it (protocol.calibration: 50
+straight reaches after 5 practice ones, at half speed with the path drawn ahead,
+about 2.5 minutes), a user module is trained on what the readout served (the
+shared modules' recipe, 500 steps), and it takes
 the shared module's place in MARS for the visit. The reaches are a run of their
 own (<protocol>_s<session>_calibration/), the module is
 checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>/.
@@ -179,7 +180,8 @@ def train_user_module(calibration, device, renderer=None):
                                       steps=plan["steps"], tick=None if renderer is None else renderer.pump)
     meta = dict(participant=calibration.participant, session=calibration.session, protocol=calibration.protocol["name"],
                 run=calibration.run_name, user=calibration.labels.get("user"), reaches=len(layouts), steps=plan["steps"],
-                seconds=round(float(lengths.sum()) * arm_task(arm).dt, 1), corruption=arm["corruption"],
+                slow=calibration.slow, seconds=round(float(lengths.sum()) * calibration.slow * arm_task(arm).dt, 1),
+                corruption=arm["corruption"],
                 input_noise=arm["input_noise"], model=arm["model"], log=log, trained=now_iso())
     path = AdapterModules.save_module(user, calibration.module_path, "user", meta={"calibration": meta})
     check = "  ".join(f"{k} {v:.3f}" for k, v in log[-1].items() if k.startswith("heading_cos"))

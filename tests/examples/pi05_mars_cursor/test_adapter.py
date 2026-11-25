@@ -7,7 +7,6 @@ import torch
 from cursor_sa import config, session
 from cursor_sa.agents import ExpertChunkAgent
 from lerobot.envs.cursor import TaskConfig, sample_layouts
-from cursor_sa.paths import adapter_path
 from cursor_sa.policy import FlowPolicy
 from lerobot.policies.steering import AdapterModules, LearnedTaskModule, LearnedUserModule
 
@@ -86,8 +85,12 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
     assert not reverse_flow(model, obs, x, 3, 10, AdapterModules(user=user)).requires_grad
 
 
-def test_old_adapter_checkpoint_loads_as_a_user_only_adapter():
-    adapter = AdapterModules.load(adapter_path("learned_adapter/gain025y_free"))
+def test_a_saved_user_module_loads_as_a_user_only_adapter(tmp_path):
+    user = LearnedUserModule(FlowPolicy().horizon, n_dims=2)
+    torch.manual_seed(0)
+    torch.nn.init.normal_(user.net[-1].weight, std=0.3)  # off its zero start, so the backward pass changes
+    AdapterModules.save_module(user, tmp_path / "u" / "adapter.pt", "user")
+    adapter = AdapterModules.load(tmp_path / "u" / "adapter.pt")
     assert adapter.kind == "user" and adapter.task is None and isinstance(adapter.user, LearnedUserModule)
     model, obs = FlowPolicy().eval(), _obs()
     x = torch.randn(3, model.horizon, 2)

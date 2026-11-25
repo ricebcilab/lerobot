@@ -15,6 +15,7 @@ FIELD, HUD = 760, 124  # px: square task field, text band above it
 BG, INK, INK_2 = (250, 250, 247), (31, 31, 30), (95, 94, 90)
 TARGET, TARGET_EDGE, GOAL = (236, 235, 230), (201, 200, 193), (251, 227, 161)
 CURSOR, PLAN, COMMAND = (42, 120, 214), (150, 190, 236), (235, 104, 52)
+GUIDE = (112, 168, 150)  # a calibration reach's whole path, drawn ahead of the cursor in every window
 GOOD, BAD = (27, 150, 100), (210, 60, 60)
 OBSTACLE, OBSTACLE_EDGE = (205, 204, 198), (150, 149, 144)
 MAX_BEHIND = 2  # frame periods a trial frame may run behind its deadline before the grid starts again (a stall)
@@ -210,6 +211,9 @@ class Renderer:
                 fill = int(radius * min(1.0, env.dwell[0] / task.dwell_steps))
                 if fill > 0:
                     pygame.draw.circle(self.screen, PLAN, center, fill)
+        guide = getattr(ctl, "guide", None)  # a calibration's: not an assist cue, so a blinded window draws it too
+        if guide is not None and not done:
+            pygame.draw.lines(self.screen, GUIDE, False, [to_px(p) for p in guide[0]], 3)
         plan = ctl.planned()[0] if self.cues else ()
         if len(plan) and not done:
             pygame.draw.lines(self.screen, PLAN, False, [to_px(env.pos[0])] + [to_px(p) for p in plan], 3)

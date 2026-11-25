@@ -27,7 +27,7 @@ import numpy as np
 from . import config
 from lerobot.teleoperators.readout import Readout
 from lerobot.envs.cursor import CursorEnv, Layouts, TaskConfig, sample_layouts
-from .demos import make_demos
+from .demos import DemoConfig, make_demos
 from .paths import RESULTS, ROOT, adapter_path, policy_path, policy_weights
 from .policy import load_policy
 from .records import (append_record, arm_fields, block_filename, environment, file_sha256, git_commit, now_iso,
@@ -154,14 +154,19 @@ def readout_for(arm, rng=None, input_noise=None, off=False):
 
 
 class Playback:
-    """The controller of a calibration reach: the cursor moves by the recorded steps `actions` [B, L, 2] on its own
-    and holds after they end, whatever the command. What `run_trials` and the window ask of a controller."""
+    """The controller of a calibration reach: the cursor moves by the recorded steps `actions` [B, L, 2] on its own,
+    each over `slow` frames (a `slow`-th of it a frame, so the reach takes `slow` times as long along the same path),
+    and holds after they end, whatever the command. With `start` [B, 2] its whole path is `guide` [B, L + 1, 2], which
+    the window draws ahead of the cursor. What `run_trials` and the window ask of a controller."""
 
     mode, chunks = "playback", 0
 
-    def __init__(self, actions):
-        self.actions, self.t = np.asarray(actions, dtype=float), 0
-        self.steered_chunks = np.zeros(len(self.actions), dtype=int)
+    def __init__(self, actions, slow=1, start=None):
+        actions = np.asarray(actions, dtype=float)
+        self.actions, self.t = np.repeat(actions / slow, slow, axis=1), 0
+        self.steered_chunks = np.zeros(len(actions), dtype=int)
+        self.guide = None if start is None else np.asarray(start, dtype=float)[:, None] + np.concatenate(
+            [np.zeros_like(actions[:, :1]), np.cumsum(actions, axis=1)], axis=1)
 
     def act(self, command, reference=None):
         step = self.actions[:, self.t] if self.t < self.actions.shape[1] else np.zeros_like(self.actions[:, 0])
@@ -176,7 +181,7 @@ class Playback:
 
 
 def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=None, hud=None, scene_encoder=None,
-               playback=None):
+               playback=None, slow=1):
     """Step len(layouts) trials in lockstep until all are done; return one record per trial.
 
     `policy` (a `CursorFlowPolicy`, `load_checkpoints`', or a bare `FlowPolicy`) goes to the controller
@@ -187,8 +192,9 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
     encoder, or a zero-argument factory of one, called once) is required: the
     running trials' two views are encoded at every observation (`view_scene_fn`).
     With `playback` (steps [B, L, 2], a calibration's demonstrations) the cursor plays those
-    steps by itself instead of a controller's (`Playback`): the commands are read and
-    logged as in any trial, nothing steers, and no feedback follows.
+    steps by itself instead of a controller's (`Playback`, each step over `slow` frames, its
+    path drawn ahead): the commands are read and logged at every frame as in any trial,
+    nothing steers, and no feedback follows.
     """
     task = arm_task(arm)
     B = len(layouts)
@@ -203,7 +209,7 @@ def run_trials(arm, layouts, agent, readout, policy, adapters, device, renderer=
                              "scene_encoder (an encoder, or a factory of one)")
         scene_fn = view_scene_fn(module, scene_encoder if hasattr(scene_encoder, "encode") else scene_encoder())
     env = CursorEnv(layouts, task)
-    ctl = Playback(playback) if playback is not None else SharedController(
+    ctl = Playback(playback, slow, layouts.start) if playback is not None else SharedController(
         policy, layouts, arm["mode"], arm["tau"], arm["n_reverse_steps"], arm["flow_steps"], arm["execute"], task.dt,
         speed_gain=arm["speed_gain"], adapter=adapter, device=device, gain_mode=arm["gain_mode"], ic_gain=arm["ic_gain"],
         lam=arm["lambda"], pinned_steps=arm["pinned_steps"], scene_fn=scene_fn)
@@ -270,6 +276,7 @@ class Run:
     manifest too."""
 
     calibration = False  # a `Calibration`'s trials are reaches the cursor plays by itself
+    slow = 1  # the frames each of those reaches' steps is played over
 
     def __init__(self, protocol, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
                  run_name=None, *, arms, section=None, labels=None):
@@ -375,7 +382,7 @@ class Run:
                     try:
                         recs = run_trials(arm, Layouts.concat([r[2] for r in rows]), self.agent, readout,
                                           self.policies[arm["model"]], self.adapters, self.device, renderer, trial_hud,
-                                          playback=self.playback(rows))
+                                          playback=self.playback(rows), slow=self.slow)
                     except Aborted as e:
                         self.append(log, block, arm_name, rows, e.args[0])
                         raise
@@ -400,10 +407,11 @@ class Run:
 
 class Calibration(Run):
     """The reaches a participant's own user module is trained on (--calibrate), before a visit's first section: on
-    the open field, under the user's readout, the cursor plays one demonstration per layout by itself (`make_demos`)
-    while the participant pushes as if steering it, and every step keeps what the readout served. A run of one
-    block in <protocol>_s<session>_calibration/ (`protocol.calibration`: its reaches and practice reaches), resumed
-    as any run is.
+    the open field, under the user's readout, the cursor plays one demonstration per layout by itself (`make_demos`,
+    straight to the goal without a miss and its correction, so the person can follow it; each step over
+    `protocol.calibration.slow` frames, its whole path drawn ahead) while the participant pushes as if steering it,
+    and every frame keeps what the readout served. A run of one block in <protocol>_s<session>_calibration/
+    (`protocol.calibration`: its reaches and practice reaches), resumed as any run is.
 
     `sections` are the visit's ({task: {arm name: arm}}): the readout and the layouts' task are their first arm's,
     the policy the one their user module steers. `module` names the module trained on the calibration
@@ -427,8 +435,11 @@ class Calibration(Run):
         super().__init__({**protocol, "blocks": blocks}, participant, session, agent, device, results_dir, resume,
                          arms={"calibration": arm}, section=section, labels=labels)
         self.module = f"participants/{protocol['study']}/{participant}/{protocol['name']}_s{session}"
-        rng, task = np.random.default_rng([self.seed, 2]), arm_task(arm)
-        self.demos = {practice: make_demos(rng, layouts, task)  # (steps [B, L, 2], lengths [B]) per layout set
+        self.slow = int(plan["slow"])
+        if self.slow < 1:
+            raise ValueError(f"protocol {protocol['name']}: calibration.slow is the frames a step is played over (>= 1)")
+        rng, task, straight = np.random.default_rng([self.seed, 2]), arm_task(arm), DemoConfig(max_bow=0.0, p_correct=0.0)
+        self.demos = {practice: make_demos(rng, layouts, task, straight)  # (steps [B, L, 2], lengths [B]) per layout set
                       for practice, layouts in ((False, self.layouts), (True, self.practice))}
 
     @staticmethod
@@ -460,19 +471,24 @@ class Calibration(Run):
         return {task: {name: swap(arm) for name, arm in arms.items()} for task, arms in sections.items()}
 
     def data(self):
-        """The played calibration as its trainer reads it: (layouts, steps [B, L, 2], lengths [B], served [B, L, 2]),
-        one row per finished reach: its layout, the demonstration the cursor played on it, and what the readout
-        served at every one of its steps."""
+        """The played calibration as its trainer reads it: (layouts, steps [B, L, 2], lengths [B], served
+        [B, L, slow, 2]), one row per finished reach: its layout, the demonstration the cursor played on it (at the
+        policy's own speed, whatever the playback's), the steps played before the dwell selected the goal, and what
+        the readout served at each frame of every one of them (the last frame's command for a step cut short)."""
         records = [r for r in self.done_trials(1, "calibration") if not r["practice"] and r["outcome"] == "hit"]
         ids = [r["layout_id"] for r in records]
         actions, lengths = self.demos[False]
-        served = np.zeros((len(ids), actions.shape[1], 2))
+        served, played = np.zeros((len(ids), actions.shape[1], self.slow, 2)), np.zeros(len(ids), dtype=lengths.dtype)
         for row, (record, i) in enumerate(zip(records, ids)):
-            if len(record["served_commands"]) != lengths[i]:
-                raise ValueError(f"{self.dir}: reach {record['trial']} has {len(record['served_commands'])} commands for a "
-                                 f"demonstration of {lengths[i]} steps (was the code changed since it was played?)")
-            served[row, :lengths[i]] = record["served_commands"]
-        return self.layouts[ids], actions[ids], lengths[ids], served
+            frames = np.asarray(record["served_commands"], dtype=float).reshape(-1, 2)
+            steps = -(-len(frames) // self.slow)
+            if not len(frames) or steps > lengths[i]:
+                raise ValueError(f"{self.dir}: reach {record['trial']} has {len(frames)} commands for a demonstration of "
+                                 f"{lengths[i]} steps played over {self.slow} frames each (was the code changed since it "
+                                 f"was played?)")
+            frames = np.concatenate([frames, np.repeat(frames[-1:], steps * self.slow - len(frames), axis=0)])
+            served[row, :steps], played[row] = frames.reshape(steps, self.slow, 2), steps
+        return self.layouts[ids], actions[ids], played, served
 
 
 class Visit:

@@ -560,18 +560,19 @@ def mixed_batch(open_data, closed_data, batch, mix):
 
 
 class CalibrationData:
-    """A recorded calibration (a session's --calibrate): the demonstrations the cursor played (a DemoSampler) and, at
-    every one of their steps, the command the participant's readout served there (`served` [B, L, 2], its noise in
-    it: a recording has one command per step)."""
+    """A recorded calibration (a session's --calibrate): the demonstrations the cursor played (a DemoSampler, at the
+    policy's own speed) and, at every one of their steps, the commands the participant's readout served while it
+    played (`served` [B, L, F, 2], one per frame of the step, its noise in it)."""
 
     def __init__(self, layouts, actions, lengths, served, policy, device):
         self.sampler = DemoSampler(layouts, actions, lengths, policy.horizon, policy.hist, device)
         self.served = torch.as_tensor(np.asarray(served), dtype=torch.float32, device=device)
 
     def sample(self, n):
-        """(obs, chunk, served): demo samples and the command served there."""
+        """(obs, chunk, served): demo samples and one of the commands served while that step played."""
         obs, chunk, i, k = self.sampler.sample(n, indexed=True)
-        return obs, chunk, self.served[i, k]
+        frame = torch.randint(self.served.shape[2], (len(i),), device=self.served.device)
+        return obs, chunk, self.served[i, k, frame]
 
 
 def held_command(policy, served):

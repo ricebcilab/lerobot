@@ -42,7 +42,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U3 --participant p1 --session 2 # a second visit, new layouts, another user
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant sim            # the expert agent, headless (20 s)
 uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant sim --watch    # the expert, rendered
-uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1 --calibrate # MARS on the person's own user module (calibration first, +3.5 min)
+uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protocol study_short --user U1 --participant p1 --calibrate # MARS on the person's own user module (calibration first, +2.5 min)
 uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long                            # tables and figures for every run of a study
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1          # the October study's report for p1 (PDF)
 uv run --extra mars python examples/pi05/mars/cursor/reports/build_study_report.py --participants p1 p2 p3 p4 # its group report
@@ -194,13 +194,16 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
   participant shares them unless the visit is calibrated (next). The task modules are the grid's vision modules.
 - **Calibration (`--calibrate`, either study).** The user module is trained in the session, on the participant's
   own commands. Before the first block the cursor plays demonstration reaches by itself on the open field (the
-  protocol's `calibration`: 100 reaches after 5 practice ones) while the participant pushes as if steering it,
-  through the user's readout. That is the shared modules' recipe with the person in the simulated expert's place:
-  every step keeps what the readout served, and a user module is trained on those commands
-  (`train_adapter.train_calibrated_user`, 500 steps, about 15 s on a GPU, a waiting screen meanwhile). It takes the
-  shared module's place in MARS for the whole visit; in the long study the task modules compose with it as with
-  any user's. MARS keeps the depth and prefix tuned with the shared module. About 3.5 minutes in all (89 s of
-  reaches, the gates between them, the training). The reaches are a run of their own,
+  protocol's `calibration`: 50 reaches after 5 practice ones) while the participant pushes as if steering it,
+  through the user's readout. The reaches go straight to the goal with no miss and correction, each recorded step
+  is played over `slow` frames (2, half speed), and the whole path is drawn ahead of the cursor, so the person can
+  follow it. That is the shared modules' recipe with the person in the simulated expert's place: every frame keeps
+  what the readout served, and a user module is trained on those commands toward the demonstration at the policy's
+  own speed (`train_adapter.train_calibrated_user`, each step's command drawn from its frames, 500 steps, about 15 s
+  on a GPU, a waiting screen meanwhile). It takes the shared module's place in MARS for the whole visit; in the long
+  study the task modules compose with it as with any user's. MARS keeps the depth and prefix tuned with the shared
+  module. About 2.5 minutes in all (about 71 s of reaches, as the dwell on the goal is not slowed, the gates between
+  them, the training). The reaches are a run of their own,
   `<protocol>_s<session>_calibration/` (mode `playback`), and the module is
   `checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>/`, named in every manifest and
   record of the visit; its meta holds the calibration and a closing check (how well a regenerated chunk heads
