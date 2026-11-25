@@ -67,6 +67,9 @@ def test_fake_bundle_returns_its_fixed_action_and_ignores_the_command():
         np.testing.assert_array_equal(out, action)
         assert out.shape == (STATION_DIMS,) and out.dtype == np.float64
     np.testing.assert_allclose(fake_bundle().action({}), np.array([0.1] * ARM_DIMS + [1.0]))
+    bundle = fake_bundle()
+    assert bundle.mean is None  # no statistics were installed
+    np.testing.assert_allclose(bundle.std, np.full(STATION_DIMS, 0.3))  # the dry run's stand-in scale
     with pytest.raises(ValueError, match="fake action"):
         fake_bundle((0.1,) * ARM_DIMS)
 

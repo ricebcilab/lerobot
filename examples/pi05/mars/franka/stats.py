@@ -5,7 +5,8 @@ configs are ``features: {}`` and the ``normalization_mapping`` says ``QUANTILES`
 so the q01/q99 statistics have to come from openpi's ``assets/droid/norm_stats.json`` before the
 pipelines mean anything (``DESIGN.md``, "What the checkpoint's own code settles"). ``install_stats``
 puts them where lerobot's normalization mixin reads them and returns the 8-wide action (mean, std) the
-steering cores use.
+steering cores use; ``action_std`` reads the same file's action quantiles as a per-dim standard
+deviation, for teleop's readout noise (teleop must not load the checkpoint).
 
 Where the steps read them (``src/lerobot/processor/normalize_processor.py``):
 
@@ -66,13 +67,7 @@ def install_stats(
     ``FlowControlSteering.action_mean_std``, is what computes it; this does not re-derive the map).
     """
     path = Path(stats_path)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{path}: {error}") from error
-    groups = data.get("norm_stats") if isinstance(data, dict) else None
-    if not isinstance(groups, dict):
-        raise ValueError(f"{path}: expected a 'norm_stats' table, got {type(groups).__name__}")
+    groups = _groups(path)
 
     state = _quantile_pair(groups, "state", path, dims)
     actions = _quantile_pair(groups, "actions", path, dims)
@@ -103,6 +98,40 @@ def install_stats(
 
     mean, std = FlowControlSteering.action_mean_std(postprocessor)
     return mean[:dims], std[:dims]
+
+
+def action_std(stats_path: Path, dims: int = STATION_DIMS) -> NDArray:
+    """The per-dim action standard deviation of ``norm_stats.json``, the first ``dims`` dims.
+
+    ``max((q99 - q01) / 2, 1e-6)``: the same affine form of the QUANTILES map that ``install_stats``
+    returns from the post-processor, read from the file directly. Teleop's readout noise is defined in
+    action-standard-deviation units, and teleop must not load the checkpoint (nor torch), so the loop
+    reads the statistics here instead. The quantiles are the 32-wide file's, width-checked by
+    ``_quantile_pair``; the 1e-6 floor keeps a constant dim from dividing by zero downstream.
+    """
+    dims = _width(dims)
+    path = Path(stats_path)
+    actions = _quantile_pair(_groups(path), "actions", path, STATION_DIMS)
+    return np.maximum((actions["q99"] - actions["q01"]) / 2.0, 1e-6)[:dims]
+
+
+def _groups(path: Path) -> dict:
+    """The ``norm_stats`` table of the statistics file, parsed once for every reader."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: {error}") from error
+    groups = data.get("norm_stats") if isinstance(data, dict) else None
+    if not isinstance(groups, dict):
+        raise ValueError(f"{path}: expected a 'norm_stats' table, got {type(groups).__name__}")
+    return groups
+
+
+def _width(dims: int) -> int:
+    """The number of per-dim statistics a caller asks for: between one and the station's 8."""
+    if isinstance(dims, bool) or not isinstance(dims, int) or not 0 < dims <= STATION_DIMS:
+        raise ValueError(f"dims: expected an integer in (0, {STATION_DIMS}], got {dims!r}")
+    return dims
 
 
 def _quantile_pair(groups: dict, name: str, path: Path, dims: int) -> dict[str, NDArray]:
