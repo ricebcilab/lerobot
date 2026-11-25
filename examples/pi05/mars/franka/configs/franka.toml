@@ -96,6 +96,21 @@ cross_step_rank = 0 # 0 = no coupling between the chunk's steps
 additive = false # true: the module supplies its own velocity term, U v + b
 # correct_by = ...  # absent = the correction is complete by the last reversal step
 
+[task]
+# Phase C's task module: `train-task` reads the demonstrations and writes <out>/task.pt and
+# train_log.json; a `[modes.mars-t]`/`[modes.mars]` table (Phase C4) will read <checkpoint>. Both the
+# dataset and the checkpoint are gitignored: `teleop --record pilot` makes the dataset, and the checkpoint
+# does not exist until `train-task` has run (it is what the C4 arms load).
+demos = "assets/demos/pilot" # a downloaded `teleop --record` dataset
+out = "assets/task/pilot" # train-task writes out/task.pt and out/train_log.json (gitignored)
+checkpoint = "assets/task/pilot/task.pt" # what [modes.mars-t] and [modes.mars] read (Phase C4)
+token_source = "vlm_image" # the scene's token source: vlm_image only in this phase
+render_size = 224 # side of the square scene render the VLM's tokens come from
+# scene_rank = ...    # absent = full-width (2048) VLM tokens; an integer fits a fixed token reduction
+d = 128 # the module's width
+tdim = 64 # its time embedding's width
+lambda_id = 1e-3 # the pull of A, b toward the identity, in main's field loss
+
 [training]
 steps = 3000
 batch = 8

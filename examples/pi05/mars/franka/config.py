@@ -14,6 +14,8 @@ harmless ones (corruption off, no noise). The explicit offs are the strings ``co
 example's directory, not the caller's working directory. Phase B's ``[user]`` and ``[training]``
 tables are the user-module trainer's knobs (DESIGN.md, "Phase B"); the ``null`` defaults there
 (``horizon``, ``step_rank``, ``correct_by``) are the absent key, since TOML cannot spell a null.
+Phase C's ``[task]`` table is the task-module trainer's (DESIGN.md, "Phase C"): the demonstrations
+dataset, the output, and the module's scene and width knobs; ``[training]`` is shared with it.
 """
 
 from __future__ import annotations
@@ -46,11 +48,12 @@ _SECTIONS = frozenset(
         "recording",
         "states",
         "user",
+        "task",
         "training",
     }
 )
 """The config file's sections: station, cameras, policy, command, readout, steering, modes,
-spacemouse, recording, states, user, training."""
+spacemouse, recording, states, user, task, training."""
 
 _MODE_KNOBS = {
     "none": frozenset(),
@@ -163,6 +166,30 @@ class UserConfig:
 
 
 @dataclass(frozen=True)
+class TaskConfig:
+    """The `[task]` table: the task-module trainer's input, output and module shape (DESIGN.md, Phase C).
+
+    ``demos`` names the downloaded ``teleop --record`` dataset the module is trained on; ``train-task``
+    writes ``<out>/task.pt`` and ``<out>/train_log.json``; ``checkpoint`` is where ``[modes.mars-t]`` and
+    the composed ``[modes.mars]`` read the trained module from (Phase C4). ``token_source`` is the scene
+    source the module records (``vlm_image`` only in this phase), ``render_size`` the side of the square
+    scene render the VLM's tokens come from, and ``scene_rank`` the width of the fixed token reduction
+    (None: full width). ``d``/``tdim`` are the module's width and time embedding's width; ``lambda_id`` is
+    the identity pull in main's field loss. ``horizon`` is never a knob: it is the checkpoint's chunk.
+    """
+
+    demos: Path = EXAMPLE_DIR / "assets" / "demos" / "pilot"
+    out: Path = EXAMPLE_DIR / "assets" / "task" / "pilot"
+    checkpoint: Path = EXAMPLE_DIR / "assets" / "task" / "pilot" / "task.pt"
+    token_source: str = "vlm_image"  # the scene source the module records: vlm_image only in this phase
+    render_size: int = 224  # the side of the square scene render the VLM's tokens come from
+    scene_rank: int | None = None  # None = full-width (2048) VLM tokens
+    d: int = 128  # the module's width
+    tdim: int = 64  # its time embedding's width
+    lambda_id: float = 1e-3  # the pull of A, b toward the identity, in main's field loss
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """The `[training]` table: the trainer's loop, split and device (DESIGN.md, Phase B)."""
 
@@ -209,6 +236,7 @@ class Config:
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     states: StatesConfig = field(default_factory=StatesConfig)
     user: UserConfig = field(default_factory=UserConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
 
@@ -473,6 +501,26 @@ def _user(table: Any) -> UserConfig:
     )
 
 
+def _task(table: Any) -> TaskConfig:
+    """The `[task]` trainer table: the demonstrations, the output and the module's scene and shape."""
+    return _build(
+        TaskConfig,
+        table,
+        {
+            "demos": _path,
+            "out": _path,
+            "checkpoint": _path,
+            "token_source": _text,
+            "render_size": _integer,
+            "scene_rank": _integer,
+            "d": _integer,
+            "tdim": _integer,
+            "lambda_id": _non_negative,
+        },
+        "[task]",
+    )
+
+
 def _training(table: Any) -> TrainingConfig:
     """The `[training]` table: the loop, the split and the device."""
     return _build(
@@ -570,5 +618,6 @@ def load_config(path: str | Path) -> Config:
         recording=_build(RecordingConfig, data.get("recording", {}), {"dir": _path}, "[recording]"),
         states=_build(StatesConfig, data.get("states", {}), {"dir": _path}, "[states]"),
         user=_user(data.get("user", {})),
+        task=_task(data.get("task", {})),
         training=_training(data.get("training", {})),
     )

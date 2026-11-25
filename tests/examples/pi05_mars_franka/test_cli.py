@@ -292,6 +292,13 @@ def test_the_shipped_config_is_the_study_config():
     assert (config.training.steps, config.training.batch, config.training.lr) == (3000, 8, 1e-3)
     assert (config.training.val_frac, config.training.seed, config.training.log_every) == (0.1, 0, 100)
     assert (config.training.val_depths, config.training.device) == ((10, 4), "cuda")
+    # Phase C's table: the pilot's recorded demonstrations and the task module train-task writes
+    assert config.task.demos == EXAMPLE_DIR / "assets" / "demos" / "pilot"
+    assert config.task.out == EXAMPLE_DIR / "assets" / "task" / "pilot"
+    assert config.task.checkpoint == EXAMPLE_DIR / "assets" / "task" / "pilot" / "task.pt"
+    assert (config.task.token_source, config.task.render_size) == ("vlm_image", 224)
+    assert (config.task.scene_rank, config.task.d, config.task.tdim) == (None, 128, 64)
+    assert config.task.lambda_id == 1e-3
 
 
 @pytest.mark.parametrize("command", SHIPPED_COMMANDS)
@@ -617,6 +624,87 @@ def test_validate_user_reports_a_user_error_as_one_line(tmp_path, monkeypatch, c
     monkeypatch.setattr(validate, "validate", refuses)
     assert cli.main(["validate-user", "--config", str(_user_config(tmp_path)), "--prompt", "pick"]) == 2
     assert "[user] checkpoint" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- the train-task command
+
+
+def _task_config(tmp_path: Path) -> Path:
+    """A config whose ``[task]`` names a demonstrations directory and an output under tmp_path."""
+    return _write(
+        tmp_path,
+        f'[task]\ndemos = "{tmp_path}/demos/pilot"\nout = "{tmp_path}/task"\n',
+    )
+
+
+def test_train_task_requires_a_prompt(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["train-task", "--config", str(SHIPPED)])
+    assert exit.value.code == 2
+    assert "--prompt is required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--steps", "2"], ["--record", "pilot"], ["--record-states", "pilot"], ["--dry-run"], ["--trace"]],
+)
+def test_train_task_takes_no_session_flags(flags, capsys):
+    """``[task]`` names the trainer's input and output; a session flag has no meaning."""
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["train-task", "--config", str(SHIPPED), "--prompt", "pick", *flags])
+    assert exit.value.code == 2
+    error = capsys.readouterr().err
+    assert "takes --config and --prompt only" in error and "[task]" in error
+
+
+def test_train_task_reaches_the_trainer_with_the_configs_values(tmp_path, monkeypatch, capsys):
+    """The command is the trainer's composition root: it hands the trainer the file's ``[task] demos`` and
+    ``out`` and the session's prompt, and prints the checkpoint the trainer returns."""
+    import train_task
+
+    config_path = _task_config(tmp_path)
+    calls = []
+
+    def fake_train(config, *, prompt, demos_path, out, device=None):
+        calls.append({"config": config, "prompt": prompt, "demos_path": Path(demos_path), "out": Path(out)})
+        return Path(out) / "task.pt"
+
+    monkeypatch.setattr(train_task, "train", fake_train)
+    assert cli.main(["train-task", "--config", str(config_path), "--prompt", "pick the cube"]) == 0
+
+    configured = load_config(config_path)
+    assert configured.task.demos == tmp_path / "demos" / "pilot"
+    assert calls == [
+        {
+            "config": configured,
+            "prompt": "pick the cube",
+            "demos_path": configured.task.demos,
+            "out": configured.task.out,
+        }
+    ]
+    assert f"task module: {configured.task.out / 'task.pt'}" in capsys.readouterr().out
+
+
+def test_train_task_reports_a_user_error_as_one_line(tmp_path, monkeypatch, capsys):
+    import train_task
+
+    def refuses(*args, **kwargs):
+        raise ValueError("[task] demos: no such dataset")
+
+    monkeypatch.setattr(train_task, "train", refuses)
+    assert cli.main(["train-task", "--config", str(_task_config(tmp_path)), "--prompt", "pick"]) == 2
+    assert "[task] demos" in capsys.readouterr().err
+
+
+def test_train_task_names_the_missing_demonstrations_dataset(tmp_path, capsys):
+    """The shipped command on a fresh checkout has no demonstrations: one line names the dataset, no
+    traceback (the demo set is what ``teleop --record`` downloads and ``[task] demos`` points at)."""
+    missing = tmp_path / "demos" / "pilot"
+    config_path = _task_config(tmp_path)
+    assert cli.main(["train-task", "--config", str(config_path), "--prompt", "pick the cube"]) == 2
+    error = capsys.readouterr().err
+    assert str(missing) in error and "teleop --record" in error
+    assert error.count("Traceback") == 0
 
 
 # ---------------------------------------------------------------- the config flag and the SpaceMouse

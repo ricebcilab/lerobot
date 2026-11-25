@@ -4,6 +4,11 @@
 # them and does not ship them, so every checkout downloads its own copy (about 4.5 kB).
 droid/
 
+# Phase C's demonstrations: `teleop --record NAME` downloads a recorded LeRobot dataset here. The
+# demonstrations are data, not source, and are collected on the station (a few hundred frames is tens of
+# MB); `[task] demos` names one and `train-task` reads it.
+demos/
+
 # Phase B/C checkpoints: the user modules and the task modules, trained on this station.
 # The config names them per condition and per task (see README.md in this folder).
 user/

@@ -149,6 +149,7 @@ def test_the_modes_inherit_the_steering_defaults(tmp_path):
         ('[recording]\nout = "x"\n', "recording", "out"),
         ('[states]\nout = "x"\n', "states", "out"),
         ('[user]\nstates_dir = "x"\n', "user", "states_dir"),
+        ("[task]\nepochs = 3\n", "task", "epochs"),
         ("[training]\nepochs = 3\n", "training", "epochs"),
     ],
 )
@@ -438,5 +439,66 @@ def test_the_training_section_parses_the_loop_and_the_device(tmp_path):
     ],
 )
 def test_the_phase_b_values_are_checked_and_named(tmp_path, text, key):
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, text)
+
+
+# ---------------------------------------------------------------- Phase C: the task module's table
+
+
+def test_the_task_section_has_the_phase_c_defaults(tmp_path):
+    """An absent ``[task]`` is the shipped study's module: the pilot's demonstrations, the VLM image
+    scene at main's render size, the shared identity pull and the module's default width."""
+    task = _load(tmp_path, "").task
+    assert task == config_module.TaskConfig()
+    assert task.demos == EXAMPLE_DIR / "assets" / "demos" / "pilot"
+    assert task.out == EXAMPLE_DIR / "assets" / "task" / "pilot"
+    assert task.checkpoint == EXAMPLE_DIR / "assets" / "task" / "pilot" / "task.pt"
+    assert (task.token_source, task.render_size, task.scene_rank) == ("vlm_image", 224, None)
+    assert (task.d, task.tdim, task.lambda_id) == (128, 64, 1e-3)
+
+
+def test_the_task_section_parses_the_trainers_knobs(tmp_path):
+    cfg = _load(
+        tmp_path,
+        "[task]\n"
+        'demos = "assets/demos/push"\n'
+        'out = "assets/task/push"\n'
+        'checkpoint = "assets/task/push/task.pt"\n'
+        'token_source = "vlm_image"\n'
+        "render_size = 256\n"
+        "scene_rank = 64\n"
+        "d = 64\n"
+        "tdim = 32\n"
+        "lambda_id = 0.5\n",
+    )
+    task = cfg.task
+    assert task.demos == EXAMPLE_DIR / "assets" / "demos" / "push"
+    assert task.out == EXAMPLE_DIR / "assets" / "task" / "push"
+    assert task.checkpoint == EXAMPLE_DIR / "assets" / "task" / "push" / "task.pt"
+    assert (task.token_source, task.render_size, task.scene_rank) == ("vlm_image", 256, 64)
+    assert (task.d, task.tdim, task.lambda_id) == (64, 32, 0.5)
+
+
+def test_the_task_sections_paths_resolve_beside_the_example(tmp_path):
+    cfg = _load(tmp_path, '[task]\ndemos = "/an/absolute/dataset"\n')
+    assert cfg.task.demos == Path("/an/absolute/dataset")
+    assert cfg.task.out == EXAMPLE_DIR / "assets" / "task" / "pilot"
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("[task]\nrender_size = 0\n", "render_size"),  # the VLM resizes it; it must be a positive side
+        ("[task]\nrender_size = 2.5\n", "render_size"),
+        ("[task]\nscene_rank = 0\n", "scene_rank"),  # the reduction is at least one token wide
+        ("[task]\nd = 0\n", "d"),
+        ("[task]\ntdim = 0\n", "tdim"),
+        ("[task]\nlambda_id = -0.1\n", "lambda_id"),  # a pull cannot push
+        ('[task]\ntoken_source = ""\n', "token_source"),
+        ("[task]\ntoken_source = 3\n", "token_source"),
+    ],
+)
+def test_the_phase_c_values_are_checked_and_named(tmp_path, text, key):
     with pytest.raises(ValueError, match=key):
         _load(tmp_path, text)
