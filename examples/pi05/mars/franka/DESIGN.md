@@ -210,8 +210,10 @@ class FakeSource:                     # tests and --dry-run
 class Loop:
     def __init__(self, *, config, station, mode: str, source=None, bundle=None, steering=None,
                  adapter_from_corruption: str | None = None)   # mode: teleop | autonomous | steered
-    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False) -> None
-    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False) -> Path
+    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False,
+            states: statefiles.Recorder | None = None) -> None
+    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False,
+                      states: statefiles.Recorder | None = None) -> Path
 ```
 The loop owns the readout, not the caller: it resolves the corruption spec and `q0` at the first episode,
 applies gain/noise, and redraws a per-trial `random` family at every episode — including the `mars-f` adapter
@@ -399,8 +401,10 @@ A faithful command leaves `U` the identity: a zero-initialised module is plain F
 (the same `prepare` boundary the loop already has) to `assets/states/NAME/states.npz`, alongside whatever the
 station records. It adds no control behaviour. Format (frozen; numpy, no pickle):
 `image_exterior`/`image_wrist` `(N,3,224,224) uint8`, `joint_position` `(N,7)`, `gripper` `(N,1)`,
-`deflection` `(N,6)`, `served` `(N,7)`, `q0` `(7,)`, `episode`/`tick` `(N,)`, `prompt`/`mode` `(N,)` str,
-`meta` (JSON: policy path, stats path, station, corruption spec, config digest, timestamp).
+`deflection` `(N,6)`, `served` `(N,7)`, `q0` `(7,)` (an `add` argument: only the loop knows the reset pose),
+`episode`/`tick` `(N,) int32`, `prompt`/`mode` `(N,)` str, `meta` (JSON: policy path, stats path, station,
+corruption spec, config path and digest, noise, seed, timestamp, format version). A re-recorded take retracts
+its rows (`Recorder.drop_episode`).
 
 **Validation (offline, no arm, no env).** On held-out states, for each FRS depth in `val_depths`: what
 steering would execute (`FlowReversalSteering` with the reference pinned) against the cue's intent, as the
@@ -427,6 +431,7 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
           correct_by = null
 [training] steps = 3000 ; batch = 8 ; lr = 1e-3 ; val_frac = 0.1 ; seed = 0 ; log_every = 100
           val_depths = [10, 4] ; device = "cuda" ; dtype = "bfloat16"
+[states]  dir = "assets/states"                     # a session's --record-states NAME lands here
 [modes.mars-u]  mode = "frs" ; adapter_user = "assets/user/rotz20/user.pt"
 ```
 
