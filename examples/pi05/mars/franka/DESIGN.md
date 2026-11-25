@@ -219,7 +219,7 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 - **Images**: the model does `img = img * 2.0 - 1.0` for SigLIP and then resizes with padding, so a batch
   image must be **float in [0,1]** (uint8 would be multiplied as 0-255 and destroyed). It accepts either
   channel order, and a client-side letterbox to 224 skips its resize. We send float32 `(3,224,224)`.
-- **A missing image key is legal**: `PI05Policy.prepare_images` fills absent `config.image_features` keys with
+- **A missing image key is legal**: `PI05Policy._preprocess_images` fills absent `config.image_features` keys with
   an image of -1 and a **zero mask**. That is why the third slot is *omitted*, not filled with zeros — a
   zeros image would carry mask 1 and be a different input. `cameras.third` can name a feed to include it
   instead; the probe prints which convention a session ran.
@@ -258,6 +258,16 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 Unknown keys are rejected. Values are the method's own defaults unless the file sets them: FC's `tau=8`,
 `ic_gain=15.0` are Kao et al.'s DROID numbers (flow-steering's constants); FRS's `n_reversal_steps=10` is
 the full reversal and `pinned_steps=8` the executed prefix (Tang et al.'s pin-executed ratio).
+
+### The station's action contract [V-R]
+
+The action keys are `{arm}/joint_velocity` (7,) and `{arm}/gripper_position` (1,), the gripper a position
+binarized at 0.5. That is not a guess: the previous project's client
+(`examples-from-unrelated-project/droid.py`) sends exactly these two keys to this station, was run on it, and its
+logs are the source of the plant measurements in `flow-steering/docs/plant.md` (bb8 integrates a joint-velocity
+unit as `q_d = q + 0.2 v`). The probe prints the manifest's own `action_keys` on every session, so a station that
+disagrees is named before anything moves. The camera feed names (`[cameras]`), the gripper's physical ends and
+whether `reset()` restores the scene remain probe facts.
 
 ## The one `src/` change
 
