@@ -384,8 +384,11 @@ exact. The module models the *readout*, not a person: it is trained from cues, n
 2. `served = readout(c)` with the session's corruption, auto gain and a noise draw (the study's σ range);
 3. `a_bci = reference(served)` — the constant 7-vector chunk FRS steers toward, `(served - mean)/std` over
    dims 0-6, zeros beyond (the core's `reference_chunk` rule, `reference_step = 1.0`);
-4. `path = reversal of reference(intent)` through the **goal-free** velocity field (prompt `do something`,
-   `Flow.reverse`, `num_inference_steps` steps) — where plain FRS would take a faithful command;
+4. `path = reversal of reference(intent)` through **the velocity field the study itself steers** — the
+   velocity field is conditioned on the prompt, so the module is calibrated in the field it will correct:
+   `train-user`/`validate-user` take the same `--prompt` a session command does, and there is no separate
+   "generic" prompt (LIBERO's study told the VLA `do something`, which is why its trainer hard-codes one; ours
+   does not). `Flow.reverse`, `num_inference_steps` steps, where plain FRS would take a faithful command;
 5. at a random reversal step `k`, target the straight-line closure
    `U(x,t) P(x,t) = (path[k+1] - path[k] - (left-after)(a_bci - path[0])) * N` with
    `left = (1 - k/N)`, `after = (1 - (k+1)/N)` (the old LIBERO trainer's `command_target`), on all **7**
@@ -414,7 +417,6 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
 
 **Config additions.**
 ```toml
-[policy]  prompt_generic = "do something"          # the goal-free field's prompt, for the trainer
 [user]    states = "assets/states/pilot"           # a states file, or a directory sharing the format
           out = "assets/user/rotz20"               # train-user writes <out>/user.pt and train_log.json
           checkpoint = "assets/user/rotz20/user.pt"  # validate-user and [modes.mars-u] read this
@@ -429,5 +431,6 @@ it), `cues.py` (a pilot's command lengths, cue twists on the sphere, and their I
 ```
 
 **Slices.** B1 readout extraction + cues (pure); B2 state recording; B3 the trainer; B4 validation + the
-`mars-u` mode. Each offline suite must run without CUDA, without a checkpoint and without the station; the
+`mars-u` mode. `train-user`/`validate-user` require `--prompt` (the field's prompt, the study's), `--config`,
+and read `[user]`.  Each offline suite must run without CUDA, without a checkpoint and without the station; the
 real velocity field, the real statistics and a real session are verification on chopper only.
