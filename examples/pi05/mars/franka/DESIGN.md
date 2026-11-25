@@ -114,11 +114,17 @@ def readout(intent7: NDArray, matrix7: NDArray | None, noise_std7: NDArray | Non
             gain: float = 1.0, rng=None) -> NDArray    # (7,) served, clipped to [-1, 1]
 def nominal_pose(obs: dict, arm: str) -> NDArray       # (7,)
 ```
-`length` is the mixed-unit scale of the 6-row solve: the angular rows of `J` are multiplied by `length`
-before the damped solve and divided back afterwards, so metres and radians enter the least-squares with the
-same weight. `matrix6_from_spec` accepts the LIBERO grammar on the 3x3 translation block
-(`{rotation_z_deg}`, `{scale: [..]}`, `{F: rows}`, `{random: {...}}`), lifts it to 6x6 as `blkdiag(M3, I3)`,
-and rejects anything else; a per-trial `random` spec draws from `rng`.
+`length` is the mixed-unit scale of the 6-row solve: the angular rows of `J` *and* the angular part of the
+twist are scaled by `length` (a symmetric weighting, `min ||S(J qdot - twist)||`), so metres and radians enter
+the least-squares with the same weight and `J qdot = twist` is unchanged. Damping (`lambda = 1e-2`) is used in
+`joint_velocity` only; `corruption_lift`/`lift_inverse` use the undamped Moore-Penrose right inverse of the
+same scaled Jacobian, because the exact-inverse property below needs `J J+ = I6`.
+`matrix6_from_spec` accepts the repo's corruption grammar on the 3x3 translation block — `lerobot.teleoperators.readout.matrix_spec(spec, 3)`'s
+forms: `{rotation_z_deg: d}`, `{scale: [sx, sy, sz]}`, `{M: rows}` (or bare rows), and `{random: {...}}` drawn
+per trial from `rng` with LIBERO's semantics (`R(axis, angle) @ diag(gains)`, axis uniform on the sphere,
+angle uniform in `rotation_deg`, gains log-uniform in `scale`). It lifts the block to 6x6 as `blkdiag(M3, I3)`
+and rejects anything else (a curl or a quantize corruption has no matrix). Names follow LIBERO's: `M` is the
+literal key, `rotation_z_deg` the 3-D rotation (`rotation_deg` is the 2-D plane's).
 The Jacobian is copied from the hardware-validated implementation in `examples-from-unrelated-project/`
 (mujoco_menagerie `panda.xml`, hinge about the *child* frame origin). Do not re-derive it.
 
@@ -238,6 +244,8 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 [command]   translation_gain = 0.11 ; rotation_gain = 0.5 ; twist_length = 0.2
             deadband = 0.02 ; gain = "auto" ; q0 = []
 [readout]   corruption = {rotation_z_deg = 20} ; noise = 0.35 ; seed = 0
+            # built-in defaults are neutral: corruption off, noise 0.0, seed 0. The values above are the
+            # shipped study config's, written out; a variant file overrides them and writes "none" to clear.
 [steering]  n_dims = 7 ; reference_step = 1.0 ; n_reversal_steps = 10 ; pinned_steps = 8
 [modes.fc]      mode = "flow_control" ; tau = 8 ; lam = 1 ; ic_gain = 15.0
 [modes.frs]     mode = "frs"
@@ -277,7 +285,7 @@ and leaves the gripper (dim 7) and the padding to the policy.
 |---|---|---|
 | A1 steering patch | `src/lerobot/policies/steering/{configuration,modeling}_steering.py`, `tests/policies/steering/test_steering_action_space.py` | new tests: FRS reference from a 7-wide command on 32-wide stats equals `(command-mean)/std` in dims 0-6 and zero beyond, with `reference_step`; `n_dims=7` delegates dims 7+ and pins dims 0-6 for the executed prefix; FC writes dims 0..6 of `x_t`; cursor and LIBERO masks bit-identical; defaults unchanged (existing suites green) |
 | A2 SpaceMouse rotation | `src/lerobot/teleoperators/spacemouse/teleop_spacemouse.py`, `tests/teleoperators/test_spacemouse.py` | report id 2 parses to `(rx, ry, rz)`; `SpaceMouseReader.rotation`; 6-axis mapping class; additive (existing tests untouched and green) |
-| A3 config + bridge | `examples/.../config.py`, `bridge.py`, `tests/.../test_config.py`, `test_bridge.py` | config loads the shipped TOML, rejects unknown keys; Jacobian reproduces the reference implementation's numbers at a known `q`; `lift_inverse(F) @ F == I` for the three families; IK round-trips a small twist; readout clips |
+| A3 config + bridge | `examples/.../config.py`, `bridge.py`, `tests/.../test_config.py`, `test_bridge.py` | config parses the schema from a TOML written in the test, rejects unknown keys, and has neutral defaults; Jacobian agrees with a finite difference of `flange_pose` and with a pinned DROID-reset pose; `lift_inverse(F) @ F == I` for the three families; the three matrix specs equal `readout.matrix_spec`'s; IK round-trips a small twist; readout clips and seeds |
 | A4 station | `examples/.../station.py`, `tests/.../test_station.py` | fake station round-trip; `observation_batch` keys/shapes/dtypes and the 32-wide state padding; `action_dict` clip/binarize; c3po never imported at module level |
 | A5 policy | `examples/.../policy.py`, `tests/.../test_policy.py` | `install_stats` on the real `norm_stats.json` installs 32-wide `q01`/`q99` for `action` and `observation.state` on the right steps and returns the 8-wide action mean/std; a real `NormalizerProcessorStep`/`UnnormalizerProcessorStep` round-trip an 8-wide action through them; the full end-to-end pipeline test is skipped when the gated PaliGemma tokenizer is not cached (it runs on chopper) |
 | A6 integration | `examples/.../loop.py`, `cli.py`, `probe.py`, `configs/franka.toml`, `README.md`, `src/lerobot/scripts/mars_franka.py`, `pyproject.toml` | loop drives a fake station and a fake sampler with exactly one `step` per action and no sleeps; every command and every mode reaches the right composition; `--dry-run` runs offline |
