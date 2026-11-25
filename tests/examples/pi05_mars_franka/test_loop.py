@@ -21,12 +21,12 @@ from types import SimpleNamespace
 import bridge
 import numpy as np
 import pytest
-from bridge import ARM_DIMS
+from bridge import ARM_DIMS, TWIST_DIMS
 from config import CommandConfig, Config, ReadoutConfig
 from loop import Loop
 from policy import STATION_DIMS, fake_bundle, teleop_action
 from source import FakeSource
-from station import FakeStation
+from station import FakeStation, observation_batch
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
 
@@ -819,6 +819,183 @@ def test_run_recording_refuses_a_station_that_cannot_record(tmp_path):
         loop.run_recording(name="pilot", dest=tmp_path, prompt="pick")
 
     assert station.steps == 0
+
+
+# ---------------------------------------------------------------- states recording
+
+
+class _Recorder:
+    """A fake ``statefiles.Recorder``: keeps every ``add`` the loop makes, in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def add(self, batch, **values) -> None:
+        self.calls.append({"batch": batch, **values})
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+
+def _recording_loop(mode: str, states, *, config=None, station=None):
+    """One mode's composition for the recording tests: ``(loop, station, source, bundle)``."""
+    station = _Station(_observations()) if station is None else station
+    source = FakeSource(deflection=DEFLECTION)
+    bundle = _CountingBundle()
+    config = _config(n_action_steps=4) if config is None else config
+    if mode == "teleop":
+        return Loop(config=config, station=station, mode="teleop", source=source), station, source, bundle
+    if mode == "autonomous":
+        return Loop(config=config, station=station, mode="autonomous", bundle=bundle), station, source, bundle
+    loop = Loop(
+        config=config,
+        station=station,
+        mode="steered",
+        source=source,
+        bundle=bundle,
+        steering=_steering(),
+    )
+    return loop, station, source, bundle
+
+
+@pytest.mark.parametrize("mode", ["teleop", "autonomous", "steered"])
+def test_a_recorder_gets_one_row_per_chunk_boundary_in_every_mode(mode):
+    """Recording is a chunk-boundary event in all three modes, teleop included (which has no batch)."""
+    recorder = _Recorder()
+    loop, station, _, _ = _recording_loop(mode, recorder)
+
+    loop.run(prompt="pick the cube", max_steps=9, states=recorder)
+
+    assert [(call["tick"], call["episode"], call["mode"]) for call in recorder.calls] == [
+        (0, 0, mode),
+        (4, 0, mode),
+        (8, 0, mode),
+    ]
+    assert all(call["prompt"] == "pick the cube" for call in recorder.calls)
+    for call in recorder.calls:
+        np.testing.assert_array_equal(call["joint_position"], JOINT)
+        np.testing.assert_array_equal(call["gripper"], np.zeros(1))
+        np.testing.assert_array_equal(call["q0"], JOINT)  # command.q0 empty: the reset pose
+    assert len(station.actions) == 9  # the recording adds no station step
+
+
+def test_the_steered_row_is_the_boundarys_raw_batch_and_held_command():
+    """The recorded batch is the pre-processor's input, and the served command is the chunk's held one."""
+    observations = _observations(joints=[JOINT, JOINT + 0.1, JOINT + 0.2])
+    station = _Station(observations)
+    bundle = _CountingBundle()
+    recorder = _Recorder()
+    loop = Loop(
+        config=_config(n_action_steps=4, readout=ReadoutConfig(noise=0.0)),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick the cube", max_steps=8, states=recorder)
+
+    first, second = recorder.calls
+    assert first["batch"] is bundle.batches[0] and "prepared" not in first["batch"]
+    assert second["batch"] is bundle.batches[1]
+    expected = observation_batch(
+        observations[0],
+        arm="follower",
+        cameras={"exterior": "scene_zed", "wrist": "wrist_zed", "third": None},
+        task="pick the cube",
+    )
+    np.testing.assert_array_equal(
+        first["batch"]["observation.images.base_0_rgb"],
+        expected["observation.images.base_0_rgb"],
+    )
+    np.testing.assert_array_equal(first["served"], bundle.commands[0])
+    np.testing.assert_array_equal(second["served"], bundle.commands[4])
+    np.testing.assert_array_equal(first["deflection"], DEFLECTION)
+    # the state before the action: tick 4's boundary observation is the second canned pose
+    np.testing.assert_array_equal(first["joint_position"], JOINT)
+    np.testing.assert_array_equal(second["joint_position"], JOINT + 0.1)
+
+
+def test_a_teleop_recording_stores_the_action_it_sends():
+    """Teleop has no bundle: the loop builds the raw batch for the recording alone, and the served
+    command it stores is the one the tick's action carries."""
+    station = _Station(_observations())
+    recorder = _Recorder()
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run(prompt="pick", max_steps=8, states=recorder)
+
+    assert len(recorder.calls) == 2
+    for call, action in zip(recorder.calls, (station.actions[0], station.actions[4]), strict=True):
+        np.testing.assert_array_equal(call["served"], action[:ARM_DIMS])
+        np.testing.assert_array_equal(call["deflection"], DEFLECTION)
+        assert call["batch"]["task"] == "pick"
+        assert call["batch"]["observation.images.base_0_rgb"].shape == (3, 224, 224)
+
+
+def test_an_autonomous_recording_stores_zeros_for_the_operator_columns():
+    """Autonomous has no operator and no command: its rows say zeros rather than inventing one."""
+    station = _Station(_observations())
+    recorder = _Recorder()
+    loop = Loop(
+        config=_config(n_action_steps=4), station=station, mode="autonomous", bundle=_CountingBundle()
+    )
+
+    loop.run(prompt="pick", max_steps=8, states=recorder)
+
+    assert len(recorder.calls) == 2
+    for call in recorder.calls:
+        np.testing.assert_array_equal(call["served"], np.zeros(ARM_DIMS))
+        np.testing.assert_array_equal(call["deflection"], np.zeros(TWIST_DIMS))
+        np.testing.assert_array_equal(call["q0"], JOINT)
+
+
+@pytest.mark.parametrize("mode", ["teleop", "autonomous", "steered"])
+def test_the_actions_are_the_same_with_and_without_a_recorder(mode, tmp_path):
+    """Recording is observation only: same station, same seed, same actions, with and without it."""
+    stats = _stats_file(tmp_path / "stats.json")
+
+    def actions(states) -> list[np.ndarray]:
+        config = _config(n_action_steps=3, readout=ReadoutConfig(corruption=SPEC, noise=0.3, seed=5))
+        config = replace(config, policy=replace(config.policy, stats=stats))
+        loop, station, _, _ = _recording_loop(mode, states, config=config)
+        loop.run(prompt="pick", max_steps=7, states=states)
+        return station.actions
+
+    without = actions(None)
+    recorder = _Recorder()
+    with_states = actions(recorder)
+
+    assert len(recorder.calls) == 3  # boundaries at ticks 0, 3, 6
+    assert len(without) == len(with_states) == 7
+    for one, two in zip(without, with_states, strict=True):
+        np.testing.assert_array_equal(one, two)
+
+
+def test_run_recording_records_every_episode_and_numbers_them_from_zero(tmp_path):
+    """The recording loop's episodes are 0-based and each restarts its ticks; the recorder sees the
+    boundaries of the episode the loop is in."""
+    schedule = [(0, 2, "done"), (1, 1, "stop")]
+    recorder = _Recorder()
+    station = _RecordingStation(_observations(), schedule)
+    loop = Loop(
+        config=_config(n_action_steps=1),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run_recording(name="pilot", dest=tmp_path, prompt="pick", states=recorder)
+
+    assert [(call["episode"], call["tick"]) for call in recorder.calls] == [(0, 0), (0, 1), (1, 0)]
+    assert {call["mode"] for call in recorder.calls} == {"teleop"}
+    assert station.steps == 3
 
 
 # ---------------------------------------------------------------- construction

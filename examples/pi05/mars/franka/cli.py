@@ -7,6 +7,14 @@ checkpoint; it always traces, so every action the loop would send is printed. It
 statistics asset: if ``[policy] stats`` is absent, teleop's noise uses a generated stand-in std and
 the run says so (a real run still fails on the missing file).
 
+``--record-states NAME`` keeps the chunk-boundary states a session visits, in
+``<config.states.dir>/NAME/states.npz`` (``statefiles.Recorder``): the recorder is handed to the loop,
+which appends one pre-action row per chunk in every mode, and this module saves it after the run and
+prints its path and count. It composes with ``--record`` (the dataset and the states describe the same
+session) and every session command takes it; ``probe`` records nothing. The states' ``meta`` names the
+config path and its SHA-256, the policy and statistics paths, the station, the effective readout and a
+timestamp, so a collected file can be replayed against the config that produced it.
+
 ``teleop`` is the operator alone (no bundle, no steering), ``autonomous`` the policy alone, and
 ``fc``/``frs``/``mars-f``/``mars-u``/``mars-t``/``mars`` read their ``[modes.<command>]`` table
 and steer the policy with it; a missing table is named with how to add it (the shipped config
@@ -26,11 +34,13 @@ line to stderr and exits 2; any other exception keeps its traceback, because tha
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import tempfile
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,6 +52,7 @@ from loop import Loop
 from numpy.typing import NDArray
 from policy import fake_bundle, load_bundle, make_steering
 from source import FakeSource, SpaceMouseSource
+from statefiles import Recorder
 from station import C3poStation, FakeStation
 from stats import CHECKPOINT_WIDTH, STATION_DIMS
 
@@ -104,6 +115,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--prompt", metavar="TEXT", help="the task text; required for the policy commands")
     parser.add_argument("--record", metavar="NAME", help="record episodes as NAME and print the dataset path")
+    parser.add_argument(
+        "--record-states",
+        metavar="NAME",
+        dest="record_states",
+        help="record chunk-boundary states as NAME (in [states] dir) and print the states path",
+    )
     parser.add_argument("--steps", type=_positive_int, metavar="N", help="stop run() after N control steps")
     parser.add_argument("--trace", action="store_true", help="print the loop's per-tick line")
     parser.add_argument(
@@ -128,7 +145,7 @@ def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         parser.error(f"--prompt is required for {args.command!r}")
     if args.corrupted and args.command != "teleop":
         parser.error("--corrupted is teleop only: the shared modes always apply [readout]")
-    if args.command == "probe" and args.record is not None:
+    if args.command == "probe" and (args.record is not None or args.record_states is not None):
         parser.error("probe records nothing: it prints the station and checkpoint facts and moves nothing")
 
 
@@ -169,6 +186,7 @@ def _run(args: argparse.Namespace, config: Config) -> int:
         loop_config = _loop_config(args.command, args.corrupted, config)
         if args.dry_run:
             loop_config = _dry_run_statistics(stack, loop_config, method.loop_mode)
+        states = _recorder(args, config, loop_config)
         loop = Loop(
             config=loop_config,
             station=station,
@@ -180,11 +198,22 @@ def _run(args: argparse.Namespace, config: Config) -> int:
         )
         if args.record is not None:
             path = loop.run_recording(
-                name=args.record, dest=config.recording.dir, prompt=prompt, trace=args.trace
+                name=args.record,
+                dest=config.recording.dir,
+                prompt=prompt,
+                trace=args.trace,
+                states=states,
             )
             print(f"dataset: {path}", flush=True)
         else:
-            loop.run(prompt=prompt, max_steps=args.steps, trace=args.trace or args.dry_run)
+            loop.run(
+                prompt=prompt,
+                max_steps=args.steps,
+                trace=args.trace or args.dry_run,
+                states=states,
+            )
+        if states is not None:
+            _save_states(states, config, args.record_states)
     return 0
 
 
@@ -285,6 +314,45 @@ def _loop_config(command: str, corrupted: bool, config: Config) -> Config:
     if command == "teleop" and not corrupted:
         return replace(config, readout=ReadoutConfig(corruption=None, noise=0.0))
     return config
+
+
+def _recorder(args: argparse.Namespace, config: Config, loop_config: Config) -> Recorder | None:
+    """The session's state recorder, when ``--record-states`` asked for one; the CLI saves it at exit."""
+    if args.record_states is None:
+        return None
+    return Recorder(_states_meta(args.config, config, loop_config))
+
+
+def _states_meta(config_path: Path, config: Config, loop_config: Config) -> dict[str, object]:
+    """The provenance a states file carries: what replaying its rows has to be reproduced against.
+
+    The readout is ``loop_config``'s -- the effective one the loop ran -- because plain teleop runs the
+    clean readout even though the file's ``[readout]`` may say otherwise. The digest is of the config
+    file's bytes, so a file can be matched to the exact config that collected it.
+    """
+    return {
+        "config": str(config_path),
+        "config_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
+        "policy": config.policy.path,
+        "stats": str(config.policy.stats),
+        "station": {
+            "host": config.station.host,
+            "port": config.station.port,
+            "arm": config.station.arm,
+            "rate": config.station.rate,
+        },
+        "corruption": loop_config.readout.corruption,
+        "noise": loop_config.readout.noise,
+        "seed": loop_config.readout.seed,
+        "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+
+
+def _save_states(recorder: Recorder, config: Config, name: str) -> None:
+    """Write ``<config.states.dir>/NAME/states.npz`` and print its path and state count."""
+    path = recorder.save(Path(config.states.dir) / name / "states.npz")
+    count = len(recorder)
+    print(f"states: {path} ({count} {'state' if count == 1 else 'states'})", flush=True)
 
 
 def _dry_run_statistics(stack: ExitStack, config: Config, loop_mode: str) -> Config:

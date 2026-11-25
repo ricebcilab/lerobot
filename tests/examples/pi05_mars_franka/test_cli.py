@@ -9,6 +9,7 @@ fakes, and the ``--dry-run`` tests drive the real composition over ``FakeStation
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import numpy as np
 import pytest
 from config import load_config
 from source import FakeSource
+from statefiles import Recorder, load
 from station import FakeStation as RealFakeStation
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
@@ -78,12 +80,15 @@ class _RecordingLoop:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
         self.runs: list[dict] = []
+        self.states: list = []
         type(self).instances.append(self)
 
-    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False) -> None:
+    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False, states=None) -> None:
+        self.states.append(states)
         self.runs.append({"prompt": prompt, "max_steps": max_steps, "trace": trace})
 
-    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False) -> Path:
+    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False, states=None) -> Path:
+        self.states.append(states)
         self.runs.append({"record": name, "dest": Path(dest), "prompt": prompt, "trace": trace})
         return Path(dest) / name
 
@@ -424,6 +429,88 @@ def test_record_switches_to_run_recording_and_prints_the_dataset(real_components
 def test_record_needs_a_recording_station_so_a_dry_run_says_so(dry_station, capsys):
     assert cli.main(["teleop", "--config", str(SHIPPED), "--dry-run", "--record", "pilot"]) == 2
     assert "recording station" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- the states flag
+
+
+def _states_config(tmp_path: Path, *, n_action_steps: int | None = None) -> Path:
+    """The shipped config with its states directory (and optionally its chunk) moved into tmp_path."""
+    text = SHIPPED.read_text(encoding="utf-8")
+    text = text.replace('dir = "assets/states"', f'dir = "{tmp_path}/states"')
+    if n_action_steps is not None:
+        text = text.replace("n_action_steps = 8", f"n_action_steps = {n_action_steps}")
+    return _write(tmp_path, text)
+
+
+@pytest.mark.parametrize("command", SHIPPED_COMMANDS)
+def test_record_states_writes_and_prints_its_file_on_every_shipped_command(command, tmp_path, capsys):
+    """Every session command takes the flag; a dry run collects one row per chunk boundary."""
+    path = _states_config(tmp_path)
+    argv = [command, "--config", str(path), "--dry-run", "--steps", "8", "--record-states", "pilot"]
+    if command != "teleop":
+        argv += ["--prompt", "pick the cube"]
+
+    assert cli.main(argv) == 0
+
+    states_path = tmp_path / "states" / "pilot" / "states.npz"
+    out = capsys.readouterr().out
+    assert f"states: {states_path} (1 state)" in out
+    arrays, meta = load(states_path)
+    assert len(arrays["episode"]) == 1  # steps 8 / n_action_steps 8: one chunk boundary
+    expected_mode = (
+        "teleop" if command == "teleop" else "autonomous" if command == "autonomous" else "steered"
+    )
+    assert arrays["mode"].tolist() == [expected_mode]
+    assert meta["config"] == str(path)
+    assert meta["config_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert meta["policy"] == "lerobot/pi05_droid"
+    assert meta["station"] == {"host": "10.42.0.1", "port": 9090, "arm": "follower", "rate": 15.0}
+    assert meta["timestamp"]
+    if command == "teleop":  # the clean readout is what the loop ran
+        assert (meta["corruption"], meta["noise"]) == (None, 0.0)
+    else:
+        assert meta["corruption"] == {"rotation_z_deg": 20} and meta["noise"] == 0.35
+
+
+def test_record_states_is_refused_on_probe(capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["probe", "--record-states", "pilot"])
+    assert exit.value.code == 2
+    assert "probe records nothing" in capsys.readouterr().err
+
+
+def test_steps_still_caps_the_run_with_record_states(tmp_path, capsys, dry_station):
+    """``--steps`` still bounds the run: one state per tick with a one-tick chunk, and it stops."""
+    path = _states_config(tmp_path, n_action_steps=1)
+    assert (
+        cli.main(["teleop", "--config", str(path), "--dry-run", "--steps", "3", "--record-states", "pilot"])
+        == 0
+    )
+    arrays, _ = load(tmp_path / "states" / "pilot" / "states.npz")
+    assert arrays["tick"].tolist() == [0, 1, 2] and arrays["episode"].tolist() == [0, 0, 0]
+    assert len(dry_station.instances[-1].actions) == 3
+    assert "(3 states)" in capsys.readouterr().out
+
+
+def test_record_states_hands_the_loop_a_recorder_and_saves_it_after_the_run(
+    real_components, tmp_path, capsys
+):
+    path = _states_config(tmp_path)
+    assert cli.main(["teleop", "--config", str(path), "--steps", "2", "--record-states", "pilot"]) == 0
+    loop = real_components.instances[-1]
+    assert isinstance(loop.states[0], Recorder)  # the real recorder, not a stand-in
+    states_path = tmp_path / "states" / "pilot" / "states.npz"
+    assert states_path.is_file()  # saved at exit, even with no rows from the fake loop
+    assert f"states: {states_path} (0 states)" in capsys.readouterr().out
+
+
+def test_record_states_composes_with_record(real_components, tmp_path):
+    path = _states_config(tmp_path)
+    assert cli.main(["teleop", "--config", str(path), "--record", "pilot", "--record-states", "pilot"]) == 0
+    loop = real_components.instances[-1]
+    assert loop.runs[0]["record"] == "pilot"
+    assert isinstance(loop.states[0], Recorder)
 
 
 # ---------------------------------------------------------------- the console-script shim

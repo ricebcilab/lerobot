@@ -8,3 +8,8 @@ droid/
 # The config names them per condition and per task (see README.md in this folder).
 user/
 task/
+
+# Phase B's collected states: `--record-states NAME` writes states/NAME/states.npz here. A session's
+# chunk-boundary states are data, not source: they are collected on the station, one directory per
+# pilot run (a few hundred states is a few tens of MB). See the DESIGN.md "Phase B" section.
+states/

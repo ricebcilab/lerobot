@@ -77,6 +77,9 @@ adapter_task = "assets/task/t/task.pt"
 
 [recording]
 dir = "outputs/mars_franka"
+
+[states]
+dir = "assets/states"
 """
 
 
@@ -111,6 +114,7 @@ def test_the_shipped_schema_parses_to_the_documented_tree(tmp_path):
     assert cfg.modes["mars"].adapter_user == EXAMPLE_DIR / "assets/user/u/user.pt"
     assert cfg.modes["mars"].adapter_task == EXAMPLE_DIR / "assets/task/t/task.pt"
     assert cfg.recording.dir == EXAMPLE_DIR / "outputs/mars_franka"
+    assert cfg.states.dir == EXAMPLE_DIR / "assets/states"
     assert cfg.policy.stats == EXAMPLE_DIR / "assets/droid/norm_stats.json"
 
 
@@ -143,6 +147,7 @@ def test_the_modes_inherit_the_steering_defaults(tmp_path):
         ('[modes.fc]\nmode = "flow_control"\ntaus = 8\n', "modes.fc", "taus"),
         ('[steering]\nmode = "frs"\n', "steering", "mode"),
         ('[recording]\nout = "x"\n', "recording", "out"),
+        ('[states]\nout = "x"\n', "states", "out"),
     ],
 )
 def test_an_unknown_key_names_its_section_and_key(tmp_path, text, where, key):
@@ -317,3 +322,15 @@ def test_the_spacemouse_section_parses_a_path_mapping_and_scales(tmp_path):
 def test_the_spacemouse_section_validates_its_fields(tmp_path, text, key):
     with pytest.raises(ValueError, match=key):
         _load(tmp_path, text)
+
+
+def test_the_states_section_defaults_to_the_assets_states_dir(tmp_path):
+    """A Phase B state file lands under assets/states unless a variant config says otherwise."""
+    states = _load(tmp_path, "").states
+    assert states == config_module.StatesConfig()
+    assert states.dir == EXAMPLE_DIR / "assets" / "states"
+
+
+def test_the_states_section_parses_its_dir_beside_the_example(tmp_path):
+    cfg = _load(tmp_path, '[states]\ndir = "assets/states/pilot"\n')
+    assert cfg.states.dir == EXAMPLE_DIR / "assets" / "states" / "pilot"

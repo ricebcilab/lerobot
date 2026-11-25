@@ -10,7 +10,8 @@ TOML has no ``null``: an absent key means "the built-in default", and the built-
 harmless ones (corruption off, no noise). The explicit offs are the strings ``corruption = "none"``
 (equivalent to the absent default, so a variant file can turn off what it inherits) and
 ``mode = "none"``. Relative paths (``policy.stats``, ``steering.adapter_user``/``adapter_task``,
-``recording.dir``) resolve against this example's directory, not the caller's working directory.
+``recording.dir``, ``states.dir``) resolve against this example's directory, not the caller's working
+directory.
 """
 
 from __future__ import annotations
@@ -31,10 +32,21 @@ EXAMPLE_DIR = Path(__file__).parent
 STEERING_MODES = ("none", "flow_control", "frs")
 
 _SECTIONS = frozenset(
-    {"station", "cameras", "policy", "command", "readout", "steering", "modes", "spacemouse", "recording"}
+    {
+        "station",
+        "cameras",
+        "policy",
+        "command",
+        "readout",
+        "steering",
+        "modes",
+        "spacemouse",
+        "recording",
+        "states",
+    }
 )
 """The config file's sections: station, cameras, policy, command, readout, steering, modes,
-spacemouse, recording."""
+spacemouse, recording, states."""
 
 _MODE_KNOBS = {
     "none": frozenset(),
@@ -114,6 +126,13 @@ class RecordingConfig:
 
 
 @dataclass(frozen=True)
+class StatesConfig:
+    """The `[states]` table: where a session's chunk-boundary states land (DESIGN.md, Phase B)."""
+
+    dir: Path = EXAMPLE_DIR / "assets" / "states"
+
+
+@dataclass(frozen=True)
 class SpaceMouseConfig:
     """The operator's ``[spacemouse]`` table: how the device is found and its six channels mapped.
 
@@ -144,6 +163,7 @@ class Config:
     modes: Mapping[str, SteeringConfig] = field(default_factory=lambda: MappingProxyType({}))
     spacemouse: SpaceMouseConfig = field(default_factory=SpaceMouseConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
+    states: StatesConfig = field(default_factory=StatesConfig)
 
 
 # ---------------------------------------------------------------- value checks
@@ -429,4 +449,5 @@ def load_config(path: str | Path) -> Config:
         modes=_modes(data.get("modes", {}), steering),
         spacemouse=_spacemouse(data.get("spacemouse", {})),
         recording=_build(RecordingConfig, data.get("recording", {}), {"dir": _path}, "[recording]"),
+        states=_build(StatesConfig, data.get("states", {}), {"dir": _path}, "[states]"),
     )
