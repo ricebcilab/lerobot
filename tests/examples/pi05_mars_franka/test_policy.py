@@ -258,6 +258,17 @@ def test_make_steering_refuses_a_steering_mode_without_statistics():
 # ---------------------------------------------------------------- the bundle's two action paths
 
 
+class _CountingPreprocessor:
+    """A preprocessor stand-in that counts how many times the raw observation goes through it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, raw_batch: dict) -> dict:
+        self.calls += 1
+        return dict(raw_batch)
+
+
 def test_steering_batch_is_the_preprocessor_and_the_caller_adds_the_command():
     """LIBERO's order: the pre-processor makes the batch, then the loop sets ``batch["command"]``; the
     batch helper must not add it (the autonomous path has no command)."""
@@ -280,6 +291,56 @@ def test_bundle_action_takes_the_first_eight_dims_after_the_postprocessor():
     out = _fake_bundle().action({"observation.state": np.zeros(CHECKPOINT_WIDTH)})
     np.testing.assert_array_equal(out, np.arange(STATION_DIMS, dtype=np.float64))
     assert out.shape == (STATION_DIMS,) and out.dtype == np.float64
+
+
+def test_act_takes_a_prepared_batch_and_returns_the_eights():
+    """``prepare`` is the pre-processor call, ``act`` is the rest of a tick: the base policy's action
+    without a command and the steered one with it, both (8,) float64, no preprocessing in ``act``."""
+    bundle = _fake_bundle()
+    make_steering(bundle, FRS)
+    batch = bundle.prepare({"observation.state": np.zeros(CHECKPOINT_WIDTH)})
+    np.testing.assert_array_equal(bundle.act(batch), np.arange(STATION_DIMS, dtype=np.float64))
+    out = bundle.act(batch, np.full(ARM_DIMS, 0.5))
+    assert out.shape == (STATION_DIMS,) and out.dtype == np.float64
+    assert np.isfinite(out).all()
+
+
+def test_prepare_once_per_chunk_and_act_per_tick_matches_action_per_tick():
+    """The policies read a batch only when their action queue is empty (once per ``n_action_steps``), so
+    the loop can prepare once per chunk and act on the ticks in between: the same actions as calling the
+    one-shot ``action`` every tick, with one preprocessing instead of ``n_action_steps``."""
+    preprocessor = _CountingPreprocessor()
+    bundle = Bundle(
+        policy=_FakePolicy(),
+        preprocessor=preprocessor,
+        postprocessor=_FakePostprocessor(),
+        mean=np.zeros(STATION_DIMS),
+        std=np.full(STATION_DIMS, 0.25),
+    )
+    make_steering(bundle, FC)
+    raw = {"observation.state": np.zeros(CHECKPOINT_WIDTH)}
+    command = np.full(ARM_DIMS, 0.5)
+    ticks = bundle.policy.config.n_action_steps
+
+    batch = bundle.prepare(raw)
+    staged = np.stack([bundle.act(batch, command) for _ in range(ticks)])
+    assert preprocessor.calls == 1  # one chunk, one preprocessing, however many ticks it serves
+    bundle.reset()
+    consecutive = np.stack([bundle.action(raw, command) for _ in range(ticks)])
+    assert preprocessor.calls == 1 + ticks  # the one-shot call preprocesses every tick
+    np.testing.assert_array_equal(staged, consecutive)
+
+
+def test_action_is_act_of_prepare():
+    """The convenient call is exactly ``act(prepare(raw_batch), command7)`` (two fresh bundles, so both
+    read their chunk from the same state)."""
+    raw = {"observation.state": np.zeros(CHECKPOINT_WIDTH)}
+    command = np.full(ARM_DIMS, 0.5)
+    one = _fake_bundle()
+    make_steering(one, FRS)
+    staged = _fake_bundle()
+    make_steering(staged, FRS)
+    np.testing.assert_array_equal(one.action(raw, command), staged.act(staged.prepare(raw), command))
 
 
 def test_bundle_action_with_a_command_flows_the_command_through_flow_control():
@@ -344,7 +405,11 @@ def _fake_loading(monkeypatch, tmp_path, *, with_stats: bool = True):
     )
     fake_config = SimpleNamespace(type="pi05")
     loaded = _FakePolicy()
-    preprocessor, postprocessor = SimpleNamespace(steps=[]), SimpleNamespace(steps=[])
+
+    def preprocessor(raw_batch):
+        return dict(raw_batch)
+
+    postprocessor = SimpleNamespace(steps=[])
     installed = []
 
     class _PolicyClass:

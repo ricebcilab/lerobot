@@ -11,8 +11,10 @@ its cached pre/post-processor JSONs declare the features empty and the ``normali
 This module is the policy half of that: ``load_bundle`` builds the checkpoint and its two pipelines on
 the configured device (weights and the gated PaliGemma tokenizer are needed for a real one: the probe on
 the station is that [V]); ``make_steering`` wraps the loaded policy in the mode's ``SteeringPolicy``;
-``Bundle.action`` is the one call a control tick makes, with or without the operator's 7-dim command;
-and ``teleop_action`` is the no-policy path's 8-wide action. The statistics half lives in ``stats.py``
+``Bundle.prepare``/``Bundle.act`` are the two halves of a control tick — the batch once per chunk, the
+action every tick, because the policies only read a batch when their action queue is empty — and
+``Bundle.action`` is the convenient single call for callers without that boundary; and
+``teleop_action`` is the no-policy path's 8-wide action. The statistics half lives in ``stats.py``
 (``install_stats``, with the ``normalize_processor.py`` lines it follows in that module's docstring).
 ``fake_bundle`` is the numpy-only stand-in ``--dry-run`` uses, so importing this module and driving it
 must not need torch, the checkpoint or the tokenizer: every lerobot import is inside the function that
@@ -68,8 +70,14 @@ class Bundle:
     ``deadband`` is the operator's idle threshold (``config.command.deadband``): it lives outside the
     ``[steering]``/``[modes.*]`` tables in the config, and ``make_steering(bundle, steering)`` has no
     other place to read it. ``_cache`` holds the one ``SteeringPolicy`` ``make_steering`` makes (the
-    loop calls ``action`` about 15 times a second, so it is made once and reset per episode) and the
-    fake bundle's fixed action.
+    loop calls ``act`` about 15 times a second, so it is made once and reset per episode) and the fake
+    bundle's fixed action.
+
+    A control tick has two halves, because the policies only read a batch when their action queue is
+    empty (once per chunk of ``n_action_steps``): ``prepare`` runs the pre-processor (the expensive part:
+    two images, the tokenizer, the device transfer) once per chunk, ``act`` turns a prepared batch into
+    one action every tick, and ``action`` is the convenient single call for callers without a chunk
+    boundary.
     """
 
     policy: Any
@@ -80,13 +88,21 @@ class Bundle:
     deadband: float = DEFAULT_DEADBAND
     _cache: dict = field(default_factory=dict, repr=False, compare=False, hash=False)
 
-    def action(self, raw_batch: dict, command7: NDArray | None = None) -> NDArray:
-        """The station's 8 numbers for one observation, in the checkpoint's raw action units.
+    def prepare(self, raw_batch: dict) -> dict:
+        """The station's raw observation through the pre-processor: batched, normalized, tokenized, on device.
 
-        ``raw_batch`` is the station's raw dict (images, 32-wide state, the task string): this runs the
-        pre-processor, then the base policy (``command7`` None: ``autonomous``) or the mode's
-        ``SteeringPolicy`` (``command7``: the operator's 7 joint-velocity command in action units, the
-        steered modes), then the post-processor, and returns its first 8 dims as float64.
+        The expensive half of a tick, so the loop builds the batch once per chunk of ``n_action_steps``
+        and calls ``act`` on the ticks in between (the policies only read a batch when their action queue
+        is empty). The operator's command is not added here.
+        """
+        return steering_batch(self, raw_batch)
+
+    def act(self, batch: dict, command7: NDArray | None = None) -> NDArray:
+        """One station action, in raw action units, from a batch ``prepare`` made: no preprocessing.
+
+        ``command7`` None: the base policy's action (``autonomous``); the operator's 7 joint-velocity
+        command in action units otherwise (the steered modes, through the mode's ``SteeringPolicy``).
+        The action is post-processed and its first 8 dims returned as float64.
 
         Without action statistics there is no action unit to return: the checkpoint's QUANTILES
         normalization is what maps the model's normalized output into action units, so this raises
@@ -100,12 +116,19 @@ class Bundle:
                 "the bundle has no action statistics: pi0.5-DROID's QUANTILES normalization needs openpi's "
                 "assets/droid/norm_stats.json (set [policy] stats); only teleop runs without it"
             )
-        batch = steering_batch(self, raw_batch)
         if command7 is None:
             action = self.policy.select_action(batch)
         else:
             action = self._steering().select_action(_command_batch(batch, command7, _device(self)))
         return _action_units(self.postprocessor(action))
+
+    def action(self, raw_batch: dict, command7: NDArray | None = None) -> NDArray:
+        """``act(prepare(raw_batch), command7)``: the convenient call, preprocessing every time.
+
+        The control loop uses ``prepare``/``act`` instead, so a mid-chunk tick does not re-run the
+        pre-processor; this exists for a caller that has no chunk boundary to hoist it across.
+        """
+        return self.act(self.prepare(raw_batch), command7)
 
     def reset(self) -> None:
         """Start a new episode: the base policy's chunk queues and the steering policy's rollout state."""
@@ -121,7 +144,7 @@ class Bundle:
         steering = self._cache.get("steering")
         if steering is None:
             raise ValueError(
-                "Bundle.action with a command needs the mode's SteeringPolicy: call "
+                "Bundle.act with a command needs the mode's SteeringPolicy: call "
                 "make_steering(bundle, steering_cfg) once before the control loop; it caches it here"
             )
         return steering
