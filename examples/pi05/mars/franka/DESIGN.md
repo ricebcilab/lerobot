@@ -87,7 +87,7 @@ examples/pi05/mars/franka/
   cli.py             `mars-franka <command>`: argument parsing, config load, composition root
   probe.py           prints what the station and the checkpoint actually are; moves nothing
   configs/franka.toml  the study config (station, cameras, policy, command, readout, steering, [modes.*])
-  assets/droid/norm_stats.json   gitignored; from openpi-assets (see README)
+  assets/droid/norm_stats.json   gitignored (assets/.gitignore); from openpi-assets (see assets/README.md)
   assets/user/, assets/task/     Phase B/C checkpoints (gitignored)
 src/lerobot/scripts/mars_franka.py   console-script shim (examples/ is not an installed package)
 tests/examples/pi05_mars_franka/     offline tests, one file per module above
@@ -158,28 +158,33 @@ def observation_batch(obs: dict, *, arm: str, cameras: dict, task: str) -> dict
 def resize_with_pad(image: NDArray, size: int = 224) -> NDArray   # openpi's letterbox, PIL bilinear
 ```
 
-### `policy.py`
+### `policy.py` and `stats.py`
 
 ```python
 @dataclass(frozen=True)
 class Bundle:
-    policy; preprocessor; postprocessor
-    mean: NDArray; std: NDArray          # action statistics, 8-wide after install_stats
-
-def load_bundle(cfg) -> Bundle           # pi05_droid on cfg.device, dtype bf16; no weights needed to test
-def install_stats(preprocessor, postprocessor, stats_path: Path, dims: int = 8) -> tuple[NDArray, NDArray]
-    # openpi's assets/droid/norm_stats.json (state and actions, 32-wide q01/q99, dims >= 8 zero) -> the
-    # q01/q99 statistics the QUANTILES norm_map reads, on the pre-processor's normalizer (state and action)
-    # and the post-processor's unnormalizer (action); returns the action (mean, std) 8-wide for the steering
-    # cores; refuses a file whose meaningful width is not `dims`
-def make_steering(bundle, steering_cfg, adapter=None) -> SteeringPolicy
-def steering_batch(bundle, raw_batch: dict) -> dict      # preprocessor(raw_batch), on the policy's device
-def policy_action(bundle, policy, batch, command7: NDArray | None, task: str) -> NDArray   # (8,) action units
-def build_adapter(steering_cfg, corruption_matrix7: NDArray | None, bundle) -> AdapterModules | None
-def teleop_action(served7: NDArray, gripper_closed: bool) -> NDArray   # (8,) action units
+    policy; preprocessor; postprocessor          # the real objects on the configured device
+    mean: NDArray | None; std: NDArray | None    # action statistics, 8-wide raw units; None without a stats file
+    deadband: float                              # the operator's deadband, action units
+    def action(self, raw_batch: dict, command7: NDArray | None) -> NDArray   # (8,) action units
+    def reset(self) -> None                      # a new episode: the base policy and the steering policy
+def load_bundle(cfg) -> Bundle                   # checkpoint, processors, statistics; device and bf16 from cfg
+def make_steering(bundle: Bundle, steering) -> SteeringPolicy   # once per session; knob-checked on build
+def steering_batch(bundle: Bundle, raw_batch: dict) -> dict     # preprocessor(raw_batch); the command is added after
+def teleop_action(served7: NDArray, gripper_closed: bool) -> NDArray  # (8,)
+def fake_bundle() -> Bundle                      # numpy-only stand-in for --dry-run
 ```
-`policy_action` runs `select_action` then the postprocessor, giving the station's 8 numbers. The steering
-policy gets the command at dim 0-6 in action units; the base policy's processors get the raw batch.
+- `stats.py` holds `install_stats(preprocessor, postprocessor, stats_path, dims=8)`: openpi's
+  `norm_stats.json` -> the `q01`/`q99` statistics the checkpoint's `QUANTILES` mapping reads, on the
+  pre-processor's normalizer for `observation.state` and `action` and the post-processor's unnormalizer for
+  `action`, with the `features` entries the mixin needs to normalize an observation key; returns the action
+  `(mean, std)` 8-wide via `FlowControlSteering.action_mean_std`.
+- The **8 meaningful dims are sliced after** the post-processor: the unnormalizer's per-dim quantiles are what
+  turn the model's normalized 32-wide tensor into station units, the gripper (dim 7) included.
+- `n_dims = 7` (the command width) and `reference_step = 1.0` (one action unit per control step) are
+  properties of this action space, not knobs — they are constants in `policy.py` with their provenance, not
+  config fields. `deadband` comes from `[command]`.
+- The steering policy is built once by `make_steering` and cached on the bundle; `Bundle.action` reuses it.
 
 ### `loop.py`
 
@@ -246,7 +251,7 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 [readout]   corruption = {rotation_z_deg = 20} ; noise = 0.35 ; seed = 0
             # built-in defaults are neutral: corruption off, noise 0.0, seed 0. The values above are the
             # shipped study config's, written out; a variant file overrides them and writes "none" to clear.
-[steering]  n_dims = 7 ; reference_step = 1.0 ; n_reversal_steps = 10 ; pinned_steps = 8
+[steering]  n_reversal_steps = 10 ; pinned_steps = 8
 [modes.fc]      mode = "flow_control" ; tau = 8 ; lam = 1 ; ic_gain = 15.0
 [modes.frs]     mode = "frs"
 [modes.mars-f]  mode = "frs" ; adapter_matrix = "corruption"     # or "corruption_inverse" or 7x7 rows
