@@ -68,3 +68,7 @@ sign = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 [recording]
 dir = "outputs/mars_franka" # relative to examples/pi05/mars/franka/
+
+[states]
+# Where `--record-states NAME` writes: assets/states/NAME/states.npz (Phase B's state collection).
+dir = "assets/states" # relative to examples/pi05/mars/franka/; gitignored

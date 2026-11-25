@@ -20,6 +20,13 @@ tokenizer, the device transfer) is the expensive half of a tick, and the policie
 when their queue is empty. Teleop has no bundle and never builds a batch. The operator's device port
 lives in ``source.py`` (``DeflectionSource`` and its two adapters); this module only consumes it.
 
+The chunk boundary is also where a ``statefiles.Recorder`` gets its rows when one is passed to
+``run``/``run_recording``: once per chunk in every mode, teleop included, the raw batch (the
+pre-processor's input), the boundary's joint positions and gripper, the deflection in force and the
+served command in force are handed over *before* the action is computed. Recording is observation
+only -- it draws no noise and reads no device a second time -- so a run sends the same actions with
+and without it. The loop never writes a file: saving the recorder is the caller's job.
+
 Corruption is resolved lazily, at the first episode, because it needs ``q0``: the configured
 ``command.q0`` or else the reset pose. A fixed corruption is drawn once and printed in the run
 header; a ``{random: ...}`` family is redrawn at every episode from
@@ -53,6 +60,7 @@ from stats import action_std
 if TYPE_CHECKING:
     from config import Config
     from policy import Bundle
+    from statefiles import Recorder
     from station import Station
 
 MODES = ("teleop", "autonomous", "steered")
@@ -99,17 +107,30 @@ class Loop:
         self._fixed_readout: Readout | None = None  # a fixed corruption, resolved once
         self._readout: Readout | None = None  # the episode's readout in force
         self._held_served: NDArray | None = None  # the shared modes' per-chunk command, in force
+        self._held_deflection: NDArray | None = None  # the deflection that command came from
         self._batch: dict | None = None  # the chunk's prepared batch, reused mid-chunk
+        self._states: Recorder | None = None  # the caller's recorder, set by run/run_recording
 
     # ------------------------------------------------------------ the run
 
-    def run(self, *, prompt: str, max_steps: int | None = None, trace: bool = False) -> None:
+    def run(
+        self,
+        *,
+        prompt: str,
+        max_steps: int | None = None,
+        trace: bool = False,
+        states: Recorder | None = None,
+    ) -> None:
         """Drive one episode: ``max_steps`` ticks, or until interrupted (Ctrl-C propagates).
 
         ``prompt`` is the task text in the batch. ``trace`` prints one line per tick; its joint
         positions are the observation that tick's action was computed from, i.e. the state *before*
-        the action. The caller closes the station.
+        the action. ``states`` is an optional ``statefiles.Recorder``: one pre-action state row is
+        appended at every chunk boundary (``_record``), in every mode. The loop never saves it -- the
+        CLI does, like the dataset download -- so an interrupted run writes no partial file. The
+        caller closes the station.
         """
+        self._states = states
         obs = self._station.reset()
         self._begin_episode(obs)
         tick = 0
@@ -117,14 +138,24 @@ class Loop:
             obs = self._station.step(self._tick(obs, prompt=prompt, tick=tick, trace=trace))
             tick += 1
 
-    def run_recording(self, *, name: str, dest: Path, prompt: str, trace: bool = False) -> Path:
+    def run_recording(
+        self,
+        *,
+        name: str,
+        dest: Path,
+        prompt: str,
+        trace: bool = False,
+        states: Recorder | None = None,
+    ) -> Path:
         """Record episodes with c3po's keyboard flags, download the dataset, return its local path.
 
         The station must be a ``station.RecordingStation`` (``C3poStation``): this raises rather than
         hoping for ``record``/``download`` on whatever it was given. c3po's documented ``recording()``
         pattern: ``q`` stops, ``n`` ends an episode, ``r`` discards the episode that just ended
         (``station.cancel_episode()``) before it is re-recorded. ``dest`` is created if absent; the
-        returned path is the station's (``dest / name`` for c3po).
+        returned path is the station's (``dest / name`` for c3po). ``states`` is the same optional
+        recorder ``run`` takes; it collects rows from every episode, and a ``r`` re-record does not
+        retract the states the discarded episode visited (c3po's cancel discards its dataset).
         """
         station = self._station
         if not isinstance(station, RecordingStation):
@@ -134,6 +165,7 @@ class Loop:
             )
         destination = Path(dest)
         destination.mkdir(parents=True, exist_ok=True)
+        self._states = states
         with station.record(name) as rec:
             while not rec.stop:
                 obs = station.reset()
@@ -156,6 +188,7 @@ class Loop:
         if self._source is not None:  # autonomous has no operator device
             self._source.reset()
         self._held_served = None
+        self._held_deflection = None
         self._batch = None
         # autonomous has no operator command, so there is nothing to corrupt: no readout is drawn
         self._readout = None if self._mode == "autonomous" else self._resolve_readout(obs)
@@ -169,6 +202,12 @@ class Loop:
         In teleop the operator's whole chain runs every tick. In the shared modes it runs once per
         chunk, at the boundary observation, and the served command is held for the chunk's ticks
         (a mid-chunk read is not what the steering core consumes, and it would redraw the noise).
+
+        A recorder, when the caller passed one, is called once at each chunk boundary with that
+        boundary's *pre-action* state: the raw batch before the pre-processor, the observation's joint
+        positions and gripper, the deflection the command was read from and the served command in
+        force. The call happens before the action is computed, and it neither draws a random number
+        nor reads the operator's device again, so the actions are the same with or without it.
         """
         chunk_start = tick % self._n_action_steps == 0
         if self._mode == "teleop":
@@ -176,7 +215,12 @@ class Loop:
         elif self._mode == "steered" and chunk_start:
             self._held_served = self._command(obs)  # once per chunk: the core reads it at the boundary
         if self._mode != "teleop" and chunk_start:
-            self._batch = self._bundle.prepare(self._raw_batch(obs, prompt))
+            raw_batch = self._raw_batch(obs, prompt)
+            self._record(raw_batch, obs, tick=tick, prompt=prompt)  # before the pre-processor sees it
+            self._batch = self._bundle.prepare(raw_batch)
+        elif chunk_start and self._states is not None:
+            # teleop has no bundle: a recording builds a batch for the recording alone
+            self._record(self._raw_batch(obs, prompt), obs, tick=tick, prompt=prompt)
         if self._mode == "teleop":
             served = self._held_served
             action = teleop_action(served, self._source.gripper())
@@ -188,16 +232,55 @@ class Loop:
         return action
 
     def _command(self, obs: dict[str, NDArray]) -> NDArray:
-        """The operator's served command: deflection -> twist -> IK -> F, gain, one noise draw."""
+        """The operator's served command: deflection -> twist -> IK -> F, gain, one noise draw.
+
+        The deflection read here is kept as the one in force, so a recorder stores the exact stick
+        position the command came from without reading the device a second time.
+        """
         if self._readout is None:
             raise RuntimeError("the episode's readout is not resolved: call run() to begin an episode")
-        twist = _twist(self._source.deflection(), self._config.command)
+        deflection = self._source.deflection()
+        self._held_deflection = np.array(deflection, dtype=np.float64, copy=True)
+        twist = _twist(deflection, self._config.command)
         intent = bridge.operator_command(twist, bridge.nominal_pose(obs, self._arm), self._length)
         return self._readout.serve(intent, self._noise_rng)
 
     def _raw_batch(self, obs: dict[str, NDArray], prompt: str) -> dict:
         """The station's observation as the policy's raw batch (before the pre-processor)."""
         return observation_batch(obs, arm=self._arm, cameras=self._cameras, task=prompt)
+
+    def _record(self, raw_batch: dict, obs: dict[str, NDArray], *, tick: int, prompt: str) -> None:
+        """Append one chunk-boundary row to the caller's recorder, if there is one.
+
+        Called from ``_tick`` at the boundary, after the boundary's command and raw batch are in hand
+        and before the action is computed: the row is the state the action is about to be computed
+        from, i.e. the state *before* the action -- the field where steering actually was. ``raw_batch``
+        is the un-preprocessed batch the policy's chunk starts from (teleop builds one for this call
+        alone); the joint positions and gripper are the observation's, the deflection and the served
+        command are the ones in force at the boundary, and ``autonomous`` -- which has no operator and
+        no command -- stores zeros in both. ``q0`` is the session's nominal pose, which only the loop
+        resolves (the CLI cannot know a station's reset pose before the run); ``episode`` is 0-based
+        and is the same index the episode's readout drew a ``{random: ...}`` family from. It draws no
+        random number and reads no device, so the actions sent do not depend on whether it ran.
+        """
+        if self._states is None:
+            return
+        if self._mode == "autonomous":
+            deflection, served = np.zeros(TWIST_DIMS), np.zeros(ARM_DIMS)
+        else:
+            deflection, served = self._held_deflection, self._held_served
+        self._states.add(
+            raw_batch,
+            joint_position=bridge.nominal_pose(obs, self._arm),
+            gripper=_gripper(obs, self._arm),
+            deflection=deflection,
+            served=served,
+            q0=self._nominal_pose(obs),
+            episode=self._episode - 1,
+            tick=tick,
+            prompt=prompt,
+            mode=self._mode,
+        )
 
     # ------------------------------------------------------------ corruption
 
@@ -323,3 +406,14 @@ def _twist(deflection: NDArray, command: Any) -> NDArray:
     twist[:3] *= float(command.translation_gain)
     twist[3:] *= float(command.rotation_gain)
     return twist
+
+
+def _gripper(obs: dict[str, NDArray], arm: str) -> NDArray:
+    """(1,) the station's gripper position from an observation: the state's dim 8 in the batch."""
+    key = f"{arm}/gripper_position"
+    if key not in obs:
+        raise ValueError(f"the observation has no {key!r} (keys: {sorted(obs)})")
+    value = np.asarray(obs[key], dtype=np.float64)
+    if value.shape != (1,):
+        raise ValueError(f"{key!r}: expected shape (1,), got {value.shape}")
+    return value
