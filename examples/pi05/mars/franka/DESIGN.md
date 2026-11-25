@@ -3,7 +3,8 @@
 Status: interface freeze for Phase A. Owner: lead. Implementers: subagents, one slice each, on their own
 branches. This file is the contract; a slice that must change it reports the change instead of making it.
 
-This example runs π0.5-DROID on an N-Droids Franka station through `c3po`, under five methods plus teleop.
+This example runs π0.5-DROID on an N-Droids Franka station through `c3po`, under teleop and five shared
+commands (`fc`, `frs`, `mars-f`, `mars-u`, `mars-t`, `mars`; the last three need checkpoints from Phases B/C).
 The methods are `lerobot.policies.steering`'s; this folder is plumbing. Replaces the `mars-franka` branch's
 example, which drove its own clock and was never brought up.
 
@@ -240,7 +241,10 @@ commands: autonomous, teleop, fc, frs, mars-f, mars-u, mars-t, mars, probe
 `teleop` without `--corrupted` uses the **clean** readout (no corruption, no noise): that is the
 demonstration-collection path. `teleop --corrupted` applies `[readout]`. Every shared mode applies
 `[readout]`. `--dry-run` uses `FakeStation` and never imports c3po or torch, and prints every action.
-`--config` defaults to `examples/pi05/mars/franka/configs/franka.toml`.
+`--config` defaults to `examples/pi05/mars/franka/configs/franka.toml`. `--prompt` is required by the seven
+policy commands and optional for `teleop`/`probe`; `--corrupted` is teleop's alone; `--record` works for every
+session command but `probe`; `--steps` caps a non-recording run only. A dry run with the shipped corrupted
+readout and no statistics file prints that it substituted a stand-in action std, and only there.
 
 ### What the checkpoint's own code settles (read from the artifact, [V])
 
