@@ -238,7 +238,7 @@ These were checked against `lerobot/pi05_droid`'s `config.json`, the cached pre/
 [command]   translation_gain = 0.11 ; rotation_gain = 0.5 ; twist_length = 0.2
             deadband = 0.02 ; gain = "auto" ; q0 = []
 [readout]   corruption = {rotation_z_deg = 20} ; noise = 0.35 ; seed = 0
-[steering]  n_reversal_steps = 10 ; pinned_steps = 8
+[steering]  n_dims = 7 ; reference_step = 1.0 ; n_reversal_steps = 10 ; pinned_steps = 8
 [modes.fc]      mode = "flow_control" ; tau = 8 ; lam = 1 ; ic_gain = 15.0
 [modes.frs]     mode = "frs"
 [modes.mars-f]  mode = "frs" ; adapter_matrix = "corruption"     # or "corruption_inverse" or 7x7 rows
@@ -260,15 +260,22 @@ the full reversal and `pinned_steps=8` the executed prefix (Tang et al.'s pin-ex
 2. `FlowControlSteering`'s written dims, when `operator_dims is None`, become `slice(0, cfg.n_dims)`
    instead of `slice(None)`. A no-op for the cursor (`max_action_dim == n_dims == 2`) and for LIBERO
    (`operator_dims = ["translation"]`).
+3. `FlowReversalSteering` gains `command_dims: int | None = None` and `delegation_mask` honours it: when
+   `operator_dims is None`, the dims from `command_dims` on are **delegated to the policy**. `core` passes
+   `cfg.n_dims`. Today's mask with `operator_dims=None` is all-False — every dim pinned, which in a 32-wide
+   action space would pin the gripper (dim 7) and the padding to the reference's zeros instead of letting the
+   policy choose them. The 7-D operator space hides this because its command is the whole action width. A
+   no-op for the cursor (its `mask[:, 2:]` is empty) and for LIBERO (the named-groups branch).
 
-That is all. FRS with a 7-wide command and `reference_step = 1.0` then builds `(command - mean) / std` over
-7 dims on any 32-wide action space, and delegates dims 7+ (the gripper and the padding) to the policy.
+That is all. FRS with a 7-wide command, `reference_step = 1.0` and `n_dims = 7` then builds
+`(command - mean) / std` over dims 0-6 on a 32-wide action space, pins those dims for the executed prefix,
+and leaves the gripper (dim 7) and the padding to the policy.
 
 ## Slices and acceptance (Phase A)
 
 | slice | files | acceptance |
 |---|---|---|
-| A1 steering patch | `src/lerobot/policies/steering/{configuration,modeling}_steering.py`, `tests/policies/steering/test_steering_action_space.py` | new tests: FRS reference from a 7-wide command on 32-wide stats equals `(command-mean)/std` in dims 0-6 and zero beyond, with `reference_step`; FC writes dims 0..6 of `x_t`; defaults unchanged (existing suites green) |
+| A1 steering patch | `src/lerobot/policies/steering/{configuration,modeling}_steering.py`, `tests/policies/steering/test_steering_action_space.py` | new tests: FRS reference from a 7-wide command on 32-wide stats equals `(command-mean)/std` in dims 0-6 and zero beyond, with `reference_step`; `n_dims=7` delegates dims 7+ and pins dims 0-6 for the executed prefix; FC writes dims 0..6 of `x_t`; cursor and LIBERO masks bit-identical; defaults unchanged (existing suites green) |
 | A2 SpaceMouse rotation | `src/lerobot/teleoperators/spacemouse/teleop_spacemouse.py`, `tests/teleoperators/test_spacemouse.py` | report id 2 parses to `(rx, ry, rz)`; `SpaceMouseReader.rotation`; 6-axis mapping class; additive (existing tests untouched and green) |
 | A3 config + bridge | `examples/.../config.py`, `bridge.py`, `tests/.../test_config.py`, `test_bridge.py` | config loads the shipped TOML, rejects unknown keys; Jacobian reproduces the reference implementation's numbers at a known `q`; `lift_inverse(F) @ F == I` for the three families; IK round-trips a small twist; readout clips |
 | A4 station | `examples/.../station.py`, `tests/.../test_station.py` | fake station round-trip; `observation_batch` keys/shapes/dtypes and the 32-wide state padding; `action_dict` clip/binarize; c3po never imported at module level |
