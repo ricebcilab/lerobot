@@ -19,6 +19,7 @@ import cli
 import numpy as np
 import pytest
 from config import load_config
+from source import FakeSource
 from station import FakeStation as RealFakeStation
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "pi05" / "mars" / "franka"
@@ -32,6 +33,18 @@ def _write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "franka.toml"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _observations() -> list[dict]:
+    """One canned station observation for the real loop: the arm and the two shipped camera feeds."""
+    return [
+        {
+            "follower/joint_position": np.zeros(7),
+            "follower/gripper_position": np.zeros(1),
+            "scene_zed": np.zeros((8, 8, 3), dtype=np.uint8),
+            "wrist_zed": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+    ]
 
 
 # ---------------------------------------------------------------- the fakes
@@ -107,6 +120,13 @@ def real_components(monkeypatch):
     monkeypatch.setattr(cli, "C3poStation", _FakeC3poStation)
     monkeypatch.setattr(cli, "SpaceMouseSource", _FakeSpaceMouse)
     return _RecordingLoop
+
+
+@pytest.fixture
+def fake_hardware(monkeypatch):
+    """The real loop over a fake station and a fake source: no c3po, no mouse, no faked loop."""
+    monkeypatch.setattr(cli, "C3poStation", lambda *args: RealFakeStation(_observations(), 15.0))
+    monkeypatch.setattr(cli, "SpaceMouseSource", lambda **kwargs: FakeSource())
 
 
 def _patch_policy(monkeypatch) -> tuple[dict, object, object]:
@@ -223,6 +243,25 @@ def test_a_dry_run_synthesizes_the_configured_arm_and_camera_feeds(dry_station, 
     }
     assert observation["cam_a"].dtype == np.uint8 and observation["cam_a"].ndim == 3
     assert dry_station.instances[-1].arm == "test_arm"
+
+
+def test_a_dry_run_without_the_statistics_file_uses_a_stand_in_std(dry_station, tmp_path, capsys):
+    """A fresh clone has no openpi asset; teleop --corrupted must still dry-run, with a stated stand-in."""
+    missing = tmp_path / "norm_stats.json"  # never written: the gitignored asset is absent
+    path = _write(tmp_path, f'[policy]\nstats = "{missing}"\n[readout]\nnoise = 0.35\n')
+    assert cli.main(["teleop", "--config", str(path), "--corrupted", "--dry-run", "--steps", "2"]) == 0
+    out = capsys.readouterr().out
+    assert f"dry run: no statistics file at {missing}; noise uses a stand-in std 0.3" in out
+    assert out.count("act[") == 2
+    assert len(dry_station.instances[-1].actions) == 2
+
+
+def test_a_real_run_without_the_statistics_file_still_fails_naming_it(fake_hardware, tmp_path, capsys):
+    """The stand-in is the dry run's alone: the real teleop path keeps failing on the missing asset."""
+    missing = tmp_path / "norm_stats.json"
+    path = _write(tmp_path, f'[policy]\nstats = "{missing}"\n[readout]\nnoise = 0.35\n')
+    assert cli.main(["teleop", "--config", str(path), "--corrupted", "--steps", "2"]) == 2
+    assert str(missing) in capsys.readouterr().err
 
 
 def test_the_command_surface_imports_without_torch_or_c3po():

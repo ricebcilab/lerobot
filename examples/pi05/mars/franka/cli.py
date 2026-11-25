@@ -2,8 +2,10 @@
 
 This is the only place real objects are built. ``--dry-run`` builds the fakes instead (a
 ``station.FakeStation`` of synthesized observations for the configured arm and camera feeds, a
-``source.FakeSource`` and ``policy.fake_bundle()``), never imports c3po and never loads a
-checkpoint; it always traces, so every action the loop would send is printed.
+``source.FakeSource`` and ``policy.fake_bundle()``), never imports c3po or torch and never loads a
+checkpoint; it always traces, so every action the loop would send is printed. It also needs no
+statistics asset: if ``[policy] stats`` is absent, teleop's noise uses a generated stand-in std and
+the run says so (a real run still fails on the missing file).
 
 ``teleop`` is the operator alone (no bundle, no steering), ``autonomous`` the policy alone, and
 ``fc``/``frs``/``mars-f``/``mars-u``/``mars-t``/``mars`` read their ``[modes.<command>]`` table
@@ -24,7 +26,9 @@ line to stderr and exits 2; any other exception keeps its traceback, because tha
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import tempfile
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +43,7 @@ from numpy.typing import NDArray
 from policy import fake_bundle, load_bundle, make_steering
 from source import FakeSource, SpaceMouseSource
 from station import C3poStation, FakeStation
+from stats import CHECKPOINT_WIDTH, STATION_DIMS
 
 EXAMPLE_DIR = Path(__file__).parent  # the shipped config and every relative asset path are beside cli.py
 
@@ -49,6 +54,9 @@ COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS, "probe")
 
 _PROMPT_OPTIONAL = ("teleop", "probe")
 """The commands that run without a task text; every other command requires ``--prompt``."""
+
+_DRY_RUN_ACTION_STD = 0.3
+"""One stand-in action standard deviation per dim, when a dry run has no statistics file."""
 
 
 @dataclass(frozen=True)
@@ -102,7 +110,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         dest="dry_run",
-        help="fake station, source and bundle: no c3po, no checkpoint, every action traced",
+        help="fake station, source and bundle: no c3po, no torch, no checkpoint; every action traced",
     )
     parser.add_argument(
         "--corrupted",
@@ -158,8 +166,11 @@ def _run(args: argparse.Namespace, config: Config) -> int:
         if method.loop_mode != "autonomous":  # autonomous is the policy alone: no operator device
             source = stack.enter_context(closing(_source(config, args.dry_run)))
         station = stack.enter_context(closing(_station(config, args.dry_run)))
+        loop_config = _loop_config(args.command, args.corrupted, config)
+        if args.dry_run:
+            loop_config = _dry_run_statistics(stack, loop_config, method.loop_mode)
         loop = Loop(
-            config=_loop_config(args.command, args.corrupted, config),
+            config=loop_config,
             station=station,
             mode=method.loop_mode,
             source=source,
@@ -201,7 +212,7 @@ def _policy(method: _Method, config: Config, *, dry_run: bool) -> tuple[Any, Any
     if method.loop_mode == "autonomous":
         return bundle, None
     if dry_run:
-        return bundle, _dry_steering()
+        return bundle, _DrySteering()
     return bundle, make_steering(bundle, _effective_steering(method))
 
 
@@ -216,14 +227,12 @@ def _effective_steering(method: _Method) -> SteeringConfig:
     return method.steering
 
 
-def _dry_steering() -> Any:
-    """The adapter holder a dry run needs instead of a ``SteeringPolicy``.
+class _DrySteering:
+    """The fake bundle returns its fixed action before any steering call, so this only satisfies the
+    loop's construction contract and carries the adapter slot the ``mars-f`` sync writes."""
 
-    ``make_steering`` builds ``lerobot.policies.steering`` objects (torch, the checkpoint's action
-    statistics), so a dry run cannot call it; ``fake_bundle`` returns its fixed action whatever the
-    command, and the adapter holder is the only part of the steering policy the loop touches.
-    """
-    return SimpleNamespace(adapter=SimpleNamespace(matrix=None))
+    def __init__(self) -> None:
+        self.adapter = SimpleNamespace(matrix=None)
 
 
 def _source(config: Config, dry_run: bool) -> Any:
@@ -276,6 +285,40 @@ def _loop_config(command: str, corrupted: bool, config: Config) -> Config:
     if command == "teleop" and not corrupted:
         return replace(config, readout=ReadoutConfig(corruption=None, noise=0.0))
     return config
+
+
+def _dry_run_statistics(stack: ExitStack, config: Config, loop_mode: str) -> Config:
+    """A dry run's stand-in for an absent openpi statistics file, when teleop's noise would read it.
+
+    ``readout.noise`` is in action-standard-deviation units and teleop's loop reads the scale from
+    ``[policy] stats`` directly (teleop must not load the checkpoint). The file is gitignored, and a
+    dry run on a fresh clone must still compose every command, so an absent file is replaced with a
+    generated one whose action std is ``_DRY_RUN_ACTION_STD`` per station dim; a real run keeps
+    failing loudly on the missing asset because this only ever runs under ``--dry-run``.
+    """
+    stats = Path(config.policy.stats)
+    if loop_mode != "teleop" or not config.readout.noise or stats.is_file():
+        return config
+    directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="mars-franka-dry-run-"))
+    path = Path(directory) / "norm_stats.json"
+    path.write_text(json.dumps(_stand_in_stats()), encoding="utf-8")
+    print(
+        f"dry run: no statistics file at {stats}; noise uses a stand-in std {_DRY_RUN_ACTION_STD:g}",
+        flush=True,
+    )
+    return replace(config, policy=replace(config.policy, stats=path))
+
+
+def _stand_in_stats() -> dict:
+    """The 32-wide openpi shape, meaningful in the 8 station dims: ``q99 - q01 = 2 * std``."""
+    q99 = [2.0 * _DRY_RUN_ACTION_STD] * STATION_DIMS + [0.0] * (CHECKPOINT_WIDTH - STATION_DIMS)
+    group = {
+        "mean": [0.0] * CHECKPOINT_WIDTH,
+        "std": [1.0] * CHECKPOINT_WIDTH,
+        "q01": [0.0] * CHECKPOINT_WIDTH,
+        "q99": q99,
+    }
+    return {"norm_stats": {"actions": group, "state": group}}
 
 
 def _print_session(args: argparse.Namespace, config: Config) -> None:
