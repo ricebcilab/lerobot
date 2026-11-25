@@ -104,6 +104,7 @@ while True: print(r.axes, r.buttons); time.sleep(0.2)"
 
 - [`cursor/README.md`](cursor/README.md): the cursor task, its experiment portal, training, sweeps, reports and tests.
 - [`libero/README.md`](libero/README.md): the LIBERO example (evaluate, drive and study steering of pi0.5), started with `./examples/pi05/mars/libero/run.sh setup`.
+- [`franka/README.md`](franka/README.md): pi0.5-DROID on an N-Droids Franka arm through `c3po`, steered by a SpaceMouse; the runbook starts with the read-only probe.
 - [`figures/`](figures/): the paper's three figures and `build_figures.py`. Fig 1's
   numbers in `figures/stats.json` reproduce with `build_figures.py --device cpu`, the
   device they were built on; CUDA draws different policy noise.
