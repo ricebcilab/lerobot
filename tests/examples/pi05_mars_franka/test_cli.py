@@ -279,11 +279,70 @@ def test_corrupted_is_only_for_teleop(command, capsys):
     assert "--corrupted is teleop only" in capsys.readouterr().err
 
 
-def test_an_unknown_command_is_refused(capsys):
+def test_an_unknown_command_is_refused_naming_the_commands_and_the_mode_tables(capsys):
+    """A first positional that is neither a fixed command nor a ``[modes.<name>]`` table is a usage
+    error; it names both what the CLI accepts and what the config it read actually defines."""
     with pytest.raises(SystemExit) as exit:
         cli.main(["fly"])
     assert exit.value.code == 2
-    assert "invalid choice" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "unknown command 'fly'" in error
+    assert "autonomous" in error and "train-task" in error  # the fixed commands are named
+    assert "[modes.fc]" in error and "[modes.mars]" in error  # and the shipped config's mode tables
+
+
+def test_an_unknown_command_names_the_configs_own_mode_tables(tmp_path, capsys):
+    """The tables named are the file's, not the shipped config's: a variant config's are its own."""
+    path = _write(tmp_path, '[modes.task-only]\nmode = "none"\nadapter_task = "assets/task/t.pt"\n')
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["fly", "--config", str(path), "--prompt", "pick"])
+    assert exit.value.code == 2
+    error = capsys.readouterr().err
+    assert "'fly'" in error and "[modes.task-only]" in error
+    assert "autonomous" in error and "[modes.fc]" not in error
+
+
+GENERIC_MODE = """
+[modes.task-only]
+mode = "none"
+adapter_task = "assets/task/pilot/task.pt"
+"""
+
+
+def test_a_mode_table_runs_as_a_steered_command_in_a_dry_run(dry_station, tmp_path, capsys):
+    """Phase D's generic dispatch: a first positional naming a ``[modes.<name>]`` table runs that table
+    exactly as ``fc``/``frs`` do (bundle + ``--prompt`` + ``[readout]``), which is how the S2
+    "policy + task module, no steering" anchor (``mode = "none"``, ``adapter_task``) runs."""
+    path = _write(tmp_path, GENERIC_MODE)
+    assert (
+        cli.main(["task-only", "--config", str(path), "--prompt", "pick", "--dry-run", "--steps", "4"]) == 0
+    )
+    station = dry_station.instances[-1]
+    assert len(station.actions) == 4
+    assert capsys.readouterr().out.count("act[") == 4
+
+
+def test_a_generic_mode_command_requires_a_prompt(tmp_path, capsys):
+    """A mode table is a policy command like ``fc``/``frs``: it runs a task, so its prompt is required."""
+    path = _write(tmp_path, GENERIC_MODE)
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["task-only", "--config", str(path), "--dry-run"])
+    assert exit.value.code == 2
+    assert "--prompt is required for 'task-only'" in capsys.readouterr().err
+
+
+def test_a_generic_mode_dispatches_exactly_like_a_steered_command(real_components, tmp_path, monkeypatch):
+    """The composition is the steered one: the mode table reaches ``make_steering`` and the loop gets
+    the bundle, the steering policy and the ``steered`` loop mode."""
+    calls, bundle, steering = _patch_policy(monkeypatch)
+    path = _write(tmp_path, '[modes.task-only]\nmode = "none"\n')
+    assert cli.main(["task-only", "--config", str(path), "--prompt", "pick", "--steps", "1"]) == 0
+    loop = real_components.instances[-1]
+    assert loop.kwargs["mode"] == "steered"
+    assert loop.kwargs["bundle"] is bundle and loop.kwargs["steering"] is steering
+    assert calls["steering"] == load_config(path).modes["task-only"]
+    assert calls["steering"].mode == "none"
+    assert loop.runs == [{"prompt": "pick", "max_steps": 1, "trace": False}]
 
 
 def test_probe_is_not_asked_to_record(capsys):
@@ -338,6 +397,11 @@ def test_the_shipped_config_is_the_study_config():
     assert (config.task.token_source, config.task.render_size) == ("vlm_image", 224)
     assert (config.task.scene_rank, config.task.d, config.task.tdim) == (None, 128, 64)
     assert config.task.lambda_id == 1e-3
+    # Phase D's block: the shipped study is S2's first row, FRS vs FRS with the task module
+    assert config.study.arms == ("frs", "mars-t")
+    assert (config.study.trials, config.study.order, config.study.max_steps) == (10, "shuffled", 600)
+    assert config.study.out == EXAMPLE_DIR / "outputs" / "mars_franka" / "study"
+    assert config.study.seed == 0
 
 
 @pytest.mark.parametrize("command", SHIPPED_COMMANDS)

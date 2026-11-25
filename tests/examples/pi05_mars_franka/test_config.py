@@ -80,6 +80,14 @@ dir = "outputs/mars_franka"
 
 [states]
 dir = "assets/states"
+
+[study]
+arms = ["frs", "mars-t"]
+trials = 10
+order = "shuffled"
+max_steps = 600
+out = "outputs/mars_franka/study"
+seed = 0
 """
 
 
@@ -116,6 +124,10 @@ def test_the_shipped_schema_parses_to_the_documented_tree(tmp_path):
     assert cfg.recording.dir == EXAMPLE_DIR / "outputs/mars_franka"
     assert cfg.states.dir == EXAMPLE_DIR / "assets/states"
     assert cfg.policy.stats == EXAMPLE_DIR / "assets/droid/norm_stats.json"
+    assert cfg.study.arms == ("frs", "mars-t")
+    assert (cfg.study.trials, cfg.study.order, cfg.study.max_steps) == (10, "shuffled", 600)
+    assert cfg.study.out == EXAMPLE_DIR / "outputs/mars_franka/study"
+    assert cfg.study.seed == 0
 
 
 def test_an_empty_or_minimal_file_has_the_neutral_readout(tmp_path):
@@ -151,6 +163,7 @@ def test_the_modes_inherit_the_steering_defaults(tmp_path):
         ('[user]\nstates_dir = "x"\n', "user", "states_dir"),
         ("[task]\nepochs = 3\n", "task", "epochs"),
         ("[training]\nepochs = 3\n", "training", "epochs"),
+        ("[study]\nblocks = 2\n", "study", "blocks"),
     ],
 )
 def test_an_unknown_key_names_its_section_and_key(tmp_path, text, where, key):
@@ -170,7 +183,6 @@ def test_an_unknown_section_is_rejected(tmp_path):
         ('[modes.frs]\nmode = "frs"\ntau = 4\n', "tau"),
         ('[modes.fc]\nmode = "flow_control"\npinned_steps = 8\n', "pinned_steps"),
         ('[modes.clean]\nmode = "none"\nadapter_user = "assets/user/u.pt"\n', "adapter_user"),
-        ('[modes.clean]\nmode = "none"\nadapter_task = "assets/task/t.pt"\n', "adapter_task"),
         ('[modes.fc]\nmode = "flow_control"\nadapter_task = "assets/task/t.pt"\n', "adapter_task"),
     ],
 )
@@ -217,6 +229,19 @@ def test_a_custom_mode_name_needs_no_adapter(tmp_path):
     """Only the shipped arm names assert a composition; a study's own table is free to be plain FRS."""
     cfg = _load(tmp_path, '[modes.slow]\nmode = "frs"\n')
     assert cfg.modes["slow"].adapter_user is None and cfg.modes["slow"].adapter_task is None
+
+
+def test_a_mode_none_table_may_name_the_task_module(tmp_path):
+    """Phase D's generic dispatch runs the S2 "policy + task module, no steering" anchor as a
+    ``mode = "none"`` table with ``adapter_task``: the task module runs on the base policy's own chunk.
+    ``adapter_user`` (the reversal's correction) still has nothing to act on there."""
+    cfg = _load(
+        tmp_path,
+        '[modes.task-only]\nmode = "none"\nadapter_task = "assets/task/pilot/task.pt"\n',
+    )
+    assert cfg.modes["task-only"].mode == "none"
+    assert cfg.modes["task-only"].adapter_task == EXAMPLE_DIR / "assets/task/pilot/task.pt"
+    assert cfg.modes["task-only"].adapter_user is None
 
 
 def test_a_mode_must_name_one_of_the_three_modes(tmp_path):
@@ -541,5 +566,79 @@ def test_the_task_sections_paths_resolve_beside_the_example(tmp_path):
     ],
 )
 def test_the_phase_c_values_are_checked_and_named(tmp_path, text, key):
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, text)
+
+
+# ---------------------------------------------------------------- Phase D: the study's block
+
+
+def test_the_study_section_has_the_phase_d_defaults(tmp_path):
+    """An absent ``[study]`` is a config with no block to run: the shipped values' round count and cap,
+    no arms, and the run directories under ``outputs/mars_franka/study`` beside the example."""
+    study = _load(tmp_path, "").study
+    assert study == config_module.StudyConfig()
+    assert study.arms == ()
+    assert (study.trials, study.order, study.max_steps) == (10, "shuffled", 600)
+    assert study.out == EXAMPLE_DIR / "outputs" / "mars_franka" / "study"
+    assert study.seed == 0
+
+
+def test_the_study_section_parses_a_block_with_its_arms_and_its_cap(tmp_path):
+    """Arms are command names: the fixed session commands and/or this config's own mode tables."""
+    cfg = _load(
+        tmp_path,
+        "[study]\n"
+        'arms = ["autonomous", "teleop", "task-only", "frs"]\n'
+        "trials = 4\n"
+        'order = "blocked"\n'
+        "max_steps = 60\n"
+        'out = "outputs/s2"\n'
+        "seed = 3\n\n"
+        '[modes.frs]\nmode = "frs"\n\n'
+        '[modes.task-only]\nmode = "none"\nadapter_task = "assets/task/pilot/task.pt"\n',
+    )
+    study = cfg.study
+    assert study.arms == ("autonomous", "teleop", "task-only", "frs")
+    assert (study.trials, study.order, study.max_steps, study.seed) == (4, "blocked", 60, 3)
+    assert study.out == EXAMPLE_DIR / "outputs" / "s2"
+
+
+def test_a_study_arm_must_resolve_to_a_command_or_a_mode_table(tmp_path):
+    """Each arm is checked when the block is read: the bad one is named, with what the config has."""
+    with pytest.raises(ValueError, match="'fly'") as error:
+        _load(tmp_path, '[study]\narms = ["fly"]\n')
+    message = str(error.value)
+    assert "autonomous" in message and "not a command that runs" in message
+    assert "[modes" in message
+
+    # a fixed steered command runs only through its own table: the message names the table to add
+    with pytest.raises(ValueError, match="'frs'") as error:
+        _load(tmp_path, '[study]\narms = ["frs"]\n')
+    assert "[modes.frs]" in str(error.value) and "add one" in str(error.value)
+
+    # teleop and autonomous need no table; a mode table resolves under its own name
+    assert _load(tmp_path, '[study]\narms = ["autonomous", "teleop"]\n').study.arms == (
+        "autonomous",
+        "teleop",
+    )
+    resolved = _load(tmp_path, '[study]\narms = ["task-only"]\n[modes.task-only]\nmode = "none"\n')
+    assert resolved.study.arms == ("task-only",)
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("[study]\narms = []\n", "arms"),  # non-empty: a block needs somewhere to put its trials
+        ("[study]\narms = [3]\n", "arms"),
+        ('[study]\narms = [""]\n', "arms"),
+        ("[study]\ntrials = 2\n", "arms"),  # arms are not optional when the table is present
+        ('[study]\narms = ["autonomous"]\ntrials = 0\n', "trials"),
+        ('[study]\narms = ["autonomous"]\norder = "random"\n', "order"),
+        ('[study]\narms = ["autonomous"]\nmax_steps = 0\n', "max_steps"),
+        ('[study]\narms = ["autonomous"]\nseed = -1\n', "seed"),
+    ],
+)
+def test_the_phase_d_values_are_checked_and_named(tmp_path, text, key):
     with pytest.raises(ValueError, match=key):
         _load(tmp_path, text)

@@ -132,3 +132,22 @@ seed = 0 # the split, the cues, the noise draws and the reversal steps all deriv
 log_every = 100
 val_depths = [10, 4] # the reversal depths validate-user runs (Phase B's validator)
 device = "cuda" # where the checkpoint and the module live while training
+
+[study]
+# Phase D's block: every arm runs once per round, `trials` rounds; round r is the pairing key.
+# An arm is a fixed command that runs (`autonomous`, `teleop`, `fc`, `frs`, `mars-f`, `mars-u`,
+# `mars-t`, `mars`) or a `[modes.<name>]` table this file defines.
+# The S1 (de-corruption) arm list: the same readout, three ways of handling it.
+#   arms = ["frs", "mars-f", "mars-u"]   # corrupted command / fixed lift F / learned user module
+# The S2 (task module) blocks: each row pairs an arm with the same arm + the task module.
+#   arms = ["frs", "mars-t"]             # FRS vs FRS+task: the shipped block
+#   arms = ["mars-u", "mars"]            # FRS+user vs FRS+user+task
+# A "policy + task module, no steering" anchor is a `[modes.<name>]` table with `mode = "none"` and
+# `adapter_task`; it is named here like any other arm:
+#   arms = ["task-only", "mars-t"]
+arms = ["frs", "mars-t"] # the shipped study is S2's first row; a variant file writes its own block
+trials = 10 # per arm: the number of rounds (each arm once per round)
+order = "shuffled" # "shuffled" (the seed fixes the round's order) or "blocked" (arm by arm)
+max_steps = 600 # a trial's control-step cap, then the outcome question
+out = "outputs/mars_franka/study" # run directory parent, relative to examples/pi05/mars/franka/
+seed = 0 # the shuffled order's seed

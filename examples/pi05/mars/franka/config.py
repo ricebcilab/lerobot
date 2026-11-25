@@ -18,6 +18,11 @@ Phase C's ``[task]`` table is the task-module trainer's (DESIGN.md, "Phase C"): 
 dataset, the output, and the module's scene and width knobs; ``[training]`` is shared with it. The
 Phase C arms' tables assert their composition: ``[modes.mars-t]`` must name ``adapter_task`` and the
 composed ``[modes.mars]`` both adapters, so an arm's name cannot describe a plain FRS run.
+
+Phase D's ``[study]`` table is a block of trials (DESIGN.md, "Phase D"): the arms' command names, the
+round count and the per-trial cap. ``mode = "none"`` reads ``adapter_task`` so the S2 build's
+"policy + task module, no steering" anchor can be a mode table (the base policy's own chunk through
+the task module, no reversal).
 """
 
 from __future__ import annotations
@@ -52,17 +57,20 @@ _SECTIONS = frozenset(
         "user",
         "task",
         "training",
+        "study",
     }
 )
 """The config file's sections: station, cameras, policy, command, readout, steering, modes,
-spacemouse, recording, states, user, task, training."""
+spacemouse, recording, states, user, task, training, study."""
 
 _MODE_KNOBS = {
-    "none": frozenset(),
+    "none": frozenset({"adapter_task"}),
     "flow_control": frozenset({"tau", "lam", "ic_gain"}),
     "frs": frozenset({"n_reversal_steps", "pinned_steps", "adapter_matrix", "adapter_user", "adapter_task"}),
 }
-"""The knobs each steering mode reads; a mode table may not set another mode's knobs."""
+"""The knobs each steering mode reads; a mode table may not set another mode's knobs. ``mode = "none"``
+reads ``adapter_task`` alone: the S2 anchor's task module runs on the base policy's own chunk, and the
+user module (reversal only) would never act."""
 
 _MODE_ADAPTERS = {
     "mars-t": ("task",),
@@ -74,6 +82,13 @@ custom mode name (``fc``, ``frs``, a study's own table) requires nothing beyond 
 
 _ADAPTER_TOOLS = {"user": ("[user] checkpoint", "train-user"), "task": ("[task] checkpoint", "train-task")}
 """Where an adapter checkpoint comes from, for the messages: its config section and the trainer that writes it."""
+
+STEERED_COMMANDS = ("fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
+"""The fixed commands that steer the policy through their own ``[modes.<command>]`` table."""
+
+SESSION_COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS)
+"""The fixed commands a study arm may name: every fixed command that runs a control session (``probe``
+and the trainers do not run one)."""
 
 
 # ---------------------------------------------------------------- the config tree
@@ -217,6 +232,25 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class StudyConfig:
+    """The `[study]` table: one block of trials (DESIGN.md, Phase D).
+
+    Each trial is one ``arm`` -- a command name: a fixed session command (``autonomous``, ``teleop``,
+    ``fc``, ...) or a ``[modes.<name>]`` table. ``trials`` is the number of rounds, every arm once per
+    round; ``order`` is ``"shuffled"`` (the seed fixes the order) or ``"blocked"`` (arm by arm);
+    ``max_steps`` caps a trial; ``out`` is the parent of its run directories. The shipped
+    ``configs/franka.toml`` names the S2 arms; a variant file writes the S1 or S2 block it runs.
+    """
+
+    arms: tuple[str, ...] = ()  # empty only for the absent table: a [study] table must name one
+    trials: int = 10
+    order: str = "shuffled"  # "shuffled" (seeded) or "blocked" (arm by arm)
+    max_steps: int = 600  # a trial's cap, then the outcome question
+    out: Path = EXAMPLE_DIR / "outputs" / "mars_franka" / "study"  # run directory parent
+    seed: int = 0
+
+
+@dataclass(frozen=True)
 class SpaceMouseConfig:
     """The operator's ``[spacemouse]`` table: how the device is found and its six channels mapped.
 
@@ -251,6 +285,7 @@ class Config:
     user: UserConfig = field(default_factory=UserConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    study: StudyConfig = field(default_factory=StudyConfig)
 
 
 # ---------------------------------------------------------------- value checks
@@ -325,6 +360,23 @@ def _depths(value: Any, where: str) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(f"{where}: expected a non-empty list of reversal depths, got {value!r}")
     return tuple(_integer(item, f"{where}[{index}]") for index, item in enumerate(value))
+
+
+def _arms(value: Any, where: str) -> tuple[str, ...]:
+    """A non-empty list of arm names: fixed session commands or ``[modes.<name>]`` tables."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{where}: expected a list of arm names, got {value!r}")
+    if not value:
+        raise ValueError(
+            f"{where}: expected at least one arm (a command name or a [modes.<name>] table), got []"
+        )
+    return tuple(_text(item, f"{where}[{index}]") for index, item in enumerate(value))
+
+
+def _study_order(value: Any, where: str) -> str:
+    if value not in ("shuffled", "blocked"):
+        raise ValueError(f"{where}: expected 'shuffled' or 'blocked', got {value!r}")
+    return value
 
 
 def _port(value: Any, where: str) -> int:
@@ -411,6 +463,11 @@ def _reject_unknown(table: dict, known: set[str] | frozenset[str], where: str) -
     unknown = sorted(set(table) - known)
     if unknown:
         raise ValueError(f"{where}: unknown key {unknown[0]!r} (expected one of {', '.join(sorted(known))})")
+
+
+def mode_tables(modes: Mapping[str, SteeringConfig]) -> str:
+    """The config's ``[modes.*]`` names, for the messages that say what a command or arm may name."""
+    return ", ".join(f"[modes.{name}]" for name in modes) or "no [modes.*] tables"
 
 
 # ---------------------------------------------------------------- the sections
@@ -553,6 +610,50 @@ def _training(table: Any) -> TrainingConfig:
     )
 
 
+def _study(table: Any | None, modes: Mapping[str, SteeringConfig]) -> StudyConfig:
+    """The `[study]` table: absent is the neutral default (no arms, nothing to run); present must resolve.
+
+    A ``[study]`` table is a block the study command can run, so every arm is checked here: a fixed
+    session command or this config's own ``[modes.<name>]`` table, named if it is neither. The tables
+    are checked after ``[modes]``, so the S2 anchor's ``mode = "none"`` table is already resolved.
+    """
+    if table is None:
+        return StudyConfig()
+    study = _build(
+        StudyConfig,
+        table,
+        {
+            "arms": _arms,
+            "trials": _integer,
+            "order": _study_order,
+            "max_steps": _integer,
+            "out": _path,
+            "seed": lambda value, where: _integer(value, where, 0),
+        },
+        "[study]",
+    )
+    if not study.arms:
+        raise ValueError("[study].arms: expected at least one arm (a command name or a [modes.<name>] table)")
+    for arm in study.arms:
+        _check_study_arm(arm, modes)
+    return study
+
+
+def _check_study_arm(arm: str, modes: Mapping[str, SteeringConfig]) -> None:
+    """One arm must resolve to a command the study can run: a fixed session command or a mode table."""
+    if arm in ("autonomous", "teleop") or arm in modes:
+        return
+    if arm in STEERED_COMMANDS:
+        raise ValueError(
+            f"[study] arms: {arm!r} is a fixed command but this config has no [modes.{arm}] table for it to "
+            f'run; add one, e.g.\n[modes.{arm}]\nmode = "frs"'
+        )
+    raise ValueError(
+        f"[study] arms: {arm!r} is not a command that runs (expected one of {', '.join(SESSION_COMMANDS)}) "
+        f"and has no [modes.{arm}] table (this config has {mode_tables(modes)})"
+    )
+
+
 _STEERING_KNOBS = {
     "tau": _integer,
     "lam": _integer,
@@ -636,6 +737,7 @@ def load_config(path: str | Path) -> Config:
         raise ValueError(f"{path}: expected a table at the top level, got {type(data).__name__}")
     _reject_unknown(data, _SECTIONS, str(path))
     steering = _steering(data.get("steering", {}))
+    modes = _modes(data.get("modes", {}), steering)
     return Config(
         station=_station(data.get("station", {})),
         cameras=_cameras(data.get("cameras", {})),
@@ -643,11 +745,12 @@ def load_config(path: str | Path) -> Config:
         command=_command(data.get("command", {})),
         readout=_readout(data.get("readout", {})),
         steering=steering,
-        modes=_modes(data.get("modes", {}), steering),
+        modes=modes,
         spacemouse=_spacemouse(data.get("spacemouse", {})),
         recording=_build(RecordingConfig, data.get("recording", {}), {"dir": _path}, "[recording]"),
         states=_build(StatesConfig, data.get("states", {}), {"dir": _path}, "[states]"),
         user=_user(data.get("user", {})),
         task=_task(data.get("task", {})),
         training=_training(data.get("training", {})),
+        study=_study(data.get("study"), modes),
     )

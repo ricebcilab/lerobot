@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from bridge import ARM_DIMS, TWIST_DIMS
 from config import CommandConfig, Config, ReadoutConfig
-from loop import Loop
+from loop import Loop, TickHook
 from policy import STATION_DIMS, fake_bundle, teleop_action
 from scene import scene_images
 from source import FakeSource
@@ -81,12 +81,17 @@ class _CountingBundle:
 
     ``scene`` is ``None`` (no scene step: the raw batch is the station's) or a task checkpoint's scene
     (the loop adds the scene camera's pictures to the raw batch; the bundle's ``prepare`` would encode
-    them, which this fake records instead).
+    them, which this fake records instead). ``plan`` is the steered modes' plan; ``plan8`` mirrors
+    ``Bundle.plan8``: the fixed plan where a command steered, the action itself without one.
     """
 
-    def __init__(self, std: np.ndarray | None = None, scene: _Scene | None = None) -> None:
+    def __init__(
+        self, std: np.ndarray | None = None, scene: _Scene | None = None, plan: np.ndarray | None = None
+    ) -> None:
         self.std = np.linspace(0.2, 0.9, STATION_DIMS) if std is None else np.asarray(std)
         self.scene = scene
+        self.plan = None if plan is None else np.asarray(plan, dtype=np.float64)
+        self.plan8: np.ndarray | None = None
         self.batches: list[dict] = []
         self.commands: list[np.ndarray | None] = []
         self.resets = 0
@@ -97,10 +102,13 @@ class _CountingBundle:
 
     def act(self, batch: dict, command7: np.ndarray | None = None) -> np.ndarray:
         self.commands.append(None if command7 is None else np.array(command7, copy=True))
-        return np.linspace(-0.3, 0.4, STATION_DIMS)
+        action = np.linspace(-0.3, 0.4, STATION_DIMS)
+        self.plan8 = action.copy() if command7 is None else None if self.plan is None else self.plan.copy()
+        return action
 
     def reset(self) -> None:
         self.resets += 1
+        self.plan8 = None
 
 
 class _Adapter:
@@ -517,6 +525,134 @@ def test_autonomous_prepares_once_per_chunk_and_acts_without_a_command():
     assert len(bundle.batches) == 2
     assert len(bundle.commands) == 8
     assert all(command is None for command in bundle.commands)
+
+
+# ---------------------------------------------------------------- the study's per-tick hook
+
+
+def _hook(calls: list) -> TickHook:
+    """The loop's ``on_tick``: append every argument tuple, in call order."""
+
+    def on_tick(tick, action8, plan8, served7, q7) -> None:
+        calls.append((tick, action8, plan8, served7, q7))
+
+    return on_tick
+
+
+def test_the_hook_is_called_once_per_step_before_the_station_step():
+    """The study's record is written before the action is sent: tick ``n``'s hook has already run when
+    the ``n + 1``-th ``station.step`` starts, and no call follows the last step."""
+    calls, seen = [], []
+    station = _Station(_observations())
+    station.on_step = lambda fake: seen.append(len(calls))  # hook calls landed by this station step
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run(prompt="pick", max_steps=5, on_tick=_hook(calls))
+
+    assert [call[0] for call in calls] == list(range(5))
+    assert seen == [1, 2, 3, 4, 5]
+
+
+def test_the_teleop_hook_reports_the_action_sent_the_command_and_the_pose():
+    """Teleop has no policy: the action is the teleop action, the command is the one in force and the
+    plan is None (the study has no base chunk to record)."""
+    calls = []
+    station = _Station(_observations())
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run(prompt="pick", max_steps=3, on_tick=_hook(calls))
+
+    expected_served = _expected_served(DEFLECTION, JOINT)
+    for tick, (got_tick, action8, plan8, served7, q7) in enumerate(calls):
+        assert got_tick == tick
+        np.testing.assert_allclose(action8, station.actions[tick])
+        assert plan8 is None
+        np.testing.assert_allclose(served7, expected_served)
+        np.testing.assert_array_equal(q7, JOINT)
+
+
+def test_the_steered_hook_reports_the_bundles_plan_and_the_held_command():
+    """The shared modes hand the hook the bundle's ``plan8`` (here deliberately different from the
+    action) and the command held for the chunk, i.e. the one ``act`` received."""
+    calls = []
+    plan = np.linspace(-0.05, 0.05, STATION_DIMS)
+    bundle = _CountingBundle(plan=plan)
+    station = _Station(_observations())
+    loop = Loop(
+        config=_config(n_action_steps=4),
+        station=station,
+        mode="steered",
+        source=FakeSource(deflection=DEFLECTION),
+        bundle=bundle,
+        steering=_steering(),
+    )
+
+    loop.run(prompt="pick", max_steps=6, on_tick=_hook(calls))
+
+    assert len(calls) == 6
+    for tick, (_, action8, plan8, served7, q7) in enumerate(calls):
+        np.testing.assert_allclose(action8, station.actions[tick])
+        np.testing.assert_array_equal(plan8, plan)  # the bundle's plan, not the action
+        np.testing.assert_allclose(served7, bundle.commands[tick])
+        np.testing.assert_array_equal(q7, JOINT)
+    assert not np.allclose(plan, station.actions[0])
+
+
+def test_the_autonomous_hook_reports_no_command_and_the_action_as_the_plan():
+    """Autonomous: nothing steered, so the action is the base policy's own chunk step and ``served7``
+    is None."""
+    calls = []
+    station = _Station(_observations())
+    loop = Loop(
+        config=_config(n_action_steps=4), station=station, mode="autonomous", bundle=_CountingBundle()
+    )
+
+    loop.run(prompt="pick", max_steps=4, on_tick=_hook(calls))
+
+    for tick, (_, action8, plan8, served7, q7) in enumerate(calls):
+        np.testing.assert_allclose(action8, station.actions[tick])
+        np.testing.assert_array_equal(plan8, action8)
+        assert served7 is None
+        np.testing.assert_array_equal(q7, JOINT)
+
+
+def test_the_hook_changes_no_action():
+    """The hook only observes: the same run with and without one sends the same actions."""
+    plain, hooked = _Station(_observations()), _Station(_observations())
+    Loop(config=_config(), station=plain, mode="autonomous", bundle=_CountingBundle()).run(
+        prompt="pick", max_steps=4
+    )
+    Loop(config=_config(), station=hooked, mode="autonomous", bundle=_CountingBundle()).run(
+        prompt="pick", max_steps=4, on_tick=lambda *args: None
+    )
+
+    np.testing.assert_array_equal(np.stack(plain.actions), np.stack(hooked.actions))
+
+
+def test_run_recording_calls_the_hook_once_per_step(tmp_path):
+    """The recording path takes the same hook: one call per control step, before each station step."""
+    calls = []
+    station = _RecordingStation(_observations(), schedule=[(0, 3, "stop")])
+    loop = Loop(
+        config=_config(),
+        station=station,
+        mode="teleop",
+        source=FakeSource(deflection=DEFLECTION),
+    )
+
+    loop.run_recording(name="pilot", dest=tmp_path, prompt="pick", on_tick=_hook(calls))
+
+    assert [call[0] for call in calls] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------- the readout

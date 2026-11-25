@@ -19,11 +19,18 @@ timestamp, so a collected file can be replayed against the config that produced 
 ``fc``/``frs``/``mars-f``/``mars-u``/``mars-t``/``mars`` read their ``[modes.<command>]`` table
 and steer the policy with it; a missing table is named with how to add it, and a mode whose adapter
 checkpoint is absent names that file (the shipped config ships ``mars-u``, ``mars-t`` and the composed
-``mars``, whose checkpoints Phase B's ``train-user`` and Phase C's ``train-task`` write). A mode that
-names ``adapter_task`` hands that checkpoint to ``policy.load_bundle(config, task=...)``, so the bundle
-carries the task module's recorded scene step and the loop adds the scene camera's frame to every
-chunk's batch; a mode without one loads the bundle exactly as before. ``--prompt`` is required by
-every policy command, optional for teleop and probe. ``teleop`` without ``--corrupted`` uses the
+``mars``, whose checkpoints Phase B's ``train-user`` and Phase C's ``train-task`` write).
+
+Any other first positional that names a ``[modes.<name>]`` table runs that table exactly as a shipped
+steered command does (bundle + ``--prompt`` + the ``[readout]``): this is how Phase D's "policy + task
+module, no steering" anchor (``mode = "none"``, ``adapter_task = ...``) is run. A name that is neither
+a fixed command nor a mode table is refused, naming the fixed commands and the mode tables the config
+has.
+
+A mode that names ``adapter_task`` hands that checkpoint to ``policy.load_bundle(config, task=...)``,
+so the bundle carries the task module's recorded scene step and the loop adds the scene camera's
+frame to every chunk's batch; a mode without one loads the bundle exactly as before. ``--prompt`` is
+required by every policy command, optional for teleop and probe. ``teleop`` without ``--corrupted`` uses the
 **clean** readout (no corruption, no noise), the demonstration-collection path; ``teleop --corrupted``
 and every shared command use the config's ``[readout]``. The loop owns the readout and prints what it
 resolves; this module only chooses the config. ``--record NAME`` switches to
@@ -59,7 +66,7 @@ from typing import Any
 
 import numpy as np
 from bridge import ARM_DIMS
-from config import Config, ReadoutConfig, SteeringConfig, load_config
+from config import STEERED_COMMANDS, Config, ReadoutConfig, SteeringConfig, load_config, mode_tables
 from loop import Loop
 from numpy.typing import NDArray
 from policy import fake_bundle, load_bundle, make_steering
@@ -72,7 +79,6 @@ EXAMPLE_DIR = Path(__file__).parent  # the shipped config and every relative ass
 
 DEFAULT_CONFIG = EXAMPLE_DIR / "configs" / "franka.toml"
 
-STEERED_COMMANDS = ("fc", "frs", "mars-f", "mars-u", "mars-t", "mars")
 NON_SESSION_COMMANDS = ("train-user", "validate-user", "train-task")
 """The commands that are not a control session: no station, no source, no loop (the Phase B/C trainers and validator)."""
 COMMANDS = ("autonomous", "teleop", *STEERED_COMMANDS, *NON_SESSION_COMMANDS, "probe")
@@ -105,11 +111,12 @@ class _Method:
 
 def main(argv: list[str] | None = None) -> int:
     """Run one command; 0 on success, 2 for a user error, 130 after Ctrl-C."""
-    args = _parse_args(argv)
+    parser, args = _parse_args(argv)
     if args.command == "probe":
         return _probe(args)
     try:
         config = load_config(args.config)
+        _check_command(args, config, parser)
         _print_session(args, config)
         if args.command == "train-user":
             return _train_user(args, config)
@@ -126,12 +133,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+def _parse_args(argv: list[str] | None) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser(
         prog="mars-franka",
         description="Drive the Franka station with pi0.5: one MARS method, teleop or autonomous.",
     )
-    parser.add_argument("command", choices=COMMANDS, help="what to run")
+    parser.add_argument(
+        "command",
+        metavar="COMMAND",
+        help="what to run: a fixed command, or a [modes.<name>] table run as a steered command",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -162,12 +173,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     _check_args(args, parser)
-    return args
+    return parser, args
 
 
 def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """The command surface's rules argparse cannot state, each named for the flag to change."""
-    if args.command not in _PROMPT_OPTIONAL and args.prompt is None:
+    """The command surface's rules argparse cannot state, each named for the flag to change.
+
+    The prompt rule covers the fixed commands here; a generic ``[modes.<name>]`` name is checked once
+    the config is read (``_check_command``), because only the file says whether it is a mode at all.
+    """
+    if args.command in COMMANDS and args.command not in _PROMPT_OPTIONAL and args.prompt is None:
         parser.error(f"--prompt is required for {args.command!r}")
     if args.corrupted and args.command != "teleop":
         parser.error("--corrupted is teleop only: the shared modes always apply [readout]")
@@ -181,6 +196,26 @@ def _check_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
                 f"{args.command} takes --config and --prompt only ({given[0]} is not one): "
                 f"{section} names its input and its output"
             )
+
+
+def _check_command(args: argparse.Namespace, config: Config, parser: argparse.ArgumentParser) -> None:
+    """The first positional: a fixed command, or a ``[modes.<name>]`` table the config has.
+
+    Generic dispatch is what runs a study's own composition (Phase D's "policy + task module, no
+    steering" anchor: ``mode = "none"`` with ``adapter_task``); it is a steered command in every other
+    way, so it requires ``--prompt`` like ``fc``/``frs``. A name that is neither is a usage error
+    naming the fixed commands and the mode tables this config actually has.
+    """
+    if args.command in COMMANDS:
+        return
+    if args.command in config.modes:
+        if args.prompt is None:
+            parser.error(f"--prompt is required for {args.command!r}")
+        return
+    parser.error(
+        f"unknown command {args.command!r}: expected one of {', '.join(COMMANDS)}, or a mode table "
+        f"({mode_tables(config.modes)})"
+    )
 
 
 def _positive_int(value: str) -> int:
