@@ -7,7 +7,7 @@ the grid use, listed in hub_manifest.yaml.
     uv run --extra mars python examples/pi05/mars/cursor/tools/hub.py upload                    # maintainers: create the repo, upload
 
 The manifest is rebuilt from the configs, never edited by hand:
-- study: every method of the study protocols (configs/study_short_<user>.yaml, study_long_<user>.yaml) in every cell: the
+- study: every method of the study protocols (configs/study_T<t>_U<k>.yaml) in every cell: the
   policies (frozen and fine-tuned per task), the four users' modules and the vision task modules, so the protocols
   play and tune after a download;
 - grid: every method of the grid's sweep (configs/grid.yaml, Figure 3d's) in every cell: the frozen and the

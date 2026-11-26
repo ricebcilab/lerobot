@@ -2,13 +2,11 @@
 
     protocol  arms (control configs), trials and practice trials per block,
               block order rule, trial timing
-    run       one participant under one protocol: blocks in a counterbalanced
-              order, the same target layouts in every arm, one jsonl per block
-              and a manifest
-    visit     a participant's visit over several tasks: one run per task
-              section, in a counterbalanced task order
+    run       one participant under one protocol (one user on one task):
+              blocks in a counterbalanced order, the same target layouts in
+              every arm, one jsonl per block and a manifest
     calibration  the reaches a participant's own user module is trained on,
-              before a visit: the cursor plays demonstrations by itself
+              before a run: the cursor plays demonstrations by itself
               while the person pushes
     trial     agent -> readout -> controller -> env, stepped at 50 Hz, logged
 
@@ -69,8 +67,8 @@ def balanced_latin_square(n):
 def block_order(arm_names, participant, order="latin_square", session=1, shift=0):
     """The arms in the order a visit plays them: a row of the balanced Latin square chosen by the
     participant number and advanced by one row per visit, so the same person's visits are
-    counterbalanced too (p1 -> row 1, then 2, ...; sim -> row 0). `shift` advances it further: each
-    task section of a visit takes the next row."""
+    counterbalanced too (p1 -> row 1, then 2, ...; sim -> row 0). `shift` advances it further: a run
+    on task T<k> takes k - 1 rows more (`task_shift`), so one person's tasks are counterbalanced too."""
     if order == "listed":
         return list(arm_names)
     if order == "latin_square":
@@ -80,17 +78,16 @@ def block_order(arm_names, participant, order="latin_square", session=1, shift=0
     raise ValueError(f"unknown block order {order!r}; expected latin_square or listed")
 
 
-def task_order(tasks, participant, order="latin_square", session=1):
-    """The tasks in the order a visit plays them: the first as listed (the open field, where every visit
-    starts), the others in a row of their own balanced Latin square, chosen as the block order's row is."""
-    tasks = list(tasks)
-    return tasks[:1] + block_order(tasks[1:], participant, order, session) if len(tasks) > 2 else tasks
+def task_shift(task):
+    """The block order's extra rows for a run on a task: T<k> -> k - 1 (T1 none); any other name none."""
+    digits = task[1:] if task and task[0] == "T" else ""
+    return int(digits) - 1 if digits.isdigit() else 0
 
 
-def layout_seed(participant, session, section=None):
-    """One seed per visit: the same layouts in every arm of the visit, new ones next visit. A task section of
-    a visit (`section`, its task's name) takes its own."""
-    return zlib.crc32((f"{participant}:{session}" + ("" if section is None else f":{section}")).encode())
+def layout_seed(participant, session, task=None):
+    """One seed per visit and task: the same layouts in every arm of a run, new ones next visit or on another
+    task (`task`, its name)."""
+    return zlib.crc32((f"{participant}:{session}" + ("" if task is None else f":{task}")).encode())
 
 
 def make_layout_sets(seed, n_trials, n_practice, targets, task):
@@ -270,24 +267,21 @@ class Run:
     """One participant's run of one task under a protocol: `arms` ({arm name: arm}) on the same layouts, a
     block each. `start()` writes the manifest and finds where to resume; `run()` plays the blocks.
 
-    `section` makes the run one task section of a `Visit`: {task, index, first_block, n_blocks, last, ...}
-    names its task (in the run's folder, its layout seed and every record), takes the block order's next
-    row per section (`index`), and counts the blocks over the visit; `labels` go into its records and
-    manifest too."""
+    `task` names the task played (its layout seed and its block order's row, `task_shift`); with `labels` (e.g.
+    the user) it goes into every record and the manifest. The run's folder is <results>/<participant>/<run_name>,
+    by default <protocol>_s<session>."""
 
     calibration = False  # a `Calibration`'s trials are reaches the cursor plays by itself
     slow = 1  # the frames each of those reaches' steps is played over
 
     def __init__(self, protocol, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
-                 run_name=None, *, arms, section=None, labels=None):
+                 run_name=None, *, arms, task=None, labels=None):
         self.protocol, self.participant, self.session, self.agent = protocol, participant, session, agent
-        self.device, self.resume, self.section = device, resume, section
-        task = section["task"] if section else None
-        self.labels = {"task": task, **(labels or {})} if section else {}
+        self.device, self.resume, self.task = device, resume, task
+        self.labels = {**({"task": task} if task else {}), **(labels or {})}
         self.arms = arms
-        self.order = block_order(list(self.arms), participant, protocol["blocks"]["order"], session,
-                                 section["index"] if section else 0)
-        self.run_name = run_name or f"{protocol['name']}_s{session}" + (f"_{task}" if section else "")
+        self.order = block_order(list(self.arms), participant, protocol["blocks"]["order"], session, task_shift(task))
+        self.run_name = run_name or f"{protocol['name']}_s{session}"
         self.dir = Path(results_dir) / participant / self.run_name
         self.seed = layout_seed(participant, session, task)
         blocks = protocol["blocks"]
@@ -304,8 +298,7 @@ class Run:
         models = dict.fromkeys(a["model"] for a in self.arms.values())  # each policy hashed once
         checkpoints = {f"policies/{m}": file_sha256(policy_weights(m)) for m in models}
         checkpoints.update(adapter_checkpoints(self.arms))
-        section = {} if self.section is None else {"section": {**self.section, **self.labels}}
-        return dict(participant=self.participant, session=self.session, run=self.run_name, **section,
+        return dict(participant=self.participant, session=self.session, run=self.run_name, **self.labels,
                     protocol=self.protocol, arms={k: arm_fields(v) for k, v in self.arms.items()},
                     block_order=self.order, layout_seed=self.seed,
                     agent=dict(name=self.agent.name, **self.agent.params()), checkpoints=checkpoints,
@@ -367,9 +360,7 @@ class Run:
                     continue
                 log = self.dir / block_filename(block, arm_name)
                 readout = readout_for(arm, np.random.default_rng([self.seed, block]))
-                before, n_blocks = (self.section["first_block"], self.section["n_blocks"]) if self.section else (0, len(self.order))
-                hud = dict(block=before + block, n_blocks=n_blocks, arm=arm_name,  # counted over the visit
-                           calibration=self.calibration)
+                hud = dict(block=block, n_blocks=len(self.order), arm=arm_name, calibration=self.calibration)
                 if renderer is not None:
                     renderer.block_screen(dict(**hud, n_practice=len(self.practice), n_trials=len(self.layouts),
                                                resumed=len(done)), self.agent)
@@ -389,9 +380,7 @@ class Run:
                     self.append(log, block, arm_name, rows, recs)
                     played += len(rows)
                 if renderer is not None and not self.calibration:  # a calibration ends in its module's training
-                    end = block == len(self.order)  # of this run; the visit ends with its last section
-                    last = end and (self.section is None or self.section["last"])
-                    renderer.break_screen(dict(**hud, last=last, section_end=end and not last), self.agent)
+                    renderer.break_screen(dict(**hud, last=block == len(self.order)), self.agent)
         finally:
             m = read_manifest(self.dir)
             m["finished"] = now_iso()
@@ -406,23 +395,23 @@ class Run:
 
 
 class Calibration(Run):
-    """The reaches a participant's own user module is trained on (--calibrate), before a visit's first section: on
+    """The reaches a participant's own user module is trained on (--calibrate), before the run's first block: on
     the open field, under the user's readout, the cursor plays one demonstration per layout by itself (`make_demos`,
     straight to the goal without a miss and its correction, so the person can follow it; each step over
     `protocol.calibration.slow` frames, its whole path drawn ahead) while the participant pushes as if steering it,
     and every frame keeps what the readout served. A run of one block in <protocol>_s<session>_calibration/
     (`protocol.calibration`: its reaches and practice reaches), resumed as any run is.
 
-    `sections` are the visit's ({task: {arm name: arm}}): the readout and the layouts' task are their first arm's,
-    the policy the one their user module steers. `module` names the module trained on the calibration
-    (checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>), `with_module` puts it in the
-    shared module's place and `data` is what its trainer reads."""
+    `arms` are the run's ({arm name: arm}): the readout and the layouts' task are their first arm's (with no
+    obstacle), the policy the one their user module steers. `module` names the module trained on the calibration
+    (checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>; `with_user_module` puts it
+    in the shared module's place) and `data` is what its trainer reads."""
 
     calibration = True
 
-    def __init__(self, protocol, sections, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
+    def __init__(self, protocol, arms, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
                  labels=None):
-        arms = [arm for section in sections.values() for arm in section.values()]
+        arms = list(arms.values())
         models = {arm["model"] for arm in arms if self.user_module(arm)}
         if len(models) != 1:
             raise ValueError(f"protocol {protocol['name']}: a calibration trains the user module of one policy; its arms "
@@ -431,9 +420,9 @@ class Calibration(Run):
                "reversal_adapter": None, "learned_adapter": None, "adapter_matrix": None}
         plan = protocol["calibration"]
         blocks = {"trials": plan["reaches"], "practice": plan["practice"], "order": "listed"}
-        section = dict(task="calibration", index=0, first_block=0, n_blocks=1, last=False)
         super().__init__({**protocol, "blocks": blocks}, participant, session, agent, device, results_dir, resume,
-                         arms={"calibration": arm}, section=section, labels=labels)
+                         f"{protocol['name']}_s{session}_calibration", arms={"calibration": arm}, task="calibration",
+                         labels=labels)
         self.module = f"cursor_participants/{protocol['study']}/{participant}/{protocol['name']}_s{session}"
         self.slow = int(plan["slow"])
         if self.slow < 1:
@@ -460,16 +449,6 @@ class Calibration(Run):
     def playback(self, rows):
         return self.demos[rows[0][0]][0][[row[3] for row in rows]]
 
-    def with_module(self, sections):
-        """`sections` with the participant's module in the shared user module's place, in every arm that plays one."""
-        def swap(arm):
-            if not self.user_module(arm):
-                return arm
-            return {**arm, "reversal_adapter": {**arm["reversal_adapter"], "user": self.module},
-                    "learned_adapter": {**arm["learned_adapter"], "user": self.module}}
-
-        return {task: {name: swap(arm) for name, arm in arms.items()} for task, arms in sections.items()}
-
     def data(self):
         """The played calibration as its trainer reads it: (layouts, steps [B, L, 2], lengths [B], served
         [B, L, slow, 2]), one row per finished reach: its layout, the demonstration the cursor played on it (at the
@@ -491,44 +470,25 @@ class Calibration(Run):
         return self.layouts[ids], actions[ids], played, served
 
 
-class Visit:
-    """One participant's visit over several task sections: a `Run` per section, in the visit's task order
-    (`task_order`), each with its own layouts, run folder and block order (the next row per section).
+def with_user_module(arms, module):
+    """`arms` ({arm name: arm}) with the user module `module` (a name) in the shared user module's place, in every arm
+    that plays one."""
+    def swap(arm):
+        if not Calibration.user_module(arm):
+            return arm
+        return {**arm, "reversal_adapter": {**arm["reversal_adapter"], "user": module},
+                "learned_adapter": {**arm["learned_adapter"], "user": module}}
 
-    `sections` maps a task's name to its arms {arm name: arm}, in the protocol's order; `order` is the task
-    order rule (latin_square | listed); `labels` (e.g. the user) go into every record and manifest."""
+    return {name: swap(arm) for name, arm in arms.items()}
 
-    def __init__(self, protocol, sections, participant, session, agent, device="cpu", results_dir=RESULTS, resume=False,
-                 order="latin_square", labels=None):
-        names = list(sections)
-        self.tasks = task_order(names, participant, order, session)
-        n_blocks, first, self.runs = sum(len(arms) for arms in sections.values()), 0, []
-        for k, task in enumerate(self.tasks):
-            section = dict(task=task, index=names.index(task), position=k + 1, of=len(names), first_block=first,
-                           n_blocks=n_blocks, last=k == len(names) - 1, task_order=self.tasks,
-                           obstacles=any(arm["obstacle"] is not None for arm in sections[task].values()))
-            self.runs.append(Run(protocol, participant, session, agent, device, results_dir, resume,
-                                 arms=sections[task], section=section, labels=labels))
-            first += len(sections[task])
 
-    def check(self):
-        """Every section's folder before anything is played (a calibration, which comes before `start`)."""
-        for run in self.runs:
-            run.check()
-
-    def start(self):
-        """Every section's manifest and checkpoints before the first screen, so an existing folder or a
-        missing checkpoint stops the visit before it begins."""
-        for run in self.runs:
-            run.start()
-
-    def run(self, renderer=None):
-        """Play every section with trials left; returns the number of trials played."""
-        played = 0
-        for run in self.runs:
-            if not run.remaining():
-                continue  # a section a resumed visit had finished
-            if renderer is not None and len(self.runs) > 1:  # a one-task visit needs no task screen
-                renderer.section_screen({**run.section, **run.labels}, run.agent)
-            played += run.run(renderer)
-        return played
+def participant_module(participant, user):
+    """The user module calibrated for this participant under this user profile in any study, by name (the newest when
+    there are several: cursor_participants/<study>/<participant>/<run>/, the profile its meta records), or None."""
+    root = adapter_path("cursor_participants").parent
+    found = []
+    for path in root.glob(f"*/{participant}/*/adapter.pt"):
+        meta = AdapterModules.read_checkpoint(path, mmap=True).get("meta", {}).get("calibration", {})
+        if meta.get("user") == user:
+            found.append((meta.get("trained", ""), str(path.parent.relative_to(root))))
+    return f"cursor_participants/{max(found)[1]}" if found else None

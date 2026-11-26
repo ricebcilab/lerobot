@@ -1,30 +1,32 @@
-"""The paper's figures: MARS (Modular Adapters for Reversal Steering, the display name of mars) illustrated,
-the human study, and the simulated user x task grid with success against the time spent demonstrating a task.
+"""The paper's figures: MARS (Modular Adapters for Reversal Steering, the display name of mars) illustrated, the simulated
+cursor grid with success against the time spent demonstrating a task, the LIBERO study, and the cursor user study.
 
-    uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py                         # all three, into examples/pi05/mars/paper/figures/
-    uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --only fig1 fig2        # some
+    uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py                         # all four, into examples/pi05/mars/paper/figures/
+    uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --only fig1 fig3        # some
     uv run --extra mars python examples/pi05/mars/paper/figures/build_figures.py --out /tmp/figs --device cpu
 
-Writes figures/fig1_method.{pdf,png}, fig2_study.{pdf,png}, fig3_grid.{pdf,png} (7.0 in wide; 300 dpi, Type 42 fonts)
-and figures/stats.json, the numbers the captions quote (one entry per figure, so --only keeps the rest).
+Writes figures/fig1_method, fig2_sim, fig3_libero, fig4_study (.pdf and .png; 7.0 in wide, 300 dpi, Type 42 fonts) and
+figures/stats.json, the numbers the captions quote (one entry per figure, so --only keeps the rest).
 
-Names: MARS is MARS with both modules (user and task; MARS-UT in Figure 3, beside its ablations), MARS-U the user
-module alone, MARS-T the task module alone.
+Names: MARS is MARS with both modules (user and task; MARS-UT in Figure 2, beside its ablations), MARS-U the user
+module alone, MARS-T the task module alone. The notation is the Method's: the command x_1 = f(a_1), the noise a_0, the
+policy's field v_theta, the user module M_U, the task module M_T, b_T.
 
 Reads (results/ is git-ignored, so these are local):
-    fig1  nothing (its reaches come from the readout's rule, its densities are made up)
-    fig2  the study recorded in October 2026, moved to results/old/2026-11-23/: p*/study_s*/ (the sessions) and
-          sim/study_s1 (the expert's reference)
-    fig3  the grid's five training seeds: results/cursor_sim/sweeps/grid_s<k>/test.json (configs/grid.yaml; seed 0 tuned, seeds
+    fig1  nothing (panel a's reaches come from the readout's rule; panel b's flows are exact flow-matching fields of
+          made-up 1-D mixtures; panel c's densities are made up)
+    fig2  the grid's five training seeds: results/cursor_sim/sweeps/grid_s<k>/test.json (configs/grid.yaml; seed 0 tuned, seeds
           1-4 tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
           module alone and with the user module, and the fine-tuned policy with the user module refitted on it), and seed
           0's checkpoints for one cell's rollouts (the vision module's scene tokens through checkpoints/scene/fig3); for
-          panel e's curve the demonstration-time runs, results/cursor_sim/sweeps/demo_time_s<k>/test.json (configs/grid_demo_time.yaml:
+          panel c's curve the demonstration-time runs, results/cursor_sim/sweeps/demo_time_s<k>/test.json (configs/grid_demo_time.yaml:
           the vision module, Fine-tuned + MARS-U, flow control and FRS on the fine-tuned policies, each per budget; on the
           grid's trials), and the fine-tuned policies' training logs (checkpoints/policies/demo_time/: each budget's
           demonstration count and training length)
-
-Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
+    fig3  the LIBERO study's users: results/libero_sim/replication/users/<user>/test/<arm>/<run>/trial_*.npz and the trial
+          videos beside them (users.sh: MARS, FRS at MARS's setting without the module, flow control, FRS; ffmpeg reads one frame)
+    fig4  the cursor user study's sessions: results/cursor_study/p<k>/study_T<t>_U<k>_s<visit>/ and the T1 sessions recorded
+          with the earlier short protocols, results/cursor_study_short/p<k>/study_short_U<k>_s<visit>_T1/
 """
 
 import argparse
@@ -52,10 +54,9 @@ from scipy import stats as sps
 from analyze_results import find_runs, load_trials
 from cursor_sa import config
 from cursor_sa.agents import ExpertAgent
-from cursor_sa.analysis import GRID, INK, INK_2, aligned_path, cumulative_hits, draw_scene, paired_lead
-from lerobot.envs.cursor import Layouts, TaskConfig, sample_layouts
+from cursor_sa.analysis import GRID, INK, INK_2, cumulative_hits, draw_scene
+from lerobot.envs.cursor import sample_layouts
 from cursor_sa.paths import CHECKPOINTS, RESULTS
-from cursor_sa.records import load_run
 from cursor_sa.session import arm_task, readout_for, load_checkpoints, run_trials
 from lerobot.policies.steering.processor_steering import SCENE_VLM_PATH, SceneEncoder
 from run_sweep import attach_scene, method_arm, scene_sources, with_setting
@@ -188,8 +189,11 @@ PANEL_EDGE, CALLOUT_EDGE, CALLOUT_FILL = "#b9b7af", "#cfcdc5", "#f6f5f1"
 DENSITY_FILL, READOUT_FILL = "#dedcd5", "#efdde5"  # the policy's density; the user readout's commands (a tint of SERVED)
 BAND_HATCH, BAND_FILL = "#a5a49e", "#efeee9"  # the actions that hit the obstacle
 OBSTACLE_STYLE = dict(facecolor="#8f8d86", edgecolor="#5f5e5a", lw=0.6)  # the scenes' obstacles: darker than the other targets
-SCHEMATIC_TITLES = {"readout": "user readout  $a_{\\mathrm{readout}}$", "noise": "noise  $z \\sim \\mathcal{N}(0, I)$",
-                    "policy": "policy actions  $a_{\\mathrm{policy}}$"}
+SCHEMATIC_TITLES = {"readout": "user commands  $x$", "noise": "noise  $a_0 \\sim \\mathcal{N}(0, I)$",
+                    "policy": "robot actions  $a$"}
+SCHEMATIC_VARS = {"readout": "x", "noise": "a_0", "policy": "a"}  # each panel's variable, at its baseline's right end
+TASK_COLOR = GRID_COLOR["mars_task"]  # the task flow (Figure 1b's lines, 1c's density); the user flow is the served colour
+TASK_FILL = "#e7e0f6"  # a tint of TASK_COLOR
 INTENT_DASH = (0, (2.5, 1.5))  # the user's intent density
 EMPHASIS = dict(color=ARM_COLOR[MARS_KEY], fontweight="bold")
 FLOW_NAME = dict(color=INK_2, fontstyle="italic")
@@ -258,9 +262,9 @@ def obstacle_band(ax, lo, hi, above=False):
 
 
 def intent_and_command(ax, pol, readout, u, uh, intent=None):
-    """The user readout's panel: the policy's density for reference, the readout's commands, the intent u (on the user's intent
-    density, dashed, when given, else on the axis; it need not be in the policy's distribution) and the command u-hat it is
-    corrupted into, joined by C."""
+    """The user commands' panel: the policy's density for reference, the commands' density, the intended action a_1 (on the
+    user's intent density, dashed, when given, else on the axis; it need not be in the policy's distribution) and the command
+    x_1 = f(a_1) the interface turns it into, joined by f."""
     density(ax, pol, DENSITY_FILL)
     if intent is not None:
         density(ax, intent, None, edge=INK, lw=0.9, ls=INTENT_DASH, support_only=True)
@@ -268,22 +272,22 @@ def intent_and_command(ax, pol, readout, u, uh, intent=None):
     yu = on_density(ax, u, np.zeros_like(readout) if intent is None else intent, "v", INK, hollow=True)
     yh = on_density(ax, uh, readout, "v", SERVED)
     ax.annotate("", xy=(uh, yh), xytext=(u, yu), arrowprops=dict(arrowstyle="-|>", color=INK_2, lw=0.7, mutation_scale=5, shrinkA=4, shrinkB=4))
-    ax.text((u + uh) / 2 - 0.08, (yu + yh) / 2 + 0.03, "$C$", fontsize=FS_TEXT, color=INK_2, ha="right", va="bottom")
-    ax.text(u - 0.12, yu + 0.07, "$u$", fontsize=FS_TEXT, ha="right", va="bottom")
-    ax.text(uh + 0.17, yh, "$\\hat u$", fontsize=FS_TEXT, ha="left", va="center", color=SERVED)
+    ax.text((u + uh) / 2 - 0.08, (yu + yh) / 2 + 0.03, "$f$", fontsize=FS_TEXT, color=INK_2, ha="right", va="bottom")
+    ax.text(u - 0.12, yu + 0.07, "$a_1$", fontsize=FS_TEXT, ha="right", va="bottom")
+    ax.text(uh + 0.17, yh, "$x_1$", fontsize=FS_TEXT, ha="left", va="center", color=SERVED)
 
 
 def noise_panel(ax, z, other, other_color):
-    """The prior with MARS's latent z-hat (in its bulk) and another method's (hollow)."""
+    """The prior with MARS's noise a-hat_0 (in its bulk) and another method's (hollow)."""
     noise = sps.norm.pdf(SCHEMATIC_X)
     density(ax, noise, DENSITY_FILL)
     h = on_density(ax, z, noise, "o", ARM_COLOR[MARS_KEY])
     on_density(ax, other, noise, "o", other_color, hollow=True)
-    ax.text(z + 0.2, h + 0.01, "$\\hat z$", fontsize=FS_TEXT, color=ARM_COLOR[MARS_KEY], ha="left", va="bottom")
+    ax.text(z + 0.2, h + 0.01, "$\\hat a_0$", fontsize=FS_TEXT, color=ARM_COLOR[MARS_KEY], ha="left", va="bottom")
 
 
-READOUT_CALLOUT = [[("The readout ", {}), ("corrupts", dict(color=SERVED, fontweight="bold")), (" the intent $u$", {})],
-               [("into an off-policy command $\\hat u$ …", {})]]
+READOUT_CALLOUT = [[("The interface ", {}), ("distorts", dict(color=SERVED, fontweight="bold")), (" the intent $a_1$", {})],
+                   [("into an off-policy command $x_1$ …", {})]]
 
 
 def schematic(fig, x0, y0, spec):
@@ -302,7 +306,7 @@ def schematic(fig, x0, y0, spec):
     for key, (px, py, w) in {"readout": (ax0, top_y, pw), "noise": (nx, ny, nw), "policy": (ax0, y0, pw)}.items():
         fig.patches.append(Rectangle(inches(fig, px, py), *inches(fig, w, ph), transform=fig.transFigure, facecolor="none",
                                      edgecolor=PANEL_EDGE, lw=0.8))
-        spec["draw"][key](density_axes(fig, px + 0.07, py + 0.1, w - 0.14, ph - band - 0.15, spec["top"][key], "z" if key == "noise" else "a"))
+        spec["draw"][key](density_axes(fig, px + 0.07, py + 0.1, w - 0.14, ph - band - 0.15, spec["top"][key], SCHEMATIC_VARS[key]))
         callout(fig, px + w / 2, py + ph - band / 2 - 0.02, spec["callouts"][key])
     fig.text(*inches(fig, ax0 + 0.02, top_y + ph + 0.05), SCHEMATIC_TITLES["readout"], fontsize=FS_TITLE, ha="left", va="bottom")
     fig.text(*inches(fig, nx + 0.02, ny + ph + 0.05), SCHEMATIC_TITLES["noise"], fontsize=FS_TITLE, ha="left", va="bottom")
@@ -323,38 +327,14 @@ def schematic(fig, x0, y0, spec):
     fig.text(*inches(fig, bx - 0.05, (ry + by) / 2), MARS, rotation=90, ha="right", va="center", fontsize=FS_TITLE, color=mars, fontweight="bold")
 
 
-def fig1_schematic():
-    """Figure 1b: the policy's two modes (two targets); the user's intent near the right one, partly off its support; the
-    readout's commands, the intent corrupted, off the policy's support. MARS's reversal (through A_U) lands in the bulk of the
-    noise and the flow brings it to the mode the user means, FRS's (A_U = I) lands far in the tail and comes back near the
-    command."""
+def pipeline_schematic():
+    """Figure 1c, the whole method on made-up 1-D densities: the policy's two modes, the one the user means running through
+    the task's constraint (the hatched band of actions); the user's intent a_1 clear of it, and the command x_1 = f(a_1) off
+    the policy's support. MARS reverses x_1 through M_U(M_T v + b_T) into the bulk of the noise, and the task's flow
+    M_T v + b_T, whose mode the task module moved clear of the constraint, generates the intended action there. FRS
+    (M_U = M_T = I, b_T = 0) reverses through the policy's own field into the noise's tail and comes back near the command,
+    off the policy's support."""
     X, mars, frs = SCHEMATIC_X, ARM_COLOR[MARS_KEY], ARM_COLOR["frs"]
-    pol = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, -0.35, 0.34)
-    intent = 0.42 * sps.norm.pdf(X, 0.45, 0.32)
-    readout = 0.42 * sps.norm.pdf(X, 2.1, 0.3)
-
-    def policy_panel(ax):
-        density(ax, pol, DENSITY_FILL)
-        h = on_density(ax, -0.35, pol, "o", mars)
-        on_density(ax, 2.05, pol, "o", frs, hollow=True)
-        ax.text(-0.15, h, "$\\hat a$", fontsize=FS_TEXT, color=mars, ha="left", va="center")
-
-    return dict(
-        draw={"readout": lambda ax: intent_and_command(ax, pol, readout, 0.45, 2.1, intent), "noise": lambda ax: noise_panel(ax, 0.62, 2.75, frs),
-              "policy": policy_panel},
-        top={"readout": 0.84, "noise": 0.46, "policy": 0.8},
-        callouts={"readout": READOUT_CALLOUT,
-                  "noise": [[("… ", {}), ("$A_U$", dict(color=mars)), (" steers its reversal", {})],
-                            [("into ", {}), ("typical noise", EMPHASIS), (" …", {})]],
-                  "policy": [[("… which the policy maps to", {})], [("an ", {}), ("in-distribution", EMPHASIS), (" action $\\hat a$.", {})]]},
-        flows=[("$\\hat z = \\hat u - \\int_0^1 A_U\\, v_P\\, dt$", [("flow reversal", FLOW_NAME), ("FRS: $A_U = I$", dict(color=frs))]),
-               ("$\\hat a = \\hat z + \\int_0^1 v_P\\, dt$", [("flow matching", FLOW_NAME)])])
-
-
-def fig3_schematic():
-    """Figure 3a: the original policy P's intended mode runs through the obstacle (the hatched band of actions); the task
-    module (A_T, b_T) moves the flow's mode clear of it; MARS lands there, MARS-U (A_T = I, b_T = 0) on P's mode."""
-    X, mars, mars_u = SCHEMATIC_X, ARM_COLOR[MARS_KEY], GRID_COLOR["mars_user"]
     lo, hi = -0.85, 0.05
     pol = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, -0.4, 0.34)
     task = 0.45 * sps.norm.pdf(X, -2.0, 0.36) + 0.55 * sps.norm.pdf(X, 0.75, 0.3)
@@ -367,25 +347,25 @@ def fig3_schematic():
 
     def policy_panel(ax):
         obstacle_band(ax, lo, hi)
-        density(ax, pol, None, edge=INK_2, lw=0.8, ls=(0, (2.5, 1.5)))
-        density(ax, task, DENSITY_FILL)
+        density(ax, pol, DENSITY_FILL)
+        density(ax, task, TASK_FILL, edge=TASK_COLOR, lw=0.9)
+        ax.fill_between(X, 0, np.minimum(pol, task), color=DENSITY_FILL, lw=0, zorder=2.2)   # where the two agree, the policy's
         h = on_density(ax, 0.75, task, "o", mars)
-        hu = on_density(ax, -0.4, pol, "o", mars_u, hollow=True)
-        ax.plot(-0.67, hu + 0.02, "x", color=INK, ms=3.6, mew=1.0, zorder=7, clip_on=False)
-        ax.text(0.95, h, "$\\hat a$", fontsize=FS_TEXT, color=mars, ha="left", va="center")
+        on_density(ax, 2.4, task, "o", frs, hollow=True)
+        ax.text(0.95, h, "$\\hat a_1$", fontsize=FS_TEXT, color=mars, ha="left", va="center")
         ax.text((lo + hi) / 2, -0.028, "task constraint", fontsize=FS_TEXT, color=INK_2, ha="center", va="top")
 
     return dict(
-        gap=1.42, noise_w=1.45,
-        draw={"readout": readout_panel, "noise": lambda ax: noise_panel(ax, 0.78, 0.5, mars_u), "policy": policy_panel},
+        gap=1.5, noise_w=1.45,
+        draw={"readout": readout_panel, "noise": lambda ax: noise_panel(ax, 0.78, 2.75, frs), "policy": policy_panel},
         top={"readout": 0.84, "noise": 0.46, "policy": 0.8},
         callouts={"readout": READOUT_CALLOUT,
-                  "noise": [[("… ", {}), ("$A_U$", dict(color=mars)), (" and ", {}), ("$A_T, b_T$", dict(color=mars)), (" steer the", {})],
+                  "noise": [[("… ", {}), ("$M_U$", dict(color=SERVED)), (" and ", {}), ("$M_T, b_T$", dict(color=TASK_COLOR)), (" steer the", {})],
                             [("reversal into ", {}), ("typical noise", EMPHASIS), (" …", {})]],
-                  "policy": [[("… which the adapted flow maps to an", {})], [("action meeting the ", {}), ("task constraint", EMPHASIS), (".", {})]]},
-        flows=[("$\\hat z = \\hat u - \\int_0^1 A_U (A_T\\, v_P + b_T)\\, dt$",
-                [("flow reversal", FLOW_NAME), (f"{MARS}-U: $A_T = I,\\ b_T = 0$", dict(color=mars_u))]),
-               ("$\\hat a = \\hat z + \\int_0^1 (A_T\\, v_P + b_T)\\, dt$", [("flow matching", FLOW_NAME)])])
+                  "policy": [[("… which the task's flow maps to an", {})], [("action meeting the ", {}), ("task constraint", EMPHASIS), (".", {})]]},
+        flows=[("$\\hat a_0 = x_1 - \\int_0^1 M_U (M_T\\, v_\\theta + b_T)\\, dt$",
+                [("flow reversal", FLOW_NAME), ("FRS: $M_U = M_T = I,\\ b_T = 0$", dict(color=frs))]),
+               ("$\\hat a_1 = \\hat a_0 + \\int_0^1 (M_T\\, v_\\theta + b_T)\\, dt$", [("flow matching", FLOW_NAME)])])
 
 
 def method_legend(entries):
@@ -396,15 +376,149 @@ def method_legend(entries):
              "command": (plt.Line2D([], [], color=SERVED, lw=0.9), "command $\\hat u$"),
              "policy": (Rectangle((0, 0), 1, 1, facecolor=DENSITY_FILL, edgecolor=INK, lw=0.7), "policy density"),
              "intent_density": (Rectangle((0, 0), 1, 1, facecolor="none", edgecolor=INK, lw=0.8, ls=INTENT_DASH), "intent density"),
-             "readout": (Rectangle((0, 0), 1, 1, facecolor=READOUT_FILL, edgecolor=SERVED, lw=0.7), "readout density"),
+             "readout": (Rectangle((0, 0), 1, 1, facecolor=READOUT_FILL, edgecolor=SERVED, lw=0.7), "command density"),
+             "task": (Rectangle((0, 0), 1, 1, facecolor=TASK_FILL, edgecolor=TASK_COLOR, lw=0.7), "task flow density"),
              "frs": (plt.Line2D([], [], color=ARM_COLOR["frs"], lw=1.2, marker="o", mfc="white", ms=4.2), "FRS"),
              "mars": (plt.Line2D([], [], color=ARM_COLOR[MARS_KEY], lw=1.2, marker="o", ms=4.2), MARS),
              "start": (plt.Line2D([], [], ls="none", color=INK, marker="o", ms=4.2), "start"),
              "cursor": (plt.Line2D([], [], ls="none", color=INK, marker="o", ms=2.6), "cursor"),
              "target": (disc("#fbe3a1", INK, 1.0), "target"),
              "other": (disc("#ecebe6", "#c9c8c1"), "other targets"),
-             "obstacle": ((hatch, disc(OBSTACLE_STYLE["facecolor"], OBSTACLE_STYLE["edgecolor"], 0.6)), "task constraint")}
+             "obstacle": ((hatch, disc(OBSTACLE_STYLE["facecolor"], OBSTACLE_STYLE["edgecolor"], 0.6)), "task constraint"),
+             "constraint": (hatch, "task constraint")}
     return [marks[e][0] for e in entries], [marks[e][1] for e in entries]
+
+
+# ================================================================ Figure 1b: the main insight as flow lines
+
+
+FLOW_T = np.linspace(0, 1, 401)  # the flow time, noise at 0 and actions at 1, as the Method writes it
+MODE_SD = 0.22
+POLICY_MODES = (-1.3, 1.3)   # the policy's two behaviours (two objects, say), in made-up action units
+TASK_MODES = (-1.3, 2.2)     # the task's demonstrations: the right behaviour moved clear of the constraint
+CONSTRAINT = (0.8, 1.8)      # the actions the task rules out (the policy's right behaviour)
+USER_F = (0.35, 2.2)         # the interface, f(a) = 0.35 a + 2.2: commands compressed and shifted above both behaviours
+FLOW_NOISES = sps.norm.ppf(np.linspace(0.04, 0.96, 12))  # the drawn lines' noises, evenly spaced in probability (none at
+# the median, whose line would balance between the two behaviours)
+MARS_NOISE = {"user": sps.norm.ppf(0.25), "task": sps.norm.ppf(0.75)}  # each panel's MARS example: the left behaviour meant
+# through the interface (left), the right one under the task's constraint (right)
+FLOW_A = (-2.35, 3.15)       # the drawn action range
+
+
+def gmm_velocity(a, t, modes, sd=MODE_SD):
+    """The flow-matching field that carries noise N(0, 1) to an equal mixture of N(m, sd^2) along the straight paths
+    a_t = t a_1 + (1 - t) a_0: E[a_1 - a_0 | a_t = a], in closed form (a Gaussian posterior per mode, weighted by the
+    mode's likelihood of a_t)."""
+    a = np.asarray(a, float)[..., None]
+    m = np.asarray(modes, float)
+    var = t ** 2 * sd ** 2 + (1 - t) ** 2
+    logw = -0.5 * (a - t * m) ** 2 / var
+    w = np.exp(logw - logw.max(-1, keepdims=True))
+    w /= w.sum(-1, keepdims=True)
+    return (w * (m + (t * sd ** 2 - (1 - t)) * (a - t * m) / var)).sum(-1)
+
+
+def flow_lines(a0, modes):
+    """The paths a_t of the noises a0 under gmm_velocity, [len(FLOW_T), len(a0)] (Euler on FLOW_T)."""
+    a = np.array(a0, float, ndmin=1)
+    out = [a.copy()]
+    for t0, t1 in zip(FLOW_T[:-1], FLOW_T[1:]):
+        a = a + (t1 - t0) * gmm_velocity(a, t0, modes)
+        out.append(a.copy())
+    return np.array(out)
+
+
+def user_lines(a0):
+    """The user's flow as the module is trained on it: from each noise a_0 the straight path to the command its action
+    gives, x_t = (1 - t) a_0 + t f(mu_theta(a_0))."""
+    a1 = flow_lines(a0, POLICY_MODES)[-1]
+    x1 = USER_F[0] * a1 + USER_F[1]
+    return (1 - FLOW_T[:, None]) * np.array(a0, float, ndmin=1) + FLOW_T[:, None] * x1
+
+
+def edge_density(ax, centers, sd, t, side, color, fill, width=0.13):
+    """A density of actions drawn sideways at flow time t (t = 1: to the right, t = 0: to the left), its peak `width` wide."""
+    y = np.linspace(*FLOW_A, 400)
+    d = sum(sps.norm.pdf(y, c, s) for c, s in zip(centers, sd))
+    d = width * d / d.max()
+    x = t + side * d
+    ax.fill_betweenx(y, t, x, color=fill, lw=0, zorder=1, clip_on=False)
+    ax.plot(np.where(d > 2e-3 * width, x, np.nan), y, color=color, lw=0.7, zorder=1.5, clip_on=False)
+
+
+def along(ax, path, color, ls="-", lw=1.4, toward=0.5, backward=False):
+    """A highlighted path over FLOW_T with an arrowhead at flow time `toward`, pointing backward in time if asked."""
+    ax.plot(FLOW_T, path, color=color, lw=lw, ls=ls, zorder=5, solid_capstyle="round", dash_capstyle="round")
+    i = int(toward * (len(FLOW_T) - 1))
+    j = i - 8 if backward else i + 8
+    ax.annotate("", xy=(FLOW_T[j], path[j]), xytext=(FLOW_T[i], path[i]), zorder=6,
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=0.8, mutation_scale=9, shrinkA=0, shrinkB=0))
+
+
+def flow_axes(fig, rect, title):
+    ax = fig.add_axes(rect)
+    ax.set(xlim=(-0.16, 1.16), ylim=FLOW_A, xticks=[0, 1], yticks=[])
+    ax.set_xticklabels(["0\nnoise", "1\naction"], fontsize=FS_TICK, linespacing=1.0)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_bounds(0, 1)
+    ax.tick_params(axis="x", pad=1.5)
+    ax.set_xlabel("flow time  $t$", fontsize=FS_LABEL, labelpad=1)
+    rich_text(fig, (rect[0] + rect[2] / 2) * fig.get_figwidth(), (rect[1] + rect[3]) * fig.get_figheight() + 0.06, title, FS_TITLE, va="bottom")
+    return ax
+
+
+def user_flow_panel(fig, rect):
+    """Figure 1b, left: the policy's flow (grey) from the noise into its two behaviours, and the user's flow (pink), which
+    joins the same noises to the commands their actions give, the policy's velocity reshaped by M_U. MARS takes the command
+    back along the user's flow to the noise of the meant action, then forward along the policy's flow to that action."""
+    mars = ARM_COLOR[MARS_KEY]
+    ax = flow_axes(fig, rect, [("user flow  ", dict(color=SERVED, fontweight="bold")), ("$v_U = M_U\\, v_\\theta$", dict(color=SERVED))])
+    grey, pink = flow_lines(FLOW_NOISES, POLICY_MODES), user_lines(FLOW_NOISES)
+    ax.plot(FLOW_T, grey, color="#b4b2ab", lw=0.6, zorder=2)
+    ax.plot(FLOW_T, pink, color=SERVED, lw=0.6, alpha=0.55, zorder=3)
+    edge_density(ax, [0], [1], 0, -1, INK_2, DENSITY_FILL)
+    edge_density(ax, POLICY_MODES, [MODE_SD] * 2, 1, 1, INK_2, DENSITY_FILL)
+    edge_density(ax, [USER_F[0] * m + USER_F[1] for m in POLICY_MODES], [USER_F[0] * MODE_SD] * 2, 1, 1, SERVED, READOUT_FILL, width=0.1)
+    a0 = MARS_NOISE["user"]
+    back, fwd = user_lines([a0])[:, 0], flow_lines([a0], POLICY_MODES)[:, 0]
+    along(ax, back, mars, ls=(0, (2.2, 1.4)), toward=0.55, backward=True)
+    along(ax, fwd, mars, toward=0.45)
+    ax.plot(1, back[-1], "v", color=SERVED, ms=4.8, zorder=7, clip_on=False)
+    ax.plot([0, 1], [a0, fwd[-1]], "o", color=mars, ms=3.8, zorder=7, clip_on=False)
+    ax.text(0.97, back[-1] + 0.12, "$x_1$", fontsize=FS_TEXT, color=SERVED, ha="right", va="bottom")
+    ax.text(-0.03, a0 - 0.12, "$\\hat a_0$", fontsize=FS_TEXT, color=mars, ha="right", va="top")
+    ax.text(1.03, fwd[-1] - 0.12, "$\\hat a_1$", fontsize=FS_TEXT, color=mars, ha="left", va="top")
+    ax.text(0.5, -2.1, "policy flow  $v_\\theta$", fontsize=FS_TEXT, color=INK_2, ha="center", va="center")
+    return ax
+
+
+def task_flow_panel(fig, rect):
+    """Figure 1b, right: the policy's flow (grey) and the task's (purple), the policy's velocity reshaped by M_T and shifted
+    by b_T, which carries the same noises to the task's behaviours: the left one kept, the right one moved clear of the
+    actions the task rules out. MARS generates along the task's flow; the policy's own flow ends in the constraint."""
+    mars = ARM_COLOR[MARS_KEY]
+    ax = flow_axes(fig, rect, [("task flow  ", dict(color=TASK_COLOR, fontweight="bold")),
+                               ("$v_T = M_T\\, v_\\theta + b_T$", dict(color=TASK_COLOR))])
+    grey, purple = flow_lines(FLOW_NOISES, POLICY_MODES), flow_lines(FLOW_NOISES, TASK_MODES)
+    ax.plot(FLOW_T, grey, color="#b4b2ab", lw=0.6, zorder=2)
+    ax.plot(FLOW_T, purple, color=TASK_COLOR, lw=0.6, alpha=0.6, zorder=3)
+    edge_density(ax, [0], [1], 0, -1, INK_2, DENSITY_FILL)
+    edge_density(ax, POLICY_MODES, [MODE_SD] * 2, 1, 1, INK_2, DENSITY_FILL)
+    edge_density(ax, TASK_MODES[1:], [MODE_SD], 1, 1, TASK_COLOR, TASK_FILL)
+    lo, hi = CONSTRAINT
+    ax.add_patch(Rectangle((0.9, lo), 0.1, hi - lo, facecolor=BAND_FILL, edgecolor=BAND_HATCH, lw=0, hatch="//////", zorder=4))
+    ax.text(0.86, (lo + hi) / 2, "task\nconstraint", fontsize=FS_TEXT, color=INK_2, ha="right", va="center", linespacing=1.0, zorder=6,
+            bbox=dict(boxstyle="square,pad=0.08", facecolor="white", edgecolor="none", alpha=0.85))
+    a0 = MARS_NOISE["task"]
+    own, task = flow_lines([a0], POLICY_MODES)[:, 0], flow_lines([a0], TASK_MODES)[:, 0]
+    ax.plot(FLOW_T, own, color=INK_2, lw=0.9, ls=(0, (2.2, 1.4)), zorder=4.5)
+    ax.plot(1, own[-1], "x", color=INK, ms=4, mew=1.1, zorder=7, clip_on=False)
+    along(ax, task, mars, toward=0.5)
+    ax.plot([0, 1], [a0, task[-1]], "o", color=mars, ms=3.8, zorder=7, clip_on=False)
+    ax.text(-0.03, a0 + 0.12, "$\\hat a_0$", fontsize=FS_TEXT, color=mars, ha="right", va="bottom")
+    ax.text(1.03, task[-1] + 0.1, "$\\hat a_1$", fontsize=FS_TEXT, color=mars, ha="left", va="bottom")
+    ax.text(0.5, -2.1, "policy flow  $v_\\theta$", fontsize=FS_TEXT, color=INK_2, ha="center", va="center")
+    return ax
 
 
 # ================================================================ Figure 1: the method
@@ -495,213 +609,353 @@ def inputs_panel(fig, x0, top, tile_w=1.0, gap_x=0.1, row_h=0.78):
         fig.text(*inches(fig, x + tile_w / 2, y - 0.03), label, fontsize=FS_TEXT, color=INK, ha="center", va="top")
 
 
+FIG1_H = 5.0  # in: a and b on top, c below
+
+
 def build_fig1(out):
     paper_style()
-    fig = plt.figure(figsize=(FULL_W, 2.62))
-    # a: where corrupted inputs come from
-    inputs_panel(fig, 0.1, 2.08)
-    panel_label(fig, 0.005, 0.995, "a")
-    # b: the method, a schematic with made-up densities
-    x0 = 2.36
-    schematic(fig, x0, 0.2, fig1_schematic())
-    panel_label(fig, (x0 + 0.02) / FULL_W, 0.995, "b")
-    handles, labels = method_legend(["policy", "intent_density", "readout"])
-    fig.legend(handles, labels, loc="center", bbox_to_anchor=inches(fig, 5.68, 0.42), ncol=len(handles), fontsize=FS_LEGEND,
-               handlelength=1.1, columnspacing=0.6, handletextpad=0.35, borderaxespad=0)
+    fig = plt.figure(figsize=(FULL_W, FIG1_H))
+    # a: where distorted commands come from
+    inputs_panel(fig, 0.1, FIG1_H - 0.5)
+    # b: the main insight, the user's and the task's flows as reshapings of the policy's
+    w, h, bottom = 1.8, 1.4, 2.98
+    user_flow_panel(fig, [*inches(fig, 2.78, bottom), *inches(fig, w, h)])
+    task_flow_panel(fig, [*inches(fig, 2.78 + w + 0.5, bottom), *inches(fig, w, h)])
+    # c: the method end to end, a schematic with made-up densities
+    schematic(fig, 0.05, 0.22, pipeline_schematic())
+    handles, labels = method_legend(["policy", "task", "intent_density", "readout", "constraint", "mars", "frs"])
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=inches(fig, 5.35, 1.3), ncol=1, fontsize=FS_LEGEND,
+               handlelength=1.6, handletextpad=0.5, borderaxespad=0, labelspacing=0.55,
+               handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)})
+    for x, y, letter in ((0.005, 0.995, "a"), (2.45 / FULL_W, 0.995, "b"), (0.005, 2.62 / FIG1_H, "c")):
+        panel_label(fig, x, y, letter)
     png = save(fig, out, "fig1_method")
     write_stats(out, "fig1", dict(inputs=[label for label, _, _ in FIG1_INPUTS],
-                                  schematic="panel a's reaches are illustrations; panel b's densities are made up"))
+                                  schematic="panel a's reaches are illustrations; panel b's flows are exact flow-matching fields "
+                                            "of made-up 1-D mixtures (the user's flow the straight paths the module is trained "
+                                            "on); panel c's densities are made up",
+                                  interface=f"panel b: f(a) = {USER_F[0]} a + {USER_F[1]}"))
     return png
 
 
-# ================================================================ Figure 2: the human study
+# ================================================================ Figure 4: the cursor user study
 
 
-RECORDED_STUDY = Path("old") / "2026-11-23"  # under results/: the October 2026 study's p1-p7 and sim/study_s1
+STUDY_DIRS = ("cursor_study_short", "cursor_study")  # under results/: the sessions recorded with the short protocols
+# (study_short_U<k>, T1 under condition_study.yaml, 2026-11-24/25) and the study's (study_T<t>_U<k>, condition_grid.yaml)
+STUDY_GROUPS = tuple(((t,), t) for t in ("T1", "T2", "T3", "T4", "T5"))  # panel a's groups, as Figure 2b's tasks
+CURVE_GROUPS = ((("T1",), "T1", "-"), (("T2", "T3", "T4", "T5"), "T2–T5", (0, (3, 1.6))))  # panel b's
 
 
-def study_trials(results):
-    runs = [r for r in find_runs(results, protocol="study") if r[0] != "sim"]
-    trials, arms = load_trials(runs)
-    return trials, [a for a in ARMS if a in arms]
+def study_sessions(results):
+    """Every logged trial of the study, by session: {(folder, participant, protocol, visit): [trial]}. A session is one
+    participant's visit under one protocol (a user profile, and a task), counted separately when a participant plays
+    several; the calibration runs are left out."""
+    sessions = {}
+    for study in STUDY_DIRS:
+        root = Path(results) / study
+        if not root.exists():
+            continue
+        runs = [r for r in find_runs(root) if r[0] != "sim" and not r[1].endswith("_calibration")]
+        trials, _ = load_trials(runs)
+        for r in trials:
+            protocol, visit = r["run"].rsplit("_s", 1)[0], r["run"].rsplit("_s", 1)[1].split("_")[0]
+            sessions.setdefault((study, r["participant"], protocol, int(visit)), []).append(r)
+    return sessions
 
 
-def participant_stats(trials, arms):
-    """Per participant, sessions pooled: n, success rate, outcome shares and the median time of the successes per arm."""
-    by_p = {}
-    for r in trials:
-        by_p.setdefault(r["participant"], []).append(r)
+def group_rates(sessions, tasks):
+    """Per session that played the tasks: each arm's success (%) over those tasks' trials."""
     out = {}
-    for p, rs in sorted(by_p.items(), key=lambda kv: int(kv[0][1:])):
-        out[p] = {"sessions": sorted({r["run"] for r in rs}, key=lambda run: int(run.rsplit("_s", 1)[1]))}
-        for arm in arms:
-            a = [r for r in rs if r["arm"] == arm]
-            times = [r["duration_s"] for r in a if r["outcome"] == "hit"]
-            out[p][arm] = dict(n=len(a), **{o: float(np.mean([r["outcome"] == o for r in a])) for o in OUTCOMES},
-                               time_s=float(np.median(times)) if times else None)
+    for key, trials in sessions.items():
+        own = [r for r in trials if r["task"] in tasks]
+        if not own:
+            continue
+        out[key] = {arm: 100 * float(np.mean([r["outcome"] == "hit" for r in own if r["arm"] == arm])) for arm in ARMS
+                    if any(r["arm"] == arm for r in own)}
     return out
 
 
-def example_trial(trials, participant="p1", arm=MARS_KEY):
-    """The participant's success under the arm of median duration, and the step whose push/served angle is the median."""
-    hits = sorted((r for r in trials if r["participant"] == participant and r["arm"] == arm and r["outcome"] == "hit"),
-                  key=lambda r: r["duration_s"])
-    r = hits[len(hits) // 2]
-    raw, served = np.asarray(r["raw_commands"], float), np.asarray(r["served_commands"], float)
-    moving = np.flatnonzero((np.linalg.norm(raw, axis=1) > 0.3) & (np.linalg.norm(served, axis=1) > 0.05))
-    angles = np.array([abs(bearing(served[i], raw[i])) for i in moving])
-    step = int(moving[np.argsort(angles)[len(angles) // 2]])
-    return r, step
-
-
-def draw_example(ax, r, step):
-    targets = np.asarray(r["targets"], float)
-    lay = Layouts(np.asarray(r["start"], float)[None], targets[None], np.ones((1, len(targets)), bool), np.array([r["goal"]]))
-    draw_scene(ax, lay, TaskConfig(target_radius=r["target_radius"]))
-    path = np.asarray(r["path"], float)
-    ax.plot(path[:, 0], path[:, 1], color=ARM_COLOR[MARS_KEY], lw=1.1, zorder=3)
-    p = path[step]
-    arrow(ax, p, np.asarray(r["raw_commands"][step]), INK, "-", 0.16)
-    arrow(ax, p, np.asarray(r["served_commands"][step]), SERVED, "-", 0.16)
-    ax.plot(*p, "o", color=INK, ms=2.5, zorder=6)
-    frame(ax)
-
-
-def draw_aligned(ax, trials, arm, radius):
-    """Every recorded trial of an arm in the reach's frame (start at the origin, goal at (1, 0)): successes in the arm's
-    colour, the failures in the outcome ramp; the start and the goal marked as in the scenes."""
-    for outcome, color, alpha, z in (("timeout", OUTCOME_GRAY["timeout"], 0.35, 2), ("wrong_target", OUTCOME_GRAY["wrong_target"], 0.3, 3),
-                                     ("hit", ARM_COLOR[arm], 0.18, 4)):
-        for r in (r for r in trials if r["arm"] == arm and r["outcome"] == outcome):
-            p = aligned_path(r)[0]
-            ax.plot(p[:, 0], p[:, 1], color=color, lw=0.35, alpha=alpha, zorder=z)
-    ax.add_patch(plt.Circle((1, 0), radius, facecolor="#fbe3a1", edgecolor="none", zorder=1))
-    ax.add_patch(plt.Circle((1, 0), radius, facecolor="none", edgecolor=INK, lw=1.0, zorder=7))
-    ax.plot(0, 0, "o", color=INK, ms=3.5, zorder=6)
-    ax.set(xlim=(-0.5, 1.55), ylim=(-0.85, 0.85), aspect="equal", xticks=[], yticks=[])
-    frame(ax)
-
-
-def build_fig2(out, results):
+def build_fig4(out, results):
     paper_style()
-    trials, arms = study_trials(results)
-    if not trials:
-        raise FileNotFoundError(f"no study sessions under {results}")
-    stats = participant_stats(trials, arms)
-    people = list(stats)
-    rng = np.random.default_rng(0)
-    fig = plt.figure(figsize=(FULL_W, 4.5))
-    # (a) the task and the corruption: an example MARS success
-    ax = fig.add_axes([0.03, 0.6, 0.19, 0.34])
-    r, step = example_trial(trials)
-    draw_example(ax, r, step)
-    handles, labels = row_major(*method_legend(["intent", "command", "start", "cursor", "target", "other"]), 2)
-    ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=FS_LEGEND, handlelength=1.3,
-              columnspacing=0.9, handletextpad=0.5, borderaxespad=0, labelspacing=0.45)
-    # (b) success per arm, the participant as the unit
-    ax = fig.add_axes([0.325, 0.6, 0.27, 0.34])
-    x = np.arange(len(arms))
-    rates = {arm: [100 * stats[p][arm]["hit"] for p in people] for arm in arms}
-    for i, p in enumerate(people):
-        y = [rates[arm][i] for arm in arms]
-        ax.plot(x, y, "-", color="#c9c8c1", lw=0.6, zorder=2)
-        ax.scatter(x, y, s=11, color=[ARM_COLOR[a] for a in arms], edgecolor="white", lw=0.5, zorder=4)
-    ci = {arm: t_ci(rates[arm]) for arm in arms}
-    for i, arm in enumerate(arms):
-        m, lo, hi = ci[arm]
-        ax.add_patch(Rectangle((i - 0.3, 0), 0.6, m, facecolor=ARM_COLOR[arm], alpha=0.18, lw=0, zorder=1))
-        ax.plot([i - 0.3, i + 0.3], [m, m], color=ARM_COLOR[arm], lw=2.2, zorder=5)
-        ax.plot([i, i], [lo, hi], color=INK, lw=0.9, zorder=5)
-        ax.text(i, 104, f"{m:.0f}", ha="center", va="bottom", fontsize=FS_TEXT, color=INK)
-    ax.set(xticks=x, xticklabels=[], ylim=(0, 115), yticks=range(0, 101, 25), xlim=(-0.6, len(arms) - 0.4))
-    ax.tick_params(axis="x", length=0)
+    sessions = study_sessions(results)
+    if not sessions:
+        raise FileNotFoundError(f"no study sessions under {results}/cursor_study*")
+    slots = [(tasks, label, group_rates(sessions, tasks)) for tasks, label in STUDY_GROUPS]
+    fig = plt.figure(figsize=(FULL_W, 2.75))
+    # a: success per arm and task, as Figure 2b, the session as the unit (a dot each, joined across the arms); each task
+    # keeps its slot, an empty one marked as such
+    ax = fig.add_axes([*inches(fig, 0.45, 0.72), *inches(fig, 4.2, 1.8)])
+    width = 0.85 / len(ARMS)
+    stats = {}
+    for i, (_, label, rates) in enumerate(slots):
+        if not rates:
+            ax.text(i, 50, "no sessions yet", ha="center", va="center", fontsize=FS_TEXT, color=INK_2, style="italic")
+            continue
+        left = i - width * len(ARMS) / 2
+        xs = left + width * (np.arange(len(ARMS)) + 0.5)
+        for per_arm in rates.values():
+            ax.plot(xs, [per_arm.get(a, np.nan) for a in ARMS], "-", color="#c9c8c1", lw=0.6, zorder=2)
+        stats[label] = {}
+        for k, arm in enumerate(ARMS):
+            vals = [per_arm[arm] for per_arm in rates.values() if arm in per_arm]
+            m, lo, hi = t_ci(vals)
+            stats[label][arm] = dict(mean_ci=[round(v, 1) for v in (m, lo, hi)], sessions=len(vals))
+            x0 = left + k * width
+            ax.add_patch(Rectangle((x0 + 0.06 * width, 0), 0.88 * width, m, facecolor=ARM_COLOR[arm], alpha=0.18, lw=0, zorder=1))
+            ax.plot([x0 + 0.06 * width, x0 + 0.94 * width], [m, m], color=ARM_COLOR[arm], lw=2.0, zorder=3)
+            if len(vals) > 1:
+                ax.plot([xs[k], xs[k]], [lo, hi], color=INK, lw=0.8, zorder=3.5, solid_capstyle="butt")
+            ax.scatter([xs[k]] * len(vals), vals, s=7, color=ARM_COLOR[arm], edgecolor="white", lw=0.4, zorder=4)
+            ax.text(xs[k], min(max(max(vals), hi if len(vals) > 1 else m), 104) + 3, f"{m:.0f}", ha="center", va="bottom",
+                    fontsize=FS_TEXT, color=INK, weight="bold" if arm == MARS_KEY else "normal", clip_on=False)
+    ax.set(xlim=(-0.5, len(slots) - 0.5), ylim=(0, 112), yticks=[0, 25, 50, 75, 100], xticks=range(len(slots)))
+    ax.set_xticklabels([f"{label}\n{len(rates)} session{'' if len(rates) == 1 else 's'}" for _, label, rates in slots],
+                       fontsize=FS_TICK, linespacing=1.1)
+    ax.tick_params(axis="x", length=0, pad=2)
     ax.set_ylabel("Success (%)", labelpad=1)
-    # (c) time to success: the share of trials succeeded by each time, mean of the participants' curves
-    ax = fig.add_axes([0.675, 0.6, 0.31, 0.34])
-    limit = trials[0]["time_limit_s"]
-    t = np.arange(0, limit + 1e-9, 0.02)
+    # b: the share of trials successful by each time, the mean of the sessions' curves; T1 solid, T2-T5 dashed
+    ax = fig.add_axes([*inches(fig, 5.35, 0.72), *inches(fig, 1.6, 1.8)])
     curves = {}
-    for arm in arms:
-        cs = [cumulative_hits([r for r in trials if r["participant"] == p and r["arm"] == arm], t) for p in people]
-        curves[arm] = 100 * np.mean(cs, 0)
-        ax.step(t, curves[arm], where="post", color=ARM_COLOR[arm], lw=1.4, zorder=3 + (arm == MARS_KEY))
-    ax.set(xlim=(0, limit), ylim=(0, 100), xticks=range(0, int(limit) + 1), yticks=range(0, 101, 25))
+    limit = 0.0
+    groups = [(tasks, label, dash, rates) for tasks, label, dash in CURVE_GROUPS if (rates := group_rates(sessions, tasks))]
+    for tasks, label, dash, rates in groups:
+        group_trials = {key: [r for r in sessions[key] if r["task"] in tasks] for key in rates}
+        lim = max(r["time_limit_s"] for ts in group_trials.values() for r in ts)
+        limit = max(limit, lim)
+        t = np.arange(0, lim + 1e-9, 0.02)
+        curves[label] = {}
+        for arm in ARMS:
+            cs = [cumulative_hits([r for r in ts if r["arm"] == arm], t) for ts in group_trials.values() if any(r["arm"] == arm for r in ts)]
+            c = 100 * np.mean(cs, 0)
+            curves[label][arm] = {f"{s:g}": round(float(np.interp(s, t, c)), 1) for s in (2, 3, 4)}
+            ax.step(t, c, where="post", color=ARM_COLOR[arm], lw=1.2, ls=dash, zorder=3 + (arm == MARS_KEY))
+    ax.set(xlim=(0, limit), ylim=(0, 100), yticks=range(0, 101, 25))
     ax.set_xlabel("Time since trial start (s)", labelpad=1)
     ax.set_ylabel("Trials successful by then (%)", labelpad=1)
-    # the arms' legend, shared by every panel, between the rows
-    handles = [Rectangle((0, 0), 1, 1, facecolor=ARM_COLOR[a], lw=0) for a in arms]
-    fig.legend(handles, [ARM_LABEL[a] for a in arms], loc="center", bbox_to_anchor=(0.5, 0.505), ncol=4, fontsize=FS_LEGEND,
-               handlelength=1.2, handleheight=0.9, columnspacing=1.6, handletextpad=0.6, borderaxespad=0)
-    # (d) every recorded trial per arm, in the reach's frame
-    radius = float(np.median([aligned_path(r)[2] for r in trials]))
-    for i, arm in enumerate(arms):
-        ax = fig.add_axes([0.03 + i * 0.1675, 0.09, 0.15, 0.36])
-        draw_aligned(ax, trials, arm, radius)
-        ax.set_title(ARM_LABEL[arm], fontsize=FS_TITLE, pad=3)
-        if i == 0:
-            ax.set_xlabel("progress", fontsize=FS_LABEL, labelpad=2)
-            ax.set_ylabel("deviation", fontsize=FS_LABEL, labelpad=2)
-    # (e) outcomes: the mean of the participants' shares; successes in the arm's colour, the failures in the outcome ramp
-    ax = fig.add_axes([0.80, 0.14, 0.185, 0.31])
-    shares = {arm: {o: 100 * np.mean([stats[p][arm][o] for p in people]) for o in OUTCOMES} for arm in arms}
-    for i, arm in enumerate(arms):
-        y0 = 0
-        for o in OUTCOMES:
-            v = shares[arm][o]
-            color = ARM_COLOR[arm] if o == "hit" else OUTCOME_GRAY[o]
-            ax.add_patch(Rectangle((i - 0.32, y0), 0.64, max(v - 0.8, 0), facecolor=color, lw=0, zorder=2))
-            if v >= 9:
-                ax.text(i, y0 + v / 2, f"{v:.0f}", ha="center", va="center", fontsize=FS_TEXT, color=text_on(color))
-            y0 += v
-    ax.set(xticks=x, xticklabels=[], ylim=(0, 100), yticks=range(0, 101, 25), xlim=(-0.6, len(arms) - 0.4))
-    ax.tick_params(axis="x", length=0)
-    ax.set_ylabel("Trials (%)", labelpad=1)
-    success = tuple(Rectangle((0, 0), 1, 1, facecolor=ARM_COLOR[a]) for a in arms)   # one swatch of the arms' colours
-    ax.legend([success] + [Rectangle((0, 0), 1, 1, facecolor=OUTCOME_GRAY[o]) for o in OUTCOMES[1:]],
-              [OUTCOME_LABEL[o] for o in OUTCOMES], handler_map={tuple: HandlerTuple(ndivide=None, pad=0)},
-              loc="upper right", bbox_to_anchor=(1.03, -0.1), ncol=3, fontsize=FS_LEGEND, handlelength=1.0, handleheight=1.0,
-              columnspacing=0.6, handletextpad=0.35, borderaxespad=0)
-    for xx, yy, letter in ((0.005, 0.995, "a"), (0.265, 0.995, "b"), (0.615, 0.995, "c"), (0.005, 0.485, "d"), (0.745, 0.485, "e")):
-        panel_label(fig, xx, yy, letter)
-    png = save(fig, out, "fig2_study")
-    # the numbers for the caption
-    leads = {}
-    for arm in arms:
-        if arm == MARS_KEY:
-            continue
-        per_p = [rates[MARS_KEY][i] - rates[arm][i] for i in range(len(people))]
-        leads[arm] = dict(mean_ci=t_ci(per_p), positive=int(sum(v > 0 for v in per_p)), of=len(people),
-                          trial_level=[100 * v for v in paired_lead(trials, MARS_KEY, arm, rng)])
-    best = {arm: 0 for arm in arms}
-    for i in range(len(people)):
-        top = max(arms, key=lambda a: rates[a][i])
-        best[top] += 1
-    sim = {}
-    sim_dir = Path(results) / "sim" / "study_s1"
-    if sim_dir.exists():
-        _, recs = load_run(sim_dir)
-        for arm in arms:
-            a = [r for r in recs if r["arm"] == arm and not r["practice"]]
-            sim[arm] = 100 * float(np.mean([r["outcome"] == "hit" for r in a])) if a else None
-    write_stats(out, "fig2", dict(
-        participants=len(people), sessions={p: stats[p]["sessions"] for p in people},
-        trials_per_arm={arm: int(sum(stats[p][arm]["n"] for p in people)) for arm in arms},
-        success_mean_ci={arm: ci[arm] for arm in arms}, success_per_participant=rates,
-        success_pooled_over_trials={arm: 100 * float(np.mean([r["outcome"] == "hit" for r in trials if r["arm"] == arm])) for arm in arms},
-        leads=leads, best_arm_for_k_participants=best,
-        median_success_time_s={arm: float(np.median([stats[p][arm]["time_s"] for p in people if stats[p][arm]["time_s"] is not None])) for arm in arms},
-        success_by_s={arm: {f"{s:g}": round(float(np.interp(s, t, curves[arm])), 1) for s in (2, 3, 4)} for arm in arms},
-        outcome_shares=shares, expert_reference_success=sim,
-        condition=dict(targets=trials[0]["targets_range"], corruption=trials[0]["corruption"], input_noise=trials[0]["input_noise"],
-                       reach=trials[0]["reach"], time_limit_s=trials[0]["time_limit_s"]),
-        flow_control_note="Kao et al.'s flow control with every chunk step written (tau 16, lambda 1) and the command in the policy's "
-                          "action units (ic_gain 2.08), executed 2 of 16 steps every 40 ms",
-        example_trial=dict(participant=r["participant"], run=r["run"], arm=r["arm"], trial=r["trial"], duration_s=r["duration_s"],
-                           arrow_step=step), durations_include_dwell_s=trials[0]["dwell_s"], aligned_goal_radius=radius))
+    if len(groups) > 1:
+        styles = [plt.Line2D([], [], color=INK_2, lw=1.0, ls=dash) for _, _, dash, _ in groups]
+        ax.legend(styles, [label for _, label, _, _ in groups], loc="upper left", fontsize=FS_LEGEND, handlelength=1.8, borderaxespad=0.2)
+    handles = [Rectangle((0, 0), 1, 1, facecolor=ARM_COLOR[a], lw=0) for a in ARMS]
+    fig.legend(handles, [ARM_LABEL[a] for a in ARMS], loc="center", bbox_to_anchor=(0.5, 0.11 / 2.75), ncol=len(ARMS),
+               fontsize=FS_LEGEND, handlelength=1.2, handleheight=0.9, columnspacing=1.6, handletextpad=0.6, borderaxespad=0)
+    for x, letter in ((0.005, "a"), (4.85 / FULL_W, "b")):
+        panel_label(fig, x, 0.995, letter)
+    png = save(fig, out, "fig4_study")
+    write_stats(out, "fig4", dict(
+        sessions=[dict(folder=k[0], participant=k[1], protocol=k[2], visit=k[3]) for k in sessions],
+        success=stats, success_per_session={label: {"|".join(map(str, k)): {a: round(v, 1) for a, v in r.items()}
+                                                    for k, r in rates.items()} for _, label, rates in slots if rates},
+        success_by_s=curves,
+        note="the session is the unit (a participant playing several user profiles counts once per profile); the sessions "
+             "in cursor_study_short played T1 under condition_study.yaml (step gain mode, 40 ms replans), those in "
+             "cursor_study every task under condition_grid.yaml (time gain mode, 80 ms); 95% t CIs over the sessions; panel b "
+             "the mean of the sessions' cumulative success curves"))
     return png
 
 
-# ================================================================ Figure 3: the simulated grid
+# ================================================================ Figure 3: LIBERO
+
+
+LIBERO_RUNS = Path("libero_sim") / "replication" / "users"  # under results/: <user>/test/<arm>/<run>/trial_*.npz (users.sh)
+LIBERO_USERS = {"rotation": "U1\nrotation 60°", "lowdof": "U2\nno vertical", "lag": "U3\nlag + turn"}  # the users, as
+# libero/configs/study_object_<user>.yaml name them: a fixed 3-D rotation of 60 degrees, the command's vertical component
+# dropped, a lag-and-turn field
+LIBERO_ARMS = ("fc", "frs", "frs_shallow", "mars")  # drawing order; the ablation, FRS at MARS's depth and prefix without the
+# module, beside MARS
+LIBERO_LABEL = {"fc": "Flow control", "frs": "FRS", "frs_shallow": f"FRS at {MARS}'s setting, no module", "mars": MARS}
+LIBERO_COLOR = {"fc": ARM_COLOR["flow_control"], "frs": ARM_COLOR["frs"], "frs_shallow": "#a39e93", "mars": ARM_COLOR[MARS_KEY]}
+LIBERO_EXAMPLES = ("3d9c5dda", "d27c18ea", "4832be44", "9eb1e0a4")  # panel c's resets (pair ids' first 8 characters), the
+# rotation user's, one per task: MARS succeeds and every other arm fails on each (tasks 1, 6, 4, 7)
+LIBERO_OBJECTS = {"akita_black_bowl_1": "bowl", "cream_cheese_1": "cheese", "wine_bottle_1": "bottle", "plate_1": "plate",
+                  "wooden_cabinet_1": "cabinet", "flat_stove_1": "stove", "wine_rack_1": "rack"}
+LIBERO_TARGETS = {8: ("akita_black_bowl_1", "plate_1"), 6: ("cream_cheese_1", "akita_black_bowl_1"),
+                  1: ("akita_black_bowl_1", "flat_stove_1"), 4: ("akita_black_bowl_1", "wooden_cabinet_1"),
+                  5: ("plate_1", "flat_stove_1"), 7: ("flat_stove_1",)}  # each task's object and destination
+LIBERO_TASK = {1: "bowl on the stove", 4: "bowl on the cabinet", 5: "plate to the stove", 6: "cheese in the bowl",
+               7: "turn on the stove", 8: "bowl on the plate"}  # panel c's titles
+LIBERO_BOX = ((-0.47, 0.16), (-0.3, 0.27), (0.88, 1.2))  # panel c's extent (m): x, y, z
+FIG3_H = 3.05
+
+
+def libero_data(results):
+    """Every test trial of the LIBERO study, per user and arm: {user: {arm: [trial]}}, a trial a dict of its record's
+    fields the figure uses, its pair id (the shared reset) and the video beside it."""
+    root = Path(results) / LIBERO_RUNS
+    keep = ("task_id", "task_description", "success", "eef_pos", "object_names", "object_pos", "pair_id", "init_state_id")
+    out = {}
+    for user in LIBERO_USERS:
+        out[user] = {}
+        for arm in LIBERO_ARMS:
+            runs = sorted((root / user / "test" / arm).glob("*/"))
+            if len(runs) != 1:
+                raise FileNotFoundError(f"{root / user / 'test' / arm}: expected one run, found {len(runs)}")
+            trials = []
+            for f in sorted(runs[0].glob("trial_*.npz")):
+                z = np.load(f, allow_pickle=False)
+                trials.append({k: z[k].item() if z[k].ndim == 0 else z[k] for k in keep} | {"video": f.with_suffix(".mp4")})
+            out[user][arm] = trials
+    return out
+
+
+def wilson(k, n, z=1.96):
+    """[rate, lower, upper] (%), the Wilson 95% interval."""
+    p = k / n
+    c = (p + z * z / (2 * n)) / (1 + z * z / n)
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return [100 * p, 100 * (c - h), 100 * (c + h)]
+
+
+def video_frame(path, k=0):
+    """Frame k of a trial's video (the agent view), as an image array, through ffmpeg."""
+    png = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{k})", "-frames:v", "1",  # nosec B603 B607
+                          "-f", "image2pipe", "-vcodec", "png", "-"], check=True, capture_output=True).stdout
+    import io
+    return plt.imread(io.BytesIO(png), format="png")
+
+
+def draw_libero_bars(ax, L):
+    """Success per user and arm: a light bar to the pooled success (60 trials), its Wilson 95% interval in ink, each task's
+    success (10 trials) as a dot, the arms of a user side by side; MARS's value in bold."""
+    users = list(LIBERO_USERS)
+    width = 0.85 / len(LIBERO_ARMS)
+    stats = {}
+    for i, user in enumerate(users):
+        left = i - width * len(LIBERO_ARMS) / 2
+        for k, arm in enumerate(LIBERO_ARMS):
+            trials = L[user][arm]
+            m, lo, hi = wilson(sum(t["success"] for t in trials), len(trials))
+            tasks = sorted({t["task_id"] for t in trials})
+            per_task = [100 * np.mean([t["success"] for t in trials if t["task_id"] == task]) for task in tasks]
+            stats[f"{user}|{arm}"] = dict(success_wilson=[round(v, 1) for v in (m, lo, hi)], n=len(trials),
+                                          per_task={str(task): round(v, 1) for task, v in zip(tasks, per_task)})
+            x0 = left + k * width
+            xc = x0 + width / 2
+            color = LIBERO_COLOR[arm]
+            ax.add_patch(Rectangle((x0 + 0.06 * width, 0), 0.88 * width, m, facecolor=color, alpha=0.18, lw=0, zorder=1))
+            ax.plot([x0 + 0.06 * width, x0 + 0.94 * width], [m, m], color=color, lw=2.0, zorder=3)
+            ax.plot([xc, xc], [lo, hi], color=INK, lw=0.8, zorder=3.5, solid_capstyle="butt")
+            jitter = np.linspace(-0.22, 0.22, len(per_task)) * width
+            ax.scatter(xc + jitter, per_task, s=5, color=color, edgecolor="white", lw=0.3, zorder=4)
+            ax.text(xc, max(hi, max(per_task)) + 3, f"{m:.0f}", ha="center", va="bottom", fontsize=FS_TEXT, color=INK,
+                    weight="bold" if arm == "mars" else "normal")
+    ax.set(xlim=(-0.5, len(users) - 0.5), ylim=(0, 112), yticks=[0, 25, 50, 75, 100], xticks=range(len(users)))
+    ax.set_xticklabels([LIBERO_USERS[u] for u in users], fontsize=FS_TICK, linespacing=1.1)
+    ax.tick_params(axis="x", length=0, pad=2)
+    ax.set_ylabel("Success (%)", labelpad=1)
+    return stats
+
+
+def draw_libero_paths(ax, L, pid, user="rotation"):
+    """One shared reset in 3-D, seen as panel a's frame shows the scene (the robot at the back; that frame is mirrored
+    left to right against the simulator's y, so y is drawn negated to match it): the table, the objects where they start
+    (the task's object and its destination as the scenes' target, named), and each arm's gripper path with its shadow on
+    the table, MARS on top."""
+    by_arm = {arm: next(t for t in L[user][arm] if t["pair_id"].startswith(pid)) for arm in LIBERO_ARMS}
+    first = by_arm["mars"]
+    names = [str(n) for n in first["object_names"]]
+    targets = LIBERO_TARGETS.get(first["task_id"], ())
+    (x0, x1), (y0, y1), (z0, z1) = LIBERO_BOX
+    table = z0 + 0.02
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    ax.add_collection3d(Poly3DCollection([[(x0, -y0, table), (x1, -y0, table), (x1, -y1, table), (x0, -y1, table)]],
+                                         facecolor="#f3f1ea", edgecolor=GRID, lw=0.5, zorder=0))
+    pos = dict(zip(names, first["object_pos"][0]))
+    for name, p in pos.items():
+        target = name in targets
+        style = TARGET_STYLE if target else dict(facecolor="#ecebe6", edgecolor="#b5b3ab", lw=0.6)
+        ax.scatter([p[0]], [-p[1]], [table], s=28 if target else 18, c=[style["facecolor"]], edgecolors=[style["edgecolor"]],
+                   linewidths=style["lw"], depthshade=False, zorder=2)
+    for arm in LIBERO_ARMS:
+        e = by_arm[arm]["eef_pos"]
+        mars = arm == "mars"
+        ax.plot(e[:, 0], -e[:, 1], np.full(len(e), table), color=LIBERO_COLOR[arm], lw=0.5, alpha=0.3, zorder=1)
+        ax.plot(e[:, 0], -e[:, 1], e[:, 2], color=LIBERO_COLOR[arm], lw=1.3 if mars else 0.8, alpha=1 if mars else 0.85,
+                zorder=5 if mars else 3)
+    e = first["eef_pos"]
+    ax.scatter([e[0, 0]], [-e[0, 1]], [e[0, 2]], s=9, c=[INK], depthshade=False, zorder=6)
+    ax.set(xlim=(x0, x1), ylim=(-y1, -y0), zlim=(z0, z1))
+    ax.set_box_aspect((x1 - x0, y1 - y0, z1 - z0), zoom=1.25)
+    ax.view_init(elev=38, azim=0)
+    ax.set_axis_off()
+    ax.text2D(0.5, 0.0, LIBERO_TASK.get(first["task_id"], first["task_description"]), transform=ax.transAxes, fontsize=FS_TICK,
+              color=INK, ha="center", va="top")   # under the table
+    paths = [np.c_[t["eef_pos"][:, 0], -t["eef_pos"][:, 1], z] for t in by_arm.values() for z in (t["eef_pos"][:, 2], np.full(len(t["eef_pos"]), table))]
+    place_labels(ax, [(np.array([pos[n][0], -pos[n][1], table]), LIBERO_OBJECTS.get(n, n)) for n in targets], np.concatenate(paths))
+    return dict(task=first["task_id"], init_state=first["init_state_id"], success={arm: bool(t["success"]) for arm, t in by_arm.items()})
+
+
+def place_labels(ax, marks, points, gap=0.065):
+    """Name each mark ((x, y, z), text) of a 3-D axes beside it, on whichever of eight sides covers the fewest of `points`
+    ([N, 3], the drawn paths) and the other marks and names, as figure text (drawn over every panel). gap: inches."""
+    from mpl_toolkits.mplot3d import proj3d
+    fig = ax.figure
+    r = fig.canvas.get_renderer()
+    proj = ax.get_proj()
+    screen = lambda xyz: ax.transData.transform(np.c_[proj3d.proj_transform(*np.asarray(xyz, float).T, proj)[:2]])  # noqa: E731
+    pts = screen(points)
+    anchors = screen([m for m, _ in marks])
+    g = gap * fig.dpi
+    sides = [((1, 0), "left", "center"), ((-1, 0), "right", "center"), ((0, 1), "center", "bottom"), ((0, -1), "center", "top"),
+             ((0.8, 0.8), "left", "bottom"), ((-0.8, 0.8), "right", "bottom"), ((0.8, -0.8), "left", "top"), ((-0.8, -0.8), "right", "top")]
+    taken = [(a[0] - g, a[1] - g, a[0] + g, a[1] + g) for a in anchors]   # the marks themselves
+    for (_, text), a in zip(marks, anchors):
+        probe = fig.text(0, 0, text, fontsize=FS_TICK)
+        bb = probe.get_window_extent(r)
+        probe.remove()
+        w, h = bb.width, bb.height
+        best = None
+        for k, ((dx, dy), ha, va) in enumerate(sides):
+            x, y = a[0] + dx * g, a[1] + dy * g
+            x0 = x - {"left": 0, "right": w, "center": w / 2}[ha]
+            y0 = y - {"bottom": 0, "top": h, "center": h / 2}[va]
+            box = (x0, y0, x0 + w, y0 + h)
+            hits = ((pts[:, 0] >= box[0]) & (pts[:, 0] <= box[2]) & (pts[:, 1] >= box[1]) & (pts[:, 1] <= box[3])).sum()
+            clash = sum(box[0] < t[2] and t[0] < box[2] and box[1] < t[3] and t[1] < box[3] for t in taken)
+            score = (hits + 50 * clash, k)   # ties keep the side listed first
+            if best is None or score < best[0]:
+                best = (score, x, y, ha, va, box)
+        _, x, y, ha, va, box = best
+        taken.append(box)
+        fig.text(*fig.transFigure.inverted().transform((x, y)), text, fontsize=FS_TICK, color=INK, ha=ha, va=va, zorder=10)
+
+
+def build_fig3(out, results):
+    paper_style()
+    L = libero_data(results)
+    fig = plt.figure(figsize=(FULL_W, FIG3_H))
+    # a: the scene, the first frame of panel c's first MARS trial
+    first = next(t for t in L["rotation"]["mars"] if t["pair_id"].startswith(LIBERO_EXAMPLES[0]))
+    ax = fig.add_axes([*inches(fig, 0.1, 0.72), *inches(fig, 1.85, 1.85)])
+    ax.imshow(video_frame(first["video"]))
+    ax.set(xticks=[], yticks=[])
+    frame(ax)
+    # b: success per user and arm, each user's glyph under its name
+    rect = [*inches(fig, 2.5, 0.78), *inches(fig, 2.05, 1.95)]
+    ax = fig.add_axes(rect)
+    stats = draw_libero_bars(ax, L)
+    # c: four shared resets in 3-D, the rotation user's, two to a row
+    examples = {}
+    for k, pid in enumerate(LIBERO_EXAMPLES):
+        r, c = divmod(k, 2)
+        ax = fig.add_axes([*inches(fig, 4.74 + c * 1.13, 1.84 - r * 1.12), *inches(fig, 1.1, 1.08)], projection="3d", computed_zorder=False)
+        ax.set_facecolor("none")   # so a neighbour's labels are not covered: the left column drawn over the right
+        ax.set_zorder(2 - c)
+        examples[pid] = draw_libero_paths(ax, L, pid)
+    handles = [plt.Line2D([], [], color=LIBERO_COLOR[a], lw=4, solid_capstyle="butt") for a in LIBERO_ARMS]
+    fig.legend(handles, [LIBERO_LABEL[a] for a in LIBERO_ARMS], loc="center", bbox_to_anchor=(0.5, 0.12 / FIG3_H), ncol=len(handles),
+               fontsize=FS_LEGEND, handlelength=1.1, columnspacing=1.3, handletextpad=0.45, borderaxespad=0)
+    for x, letter in ((0.005, "a"), (2.08 / FULL_W, "b"), (4.72 / FULL_W, "c")):
+        panel_label(fig, x, 0.99, letter)
+    png = save(fig, out, "fig3_libero")
+    write_stats(out, "fig3", dict(
+        users={u: v.replace("\n", " ") for u, v in LIBERO_USERS.items()}, arms=LIBERO_LABEL, success=stats, examples=examples,
+        note="LIBERO-Goal tasks 1, 4, 5, 6, 7, 8, 10 test trials each per arm on shared resets (users.sh); success with a "
+             "Wilson 95% interval over the 60 trials, a dot per task; FC at gain 1.5, each arm at its tuned setting"))
+    return png
+
+
+# ================================================================ Figure 2: the simulated cursor grid
 
 
 TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustration
@@ -712,8 +966,8 @@ FT_ARM = "ft_mars_user"   # the policy fine-tuned on each obstacle task's 300 de
 # with the user modules refitted on it
 GRID_BASELINES = ("teleop", "ft_flow_control", "ft_frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
-ROLLOUT_SEED = 7  # panel b's trials
-FIG3_H = 6.15  # in: a (the schematic) and b (the tasks) side by side on top, then c, then d and e (positions in inches from the bottom)
+ROLLOUT_SEED = 7  # panel a's trials
+FIG2_H = 4.2  # in: a (the users x tasks matrix) on top, the methods' legend in one line, then b and c (positions in inches from the bottom)
 
 
 def grid_data(results):
@@ -789,42 +1043,93 @@ def tuned(cell):
     return cell.get("settings", cell.get("depths"))
 
 
-def draw_training(fig, D, rect):
-    """How the modules were trained, as a users x tasks matrix (the user modules on the open field through each
-    user's readout, the task modules on one task each with one user's module in the loop, the other cells
-    compositions never trained together), with its key beside it."""
-    x0, y0, w, h = rect
+CELL_FILL = {"U": "#dbe6f5", "T": "#e5dff7", "": "white"}  # a cell whose user module, task module, or neither was trained there
+
+
+def user_glyph(ax, spec):
+    """A user's readout in Figure 1a's terms: the straight push the user means (ink) and where the readout sends the
+    cursor (the served colour): a gain, a rotation, or for a curl force field a clockwise-bending arrow."""
+    start, aim = np.array([0.3, 0.2]), np.array([0.5, 0.5])
+    ax.annotate("", xy=start + aim, xytext=start, arrowprops=dict(arrowstyle="-|>", color=INK, lw=0.7, mutation_scale=4.5, shrinkA=0, shrinkB=0))
+    served = dict(arrowstyle="-|>", color=SERVED, lw=0.9, mutation_scale=4.5, shrinkA=0, shrinkB=0)
+    if "scale" in spec:
+        end = start + np.array(spec["scale"]) * aim
+    elif "rotation_deg" in spec:
+        c, s = np.cos(np.radians(spec["rotation_deg"])), np.sin(np.radians(spec["rotation_deg"]))
+        end = start + 0.9 * np.array([[c, -s], [s, c]]) @ aim   # anticlockwise, as the readout turns it
+    else:   # the curl turns the cursor clockwise, by atan(tau * curl) at steady state, and slows it
+        turn = -np.arctan(spec["tau"] * spec["curl"])
+        c, s = np.cos(turn), np.sin(turn)
+        end = start + 0.8 * np.array([[c, -s], [s, c]]) @ aim
+        served["connectionstyle"] = "arc3,rad=-0.45"
+    ax.annotate("", xy=end, xytext=start, arrowprops=served)
+    ax.plot(*start, "o", color=INK, ms=1.8)
+    ax.set(xlim=(0, 1), ylim=(0, 1), xticks=[], yticks=[], aspect="equal")
+    frame(ax)
+
+
+def draw_users_tasks(fig, D, shown, top, side=0.74, pitch=0.8, row_h=0.25, glyph_gap=0.06, key_gap=0.16):
+    """Figure 2a: the tasks as columns, each headed by its scene with a successful MARS trial (task_rollouts); the users as
+    rows, each named beside its readout's glyph; each cell MARS-UT's success (mean over the seeds), filled by what was
+    trained there (the user modules on T1, each task module on one task with one user's module in the loop; the rest
+    compositions never trained together); the key on the rows to the right. The block (names to key) is centred on the
+    figure; top inches its top. Returns the cells' numbers."""
     users, tasks = D["users"], D["tasks"]
-    nU, nT = len(users), len(tasks)
-    t0 = tasks[0]
+    names = [f"{u}  {corruption_label(D['G']['cells'][f'{u}x{tasks[0]}']['corruption'])}" for u in users]
+    key = [("", f"cells: {MARS}-UT success (%)"), ("U", "user module trained"), ("T", "task module trained"),
+           ("", "composed at test time")]
+    r = fig.canvas.get_renderer()
 
-    def matrix(x, labels):
-        ax = fig.add_axes([x, y0, 0.19 * w, h])
-        ax.set(xlim=(-0.5, nT - 0.5), ylim=(nU - 0.5, -0.5), xticks=range(nT), yticks=range(nU), aspect="equal")
-        ax.xaxis.tick_top()
-        ax.set_xticklabels(tasks, fontsize=FS_TICK)
-        ax.set_yticklabels(labels, fontsize=FS_TICK)
-        ax.tick_params(length=0, pad=2)
-        for sp in ax.spines.values():
-            sp.set_visible(False)
-        return ax
+    def width(text):   # inches, measured on a text removed again
+        probe = fig.text(0, 0, text, fontsize=FS_TICK)
+        w = probe.get_window_extent(r).width / fig.dpi
+        probe.remove()
+        return w
 
-    styles = {"U": "#dbe6f5", "T": "#e5dff7", "": "white"}
-    ax = matrix(x0, [f"{u}  {corruption_label(D['G']['cells'][u + 'x' + t0]['corruption'])}" for u in users])
-    for i, u in enumerate(users):
+    name_w = max(width(n) for n in names)
+    key_w = max(width(t) + (0.22 if i else 0) for i, (_, t) in enumerate(key))
+    glyph = row_h - 0.03
+    grid_w = (len(tasks) - 1) * pitch + side
+    block = name_w + glyph_gap + glyph + 0.1 + grid_w + key_gap + key_w
+    x0 = (FULL_W - block) / 2
+    gx = x0 + name_w + glyph_gap          # the glyphs' left edge
+    cx = gx + glyph + 0.1                 # the first column's left edge
+    kx = cx + grid_w + key_gap            # the key's left edge
+    for j, t in enumerate(tasks):
+        ax = fig.add_axes([*inches(fig, cx + j * pitch, top - side), *inches(fig, side, side)])
+        s = shown[t]
+        draw_scene(ax, s["layouts"], s["task"], obstacle_style=OBSTACLE_STYLE)
+        if s["path"] is not None:
+            ax.plot(s["path"][:, 0], s["path"][:, 1], color=GRID_COLOR["mars"], lw=1.0, zorder=3)
+        ax.text(0.04, 0.96, t, transform=ax.transAxes, fontsize=FS_TEXT, color=INK, ha="left", va="top", zorder=5,
+                bbox=dict(boxstyle="square,pad=0.12", facecolor="white", edgecolor="none"))
+        frame(ax)
+    values = {}
+    row_y = [top - side - 0.08 - (i + 1) * row_h for i in range(len(users))]   # each row's bottom
+    for i, (u, y) in enumerate(zip(users, row_y)):
+        spec = D["G"]["cells"][f"{u}x{tasks[0]}"]["corruption"]
+        fig.text(*inches(fig, gx - glyph_gap, y + row_h / 2), names[i], fontsize=FS_TICK, color=INK, ha="right", va="center")
+        user_glyph(fig.add_axes([*inches(fig, gx, y + 0.015), *inches(fig, glyph, glyph)]), spec)
         for j, t in enumerate(tasks):
-            kind = "U" if t == t0 else "T" if (u, t) in D["train"] else ""
-            ax.add_patch(Rectangle((j - 0.5, i - 0.5), 1, 1, facecolor=styles[kind], edgecolor=GRID, lw=0.6, zorder=1))
+            kind = "U" if t == tasks[0] else "T" if (u, t) in D["train"] else ""
+            x = cx + j * pitch
+            fig.patches.append(Rectangle(inches(fig, x, y + 0.01), *inches(fig, side, row_h - 0.02), transform=fig.transFigure,
+                                         facecolor=CELL_FILL[kind], edgecolor=GRID, lw=0.6))
+            v = seed_mean(D, u, t, "mars")
+            values[f"{u}x{t}"] = round(v, 1)
+            fig.text(*inches(fig, x + side / 2, y + row_h / 2), f"{v:.0f}", fontsize=FS_TEXT, color=INK, ha="center", va="center")
             if kind:
-                ax.text(j, i, kind, ha="center", va="center", fontsize=FS_TEXT, color=INK, zorder=2)
-    lines = [("U", "User module training"), ("T", "Task module training"), ("", "Composed at test time")]
-    xt = x0 + 0.235 * w
-    for k, (kind, text) in enumerate(lines):
-        yy = y0 + h * (0.84 - 0.36 * k)
-        sw, sh = inches(fig, 0.112, 0.172)
-        fig.patches.append(Rectangle((xt, yy - sh / 2), sw, sh, transform=fig.transFigure, facecolor=styles[kind], edgecolor=GRID, lw=0.6))
-        fig.text(xt + 0.008, yy, kind, ha="center", va="center", fontsize=FS_TEXT, color=INK)
-        fig.text(xt + 0.026, yy, text, ha="left", va="center", fontsize=FS_LEGEND, color=INK, linespacing=1.2)
+                fig.text(*inches(fig, x + 0.05, y + row_h / 2), kind, fontsize=FS_TICK, color=INK_2, ha="left", va="center")
+    for i, ((kind, text), y) in enumerate(zip(key, row_y)):   # the key, a line per row
+        yy = y + row_h / 2
+        if i == 0:
+            fig.text(*inches(fig, kx, yy), text, fontsize=FS_LEGEND, color=INK, ha="left", va="center")
+            continue
+        fig.patches.append(Rectangle(inches(fig, kx, yy - 0.08), *inches(fig, 0.16, 0.16), transform=fig.transFigure,
+                                     facecolor=CELL_FILL[kind], edgecolor=GRID, lw=0.6))
+        fig.text(*inches(fig, kx + 0.08, yy), kind, fontsize=FS_TICK, color=INK_2, ha="center", va="center")
+        fig.text(*inches(fig, kx + 0.22, yy), text, fontsize=FS_LEGEND, color=INK, ha="left", va="center")
+    return values
 
 
 def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
@@ -848,27 +1153,6 @@ def task_rollouts(D, device, n=8, seed=ROLLOUT_SEED):
         out[t] = dict(cell=f"{u}x{t}", layouts=layouts, task=task, path=np.asarray(recs[hits[0]]["path"], float) if hits else None,
                       trial=hits[0] if hits else None, hits=len(hits), of=n)
     return out
-
-
-def draw_tasks(fig, D, shown, rect, cols=2, gap=0.08):
-    """Each task's layout with its successful MARS trial (task_rollouts): square scenes, `cols` to a row, each row centred in
-    rect (the last one too), gap in inches."""
-    x0, y0, w, h = rect[0] * fig.get_figwidth(), rect[1] * fig.get_figheight(), rect[2] * fig.get_figwidth(), rect[3] * fig.get_figheight()
-    n = len(D["tasks"])
-    rows = -(-n // cols)
-    side = min((w - (cols - 1) * gap) / cols, (h - (rows - 1) * gap) / rows)
-    for i, t in enumerate(D["tasks"]):
-        r, c = divmod(i, cols)
-        in_row = min(cols, n - r * cols)
-        left = x0 + (w - in_row * side - (in_row - 1) * gap) / 2
-        ax = fig.add_axes([*inches(fig, left + c * (side + gap), y0 + h - (r + 1) * side - r * gap), *inches(fig, side, side)])
-        s = shown[t]
-        draw_scene(ax, s["layouts"], s["task"], obstacle_style=OBSTACLE_STYLE)
-        if s["path"] is not None:
-            ax.plot(s["path"][:, 0], s["path"][:, 1], color=GRID_COLOR["mars"], lw=1.1, zorder=3)
-        ax.text(0.03, 0.97, t, transform=ax.transAxes, fontsize=FS_TEXT, color=INK, ha="left", va="top", zorder=5,
-                bbox=dict(boxstyle="square,pad=0.12", facecolor="white", edgecolor="none"))   # over a disc that sits in the corner
-        frame(ax)
 
 
 def draw_grid_bars(fig, D, rect):
@@ -916,32 +1200,24 @@ def draw_grid_bars(fig, D, rect):
     return means
 
 
-def build_fig3(out, results, device):
+def build_fig2(out, results, device):
     paper_style()
     D = grid_data(results)
-    fig = plt.figure(figsize=(FULL_W, FIG3_H))
-    y = lambda inch: inch / FIG3_H
-    # a: the method with the task module, a schematic with made-up densities (as Figure 1b)
-    schematic(fig, 0.05, 3.8, fig3_schematic())
-    # b: the tasks, two to a row, beside it
+    fig = plt.figure(figsize=(FULL_W, FIG2_H))
+    y = lambda inch: inch / FIG2_H
+    # a: the users x tasks matrix, each task headed by its scene and a MARS trial, each cell MARS-UT's success
     shown = task_rollouts(D, device)
-    draw_tasks(fig, D, shown, (5.12 / FULL_W, y(3.65), 1.85 / FULL_W, y(2.35)))
-    # the marks of a and b, one legend as Figure 1's
-    handles, labels = method_legend(["policy", "intent_density", "readout", "obstacle", "start", "target", "other"])
-    fig.legend(handles, labels, loc="center", bbox_to_anchor=(0.5, y(3.37)), ncol=len(handles), fontsize=FS_LEGEND, handlelength=1.7, columnspacing=1.1,
-               handletextpad=0.5, borderaxespad=0, labelspacing=0.4, handler_map={tuple: HandlerTuple(ndivide=None, pad=0.4)})
-    # c: how the modules were trained; beside it the methods' legend, for d and e below
-    draw_training(fig, D, (0.193, y(2.0), 0.85, y(0.9)))
+    cell_values = draw_users_tasks(fig, D, shown, FIG2_H - 0.1)
+    # the methods' legend, for b and c below
     handles = [plt.Line2D([], [], color=GRID_COLOR[m], lw=4, solid_capstyle="butt") for m in D["methods"]]
-    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(5.6 / FULL_W, y(2.45)), ncol=2,
-               fontsize=FS_LEGEND, handlelength=1.1, columnspacing=1.4, handletextpad=0.5, labelspacing=0.6, borderaxespad=0)
-    # d: every method on every task; e: on the obstacle tasks, the two arms against the time spent demonstrating each
-    task_cis = draw_grid_bars(fig, D, (0.065, y(0.45), 4.45 / FULL_W, y(1.2)))
-    demo_time = draw_demo_time(fig, demo_time_data(results), (5.5 / FULL_W, y(0.45), 1.45 / FULL_W, y(1.2)))
-    for x, yy, letter in ((0.005, 0.995, "a"), (5.1 / FULL_W, 0.995, "b"), (0.005, y(3.05), "c"), (0.005, y(1.77), "d"),
-                          (5.0 / FULL_W, y(1.77), "e")):
+    fig.legend(handles, [GRID_LABEL[m] for m in D["methods"]], loc="center", bbox_to_anchor=(0.5, y(2.0)), ncol=len(handles),
+               fontsize=FS_LEGEND, handlelength=1.1, columnspacing=1.3, handletextpad=0.45, borderaxespad=0)
+    # b: every method on every task; c: on the obstacle tasks, the arms against the time spent demonstrating each
+    task_cis = draw_grid_bars(fig, D, (0.065, y(0.42), 4.45 / FULL_W, y(1.2)))
+    demo_time = draw_demo_time(fig, demo_time_data(results), (5.5 / FULL_W, y(0.42), 1.45 / FULL_W, y(1.2)))
+    for x, yy, letter in ((0.005, 0.995, "a"), (0.005, y(1.74), "b"), (5.0 / FULL_W, y(1.74), "c")):
         panel_label(fig, x, yy, letter)
-    png = save(fig, out, "fig3_grid")
+    png = save(fig, out, "fig2_sim")
     users, tasks, methods, seeds = D["users"], D["tasks"], D["methods"], D["seeds"]
     cells = [(u, t) for u in users for t in tasks]
     obstacle = [(u, t) for u in users for t in D["obstacle_tasks"]]
@@ -954,7 +1230,7 @@ def build_fig3(out, results, device):
                              for k in range(len(seeds))] for m in methods}
     beyond = lambda leads: dict(cells=int(sum(v[1] > 0 for v in leads.values())), of=len(leads),
                                 level=[c for c, v in leads.items() if v[1] <= 0])
-    write_stats(out, "fig3", dict(
+    write_stats(out, "fig2", dict(
         names={"MARS-UT": "user + task modules (mars)", "MARS-T": "task module alone (mars_task)"},
         seeds=seeds, seed_runs=[f"results/cursor_sim/sweeps/{SEED_RUNS[k]}" for k in seeds],
         task_module_note="the task module is the vision module: pi0.5's vision tokens of a picture of the scene (vlm_image, "
@@ -963,8 +1239,8 @@ def build_fig3(out, results, device):
                   "from 100 demonstrations, task modules from 300) and the fine-tuned policies (each obstacle task's policy "
                   "fine-tuned on 300 demonstrations, its user modules refitted on it; flow control and FRS play on them) on "
                   "their own draws and rerun them on the grid's trials; teleop trains nothing, so its is the grid's in every seed",
-        ci_note=f"panel d: 95% t CIs over the four users (each user's success averaged over the seeds), the user the unit as "
-                f"the participant in Figure 2b (the drawn lines stop at the axis); panel e: 95% t CIs over the training "
+        ci_note=f"panel b: 95% t CIs over the four users (each user's success averaged over the seeds), the user the unit as "
+                f"the session in Figure 4 (the drawn lines stop at the axis); panel c: 95% t CIs over the training "
                 f"seeds (demo_time); the leads: 95% CIs resampling the seeds, then the trials within each ({N_BOOT} draws)",
         users={u: corruption_label(D["G"]["cells"][f"{u}x{tasks[0]}"]["corruption"]) for u in users},
         tasks={t: dict(label=task_label(D["G"]["cells"][f"{users[0]}x{t}"]["obstacle"]), time_limit_s=D["G"]["cells"][f"{users[0]}x{t}"]["time_limit_s"] or 8.0) for t in tasks},
@@ -982,7 +1258,7 @@ def build_fig3(out, results, device):
         composed_over_fine_tuned=over_fine_tuned, composed_beats_fine_tuned=beyond(over_fine_tuned),
         t1_user_module_over_teleop={f"{u}x{tasks[0]}": r1(lead_ci(D, u, tasks[0], "mars", "teleop")) for u in users},
         tuned_settings={f"{u}x{t}": {f"s{s}": tuned(D["cell"](u, t, k)) for k, s in enumerate(seeds)} for u, t in cells},
-        schematic="panel a's densities are made up",
+        mars_ut_per_cell=cell_values,
         task_rollouts={t: {k: v[k] for k in ("cell", "trial", "hits", "of")} for t, v in shown.items()},
         t1_note="on T1 MARS-U is MARS, MARS-T is FRS and the fine-tuned arm is MARS, and flow control and FRS play the frozen "
                 "policy (no obstacle, nothing to fine-tune on), so only four arms are drawn",
@@ -997,10 +1273,10 @@ def build_fig3(out, results, device):
 DEMO_SECONDS = (30, 60, 120, 300, 600, 1200, 3600, 10800)  # the budgets, time spent demonstrating a task (s; _t<s> in names)
 DEMO_RUNS = "demo_time"  # results/cursor_sim/sweeps/demo_time_s<k> (configs/grid_demo_time.yaml), one per training seed
 DEMO_ARMS = {"ft_frs": "ft_frs_t{s}", "ft_flow_control": "ft_flow_control_t{s}", FT_ARM: "ft_mars_user_t{s}",
-             "mars": "mars_t{s}"}  # panel d's arm: its method per budget (_t<s>), in drawing order (MARS-UT on top);
-# colours and labels are panel d's
+             "mars": "mars_t{s}"}  # panel b's arm: its method per budget (_t<s>), in drawing order (MARS-UT on top);
+# colours and labels are panel b's
 DEMO_TASKS = {"T2": "disc_large", "T3": "wall_gap", "T4": "ring_goal", "T5": "ring_start"}  # the tasks' checkpoint names
-GRID_DEMOS = 300  # the grid's task modules (and panel d's fine-tuned policies): 300 demonstrations of the task
+GRID_DEMOS = 300  # the grid's task modules (and panel b's fine-tuned policies): 300 demonstrations of the task
 
 
 def demo_time_data(results):
@@ -1038,8 +1314,8 @@ def mean_ci(values):
 def draw_demo_time(fig, D, rect):
     """Panel e: each arm's success on the 16 obstacle cells against the time spent demonstrating each task (log): MARS-UT
     with the vision task module trained on the budget, and the three arms on the policy fine-tuned on it (Fine-tuned +
-    MARS-U, flow control, FRS); the mean over the training seeds with its 95% t CI as a band, on panel d's success scale,
-    and in grey the time the grid's 300 demonstrations take (panel d's task modules and fine-tuned policies; each task's
+    MARS-U, flow control, FRS); the mean over the training seeds with its 95% t CI as a band, on panel b's success scale,
+    and in grey the time the grid's 300 demonstrations take (panel b's task modules and fine-tuned policies; each task's
     at its mean demonstration, from the largest budget's draw). The methods' legend is the figure's. Returns the panel's
     numbers."""
     ax = fig.add_axes(rect)
@@ -1048,7 +1324,7 @@ def draw_demo_time(fig, D, rect):
     grid_min = {t: GRID_DEMOS * v / 60 for t, v in per_demo.items()}
     lo, hi = min(grid_min.values()), max(grid_min.values())
     ax.axvspan(lo, hi, color=GRID, alpha=0.7, lw=0, zorder=1)
-    ax.text(np.sqrt(lo * hi), 107, f"{GRID_DEMOS} demos (d)", ha="center", va="top", fontsize=FS_TEXT, color=INK_2)
+    ax.text(np.sqrt(lo * hi), 107, f"{GRID_DEMOS} demos (b)", ha="center", va="top", fontsize=FS_TEXT, color=INK_2)
     curve = {arm: np.array([mean_ci(D["curve"][arm][s]) for s in DEMO_SECONDS]) for arm in DEMO_ARMS}
     for arm in DEMO_ARMS:
         if len(D["seeds"][arm]) > 1:
@@ -1077,16 +1353,19 @@ def draw_demo_time(fig, D, rect):
 # ================================================================
 
 
+FIGURES = ("fig1", "fig2", "fig3", "fig4")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--only", nargs="+", choices=["fig1", "fig2", "fig3"], default=["fig1", "fig2", "fig3"])
+    p.add_argument("--only", nargs="+", choices=list(FIGURES), default=list(FIGURES))
     p.add_argument("--out", default=str(FIG_DIR), help="output folder (default: figures/)")
     p.add_argument("--results", default=str(RESULTS))
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args(argv)
     out, results = Path(args.out), Path(args.results)
-    builders = {"fig1": lambda: build_fig1(out), "fig2": lambda: build_fig2(out, results / RECORDED_STUDY),
-                "fig3": lambda: build_fig3(out, results, args.device)}
+    builders = {"fig1": lambda: build_fig1(out), "fig2": lambda: build_fig2(out, results, args.device), "fig3": lambda: build_fig3(out, results),
+                "fig4": lambda: build_fig4(out, results)}
     for name in args.only:
         print(f"{name} -> {builders[name]()}", flush=True)
 

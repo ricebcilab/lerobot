@@ -125,20 +125,9 @@ class Renderer:
         lines.append("Press a SpaceMouse button or Enter to start.")
         self.screen_message(title, lines, agent)
 
-    def section_screen(self, info, agent):
-        """Before a task section of a visit over several tasks."""
-        lines = ["This task has obstacles: steer around them. Touching one ends the trial." if info.get("obstacles")
-                 else "This task has no obstacles.",
-                 "Press a SpaceMouse button or Enter to continue."]
-        self.screen_message(f"Task {info['position']} of {info['of']}", lines, agent)
-
     def break_screen(self, info, agent):
         if info["last"]:
             self.screen_message("Done. Thank you!", ["Press a SpaceMouse button or Enter to finish."], agent)
-        elif info.get("section_end"):
-            self.screen_message(f"End of block {info['block']} of {info['n_blocks']}",
-                                ["That was the last block of this task. Take a longer break if you like.",
-                                 "Press a SpaceMouse button or Enter to continue."], agent)
         else:
             self.screen_message(f"End of block {info['block']} of {info['n_blocks']}",
                                 ["Take a break if you like.", "Press a SpaceMouse button or Enter to continue."], agent)

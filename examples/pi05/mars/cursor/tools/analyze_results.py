@@ -1,8 +1,8 @@
 """Analyze experiment runs: per participant and pooled, human or simulated.
 
-    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_short                    # every run of a study
-    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long --participants p1 sim
-    python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long --protocol study_long_U2 --out long_U2
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study                          # every run of the study
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study --participants p1 sim
+    python examples/pi05/mars/cursor/tools/analyze_results.py --study study --protocol study_T2_U2 --out T2_U2
     python examples/pi05/mars/cursor/tools/analyze_results.py --results ../results/old/2026-11-23 --protocol study  # the October study
 
 A study's runs are under results/cursor_<study>/<participant>/ (run_experiment.py); without --study the participants'
@@ -190,7 +190,7 @@ def fig_paths(trials, arms, participant, out):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--results", default=str(RESULTS))
-    p.add_argument("--study", help="the study (study_short, study_long), whose participants under --results/cursor_<study>/ are read")
+    p.add_argument("--study", help="the study (study; study_short for the earlier T1 sessions), whose participants under --results/cursor_<study>/ are read")
     p.add_argument("--participants", nargs="+", help="p1 p2 ... sim (default: all)")
     p.add_argument("--protocol", help="only runs of this protocol name")
     p.add_argument("--out", help="folder name under results/analysis/ (default: the study, or all)")

@@ -123,7 +123,8 @@ def static_arrays(layouts, device="cpu", sources=None):
 def observation(layouts, pos, hist, device="cpu", goal_given=False, scene=None, static=None):
     """The policy's observation of a batch of trials: cursor positions [B, 2], their last
     displacements [B, h, 2], the targets, the goal flags (all False unless goal_given), and the
-    task's obstacles (which the policy ignores and a task module reads) and, when the layouts have one, their scene;
+    task's obstacles (read by a policy with obstacle tokens, the obstacle tasks' fine-tuned ones, and by a task module
+    of the geometry; the frozen policy ignores them) and, when the layouts have one, their scene;
     `scene` (source -> array, e.g. a scene provider's tokens of this step) joins the layouts' own. `static` is
     `static_arrays(layouts, device, ...)` made once for many observations (a controller's); without it they are
     made here, every layout scene array included."""

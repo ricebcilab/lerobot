@@ -16,14 +16,18 @@ def test_fig1_builds_from_its_pictograms_and_reaches(tmp_path):
         assert path.ndim == 2 and path.shape[1] == 2 and np.isfinite(path).all(), kind
         assert np.allclose(path[0], bf.START) or kind == "misjudge", kind   # misjudge's path starts at its turn
         assert ((path >= 0) & (path <= [bf.TILE_W, bf.TILE_H])).all(), kind   # inside the tile
+    ends = bf.flow_lines(bf.FLOW_NOISES, bf.POLICY_MODES)[-1]   # panel b's policy flow carries each noise to a behaviour
+    assert np.min(np.abs(ends[:, None] - np.array(bf.POLICY_MODES)), 1).max() < 3 * bf.MODE_SD
+    assert (ends < 0).sum() == (ends > 0).sum() == len(ends) // 2   # half the noises to each, in order
+    assert np.allclose(bf.user_lines(bf.FLOW_NOISES)[0], bf.FLOW_NOISES)   # the user's flow starts at the same noises
     bf.main(["--only", "fig1", "--out", str(tmp_path), "--device", "cpu"])
     assert (tmp_path / "fig1_method.pdf").exists() and (tmp_path / "fig1_method.png").exists()
     stats = json.loads((tmp_path / "stats.json").read_text())
     assert set(stats) == {"fig1"} and stats["fig1"]["inputs"] == [label for label, _, _ in bf.FIG1_INPUTS]
 
 
-def _trial(participant, run, arm, outcome, duration):
-    return dict(participant=participant, run=run, arm=arm, outcome=outcome, duration_s=duration, layout_id=duration)
+def _trial(arm, outcome, task="T1", duration=1.0):
+    return dict(arm=arm, outcome=outcome, task=task, duration_s=duration)
 
 
 def _seed_runs(per_seed, cell="U1xT2"):
@@ -34,16 +38,17 @@ def _seed_runs(per_seed, cell="U1xT2"):
                 test_n=len(next(iter(per_seed[0].values()))), cell=lambda u, t, k=0: runs[k]["test"][f"{u}x{t}|1.0"])
 
 
-def test_the_statistics_pool_participants_and_pair_trials_within_a_seed():
-    trials = [_trial("p1", "study_s1", "teleop", "hit", 1.0), _trial("p1", "study_s1", "teleop", "timeout", 5.0),
-              _trial("p1", "study_s2", "teleop", "hit", 2.0), _trial("p1", "study_s2", "teleop", "hit", 3.0),
-              _trial("p2", "study_s1", "teleop", "wrong_target", 2.0), _trial("p2", "study_s1", "teleop", "hit", 4.0)]
-    stats = bf.participant_stats(trials, ["teleop"])
-    assert list(stats) == ["p1", "p2"] and stats["p1"]["sessions"] == ["study_s1", "study_s2"]
-    assert stats["p1"]["teleop"]["n"] == 4 and stats["p1"]["teleop"]["hit"] == 0.75 and stats["p1"]["teleop"]["time_s"] == 2.0
-    assert stats["p2"]["teleop"]["wrong_target"] == 0.5 and stats["p2"]["teleop"]["timeout"] == 0.0
+def test_the_statistics_count_sessions_and_pair_trials_within_a_seed():
+    sessions = {("cursor_study_short", "p2", "study_short_U1", 1): [_trial("teleop", "hit"), _trial("teleop", "timeout"), _trial("mars", "hit")],
+                ("cursor_study_short", "p2", "study_short_U2", 1): [_trial("teleop", "hit"), _trial("mars", "wrong_target")],
+                ("cursor_study", "p2", "study_T2_U1", 1): [_trial("teleop", "hit", "T2")]}
+    rates = bf.group_rates(sessions, ("T1",))   # one entry per session, a participant's profiles apart
+    assert rates == {("cursor_study_short", "p2", "study_short_U1", 1): {"teleop": 50.0, "mars": 100.0},
+                     ("cursor_study_short", "p2", "study_short_U2", 1): {"teleop": 100.0, "mars": 0.0}}
+    assert bf.group_rates(sessions, ("T2",)) == {("cursor_study", "p2", "study_T2_U1", 1): {"teleop": 100.0}}
     m, lo, hi = bf.t_ci([0.75, 0.5])
     assert m == 0.625 and lo < m < hi
+    assert bf.wilson(48, 60)[0] == pytest.approx(80) and bf.wilson(48, 60)[1] < 80 < bf.wilson(48, 60)[2] < 100
     D = _seed_runs([{"mars": ["hit"] * 6 + ["timeout"] * 4, "teleop": ["hit"] * 3 + ["collision"] * 7},
                     {"mars": ["hit"] * 8 + ["collision"] * 2, "teleop": ["hit"] * 4 + ["timeout"] * 6}])
     assert bf.seed_values(D, "U1", "T2", "mars") == pytest.approx([60, 80]) and bf.seed_mean(D, "U1", "T2", "teleop") == pytest.approx(35)
@@ -66,11 +71,10 @@ def test_drawing_helpers_order_legends_bearings_and_rich_text():
     bf.plt.close(fig)
 
 
-@pytest.mark.parametrize("spec", [bf.fig1_schematic, bf.fig3_schematic])
-def test_schematic_draws_three_density_panels_and_its_flows(spec):
+def test_schematic_draws_three_density_panels_and_its_flows():
     bf.paper_style()
     fig = bf.plt.figure(figsize=(bf.FULL_W, 2.62))
-    bf.schematic(fig, 0.05, 0.2, spec())
+    bf.schematic(fig, 0.05, 0.2, bf.pipeline_schematic())
     assert len(fig.axes) == 3
     texts = [t.get_text() for t in fig.texts]
     assert "flow reversal" in texts and "flow matching" in texts and bf.MARS in texts
@@ -81,13 +85,21 @@ def test_schematic_draws_three_density_panels_and_its_flows(spec):
     bf.plt.close(fig)
 
 
-@pytest.mark.skipif(not any((RESULTS / bf.RECORDED_STUDY / f"p{i}").exists() for i in range(1, 10)),
-                    reason="no recorded study sessions")
-def test_fig2_builds_from_the_recorded_sessions(tmp_path):
-    bf.main(["--only", "fig2", "--out", str(tmp_path)])
-    stats = json.loads((tmp_path / "stats.json").read_text())["fig2"]
-    assert stats["participants"] >= 1 and set(stats["success_mean_ci"]) == set(bf.ARMS)
-    assert all(len(v) == 3 for v in stats["success_mean_ci"].values())
+@pytest.mark.skipif(not any((RESULTS / s).exists() for s in bf.STUDY_DIRS), reason="no study sessions")
+def test_fig4_builds_from_the_study_sessions(tmp_path):
+    bf.main(["--only", "fig4", "--out", str(tmp_path)])
+    stats = json.loads((tmp_path / "stats.json").read_text())["fig4"]
+    assert stats["sessions"] and set(stats["success"]["T1"]) == set(bf.ARMS)
+    assert all(len(v["mean_ci"]) == 3 for v in stats["success"]["T1"].values())
+
+
+@pytest.mark.skipif(not (RESULTS / bf.LIBERO_RUNS).exists(), reason="no LIBERO study runs")
+def test_fig3_builds_from_the_libero_users(tmp_path):
+    bf.main(["--only", "fig3", "--out", str(tmp_path)])
+    stats = json.loads((tmp_path / "stats.json").read_text())["fig3"]
+    assert set(stats["success"]) == {f"{u}|{a}" for u in bf.LIBERO_USERS for a in bf.LIBERO_ARMS}
+    assert all(v["n"] == 60 for v in stats["success"].values())
+    assert all(e["success"]["mars"] and not e["success"]["fc"] and not e["success"]["frs"] for e in stats["examples"].values())
 
 
 def _grid_results(sweeps):
@@ -107,7 +119,7 @@ def _grid_results(sweeps):
 
 
 def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
-    """Figure 3e's runs on two cells, one per seed (configs/grid_demo_time.yaml's arms): the vision module (mars),
+    """Figure 2c's runs on two cells, one per seed (configs/grid_demo_time.yaml's arms): the vision module (mars),
     Fine-tuned + MARS-U (ft), flow control and FRS on the fine-tuned policy (ft - 0.1 and 0.1), and teleop; and the grid's
     run, whose teleop the curve's must replay."""
     cells = ["U1xT2|1.0", "U2xT3|1.0"]
@@ -124,7 +136,7 @@ def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
     write("grid_s0", {"teleop": 0.2})
 
 
-def test_fig3_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
+def test_fig2_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
     _grid_results(tmp_path / "cursor_sim" / "sweeps")
     D = bf.grid_data(tmp_path)
     assert D["methods"] == bf.GRID_METHODS   # the grid's arms, the fine-tuned arm among them
@@ -139,7 +151,7 @@ def test_fig3_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
         bf.demo_time_data(tmp_path / "off")
     monkeypatch.setattr(bf, "demo_log", lambda task, seconds, seed=0: {"args": {"n_demos": seconds}, "best_step": 5000})
     bf.paper_style()
-    fig = bf.plt.figure(figsize=(bf.FULL_W, bf.FIG3_H))
+    fig = bf.plt.figure(figsize=(bf.FULL_W, bf.FIG2_H))
     stats = bf.draw_demo_time(fig, D, (0.6, 0.4, 0.35, 0.15))
     assert [line.get_color() for line in fig.axes[0].get_lines()] == [bf.GRID_COLOR[arm] for arm in bf.DEMO_ARMS]   # MARS-UT last, on top
     assert stats["success"]["mars"]["300"][0] == pytest.approx(75) and stats["grid_demonstrations_minutes"]["T2"] == pytest.approx(5.0)

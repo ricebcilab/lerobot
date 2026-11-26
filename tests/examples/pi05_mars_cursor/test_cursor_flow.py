@@ -316,8 +316,8 @@ def test_arm_task_parameters_reach_the_env_and_the_records():
 
 
 def test_config_files_fill_defaults_and_reject_unknown_keys(tmp_path):
-    protocol = config.load_protocol("study_short_U1.yaml")
-    assert list(protocol["cells"]["methods"]) == ["teleop", "flow_control", "frs", "mars"] and protocol["cells"]["task_order"] == "latin_square"
+    protocol = config.load_protocol("study_T1_U1.yaml")
+    assert list(protocol["cells"]["methods"]) == ["teleop", "flow_control", "frs", "mars"] and "task_order" not in protocol["cells"]
     assert protocol["blocks"]["trials"] == 40 and protocol["display"] == {"blind": True, "cues": False}
     cells = ("cells: {methods: {teleop: {mode: teleop}}, grid: {users: {U1: {corruption: null}}, tasks: {T1: {obstacle: null}}, "
              "noises: [0.5]}, settings: {}}\n")
@@ -326,7 +326,7 @@ def test_config_files_fill_defaults_and_reject_unknown_keys(tmp_path):
         config.load_protocol(tmp_path / "p.yaml")
     (tmp_path / "q.yaml").write_text(cells)
     plain = config.load_protocol(tmp_path / "q.yaml")
-    assert (plain["study"], protocol["study"]) == ("q", "study_short")  # results/cursor_<study>/<participant>/, by default the name
+    assert (plain["study"], protocol["study"]) == ("q", "study")  # results/cursor_<study>/<participant>/, by default the name
     (tmp_path / "deep.yaml").write_text(cells + "study: a/b\n")
     with pytest.raises(ValueError, match="study"):
         config.load_protocol(tmp_path / "deep.yaml")

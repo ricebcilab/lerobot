@@ -1,23 +1,20 @@
 """The portal: run an experiment protocol for a participant.
 
-    python run_experiment.py --protocol study_short --user U1 --participant p1            # a person on the SpaceMouse
-    python run_experiment.py --protocol study_short --user U1 --participant p1 --resume   # continue an interrupted visit
-    python run_experiment.py --protocol study_short --user U3 --participant p2            # another participant, another user
-    python run_experiment.py --protocol study_short --user U1 --participant sim           # the expert agent, headless
-    python run_experiment.py --protocol study_short --user U1 --participant sim --watch   # the expert, rendered
-    python run_experiment.py --protocol study_long --user U1 --participant p1 --prepare   # a visit's scene tokens, ahead
-    python run_experiment.py --protocol study_long --user U3 --participant p1             # the long study with another user
-    python run_experiment.py --protocol study_short --user U1 --participant p1 --calibrate  # MARS on the person's own module
+    python run_experiment.py --protocol study --task T1 --user U1 --participant p1             # a person on the SpaceMouse
+    python run_experiment.py --protocol study --task T1 --user U1 --participant p1 --resume    # continue an interrupted visit
+    python run_experiment.py --protocol study --task T3 --user U2 --participant p2             # another task, another user
+    python run_experiment.py --protocol study --task T1 --user U1 --participant sim            # the expert agent, headless
+    python run_experiment.py --protocol study --task T1 --user U1 --participant sim --watch    # the expert, rendered
+    python run_experiment.py --protocol study --task T2 --user U1 --participant p1 --prepare   # an obstacle task's scene tokens, ahead
+    python run_experiment.py --protocol study --task T1 --user U1 --participant p1 --calibrate # MARS on the person's own module
 
 A participant is p<N> (a person) or sim (the expert agent). Both run the same
 protocol through the same mechanism (cursor_sa/session.py) and write the same
-records. A study has one protocol file per user (study_short_<user>.yaml,
-study_long_<user>.yaml); --user picks it (study_short and U3 play
-study_short_U3.yaml, which --protocol can also name whole). A protocol gives its
-cells, one user x the tasks played, as a sweep of its own (run_sweep.py tunes
-it): one task section per task, each a run of its own in
-results/cursor_<study>/<participant>/<protocol>_s<session>_<task>/ (study_short or
-study_long), with the arms for the user's cell at their tuned settings.
+records. The study has one protocol file per task and user (study_T<t>_U<k>.yaml);
+--task and --user pick it (study, T3 and U2 play study_T3_U2.yaml, which --protocol
+can also name whole). A protocol is one user on one task, as a sweep of its own
+(run_sweep.py tunes it): a run in results/cursor_<study>/<participant>/<protocol>_s<session>/,
+with the arms for the user's cell at their tuned settings.
 
 --calibrate trains the user module in the session, on the participant's own
 commands: before the first block the cursor plays demonstration reaches by
@@ -28,6 +25,8 @@ shared modules' recipe, 500 steps), and it takes
 the shared module's place in MARS for the visit. The reaches are a run of their
 own (<protocol>_s<session>_calibration/), the module is
 checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>/.
+Without --calibrate, a participant who already has a module calibrated for the user played (in any study)
+plays MARS with it; the task modules are the grid's either way.
 
 If a window cannot open (e.g. over SSH), set DISPLAY=:1 first.
 """
@@ -43,15 +42,16 @@ from cursor_sa import config
 from cursor_sa.agents import make_agent
 from cursor_sa.paths import CHECKPOINTS, RESULTS
 from cursor_sa.records import load_run, now_iso, summarize
-from cursor_sa.session import Aborted, Calibration, Visit, arm_task, load_checkpoints
+from cursor_sa.session import Aborted, Calibration, Run, arm_task, load_checkpoints, participant_module, with_user_module
 from lerobot.policies.steering import AdapterModules
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--protocol", required=True, help="the study, with --user (study_short, study_long), or a protocol config "
-                   "named whole, e.g. study_short_U1.yaml (bare names are looked up in configs/)")
-    p.add_argument("--user", help="the user profile played, e.g. U3: the study's protocol file for that user")
+    p.add_argument("--protocol", required=True, help="the study, with --task and --user (study), or a protocol config "
+                   "named whole, e.g. study_T1_U1.yaml (bare names are looked up in configs/)")
+    p.add_argument("--task", help="the task played, e.g. T2: with --user, the study's protocol file for that task and user")
+    p.add_argument("--user", help="the user profile played, e.g. U3")
     p.add_argument("--participant", required=True, help="p<N> for a person, sim for the expert agent")
     p.add_argument("--session", type=int, default=1, help="visit number; a new one gets new layouts")
     p.add_argument("--resume", action="store_true", help="continue an interrupted visit from its next trial")
@@ -60,35 +60,36 @@ def parse_args(argv=None):
     p.add_argument("--watch", action="store_true", help="render a sim run in real time")
     p.add_argument("--no-blind", action="store_true", help="show the condition to the participant")
     p.add_argument("--allow-keyboard", action="store_true", help="arrow keys may drive the cursor (study runs)")
-    p.add_argument("--prepare", action="store_true", help="make and cache the visit's scene tokens (the task modules that "
+    p.add_argument("--prepare", action="store_true", help="make and cache the run's scene tokens (the task modules that "
                    "read a picture of the scene), print its order, write nothing under results and exit")
-    p.add_argument("--scene-cache", help="where a visit's scene tokens are kept (default checkpoints/scene/<protocol>)")
+    p.add_argument("--scene-cache", help="where a run's scene tokens are kept (default checkpoints/scene/<protocol>)")
     p.add_argument("--results", default=str(RESULTS), help="results folder; a run goes to <results>/<study>/<participant>/")
     p.add_argument("--cpu", action="store_true", help="run the policy on the CPU")
     args = p.parse_args(argv)
     if args.participant != "sim" and not (args.participant.startswith("p") and args.participant[1:].isdigit()):
         p.error("--participant must be p<N> (a person) or sim (the expert agent)")
     try:
-        args.protocol = protocol_file(args.protocol, args.user)
+        args.protocol = protocol_file(args.protocol, args.user, args.task)
     except (FileNotFoundError, ValueError) as e:
         p.error(str(e))
     return args
 
 
-def protocol_file(protocol, user=None):
-    """The protocol config a visit plays: `protocol` as named, or with `user` the study's file for that user
-    (study_short and U3 -> study_short_U3.yaml). A study named without its user, or with one it has no file for,
-    is an error that lists the users it has."""
+def protocol_file(protocol, user=None, task=None):
+    """The protocol config a visit plays: `protocol` as named, or with `task` and `user` the study's file for them
+    (study, T3 and U2 -> study_T3_U2.yaml). A study named without both, or with a pair it has no file for, is an error
+    that lists the files it has."""
     study = protocol.removesuffix(".yaml")
-    name = f"{study}_{user}.yaml" if user else f"{study}.yaml"
+    name = f"{study}.yaml" if not (task or user) else f"{study}_{task}_{user}.yaml"
     try:
         config.resolve(name)
     except FileNotFoundError:
         prefix = f"{Path(study).name}_"
-        users = sorted(p.stem.removeprefix(prefix) for p in config.CONFIG_DIR.glob(f"{prefix}*.yaml"))
-        if not users:
+        pairs = sorted(p.stem.removeprefix(prefix) for p in config.CONFIG_DIR.glob(f"{prefix}T*_U*.yaml"))
+        if not pairs:
             raise
-        raise ValueError(f"{study} has a protocol per user: pass --user {', '.join(users[:-1])} or {users[-1]}") from None
+        raise ValueError(f"{study} has a protocol per task and user ({', '.join(pairs)}): pass --task T<t> --user U<k> "
+                         f"for one of them") from None
     return name
 
 
@@ -104,49 +105,43 @@ def make_renderer(**kw):
 # ---------------------------------------------------------------- a protocol run
 
 
-def protocol_sections(protocol):
-    """A protocol's task sections, {task: {method: arm}} in the order of its tasks, and the user played. The protocol's
-    cells are a sweep of their own (`run_sweep.protocol_sweep`: one user x the tasks played, at one noise level), and
-    every arm is the one that sweep builds for the user's cell on that task (`run_sweep.method_arm`: the user's
-    corruption and module, the task's obstacle, time limit, policy and task module), at the cell's tuned setting from
-    `cells.settings` ('<cell>|<noise>' -> method -> setting, run_sweep.py's settings.yaml for the protocol) and at the
-    sweep's noise, which a sweep sets per trial and an arm of its own does not carry."""
+def protocol_arms(protocol):
+    """A protocol's arms {method: arm}, the user and the task played. The protocol's cells are a sweep of their own
+    (`run_sweep.protocol_sweep`: one user on one task, at one noise level), and every arm is the one that sweep builds
+    for that cell (`run_sweep.method_arm`: the user's corruption and module, the task's obstacle, time limit, policy and
+    task module), at the cell's tuned setting from `cells.settings` ('<cell>|<noise>' -> method -> setting,
+    run_sweep.py's settings.yaml for the protocol) and at the sweep's noise, which a sweep sets per trial and an arm of
+    its own does not carry."""
     from run_sweep import cell_key, is_tuned, method_arm, protocol_sweep, with_setting  # run_sweep imports the session
     sweep = protocol_sweep(protocol)
     grid = sweep["grid"]
-    if grid["family"] != "grid" or len(grid["noises"]) != 1:
-        raise ValueError(f"protocol {protocol['name']}: its cells must be a users x tasks grid at one noise level")
-    if len(grid["users"]) != 1:
-        raise ValueError(f"protocol {protocol['name']}: a protocol plays one user, got {grid['users']} (one protocol "
-                         f"per user: study_long_<user>.yaml)")
-    user, noise, settings = grid["users"][0], grid["noises"][0], protocol["cells"]["settings"]
-    sections = {}
-    for task in grid["tasks"]:
-        level = f"{user}x{task}"
-        tuned, arms = settings.get(cell_key(level, noise)) or {}, {}
-        for method in sweep["methods"]:
-            arm = method_arm(sweep, method, level)
-            if is_tuned(arm):
-                if tuned.get(method) is None:
-                    raise ValueError(f"protocol {protocol['name']}: cells.settings has no tuned setting for "
-                                     f"{cell_key(level, noise)}, {method}")
-                arm = with_setting(arm, tuned[method])
-            arms[method] = {**arm, "input_noise": noise}
-        sections[task] = arms
-    return sections, user
+    if grid["family"] != "grid" or len(grid["noises"]) != 1 or len(grid["users"]) != 1 or len(grid["tasks"]) != 1:
+        raise ValueError(f"protocol {protocol['name']}: its cells must be one user on one task at one noise level (a "
+                         f"protocol per task and user, study_T<t>_U<k>.yaml), got users {grid['users']}, tasks "
+                         f"{grid['tasks']}, noises {grid['noises']}")
+    user, task, noise = grid["users"][0], grid["tasks"][0], grid["noises"][0]
+    level, settings = f"{user}x{task}", protocol["cells"]["settings"]
+    tuned, arms = settings.get(cell_key(level, noise)) or {}, {}
+    for method in sweep["methods"]:
+        arm = method_arm(sweep, method, level)
+        if is_tuned(arm):
+            if tuned.get(method) is None:
+                raise ValueError(f"protocol {protocol['name']}: cells.settings has no tuned setting for "
+                                 f"{cell_key(level, noise)}, {method}")
+            arm = with_setting(arm, tuned[method])
+        arms[method] = {**arm, "input_noise": noise}
+    return arms, user, task
 
 
-def attach_scenes(runs, cache_dir, encoder_factory=None):
-    """Give every run's layouts (its trials and its practice trials) the scene arrays its task modules read
+def attach_scenes(run, cache_dir, encoder_factory=None):
+    """Give the run's layouts (its trials and its practice trials) the scene arrays its task modules read
     (`run_sweep.scene_sources`: a picture of the scene or its vision tokens), from the cache or made and cached
-    (`run_sweep.attach_scene`, keyed by participant, visit and task). The runs' checkpoints must be loaded;
+    (`run_sweep.attach_scene`, keyed by participant, visit and task). The run's checkpoints must be loaded;
     `encoder_factory()` makes the pi0.5 scene encoder, called only for vision tokens the cache lacks."""
     from run_sweep import attach_scene, scene_sources
-    for run in runs:
-        sources = scene_sources(run.adapters)
-        task = run.section["task"] if run.section else "run"
-        for layouts, split in ((run.layouts, "trials"), (run.practice, "practice")):
-            attach_scene(layouts, sources, cache_dir, f"{run.participant}_s{run.session}_{task}_{split}", encoder_factory)
+    sources = scene_sources(run.adapters)
+    for layouts, split in ((run.layouts, "trials"), (run.practice, "practice")):
+        attach_scene(layouts, sources, cache_dir, f"{run.participant}_s{run.session}_{run.task or 'run'}_{split}", encoder_factory)
 
 
 def scene_encoders(device):
@@ -193,28 +188,29 @@ def run_protocol(args):
     protocol = config.load_protocol(args.protocol)
     sim = args.participant == "sim"
     agent = make_agent("expert", **protocol["expert"]) if sim else make_agent("human", allow_keyboard=args.allow_keyboard)
-    results = Path(args.results) / f"cursor_{protocol['study']}"  # results/cursor_study_short/p1/, results/cursor_study_long/p1/
+    results = Path(args.results) / f"cursor_{protocol['study']}"  # results/cursor_study/p1/
     device, common = device_for(args), (args.participant, args.session, agent, device_for(args), results, args.resume)
-    sections, user = protocol_sections(protocol)  # a task section per task, its arms at their tuned settings
+    arms, user, task = protocol_arms(protocol)  # the cell's arms at their tuned settings
+    labels = {"user": user}
     calibration = None
-    if args.calibrate and not args.prepare:  # a visit's scene tokens do not depend on whose user module plays
-        calibration = Calibration(protocol, sections, *common, labels={"user": user})
-        sections = calibration.with_module(sections)  # MARS plays the participant's own module
+    if args.calibrate and not args.prepare:  # a run's scene tokens do not depend on whose user module plays
+        calibration = Calibration(protocol, arms, *common, labels=labels)
+        arms = with_user_module(arms, calibration.module)  # MARS plays the participant's own module
         print(f"{args.participant}, {calibration.run_name}: {len(calibration.layouts)} reaches + "
               f"{len(calibration.practice)} practice, layout seed {calibration.seed} -> {calibration.dir}; the module is "
               f"{calibration.module}" + (" (trained)" if calibration.ready else ""), flush=True)
-    visit = Visit(protocol, sections, *common, order=protocol["cells"]["task_order"], labels={"user": user})
-    runs = visit.runs
-    for run in runs:
-        print(f"{args.participant}, {run.run_name}: blocks {run.order}, {len(run.layouts)} trials + "
-              f"{len(run.practice)} practice each, layout seed {run.seed} -> {run.dir}", flush=True)
+    elif not args.prepare and (own := participant_module(args.participant, user)) is not None:
+        arms = with_user_module(arms, own)  # the module calibrated for them before, in any study
+        print(f"{args.participant}: MARS plays their own user module for {user}, {own}", flush=True)
+    run = Run(protocol, *common, arms=arms, task=task, labels=labels)
+    print(f"{args.participant}, {run.run_name}: blocks {run.order}, {len(run.layouts)} trials + "
+          f"{len(run.practice)} practice each, layout seed {run.seed} -> {run.dir}", flush=True)
     cache = Path(args.scene_cache) if args.scene_cache else CHECKPOINTS / "scene" / protocol["name"]
     factory, encoders = scene_encoders(device)
     if args.prepare:  # the scene tokens alone: checkpoints loaded, nothing written under results
         try:
-            for run in runs:
-                run.policies, run.adapters = load_checkpoints(run.arms, device)
-            attach_scenes(runs, cache, factory)
+            run.policies, run.adapters = load_checkpoints(run.arms, device)
+            attach_scenes(run, cache, factory)
         finally:
             for encoder in encoders:
                 encoder.close()
@@ -235,17 +231,19 @@ def run_protocol(args):
     tic, played = time.time(), 0
     try:
         if calibration is not None and not calibration.ready:
-            visit.check()  # a section that has trials stops the visit before its calibration is played
+            run.check()  # a run that has trials stops the visit before its calibration is played
             calibration.start()
             played += calibration.run(window())
             train_user_module(calibration, device, window())
-        visit.start()
-        try:
-            attach_scenes([run for run in runs if run.adapters is not None], cache, factory)
-        finally:
-            for encoder in encoders:  # pi0.5 leaves the GPU before the first trial
-                encoder.close()
-        played += visit.run(window())
+        run.start()
+        if run.adapters is not None:
+            try:
+                attach_scenes(run, cache, factory)
+            finally:
+                for encoder in encoders:  # pi0.5 leaves the GPU before the first trial
+                    encoder.close()
+        if run.remaining():
+            played += run.run(window())
         print(f"{played} trials in {time.time() - tic:.0f}s")
     except Aborted:
         print("aborted by the participant; re-run with --resume to continue")
@@ -254,9 +252,8 @@ def run_protocol(args):
             renderer.close()
         if hasattr(agent, "close"):
             agent.close()
-    for run in runs:
-        if (run.dir / "manifest.json").exists():
-            print_summary(run.dir)
+    if (run.dir / "manifest.json").exists():
+        print_summary(run.dir)
 
 
 def print_summary(run_dir):
