@@ -30,7 +30,7 @@ from lerobot.optim import AdamWConfig, LRSchedulerConfig, OptimizerConfig
 from lerobot.teleoperators import readout
 
 STEERING_MODES = ("none", "flow_control", "frs")
-SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views")
+SCENE_SOURCES = ("discs", "vlm_image", "vlm_prefix", "cnn", "vlm_views", "pi05_cameras")
 # absolute: a learned position per image token (round 1); relative: the token centre's offset from the cursor
 # through the disc-token MLP
 TOKEN_GEOMETRIES: tuple[str, ...] = ("absolute", "relative")

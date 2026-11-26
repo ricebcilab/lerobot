@@ -700,3 +700,49 @@ def test_a_ragged_adapter_matrix_is_refused_by_name():
     for bad in ([[1.0, 0.0], [0.0]], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]):
         with pytest.raises(ValueError, match="adapter_matrix"):
             SteeringConfig(adapter_matrix=bad, device="cpu")
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+@pytest.mark.parametrize("camera_stage", ["pre", "post"])
+def test_pi05_camera_identity_parity_and_prefix_reuse(depth, camera_stage):
+    class CameraBase(_SamplerBase):
+        prefixes = 0
+
+        def camera_field(self, batch, *, stage):
+            assert stage == camera_stage
+            self.prefixes += 1
+            return self.velocity, torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(5)).expand(
+                2, -1, -1
+            )
+
+    base = CameraBase()
+    policy = SteeringPolicy(
+        SteeringConfig(
+            mode="frs", operator_dims=["translation"], n_dims=3, n_reversal_steps=depth, device="cpu"
+        ),
+        base_policy=base,
+        postprocessor=_pi05_postprocessor(),
+    )
+    batch = _pi05_batch()
+    torch.manual_seed(1)
+    plain = policy.select_action(batch)
+    policy.reset()
+    policy.adapter = AdapterModules(
+        task=LearnedTaskModule(
+            horizon=6,
+            n_dims=3,
+            d=16,
+            heads=2,
+            layers=1,
+            token_source="pi05_cameras",
+            camera_stage=camera_stage,
+            scene_tokens=4,
+            scene_dim=8,
+        ),
+        n_dims=None,
+    )
+    torch.manual_seed(1)
+    torch.testing.assert_close(policy.select_action(batch), plain)
+    policy.select_action(batch)  # next queued action
+    assert base.prefixes == 1
+    assert all(b["pi05.prepared_velocity"] == base.velocity for b in base.batches[-2:])

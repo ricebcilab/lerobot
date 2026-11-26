@@ -1,0 +1,6 @@
+# The clean operator knows the destination. The executing policy sees only the scene and generic prompt.
+extends: study_goal.yaml
+scene:
+  task_ids: [1, 8]
+experiment:
+  output_dir: outputs/pi05_libero_visual_task

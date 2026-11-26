@@ -418,7 +418,7 @@ class Session:
             "policy": self.policy,
             "env_preprocessor": self.env_preprocessor,
             "env_postprocessor": self.env_postprocessor,
-            "preprocessor": self.preprocessor,
+            "preprocessor": self._prepare_policy_batch,
             "postprocessor": self.postprocessor,
             "action_hook": None,
             "max_steps": None,
@@ -627,7 +627,18 @@ class Session:
         obs = preprocess_observation(observation)
         obs["task"] = [prompt]
         obs = self.env_preprocessor(obs)
-        return self.preprocessor(obs)
+        return self._prepare_policy_batch(obs)
+
+    def _prepare_policy_batch(self, obs):
+        xyz = (
+            obs["observation.state"][:, :3]
+            if getattr(self.adapter.task, "gripper_projection", None) is not None
+            else None
+        )
+        batch = self.preprocessor(obs)
+        if xyz is not None:
+            batch["gripper_xyz"] = xyz
+        return batch
 
     def policy_chunk(self, observation, prompt: str) -> torch.Tensor:
         """The policy's own action chunk for `observation` under `prompt`, in its normalized space."""

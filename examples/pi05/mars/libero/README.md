@@ -661,15 +661,197 @@ defaults), and every place that loads a user module for steering
 rebuilds it from that config: there is nothing to set at run time.
 
 The checkpoint carries its kind (`user`), config and meta (corruption, policy,
-prompt). Task modules (`kind: task`, `LearnedTaskModule`) have the slot, the
-hooks and the loader, but no LIBERO trainer yet: the cursor project's task
-module reads obstacle tokens the scene provides, which LIBERO does not.
+prompt). The clean-operator visual task pilot below trains a task module from the
+executing LIBERO policy's external and wrist camera features.
 
 **A note on partial reversals.** With `n_reversal_steps` < 10 this example runs
 the forward flow from `t = n/10` in `n` steps of the policy's own step size
 (since commit `b199239a`); the cursor project still runs it in `10 − n` steps,
 which its notes flag as the reason `n = 9` fails there. Tuned depths do not
 transfer between the two schedules.
+
+## Clean-operator visual task pilot
+
+Run from the repository root with the existing LIBERO installation. Each stage reuses
+the same output directory (default `outputs/pi05_libero_visual_task`). To use another
+directory, pass the same `--out` to each invocation.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+PILOT=examples/pi05/mars/libero/train_visual_task.py
+"${UV_RUN[@]}" python "$PILOT" probe
+"${UV_RUN[@]}" python "$PILOT" collect
+"${UV_RUN[@]}" python "$PILOT" train
+"${UV_RUN[@]}" python "$PILOT" evaluate
+```
+
+The marked disk is a visual-only MuJoCo geom. Scoring checks whether the bowl centre
+crosses its vertical projection between consecutive control steps, including the
+terminal step. The disk is sampled on either the bowl-to-stove or bowl-to-plate
+route for both tasks. The immediate clean operator receives the destination prompt.
+The executing policy receives `do something`.
+
+`probe` tests the waypoint teacher and plain FRS on development states, saves
+representative two-camera videos and selects depth and prefix by joint success.
+Inspect the videos and `development.json` before collecting. The fixed split has
+20 training, 10 development and 20 held-out initial states per destination.
+`collect` saves 100 successful, violation-free episodes balanced across destination
+and marker route, recording failed attempts in the same directory. Each archive
+holds both oriented RGB views and robot state at replans, the stride and all
+executed actions. Completed trials can be resumed.
+
+`train` fits a 64-wide task head on frozen SigLIP patch features from the pinned
+`lerobot/pi05_libero_finetuned` snapshot. It also fits the same head with only its
+null token. Both see identical data draws per training seed. Targets are the XYZ
+components of noise minus normalized actions on valid steps; the base velocity
+uses the full padded chunk. Load a trained head in the regular LIBERO runner with
+`control.reversal_adapter: {task: path/to/task.pt}`. The checkpoint is fitted to
+this policy's field.
+
+`evaluate` compares clean FRS, masked T, visual T and the visual checkpoint given
+an image of the same robot pose with the marker on the other route. Only the adapter
+receives those counterfactual tokens. `report.md` contains per-arm placement,
+violation and joint success, replan latency and paired intervals clustered by
+initial state. Regenerate it with the `report` stage. The default training seeds
+are 0, 1 and 2. For smaller development runs, use a separate output directory with
+`--states` (per split and destination), `--demos` (multiple of four), `--steps`,
+`--batch` and `--seeds`.
+
+### Solid utensil holder and pickup diagnostics
+
+Run the same stages with `--obstacle holder` to use a fixed ceramic crock with two
+utensils. The holder run defaults to `outputs/pi05_libero_utensil_holder` and the
+executing prompt `place the black bowl somewhere`. The operator still sees the
+actual destination. `--prompt` changes the execution and adapter-training prompt
+together. Use a separate output directory for each prompt.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+PILOT=examples/pi05/mars/libero/train_visual_task.py
+for stage in probe prompt-check collect train evaluate; do
+    "${UV_RUN[@]}" python "$PILOT" "$stage" --obstacle holder || break
+done
+```
+
+The holder is 18.4 cm tall including the utensils. Reset sampling preserves the
+original bowl and destination positions and rejects overlapping placements.
+A blocked layout intersects the approximate swept width of a bowl on the direct
+route. Joint success requires correct placement and zero physical bowl or robot
+contacts with the holder, including transient contacts during physics substeps.
+
+`prompt-check` compares the bowl prompt and `do something` on the same
+development resets with both plain FRS and the unsteered frozen policy. Held-out
+evaluation uses the main prompt for every arm. A verified pickup requires both
+finger pads to contact the same object while it is at least 2.5 cm above its
+starting height. Trial JSONs include the picked objects, maximum lift per object,
+final LIBERO destination predicates and first holder contact.
+
+To reproduce the original disk failure audit with separate output files:
+
+```bash
+"${UV_RUN[@]}" python "$PILOT" audit --out outputs/pi05_libero_disk_pick_audit
+"${UV_RUN[@]}" python "$PILOT" audit-report --out outputs/pi05_libero_disk_pick_audit \
+    --reference outputs/pi05_libero_visual_task
+```
+
+### Camera features before and after image–text fusion
+
+New LIBERO holder experiments use post-fusion T. To reproduce the original comparison
+with pre-fusion T, run the following from the repository root with the holder demonstrations available.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+"${UV_RUN[@]}" python examples/pi05/mars/libero/train_visual_task.py camera-pilot
+```
+
+Both heads use `place the black bowl somewhere, avoiding obstacles along the way`
+during training and execution. The pre-fusion head reads the projected external and
+wrist patches. The post-fusion head reads the same 512 camera positions after the
+frozen language model processes the image and text prefix. Both reuse the prefix
+pass that produces the action expert’s cache. The adapter receives camera features,
+flow state, time, and base velocity. The teacher uses simulator geometry to produce
+clean demonstrations, and the evaluator uses it to score contact.
+
+`--reference` selects the source holder run with its demonstrations, checkpoint
+revision and development-selected steering settings. The default output directory
+is `outputs/pi05_libero_holder_camera_stages`. It contains the dataset digest,
+six trained heads, and paired test results for plain FRS and each head with the
+real and alternate holder views. Rerunning the command resumes completed heads and
+trials. The report gives placement, contact and joint success by destination and layout.
+
+### Gripper geometry and corrective demonstrations
+
+Run the three post-fusion conditions against the archived real-view baseline from
+`camera-pilot`. The collector uses the baseline heads on training resets. Evaluation
+loads the archived baseline rows for the paired comparisons.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+"${UV_RUN[@]}" python examples/pi05/mars/libero/holder_factorial.py experiment
+```
+
+`--baseline` defaults to `outputs/pi05_libero_holder_camera_stages`. The new
+checkpoints, recovery attempt logs, projection overlay, and report go under
+`outputs/pi05_libero_holder_factorial`. Use the `collect` stage to run just the
+resumable recovery collection. The geometry head adds external patch offsets from
+the projected end effector. The mixed head samples one original chunk and one
+clean teacher-recovery chunk per update. The combined head uses both changes.
+Recovery quotas are 16 blocked-plate and 16 other episodes, with a minimum of
+eight in each group and a limit of 200 attempts per group. Below the minimum,
+the experiment runs geometry only.
+
+To continue collection and train just the mixed head, use `holder_factorial.py mixed`.
+It reuses completed trials from `--recovery-source` (the factorial run by default),
+extends the collection limit to 2,000 attempts per pool, and writes to
+`outputs/pi05_libero_holder_mixed`. It targets 16 recoveries per pool and uses
+the same minimum of eight and the same held-out reset schedule.
+
+### Replaying the approach to holder contact
+
+The clean 10/10 intervention pilot starts from the seed-0 post-fusion checkpoint in
+`outputs/pi05_libero_holder_camera_stages`. Run from the repository root, with the
+same cached π0.5 snapshot as that experiment.
+
+```bash
+source examples/pi05/mars/libero/env.sh
+PILOT=examples/pi05/mars/libero/holder_interventions.py
+"${UV_RUN[@]}" python "$PILOT" collect
+```
+
+Collection replays the two replans before first contact and checks the original contact
+step and geometry. Each branch changes XYZ for one ten-step prefix and then resumes
+the same controller. A rescue requires correct placement without any holder contact.
+The `pairs/` JSON files record failed attempts as well as rescues. Accepted archives
+also store the camera views, input command, Gaussian sample and gripper reference.
+
+The initial screen uses 20 blocked-plate contact episodes. Five rescues trigger
+further collection to 32 rescues including at least 16 on blocked plate, capped at
+200 contacting episodes. With those quotas met, the `train` stage compares
+matched corrective-data continuations with and without the executed-prefix loss,
+then selects a head on development layouts. If neither A nor B meets the development criterion,
+the training stage fits a two-output contact predictor with reset-grouped cross-validation.
+It must rank the rescuing prefix safer for at least two thirds of the robot-first pairs and
+two thirds of the bowl-first pairs. Only pairs with contact within the executed prefix
+enter this ranking check. Passing enables a third continuation with the frozen predictor
+penalizing predicted contact. When the replay screen falls short and
+gripper contacts dominate, the `wrist` stage tests one additional roll or pitch
+correction on the gripper-first failures. Outputs default to
+`outputs/pi05_libero_holder_interventions`.
+
+### Single-seed rotation grid
+
+With the holder mixed-T run available, run the paired rotation-user comparison:
+
+```bash
+source examples/pi05/mars/libero/env.sh
+"${UV_RUN[@]}" python examples/pi05/mars/libero/holder_rotation_grid.py
+```
+
+This calibrates a learned U for the fixed 60° rotation on Goal tasks 0, 2, 3 and 9,
+then pairs FRS, U, seed-0 mixed T and UT on the first five scheduled held-out resets
+per destination and holder layout. The output under `outputs/pi05_libero_holder_rotation_grid`
+includes the known-command check, checkpoint digests, reset schedule, per-trial JSON,
+videos and paired gains and losses. Completed checkpoints and rollouts are reused.
 
 ## Analysis
 
@@ -780,3 +962,32 @@ size of 1.
   few minutes and the `No valid triton configs` messages are harmless.
 - **Rendering errors** — `env.sh` selects `MUJOCO_GL=egl`; try
   `MUJOCO_GL=osmesa` or make sure EGL drivers are installed.
+
+### Paired goals with two physical obstacles
+
+Run `paired_obstacles.py --layouts 2` in the LIBERO environment for a four-rollout
+smoke test. It uses the post-fusion condition C checkpoint by default. A fixed
+utensil holder and a fixed wooden pepper mill occupy the two direct bowl-to-goal
+routes. Their assignments alternate across layouts. Each layout is replayed for
+both intended destinations on the same underlying LIBERO reset. Only the
+goal-aware operator receives the destination instruction. The evaluator switches
+the native placement predicate and verifies identical initial images, physical
+state and obstacle positions across each pair.
+
+A contact between either designated obstacle and the robot or bowl disqualifies
+joint success. Intentional contacts with the bowl, table and placement surface are
+handled by the ordinary task physics. Trial JSON records the first obstacle hit,
+and the output directory includes initial external camera views.
+
+Run `two_obstacle_pilot.py` for the clean-input training comparison. The pilot
+freezes 16 paired evaluation layouts and runs holder-trained condition C on both
+intentions. On disjoint training reset IDs it screens up to four balanced passes
+of 20 layouts, seeking eight verified rescues per first obstacle hit and
+destination. Each branch must finish at the requested destination without
+contact with either obstacle. Successful source episodes supply preservation
+prefixes. The predictor must rank the rescuing prefix safer on at least two
+thirds of eligible held-out pairs for each obstacle. The run records a shortfall
+before training if either collection or ranking falls short. Otherwise it
+continues the original post-fusion checkpoint with the condition C loss and
+evaluates the new checkpoint against the frozen baseline schedule. Results and
+the advancement decision are in `outputs/pi05_libero_two_obstacle_pilot`.

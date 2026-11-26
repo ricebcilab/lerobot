@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>LIBERO command collection</title>
+<style>body{font:18px system-ui;max-width:850px;margin:2em auto;padding:0 1em}video,img{width:min(100%,650px);display:block}label{display:block;margin:1em 0}input{width:260px}button{font:inherit;padding:.4em 1em}</style>
+<h1 id="title"></h1><p>Watch the approach, then choose one translation command for the next 10 actions. The paused image shows the decision state. Zero means let go.</p>
+<video id="clip" controls playsinline></video><details><summary>Decision state</summary><img id="still" alt="External and wrist camera views at decision time"></details>
+<form id="form"><div id="axes"></div><button>Confirm command</button></form><p id="message"></p><button id="download" hidden>Save answers.json</button>
+<script>
+const cases=/*CASES*/[];
+const key="libero-human-command-v1:"+location.pathname;
+const answers=JSON.parse(localStorage.getItem(key)||"{}");
+const labels=["X (− forward, + toward you)","Y (− right, + left)","Z (− down, + up)"];
+for(const [i,name] of labels.entries()){
+ const label=document.createElement("label"), input=document.createElement("input"), value=document.createElement("output");
+ input.type="range";input.min=-1;input.max=1;input.step=.05;input.id="v"+i;
+ input.oninput=()=>value.textContent=Number(input.value).toFixed(2);
+ label.append(name+" ",input," ",value);axes.append(label);
+}
+let current;
+function show(){
+ current=cases.find(c=>!(c.id in answers));
+ if(!current){
+ document.getElementById("title").textContent="Commands collected";form.hidden=clip.hidden=true;download.hidden=false;
+ message.textContent="Download answers.json and return it for scoring.";return;
+ }
+ document.getElementById("title").textContent=(current.practice?"Practice":"Trial")+" · Put the bowl on the "+current.goal;
+ clip.src=current.mp4;still.src=current.png;clip.poster=still.src;
+ for(const el of form.querySelectorAll("input")){el.value=0;el.oninput();}
+}
+form.onsubmit=e=>{e.preventDefault();answers[current.id]=Array.from(form.querySelectorAll("input"),el=>Number(el.value));localStorage.setItem(key,JSON.stringify(answers));show();};
+download.onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(answers,null,2)],{type:"application/json"})),a=document.createElement("a");a.href=url;a.download="answers.json";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+show();
+</script>

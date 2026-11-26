@@ -62,6 +62,7 @@ from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 
 
 class ActionSelectKwargs(TypedDict, total=False):
+    prepared_velocity: Callable[[Tensor, Tensor], Tensor] | None
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
@@ -816,7 +817,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Encode the observation prefix once: ``(hidden, prefix_pad_masks, past_key_values)``, ``hidden`` the
         language model's last hidden state on the prefix ``(B, L, width)`` (the images' tokens, then the
         language tokens), the pad masks and the KV cache the action expert attends to."""
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        return self._encode_prefix_embeddings(*self.embed_prefix(images, img_masks, tokens, masks))
+
+    def _encode_prefix_embeddings(self, prefix_embs, prefix_pad_masks, prefix_att_masks):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -883,8 +886,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        _, prefix_pad_masks, past_key_values = self.encode_prefix(images, img_masks, tokens, masks)
-        velocity = self._velocity_fn(prefix_pad_masks, past_key_values, bsize, device)
+        velocity = kwargs.get("prepared_velocity")
+        if velocity is None:
+            _, prefix_pad_masks, past_key_values = self.encode_prefix(images, img_masks, tokens, masks)
+            velocity = self._velocity_fn(prefix_pad_masks, past_key_values, bsize, device)
 
         x_t_hook = kwargs.get("x_t_hook")
         noise_fn = kwargs.get("noise_fn")
@@ -1304,6 +1309,25 @@ class PI05Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
+    def camera_field(self, batch: dict[str, Tensor], *, stage: str = "pre") -> tuple[Callable, Tensor]:
+        """Velocity and the two real cameras’ tokens before or after the frozen VLM prefix encoder."""
+        if stage not in ("pre", "post"):
+            raise ValueError(f"Invalid camera stage {stage!r}")
+        self.eval()
+        cameras = ["observation.images.image", "observation.images.image2"]
+        if [k for k in self.config.image_features if k in batch] != cameras:
+            raise ValueError("visual T requires external and wrist images in checkpoint order")
+        images, masks = self._preprocess_images(batch)
+        tokens = batch[OBS_LANGUAGE_TOKENS]
+        embeddings = self.model.embed_prefix(images, masks, tokens, batch[OBS_LANGUAGE_ATTENTION_MASK])
+        image_length = embeddings[0].shape[1] - tokens.shape[1]
+        hidden, prefix_mask, cache = self.model._encode_prefix_embeddings(*embeddings)
+        features = embeddings[0] if stage == "pre" else hidden
+        patches = features[:, : 2 * (image_length // len(images))]
+        velocity = self.model._velocity_fn(prefix_mask, cache, len(tokens), tokens.device)
+        return velocity, patches
+
+    @torch.no_grad()
     def velocity_field(self, batch: dict[str, Tensor]):
         """The flow field for a preprocessed batch: ``velocity(x_t, time)`` on padded normalized chunks
         of shape (batch, chunk_size, max_action_dim); see ``PI05Pytorch.velocity_field``."""
@@ -1318,7 +1342,12 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        prepared = batch.get("pi05.prepared_velocity")
+        if prepared is None:
+            images, img_masks = self._preprocess_images(batch)
+        else:
+            images, img_masks = [], []
+            kwargs["prepared_velocity"] = prepared
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)

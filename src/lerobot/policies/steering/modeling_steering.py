@@ -36,6 +36,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import batched_trial
 from lerobot.teleoperators import readout
 from lerobot.utils.constants import (
+    ACTION,
     OBS_PREFIX,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
@@ -361,6 +362,9 @@ class LearnedTaskModule(nn.Module):
         token_geometry: str = "absolute",
         wrist_span: float | None = None,
         scene_rank: int | None = None,
+        mask_scene: bool = False,
+        camera_stage: str = "pre",
+        gripper_projection: list[list[float]] | None = None,
     ):
         super().__init__()
         if token_geometry not in TOKEN_GEOMETRIES:
@@ -370,7 +374,9 @@ class LearnedTaskModule(nn.Module):
                 f"relative token_geometry needs token_source vlm_image or cnn, got {token_source!r}"
             )
         self._check_scene(token_source, image_size, wrist_span, scene_rank, width=None)
-        if token_source.startswith("vlm") and (scene_dim is None or scene_tokens is None):
+        if (token_source.startswith("vlm") or token_source == "pi05_cameras") and (
+            scene_dim is None or scene_tokens is None
+        ):
             raise ValueError(f"token_source {token_source!r} needs scene_dim and scene_tokens")
         if scene_rank is not None and not 1 <= scene_rank < scene_dim:
             raise ValueError(f"scene_rank must be in 1..{scene_dim - 1}, got {scene_rank}")
@@ -388,6 +394,14 @@ class LearnedTaskModule(nn.Module):
             "scale": scale,
             "n_dims": n_dims,
         }
+        if camera_stage not in ("pre", "post") or (camera_stage == "post" and token_source != "pi05_cameras"):
+            raise ValueError("post camera features require pi05_cameras; camera_stage must be pre or post")
+        self.camera_stage = camera_stage
+        if camera_stage == "post":
+            self.config["camera_stage"] = camera_stage
+        self.mask_scene = mask_scene
+        if mask_scene:
+            self.config["mask_scene"] = True
         if token_source != "discs":  # nosec B105
             self.config |= {
                 "token_source": token_source,
@@ -429,7 +443,7 @@ class LearnedTaskModule(nn.Module):
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
         # after everything above, so a discs module's weights do not depend on the image sources
-        if token_source.startswith("vlm"):
+        if token_source.startswith("vlm") or token_source == "pi05_cameras":
             self.scene_in = nn.Linear(scene_rank or scene_dim, d)
         elif token_source == "cnn":  # nosec B105
             chans = [3, 32, 64, 128, d]
@@ -450,6 +464,37 @@ class LearnedTaskModule(nn.Module):
         if scene_rank is not None:  # zeros until set_reduction; persistent, so a checkpoint carries them
             self.register_buffer("scene_mean", torch.zeros(scene_dim))
             self.register_buffer("scene_basis", torch.zeros(scene_dim, scene_rank))
+
+        self.register_buffer("gripper_projection", None, persistent=False)
+        if gripper_projection is not None:
+            projection = torch.as_tensor(gripper_projection, dtype=torch.float32)
+            if (
+                camera_stage != "post"
+                or scene_tokens != 512
+                or projection.shape != (3, 4)
+                or not projection.isfinite().all()
+            ):
+                raise ValueError(
+                    "External gripper geometry needs a finite 3x4 projection and 512 post-fusion camera tokens"
+                )
+            self.config["gripper_projection"] = projection.tolist()
+            self.gripper_projection = projection
+            axis = (torch.arange(16) + 0.5) / 16
+            yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+            self.register_buffer(
+                "external_centers", torch.stack((xx, yy), -1).reshape(256, 2), persistent=False
+            )
+            self.offset_weight = nn.Parameter(torch.zeros(2, d))
+
+    def project_gripper(self, xyz):
+        """Project unnormalized world XYZ into the policy-oriented external image in [width,height] units."""
+        if xyz is None or xyz.ndim != 2 or xyz.shape[-1] != 3:
+            raise ValueError("External camera geometry requires batched, unnormalized gripper XYZ")
+        matrix = self.gripper_projection
+        uvz = xyz.to(matrix) @ matrix[:, :3].T + matrix[:, 3]
+        if not (uvz[:, 2] > 0).all():
+            raise ValueError("Projected gripper is behind the external camera")
+        return uvz[:, :2] / uvz[:, 2:]
 
     @staticmethod
     def _check_scene(
@@ -500,6 +545,8 @@ class LearnedTaskModule(nn.Module):
         cls._check_scene(source, size, wrist_span, scene_rank)
         if source == "discs":  # nosec B105
             return {"token_source": "discs"}
+        if source == "pi05_cameras":
+            return {"token_source": source, "scene_dim": VLM_SCENE_DIM, "scene_tokens": VLM_VIEWS_TOKENS}
         if size <= 0:
             raise ValueError(f"size must be positive, got {size}")
         if source == "cnn":  # nosec B105
@@ -544,6 +591,8 @@ class LearnedTaskModule(nn.Module):
         every token is real). Without ``obs`` only the null token."""
         null = self.null.expand(b, 1, -1)
         src = self.token_source
+        if self.mask_scene:
+            return null, None
         if src != "discs":
             if obs is None:
                 return null, None
@@ -572,6 +621,9 @@ class LearnedTaskModule(nn.Module):
                 scene = scene + self.token_in(feats)
             else:
                 scene = scene + self.scene_pos
+            if self.gripper_projection is not None:
+                offsets = self.external_centers - self.project_gripper(obs.get("gripper_xyz"))[:, None]
+                scene = torch.cat((scene[:, :256] + offsets @ self.offset_weight, scene[:, 256:]), dim=1)
             keep = obs.get("scene_keep")
             if keep is None:
                 return torch.cat([null, scene], 1), None
@@ -623,6 +675,19 @@ class LearnedTaskModule(nn.Module):
         out = self.out(q)
         a = torch.eye(n, device=x_t.device) + out[..., : n * n].view(b, h, n, n)
         return a, out[..., n * n :]
+
+    def pi05_field_loss(self, velocity, patches, actions, noise, times, valid, lambda_id, gripper_xyz=None):
+        """π0.5 time runs from action (0) to noise (1). Fit the head's dims (LIBERO XYZ) on valid steps."""
+        x = torch.lerp(actions, noise, times[:, None, None])
+        n = self.n_dims
+        with torch.no_grad():
+            v = velocity(x, times)[..., :n].float()
+        matrix, bias = self(x, times, v, obs={"scene": {"pi05_cameras": patches}, "gripper_xyz": gripper_xyz})
+        corrected = (matrix @ v.unsqueeze(-1)).squeeze(-1) + bias
+        error = (corrected - (noise - actions)[..., :n]).square().mean(-1)
+        identity = (matrix - torch.eye(n, device=x.device)).square().mean((-1, -2)) + bias.square().mean(-1)
+        selected = (error + lambda_id * identity)[valid]
+        return selected.mean() if selected.numel() else selected.sum()
 
     def bind(self, obs: dict) -> _BoundTaskModule:
         """This module with ``obs`` fixed: a ``(x_t, t, v) -> (A, b)`` callable carrying ``n_dims``."""
@@ -1776,7 +1841,7 @@ class FlowReversalSteering(_ChunkSteering):
 # (``SteeringPolicy.forward``'s, which the pre-processor carries through untouched)
 COMMAND = "command"
 TRAINING_KEYS = ("kind", "chunk", "latent", "noise", "time", "weight", "bci_target")
-STEERING_BATCH_KEYS = (COMMAND, *TRAINING_KEYS)
+STEERING_BATCH_KEYS = (COMMAND, "adapter_camera_tokens", "gripper_xyz", *TRAINING_KEYS)
 # The config fields of pi0.5's sampler interface a base policy offers (``noise_time`` optional: 1.0, pi0.5's)
 SAMPLER_CONFIG_FIELDS = ("num_inference_steps", "chunk_size", "max_action_dim", "n_action_steps")
 
@@ -2094,6 +2159,33 @@ class SteeringPolicy(PreTrainedPolicy):
         example trainer's batches (see the class docstring; the pre-processor carries their keys through)."""
         obs, kind = self.observation(batch), batch.get("kind")
         view = self._adapter_view(obs)
+        task_module = self.adapter.task
+        if kind == "task" and getattr(task_module, "token_source", None) == "pi05_cameras":
+            base = self.base_policy
+            actions = base.prepare_action({ACTION: self._normalized_chunk(batch["chunk"])})
+            noise, times = batch.get("noise"), batch.get("time")
+            if noise is None:
+                noise = base.model.sample_noise(actions.shape, actions.device)
+            if times is None:
+                times = base.model.sample_time(len(actions), actions.device)
+            pad = batch.get("action_is_pad")
+            valid = (
+                torch.ones_like(actions[..., 0], dtype=torch.bool)
+                if pad is None
+                else ~pad.to(actions.device).bool()
+            )
+            velocity, patches = base.camera_field(obs, stage=task_module.camera_stage)
+            loss = task_module.pi05_field_loss(
+                velocity,
+                patches,
+                actions,
+                noise,
+                times,
+                valid,
+                self.config.lambda_id,
+                batch.get("gripper_xyz"),
+            )
+            return loss, {"field": loss.item()}
         velocity = self._velocity(obs)
         if kind == "task":
             if self.adapter.task is None:
@@ -2127,6 +2219,11 @@ class SteeringPolicy(PreTrainedPolicy):
         mode ``"none"`` too; None when there is none) and the adapter's field bound to this observation."""
         obs = self.observation(batch)
         view = self._adapter_view(obs)
+        if getattr(self.adapter.task, "token_source", None) == "pi05_cameras":
+            velocity, patches = self.base_policy.camera_field(obs, stage=self.adapter.task.camera_stage)
+            obs = {**obs, "pi05.prepared_velocity": velocity}
+            view["scene"] = {"pi05_cameras": batch.get("adapter_camera_tokens", patches)}
+            view["gripper_xyz"] = batch.get("gripper_xyz")
         return obs, self._command(batch.get(COMMAND), view), self._field(view)
 
     def _own_chunk(self, obs: dict, field: AdaptedField | None, noise=None) -> Tensor:
