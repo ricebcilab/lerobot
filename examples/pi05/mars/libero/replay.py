@@ -10,7 +10,7 @@
 
 """Add `policy_translation` to trials recorded before it was recorded live.
 
-    run.sh python replay.py outputs/human_pilot/p01 [--force] [--tolerance 1e-4]
+    run.sh python replay.py examples/pi05/mars/results/libero_study/<run> [--force] [--tolerance 1e-4]
 
 `policy_translation` is what the policy would have executed on its own at each
 step (see README, "What gets recorded"). experiment.py now records it during the

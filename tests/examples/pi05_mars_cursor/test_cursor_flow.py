@@ -326,7 +326,7 @@ def test_config_files_fill_defaults_and_reject_unknown_keys(tmp_path):
         config.load_protocol(tmp_path / "p.yaml")
     (tmp_path / "q.yaml").write_text(cells)
     plain = config.load_protocol(tmp_path / "q.yaml")
-    assert (plain["study"], protocol["study"]) == ("q", "study_short")  # results/<study>/<participant>/, by default the name
+    assert (plain["study"], protocol["study"]) == ("q", "study_short")  # results/cursor_<study>/<participant>/, by default the name
     (tmp_path / "deep.yaml").write_text(cells + "study: a/b\n")
     with pytest.raises(ValueError, match="study"):
         config.load_protocol(tmp_path / "deep.yaml")

@@ -13,11 +13,11 @@
 # define them, each with its one knob tuned (flow control over tau at lambda 1, its gain the command in action units;
 # FRS over the pinned prefix at the full reversal); MARS, with the user's module (cursor_sim/user_<tag>_expert_n100_s0: the
 # grid's own module, trained at noise 1.0), tunes the reversal depth x the pinned prefix.
-# run_sweep.py writes the tuned values to results/sim/sweeps/study_short_U3/settings.yaml; they go into cells.settings.
+# run_sweep.py writes the tuned values to results/cursor_sim/sweeps/study_short_U3/settings.yaml; they go into cells.settings.
 # Every arm sees the same 40 layouts, in a different order per block; the block order is a balanced Latin square row
 # by participant number and visit. The condition is hidden, and the window shows the cursor and the targets and
 # nothing of the command or the plan (display.cues: false). The records go to
-# results/study_short/<participant>/study_short_U3_s<visit>_T1/.
+# results/cursor_study_short/<participant>/study_short_U3_s<visit>_T1/.
 name: study_short_U3
 study: study_short
 cells:

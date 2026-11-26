@@ -24,4 +24,4 @@ control:
 server:
   port: 8765
 
-output_dir: outputs/pi05_libero_interactive
+output_dir: examples/pi05/mars/results/libero_study/interactive

@@ -174,8 +174,8 @@ def adapter_names(arm):
 
 
 def load_protocol(path):
-    """A protocol {name, study, cells, blocks, trial, expert, display, calibration}. `study` is the folder under results/ its runs
-    go to (results/<study>/<participant>/<name>_s<visit>_<task>/; by default the name), so protocols of one study
+    """A protocol {name, study, cells, blocks, trial, expert, display, calibration}. `study` names the folder under results/ its runs
+    go to (results/cursor_<study>/<participant>/<name>_s<visit>_<task>/; by default the name), so protocols of one study
     (study_long_U1 ... U4, study_short_U1 ... U4) share it. `cells` says what a participant plays: a sweep of its
     own in a sweep config's form (run_sweep.py), its users x tasks grid one user x the tasks played, each task a
     section of the visit (`run_experiment.protocol_sections`), the methods in the order given; beside it settings,
@@ -191,7 +191,7 @@ def load_protocol(path):
         raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
     study = str(data.get("study") or data.get("name", path.stem))
     if not study or "/" in study or study.startswith("."):
-        raise ValueError(f"{path}: study names the folder under results/ its runs go to, one name; got {study!r}")
+        raise ValueError(f"{path}: study names the folder results/cursor_<study>/ its runs go to, one name; got {study!r}")
     cells = data.get("cells")
     if not isinstance(cells, dict) or set(CELLS_KEYS) - set(cells) or not isinstance(cells.get("methods"), dict):
         raise ValueError(f"{path}: cells takes a sweep's methods and grid (and its arm, tune, trials, seed), settings and "

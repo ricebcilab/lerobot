@@ -17,11 +17,11 @@
 #
 # `cells` is the sweep that builds the arms and tunes them with the simulated expert (the baselines as their papers
 # define them, each with its one knob tuned; MARS the reversal depth x the pinned prefix); run_sweep.py writes the
-# tuned values to results/sim/sweeps/study_long_U2/settings.yaml, and they go into cells.settings. A task section per
+# tuned values to results/cursor_sim/sweeps/study_long_U2/settings.yaml, and they go into cells.settings. A task section per
 # task, T1 first and T2-T5 in a balanced Latin square row by participant number and visit; within a section every arm
 # sees the same 40 layouts and the block order is the next row of the arms' square. The condition is hidden, and the
 # window shows the cursor, the targets and the obstacles and nothing of the command or the plan (display.cues: false).
-# Each section's records go to results/study_long/<participant>/study_long_U2_s<visit>_<task>/.
+# Each section's records go to results/cursor_study_long/<participant>/study_long_U2_s<visit>_<task>/.
 name: study_long_U2
 study: study_long
 cells:

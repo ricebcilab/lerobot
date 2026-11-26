@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Report for the grid rederived with the vision task module, and its decoy control.
 
-Reads ``<results>/sim/sweeps/<run>_s<k>/test.json`` for the seeds that exist of ``grid_vision`` (teleop, ft_flow_control,
+Reads ``<results>/cursor_sim/sweeps/<run>_s<k>/test.json`` for the seeds that exist of ``grid_vision`` (teleop, ft_flow_control,
 ft_frs, mars_task, mars), ``grid`` (mars_user) and ``grid_ft`` (ft_mars_user), and of ``grid_vision_decoy`` (the four
 trained-on obstacle cells with the obstacle placed about a non-goal target, every arm at the grid's tuned settings), and
 writes ``report.md`` and ``report.json`` to ``--out``. Metrics are the sweeps' fractions (``success``, ``collision``,
@@ -161,7 +161,7 @@ def main(argv=None):
     p.add_argument("--results", default=str(Path(__file__).resolve().parents[2] / "results"))
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
-    sweeps = Path(a.results) / "sim" / "sweeps"
+    sweeps = Path(a.results) / "cursor_sim" / "sweeps"
     runs = {name: load_runs(sweeps, name) for name in ("grid_vision", "grid", "grid_ft", "grid_vision_decoy")}
     report = dict(runs={n: sorted(r) for n, r in runs.items()}, grid=grid_tables(runs), decoy=decoy_table(runs), checks=checks(runs))
     out = Path(a.out)

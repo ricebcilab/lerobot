@@ -1,5 +1,5 @@
 # Figure 3d: users {U1 ... U4} x tasks {T1 ... T5} at noise 1.0 (2026-11-25, grid_vision.yaml and grid_ft.yaml in one;
-# its runs are results/sim/sweeps/grid_s<k>, merged from theirs). The arms, on the same trials per cell:
+# its runs are results/cursor_sim/sweeps/grid_s<k>, merged from theirs). The arms, on the same trials per cell:
 #   teleop                   the expert alone through the user's readout
 #   ft_flow_control, ft_frs  flow control and FRS on each obstacle task's fine-tuned policy (T1 the frozen policy), each
 #                            tuned on its paper's one knob (tau at lambda 1; the pinned prefix at the full reversal)

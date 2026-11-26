@@ -29,7 +29,7 @@ uv run --extra mars python examples/pi05/mars/cursor/tools/analyze_results.py --
 `hub_manifest.yaml`, 137 folders, about 150 MB, from the public Hub repo `ricebcilab/mars-cursor`; no login) into
 `examples/pi05/mars/checkpoints/`. The session needs the SpaceMouse (see [../README.md](../README.md#spacemouse)
 for the udev rule) and a display; `--participant sim` runs the same protocol with the expert agent, headless,
-with neither. The runs go to `results/study_short/<participant>/` (the long study's to `results/study_long/<participant>/`);
+with neither. The runs go to `results/cursor_study_short/<participant>/` (the long study's to `results/cursor_study_long/<participant>/`);
 `analyze_results.py` prints the per-arm table and writes `results/analysis/study_short/`.
 
 More:
@@ -136,7 +136,7 @@ such as `checkpoints/` and `results/` are under `examples/pi05/mars/`.
   that runs late, as one with a new MARS chunk and a vision task module does (about 33 ms), is followed by a
   shorter one, so every arm plays at 50 Hz in wall-clock time as in steps; the run summary prints each arm's
   mean, median and 95th-percentile frame time.
-- **Records.** `results/<study>/<participant>/<protocol>_s<session>_<task>/manifest.json` (order, layout seed,
+- **Records.** `results/cursor_<study>/<participant>/<protocol>_s<session>_<task>/manifest.json` (order, layout seed,
   resolved arms with their matrices, checkpoint SHA-256s, git commit, environment) and one
   `block<k>_<arm>.jsonl` per block, one record per trial: block, arm, method, trial, practice,
   layout id, start and end times, duration, outcome, targets, path, raw and served commands,
@@ -170,7 +170,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
 ```
 
 - **Participant and user on the command line.** `--participant p<N>` names the person (the folder under
-  `results/<study>/`, and with `--session` the rows of the block and task orders and the layouts); `--user U<k>`
+  `results/cursor_<study>/`, and with `--session` the rows of the block and task orders and the layouts); `--user U<k>`
   names the user profile, the readout the person plays through (U1 vertical gain 0.25, U2 horizontal gain 0.25, U3
   a 60 degree rotation, U4 a curl field), and picks the study's protocol file for it (`study_short_U3.yaml`; a file
   named whole with `--protocol` needs no `--user`). A study named without its user is an error that lists them. The
@@ -183,9 +183,9 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
   arm is the one that sweep builds for the user's cell, at its tuned setting and the sweep's noise, so a
   participant plays exactly what the expert was tuned on. A study's four protocols differ only in their user and
   its settings (a test checks it). A protocol's `study` names its folder under `results/`: the short study's runs go
-  to `results/study_short/<participant>/`, every long protocol's to `results/study_long/<participant>/`.
+  to `results/cursor_study_short/<participant>/`, every long protocol's to `results/cursor_study_long/<participant>/`.
 - **Task sections.** A task is a section with its own layouts, block order and run folder
-  (`results/<study>/<participant>/<protocol>_s<session>_<task>/`, a normal run, so the analysis reads it unchanged; its
+  (`results/cursor_<study>/<participant>/<protocol>_s<session>_<task>/`, a normal run, so the analysis reads it unchanged; its
   records also name the `task` and the `user`). T1 comes first and T2 to T5 in a balanced Latin square row by
   participant number and visit; each section takes the next row of the arms' square. A visit can stop after any
   block and `--resume`; finished sections are left as they are.
@@ -238,7 +238,7 @@ tune per mode (`tune`: flow control's `tau`, `lambda` and `ic_gain`, FRS's `n_re
 optionally `axes`: arm parameters such as `targets`, `min_target_sep`, `reach` or `dwell_s`, each
 with a list of values, every combination a cell), the trial counts and the focus. Cells whose
 layouts cannot be sampled (too many targets for the spacing) are skipped and listed in `test.json`.
-Outputs go to `results/sim/sweeps/<name>/`: `tuning.json`, `test.json`, `settings.yaml` (the tuned
+Outputs go to `results/cursor_sim/sweeps/<name>/`: `tuning.json`, `test.json`, `settings.yaml` (the tuned
 settings, to copy into arm configs), `ranking.csv` (every cell, best lead first by the lower end of
 its CI), `log.txt` (everything the sweep printed) and `figs/` (tuning curves, the test map or lines,
 or `axes.png` with the lead against every varied parameter, the showcase cell or, for a users × tasks

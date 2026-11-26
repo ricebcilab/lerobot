@@ -19,40 +19,40 @@
 #                          1.5 (Kao et al.'s on LIBERO), 3, 5, 8 and 12 at tau 10 and at the whole chunk
 #   TRANSLATION_NOISE=0.5 FC_GAIN=3 user_study.sh 1
 #                          the baselines as their papers define them, each with its one knob tuned as on the cursor,
-#                          under the clean readout and the four users at translation noise TRANSLATION_NOISE: FRS at the full reversal
+#                          under the clean readout and the three users at translation noise TRANSLATION_NOISE: FRS at the full reversal
 #                          over the pinned prefix (Tang et al.), FC at lambda 1 over tau with a full push written at
 #                          FC_GAIN sigma and rotation set to 0 (Kao et al., App. G.1), and teleop (the operator
 #                          alone, as on the cursor: its translation, rotation and gripper, no policy; the
 #                          rotation and the gripper carry ROTATION_NOISE and GRIPPER_NOISE, default 0.04 and
 #                          1.0, the study's levels beside TRANSLATION_NOISE 0.5)
 #   TRANSLATION_NOISE=0.2 user_study.sh modules
-#                          stage 2, first half: one user module per user (rotation, lowdof, lag, keypad), each
+#                          stage 2, first half: one user module per user (rotation, lowdof, lag), each
 #                          calibrated by train_user_module.py in the LIBERO-Goal scene on the four tasks outside
 #                          Goal-6 (0, 2, 3, 9): 20 episodes of the policy under "do something", unsteered, the
 #                          synthetic operator watching and pushing or resting by the let-go rule, five start states
 #                          per task; that user's readout, noise TRANSLATION_NOISE drawn once per state; 3000 steps,
 #                          a fifth of the states held out, into
-#                          MODULES/<user>/ (default outputs/pi05_libero_user_study/user_modules). Extra flags
+#                          MODULES/<user>/ (default examples/pi05/mars/checkpoints/adapters/libero_sim). Extra flags
 #                          reach the trainer (e.g. --steps 2000); it has no --dry-run
 #   TRANSLATION_NOISE=0.5 user_study.sh 2
 #                          stage 2, second half: MARS with each user's module on the development split, over the
 #                          reversal depth (1, 2, 4, 6, 10 of the policy's 10 steps; DEPTHS picks some) x the
 #                          pinned prefix (5, 10, 25, 50), Goal-6 first
-#   CONTROL=1 DEPTHS="6 4 2 1" USERS="clean rotation lowdof lag keypad" TRANSLATION_NOISE=0.5 user_study.sh 2
+#   CONTROL=1 DEPTHS="6 4 2 1" USERS="clean rotation lowdof lag" TRANSLATION_NOISE=0.5 user_study.sh 2
 #                          the control for MARS's depths: the same loop without a module (FRS at a partial
 #                          reversal), so a gain at a shallow depth can be told from the module's
 #   ARMS="frs teleop" TRANSLATION_NOISE=0.5 user_study.sh 1       only those arms (of frs, fc, teleop; fc needs FC_GAIN)
 #   ARMS="frs fc teleop floor ceiling" ... user_study.sh 1        with the anchors beside them (the policy alone
 #                                     under the arm's prompt and under the scene's own instruction: no user in them)
 #   SUITES="goal" ... user_study.sh 1                             only that suite (of object, goal), at any stage
-#   USERS="keypad" TRANSLATION_NOISE=0.5 FC_GAIN=3 user_study.sh 1    only those users (of clean, rotation, lowdof, lag, keypad)
+#   USERS="lag" TRANSLATION_NOISE=0.5 FC_GAIN=3 user_study.sh 1       only those users (of clean, rotation, lowdof, lag)
 #   SPLIT=1 ... user_study.sh 1       a run per knob value instead of one process per sweep: a few cells spread
 #                                     over every worker (each run loads the policy)
 #   TRANSLATION_NOISE=0.5 FC_GAIN=3 user_study.sh 1 --dry-run     validate every run without loading a policy
 #   GPUS="0" PER_GPU=2 user_study.sh 0    two runs at a time on GPU 0
 #
-# Extra flags reach every run. Environment: OUT (default outputs/pi05_libero_user_study/stage<N>), MODULES (where
-# the user modules are written and read, default outputs/pi05_libero_user_study/user_modules), GPUS (default
+# Extra flags reach every run. Environment: OUT (default examples/pi05/mars/results/libero_sim/stage<N>), MODULES (where
+# the user modules are written and read, default examples/pi05/mars/checkpoints/adapters/libero_sim), GPUS (default
 # "0 1"), PER_GPU (runs per GPU at a time, default 3), BASE_PORT (default 8800; each worker takes its own), SEED
 # (default 0). A worker takes the next run as it finishes one. Every launch keeps its own record under
 # $OUT/logs/<launch time>/: each run's log and code_state.txt (HEAD, the working tree's status and its diff); a
@@ -66,7 +66,7 @@ REPO_ROOT="$(cd -- "${HERE}/../../../../.." && pwd)"
 
 STAGE="${1:?usage: user_study.sh STAGE [experiment flags...]}"
 shift
-OUT="${OUT:-outputs/pi05_libero_user_study/stage${STAGE}}"
+OUT="${OUT:-examples/pi05/mars/results/libero_sim/stage${STAGE}}"
 read -r -a GPU_LIST <<<"${GPUS:-0 1}"
 PER_GPU="${PER_GPU:-3}"
 BASE_PORT="${BASE_PORT:-8800}"
@@ -75,7 +75,7 @@ SUITES="${SUITES:-object goal}"
 SPACEMOUSE="--set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4"
 FC_MODE="--set control.mode=shared_flow_control"
 FC_ROTATION="--set control.zeroed_dims=[rotation]" # Kao et al. on LIBERO: rotation 0 in the steered steps
-MODULES="${MODULES:-outputs/pi05_libero_user_study/user_modules}" # the user modules: <user>/user.pt
+MODULES="${MODULES:-examples/pi05/mars/checkpoints/adapters/libero_sim}" # the user modules: <user>/user.pt
 [[ "${STAGE}" == modules ]] && OUT="${MODULES}" # the trainer's logs go with its modules
 
 # A job is "<name> <experiment flags>"; no flag holds a space. Longer jobs first: workers take them in order.
@@ -118,7 +118,7 @@ case "${STAGE}" in
         : "${TRANSLATION_NOISE:?stage 1 needs TRANSLATION_NOISE, the translation noise every user carries (the study uses 0.5)}"
         translation_noise="--set control.translation_noise=${TRANSLATION_NOISE}"
         ARMS="${ARMS:-frs fc teleop}"
-        USERS="${USERS:-clean rotation lowdof lag keypad}"
+        USERS="${USERS:-clean rotation lowdof lag}"
         if [[ " ${ARMS} " == *" fc "* ]]; then
             : "${FC_GAIN:?stage 1 needs FC_GAIN for the fc arm, the gain the gain step chose}"
         fi
@@ -150,8 +150,8 @@ case "${STAGE}" in
         ;;
     modules)
         : "${TRANSLATION_NOISE:?the modules stage needs TRANSLATION_NOISE, the noise of the readout they calibrate on}"
-        for user in ${USERS:-rotation lowdof lag keypad}; do
-            JOBS+=("module_${user} --config ${HERE}/../configs/experiment/study_goal_${user}.yaml --set scene.task_ids=[0,2,3,9] --out ${MODULES}/${user} --episodes 0 --open-episodes 20 --sigma ${TRANSLATION_NOISE} ${TRANSLATION_NOISE} --frozen-noise --steps 3000 --val-frac 0.2 --log-every 300")
+        for user in ${USERS:-rotation lowdof lag}; do
+            JOBS+=("module_${user} --config ${HERE}/../configs/study_goal_${user}.yaml --set scene.task_ids=[0,2,3,9] --out ${MODULES}/${user} --episodes 0 --open-episodes 20 --sigma ${TRANSLATION_NOISE} ${TRANSLATION_NOISE} --frozen-noise --steps 3000 --val-frac 0.2 --log-every 300")
         done
         ;;
     2)
@@ -159,7 +159,7 @@ case "${STAGE}" in
         for suite in goal object; do # Goal-6 first: stage 1 found the gap to close there
             [[ " ${SUITES} " == *" ${suite} "* ]] || continue
             for depth in ${DEPTHS:-10 6 4 2 1}; do # the longer runs first
-                for user in ${USERS:-rotation lowdof lag keypad}; do
+                for user in ${USERS:-rotation lowdof lag}; do
                     c="study_${suite}_${user}.yaml"
                     [[ "${user}" == clean ]] && c="study_${suite}.yaml"
                     if [[ "${CONTROL:-0}" == 1 ]]; then # the same loop without a module: FRS at this depth

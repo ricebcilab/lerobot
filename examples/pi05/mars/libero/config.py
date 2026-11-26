@@ -75,7 +75,7 @@ class SessionSettings:
     task_id: int = 0
     port: int = 8765
     headless: bool = False  # no live view: no page, no frame stream, no browser tab (experiments of the synthetic operator)
-    output_dir: Path = Path("outputs/pi05_libero_interactive")
+    output_dir: Path = Path("examples/pi05/mars/results/libero_study/interactive")
     operator: str = "human"
     policy_operator: PolicyOperatorSettings = field(default_factory=PolicyOperatorSettings)
     control: ControlSettings = field(default_factory=ControlSettings)
@@ -91,7 +91,7 @@ class ExperimentSettings:
     first_occurrence: int = (
         0  # each task's trials start at this occurrence of its initial states (a split's offset)
     )
-    output_dir: Path = Path("outputs/pi05_libero_experiments")
+    output_dir: Path = Path("examples/pi05/mars/results/libero_sim/experiments")
     task_ids: list[int] | None = None  # None = every task in the suite
     prompt: str = "do something"
 

@@ -21,13 +21,8 @@ interactive.py                       the REPL
 experiment.py                        the scripted trial runner
 replay.py                            adds policy_translation to runs recorded before it was recorded live
 configs/interactive.yaml             REPL settings
-configs/experiment/                  the study's arms (see Experiments)
-experiments/arms.sh                  the arms (fc, frs, frs_ra, floor, ceiling) and how each is launched
-experiments/oracle_sweep.sh          synthetic-operator study
-experiments/task_audit.sh            picks the human-pilot task (oracle_sweep.sh with the SpaceMouse-like operator)
-experiments/human_pilot.sh           the human study
+configs/*.yaml                       base.yaml and the study's conditions (see Experiments)
 notebooks/analyze.py                 loading, tables, paired tests, per-trial metrics, plots
-notebooks/analyze_human_pilot.ipynb  the human study's figures
 ```
 
 The steering methods themselves live in
@@ -74,7 +69,7 @@ use:
 
 ```bash
 ./examples/pi05/mars/libero/run.sh lerobot-eval \
-  --output_dir=outputs/pi05_libero_eval \
+  --output_dir=examples/pi05/mars/results/libero_sim/eval \
   --policy.path=lerobot/pi05_libero_finetuned \
   --policy.n_action_steps=10 \
   --policy.compile_model=true \
@@ -108,7 +103,7 @@ starts, so a chain of runs keeps a single tab.
 
 Type an instruction (or press Enter for the scene's built-in one) to run a
 rollout in the current scene; each rollout is also saved as an MP4 under
-`outputs/pi05_libero_interactive/`. `tasks` lists the suite's scenes,
+`examples/pi05/mars/results/libero_study/interactive/`. `tasks` lists the suite's scenes,
 `task <suite> <id>` switches scene, `quit` exits. Settings can also come from
 `configs/interactive.yaml` (`run.sh interactive --config`); the command
 reference is `interactive.py --help`.
@@ -234,7 +229,7 @@ auto` is 1.
   reversal_adapter:
     translation: {rotation_z_deg: 40}                 # or {scale: [...]}, or a 3x3 literal
   reversal_adapter: {F: [[..7 rows..]]}               # literal
-  reversal_adapter: {learned: outputs/user_modules/rotz20/user.pt}      # MARS-U, learned
+  reversal_adapter: {learned: examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k>/user.pt}      # MARS-U, learned
   reversal_adapter: {user: {learned: u.pt}, task: t.pt}                 # MARS: user + task module
   reversal_adapter: {user: {translation: corruption}, task: t.pt}       # a fixed F with a task module
   ```
@@ -267,7 +262,7 @@ the REPL) holds the same spec forms at its top level.
 same policy, live view and modes as the REPL. Each trial draws a task from the
 configured scene, shows **you** the task, and lets you attempt it with the VLA
 in the configured shared-autonomy mode. A bare file name is looked up under
-`configs/experiment/`:
+`configs/`:
 
 ```bash
 R=./examples/pi05/mars/libero/run.sh
@@ -286,7 +281,7 @@ instead, the conventional setup where both know the goal.
 
 ### Arms, overrides and sweeps
 
-`configs/experiment/base.yaml` holds every setting the experiments share, each
+`configs/base.yaml` holds every setting the experiments share, each
 with its default (FRS on LIBERO-Goal, the prompt "do something", no
 corruption); the study files (`study_*.yaml`) extend it. An arm is the base
 plus a few settings, given with `--set`:
@@ -303,7 +298,7 @@ plus a few settings, given with `--set`:
   identity, so the only difference from FRS is `M` applied to the reversal's
   translation.
 - **MARS** with a learned user module:
-  `control.reversal_adapter={learned: outputs/user_modules/rotz20/user.pt}`
+  `control.reversal_adapter={learned: examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k>/user.pt}`
   (trained as below).
 - The policy alone: `control.mode=policy`, with the arm's prompt the **floor**
   of every comparison, with `--set prompt=task` its **ceiling**.
@@ -323,10 +318,7 @@ $R experiment --config base.yaml --set 'control.corruption={rotation_z_deg: 20}'
 $R experiment --config study_goal_rotation.yaml --set control.mode=shared_flow_control --sweep control.tau=5,10,25,50   # a study user
 ```
 
-`experiments/arms.sh` packages these launches for the pilot scripts as
-`run_arm fc|frs|mars|mars_learned|floor|ceiling <depths> [flags]` (`frs_ra` is
-still accepted for `mars`) under `CORRUPTION=rotz20` (the default) or `scale`, so they
-share one arm → settings → sweep-key mapping. Each block gets its own run
+Each block gets its own run
 directory named after the file and the overrides in force, e.g.
 `20260903_101500_study_goal_n_reversal_steps-4/`, and its
 `config.yaml` lists the overrides under `overrides`. Keys that would need a
@@ -340,41 +332,41 @@ rejected and a key set to `null` keeps the built-in default, so a typo fails
 immediately instead of silently doing nothing. The run's name is the config
 file's stem plus any `--set`/`--sweep` values.
 
-| Key                                  | Default                           | Meaning                                                                                                                                                                                              |
-| ------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `experiment.n_trials`                | `10`                              | Number of trials                                                                                                                                                                                     |
-| `experiment.seed`                    | `0`                               | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and noise streams                                                                     |
-| `experiment.task_order`              | `random`                          | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                                                          |
-| `experiment.first_occurrence`        | `0`                               | Each task's trials start at this occurrence of its initial states: `5` continues where a 5-per-task run stopped, so a development and a test split share no state within a pass                      |
-| `experiment.output_dir`              | `outputs/pi05_libero_experiments` | Parent of the run directory                                                                                                                                                                          |
-| `scene.suite`                        | `libero_goal`                     | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                                              |
-| `scene.task_ids`                     | `null`                            | Task pool to draw from; `null` = every task in the suite                                                                                                                                             |
-| `prompt`                             | `"do something"`                  | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                                                   |
-| `policy.path`                        | `lerobot/pi05_libero_finetuned`   | Hub id or local checkpoint directory                                                                                                                                                                 |
-| `policy.n_action_steps`              | `10`                              | Actions executed per predicted chunk                                                                                                                                                                 |
-| `policy.compile`                     | `false`                           | `torch.compile` the model (slow first trial, faster after)                                                                                                                                           |
-| `control.mode`                       | `shared_flow_reversal_steering`   | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see [Interactive prompting](#interactive-prompting)                                                  |
-| `control.tau`                        | `null`                            | `shared_flow_control`: chunk steps (of 50) the command is written into; `null` = the whole chunk                                                                                                     |
-| `control.lambda`                     | `1`                               | `shared_flow_control`: denoising steps at whose start it is written (1 = the initial condition, Kao et al.; 0 = policy alone). `n_guided_steps` is accepted as the old name                          |
-| `control.ic_gain`                    | `action`                          | `shared_flow_control`: the command's scale in the noise prior (a full push writes `ic_gain` sigma), or `action` for the checkpoint's action units                                                    |
-| `control.zeroed_dims`                | `[]`                              | `shared_flow_control`: dim groups (`rotation`, `gripper`) set to 0 in the steps the command is written into; Kao et al. on LIBERO zero rotation                                                      |
-| `control.n_reversal_steps`           | `null`                            | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                                               |
-| `control.pinned_steps`               | `null`                            | `shared_flow_reversal_steering` only: leading chunk steps the reference pins, the rest is the policy's; `null` = the executed steps                                                                  |
-| `control.translation_noise`          | `0.0`                             | Std of the Gaussian noise added to the x/y/z command at every read, the operator resting or not                                                                                                      |
-| `control.rotation_noise`             | `0.0`                             | Std of the Gaussian noise added to each axis of the rotation command; only teleop mode executes that command                                                                                         |
-| `control.gripper_noise`              | `0.0`                             | Std of the Gaussian noise added to the gripper command, which is then served as its sign (open or close); only teleop mode executes it                                                               |
-| `control.translation_gain`           | `null`                            | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)                    |
-| `control.max_steps`                  | `null`                            | Rollout length; `null` = the suite's own episode length                                                                                                                                              |
-| `control.corruption`                 | `null`                            | Matrix spec applied to the operator's command, `{curl: b, tau: s}` for a curl field or `{quantize: axes}` for a keypad — see [Perturbing the operator](#perturbing-the-operator)                     |
-| `control.reversal_adapter`           | `null`                            | MARS adapter spec for `shared_flow_reversal_steering`: a fixed `F`, `{learned: path}` or `{user: ..., task: ...}` — see [Perturbing the operator](#perturbing-the-operator)                          |
-| `control.operator_dims`              | `[translation]`                   | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                                                         |
-| `operator`                           | `human`                           | `human` (SpaceMouse / keyboard) or `policy` — see [Synthetic operator](#synthetic-operator)                                                                                                          |
-| `policy_operator.update_every_steps` | `null`                            | Environment steps between synthetic intent queries; `null` uses `policy.n_action_steps`. Requires `operator: policy`                                                                                 |
-| `policy_operator.delay_steps`        | `0`                               | Environment steps from observing the scene to delivering that synthetic command                                                                                                                      |
-| `policy_operator.intent`             | `plan`                            | Where the synthetic operator's intent comes from: `plan` the task-prompted policy's own plan, `target` a straight push at the task's object and then its destination (see Synthetic operator)        |
-| `policy_operator.let_go_cosine`      | `null`                            | Under a steering arm (FC, FRS, MARS) the operator rests (zero command) for the next update while the robot's executed motion heads with its intent at this cosine or more; `null` = it always pushes |
-| `server.port`                        | `8765`                            | Live view port                                                                                                                                                                                       |
-| `server.headless`                    | `false`                           | No live view: no page, no frame stream, no browser tab; for runs of the synthetic operator (the study files set it), refused with a human operator                                                   |
+| Key                                  | Default                                             | Meaning                                                                                                                                                                                              |
+| ------------------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `experiment.n_trials`                | `10`                                                | Number of trials                                                                                                                                                                                     |
+| `experiment.seed`                    | `0`                                                 | Seeds task order, per-task initial-state permutations, and independent environment, policy, synthetic-operator and noise streams                                                                     |
+| `experiment.task_order`              | `random`                                            | `random` (uniform, with replacement), `shuffled` (permuted blocks, each task once per block), `sequential` (cycle in order)                                                                          |
+| `experiment.first_occurrence`        | `0`                                                 | Each task's trials start at this occurrence of its initial states: `5` continues where a 5-per-task run stopped, so a development and a test split share no state within a pass                      |
+| `experiment.output_dir`              | `examples/pi05/mars/results/libero_sim/experiments` | Parent of the run directory                                                                                                                                                                          |
+| `scene.suite`                        | `libero_goal`                                       | LIBERO suite (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`, `libero_100`)                                                                                              |
+| `scene.task_ids`                     | `null`                                              | Task pool to draw from; `null` = every task in the suite                                                                                                                                             |
+| `prompt`                             | `"do something"`                                    | Instruction handed to the VLA; the literal `task` uses the scene's own instruction                                                                                                                   |
+| `policy.path`                        | `lerobot/pi05_libero_finetuned`                     | Hub id or local checkpoint directory                                                                                                                                                                 |
+| `policy.n_action_steps`              | `10`                                                | Actions executed per predicted chunk                                                                                                                                                                 |
+| `policy.compile`                     | `false`                                             | `torch.compile` the model (slow first trial, faster after)                                                                                                                                           |
+| `control.mode`                       | `shared_flow_reversal_steering`                     | `policy`, `teleop`, `shared_override`, `shared_flow_control`, `shared_flow_reversal_steering` — see [Interactive prompting](#interactive-prompting)                                                  |
+| `control.tau`                        | `null`                                              | `shared_flow_control`: chunk steps (of 50) the command is written into; `null` = the whole chunk                                                                                                     |
+| `control.lambda`                     | `1`                                                 | `shared_flow_control`: denoising steps at whose start it is written (1 = the initial condition, Kao et al.; 0 = policy alone). `n_guided_steps` is accepted as the old name                          |
+| `control.ic_gain`                    | `action`                                            | `shared_flow_control`: the command's scale in the noise prior (a full push writes `ic_gain` sigma), or `action` for the checkpoint's action units                                                    |
+| `control.zeroed_dims`                | `[]`                                                | `shared_flow_control`: dim groups (`rotation`, `gripper`) set to 0 in the steps the command is written into; Kao et al. on LIBERO zero rotation                                                      |
+| `control.n_reversal_steps`           | `null`                                              | `shared_flow_reversal_steering` only: denoising steps the reference is reversed through; `null` = all the way to noise                                                                               |
+| `control.pinned_steps`               | `null`                                              | `shared_flow_reversal_steering` only: leading chunk steps the reference pins, the rest is the policy's; `null` = the executed steps                                                                  |
+| `control.translation_noise`          | `0.0`                                               | Std of the Gaussian noise added to the x/y/z command at every read, the operator resting or not                                                                                                      |
+| `control.rotation_noise`             | `0.0`                                               | Std of the Gaussian noise added to each axis of the rotation command; only teleop mode executes that command                                                                                         |
+| `control.gripper_noise`              | `0.0`                                               | Std of the Gaussian noise added to the gripper command, which is then served as its sign (open or close); only teleop mode executes it                                                               |
+| `control.translation_gain`           | `null`                                              | Scale on the operator's command that keeps the corruption out of the clip: `null` (off), `auto` or a number in `(0, 1]` — see [Perturbing the operator](#perturbing-the-operator)                    |
+| `control.max_steps`                  | `null`                                              | Rollout length; `null` = the suite's own episode length                                                                                                                                              |
+| `control.corruption`                 | `null`                                              | Matrix spec applied to the operator's command, `{curl: b, tau: s}` for a curl field or `{quantize: axes}` for a keypad — see [Perturbing the operator](#perturbing-the-operator)                     |
+| `control.reversal_adapter`           | `null`                                              | MARS adapter spec for `shared_flow_reversal_steering`: a fixed `F`, `{learned: path}` or `{user: ..., task: ...}` — see [Perturbing the operator](#perturbing-the-operator)                          |
+| `control.operator_dims`              | `[translation]`                                     | Which dim groups the operator commands (`translation`, `rotation`, `gripper`); the rest of the reversed reference is delegated to the policy                                                         |
+| `operator`                           | `human`                                             | `human` (SpaceMouse / keyboard) or `policy` — see [Synthetic operator](#synthetic-operator)                                                                                                          |
+| `policy_operator.update_every_steps` | `null`                                              | Environment steps between synthetic intent queries; `null` uses `policy.n_action_steps`. Requires `operator: policy`                                                                                 |
+| `policy_operator.delay_steps`        | `0`                                                 | Environment steps from observing the scene to delivering that synthetic command                                                                                                                      |
+| `policy_operator.intent`             | `plan`                                              | Where the synthetic operator's intent comes from: `plan` the task-prompted policy's own plan, `target` a straight push at the task's object and then its destination (see Synthetic operator)        |
+| `policy_operator.let_go_cosine`      | `null`                                              | Under a steering arm (FC, FRS, MARS) the operator rests (zero command) for the next update while the robot's executed motion heads with its intent at this cosine or more; `null` = it always pushes |
+| `server.port`                        | `8765`                                              | Live view port                                                                                                                                                                                       |
+| `server.headless`                    | `false`                                             | No live view: no page, no frame stream, no browser tab; for runs of the synthetic operator (the study files set it), refused with a human operator                                                   |
 
 `--n-trials`, `--seed`, `--output-dir` and `--port` are aliases for the
 corresponding `--set`.
@@ -516,117 +508,16 @@ delay sweep repeats equivalent conditions. Profiles must not be pooled:
 what the operator computed versus what the policy actually consumed
 (`user_translation_raw` with `user_reads`).
 
-### The oracle sweep
-
-`experiments/oracle_sweep.sh` runs the grid with the synthetic operator: the
-arms in `ARMS` swept over their depths on every LIBERO-Goal task, matched
-resets across arms:
-
-```bash
-S=./examples/pi05/mars/libero/experiments/oracle_sweep.sh
-"$S"                                                  # 10 tasks, 10 trials per block, ~a few hours
-TASKS="0 2" DEPTHS=4,10 N_TRIALS=5 "$S"
-FC_DEPTHS=8,10 FRS_DEPTHS=2,4 ARMS="fc frs frs_ra ceiling" "$S"                  # no floor
-"$S" --set policy_operator.update_every_steps=20 --set policy_operator.delay_steps=4  # flags reach every run
-"$S" --dry-run                                        # validate without loading a policy
-```
-
-`FC_DEPTHS`, `FRS_DEPTHS` and `FRS_RA_DEPTHS` set the depths per arm (`DEPTHS`
-sets all three), `SEED` the reset assignment, `OUT` the output root (default
-`outputs/pi05_libero_oracle_sweep_v2`).
-
-### Human pilot
-
-`experiments/human_pilot.sh` runs one task for a person on the SpaceMouse: ten
-matched trials per method and depth, FC at depths 2/4/6/8/10 and the reversal
-arms at 1/2/4/6/8 — 150 trials, +20° corruption, MARS (then called MARS) at `F = M`, a 300-step
-cap (LIBERO-Goal's own episode length), no synthetic delay:
-
-```bash
-P=./examples/pi05/mars/libero/experiments/human_pilot.sh
-"$P" --dry-run
-OUT=outputs/human_pilot/p01 ORDER="fc frs frs_ra" "$P"
-OUT=outputs/human_pilot/p02 ORDER="frs_ra fc frs" "$P"     # a new OUT and arm order per participant/session
-"$P" --set 'control.corruption={rotation_z_deg: 40}'                  # another rotation
-CORRUPTION=scale "$P" --set 'control.corruption={scale: [4, 1, 1]}'   # an x gain instead
-```
-
-The first arm opens the live view (`http://localhost:8773`) and the same tab
-follows the next arms. `TASK`, `N_TRIALS`, `SEED`, `FC_DEPTHS`, `FRS_DEPTHS`
-(or `DEPTHS` for both), `ORDER`, `CORRUPTION`, `MAX_STEPS`, `PORT` and `OUT` are
-environment variables; vary the arm order across participants to spread
-practice and fatigue. The pilots recorded so far (`human_pilot/p01`,
-`human_pilot_rotz40/p01`, `human_pilot_scalex4/p01`) ran with `MAX_STEPS=600`
-and before the translation gain existed (`--set control.translation_gain=null` restores
-that). Afterwards set `ROOT` in
-[`analyze_human_pilot.ipynb`](notebooks/analyze_human_pilot.ipynb) to that
-`OUT` and Run All: it checks counts and reset pairing, labels incomplete data
-as partial, and exports the figures and CSVs under `<OUT>/figures/`
-(`outcomes_vs_authority`, `best_vs_best`, `success_over_time`).
-
-#### Why task 4 and these depths
-
-Task 1 ("put the bowl on the stove") saturated in a first human session: FC
-reached 100% by depth 6, leaving nothing to separate. `experiments/task_audit.sh`
-picked the replacement by running `oracle_sweep.sh` with the SpaceMouse-like
-operator (`update_every_steps: 20, delay_steps: 4`) on tasks 4-8, 20 matched
-trials per cell, seed 0, FC over depths 4-10, FRS over 1-4, MARS
-(F@40) over 1-6, plus the ceiling. Tasks 0/2/3/9 were left out: the oracle
-sweep scores them ~0 for every method (the translation-only command cannot
-express them). Success at each method's best depth:
-
-| Task                           | Ceiling | FC      | FRS    | MARS   | MARS − FC (McNemar, 20 pairs) |
-| ------------------------------ | ------: | ------- | ------ | ------ | ----------------------------- |
-| **4** bowl on top of cabinet   |     100 | d4: 20  | d1: 45 | d2: 60 | **+40, p = 0.021**            |
-| 5 push plate to front of stove |      95 | d8: 30  | d4: 25 | d2: 25 | −4, p = 1.0                   |
-| 6 cream cheese in bowl         |     100 | d8: 15  | d2: 25 | d1: 25 | +10, p = 0.69                 |
-| 7 turn on stove                |     100 | d10: 85 | d1: 85 | d1: 85 | 0, p = 1.0                    |
-| 8 bowl on plate                |     100 | d6: 55  | d4: 80 | d4: 65 | +9, p = 0.69                  |
-
-Task 4 is the only one where MARS beats FC at both methods' best depths,
-with a 100% ceiling and FC far from it (MARS vs. FRS is +15 points
-but not significant at 20 pairs, p = 0.55). The timing profile is what opens
-the gap: under the immediate oracle the same task gives FC d10 95% and FRS d1
-100%. FC gains from depth while the reversal arms fall off by depth 4 on most
-tasks, so the pilot sweeps FC over 2-10 and the reversal arms over 1-8. One
-seed and one operator profile: the pilot is also a test of whether a person
-behaves like (20, 4).
-
-#### Study record
-
-What has been run, in order, and what it found (all under `outputs/`). The
-task audit above and `human_pilot/p01` ran MARS with a fixed 40° rotation
-adapter (F@40) through a script override that has since been removed, and the
-v2 sweeps compared several adapter angles; the scripts now always run `F = M`.
-To repeat an F@40 cell, add
-`--set 'control.reversal_adapter={translation: {rotation_z_deg: 40}}'` to a
-MARS run.
-
-- `pi05_libero_oracle_sweep_v2` — the immediate oracle, all ten tasks, three
-  arms over depth plus anchors, seed 0; confirmation on seeds 1-2 in
-  `pi05_libero_confirm_v2`; adapter angles −20…40 at FRS depth 2 in
-  `pi05_libero_adapter_angles_v2`. FC peaks deep (d10, 58%) and FRS shallow
-  (d1, 51%); the adapter lifts FRS to parity with FC (F@40: 60%) but not past
-  it, because the +20° corruption barely costs FC anything at FRS's best depth.
-  F = M is not special: the optimum sits past it. Tasks 0/2/3/9 are at the
-  floor for every method.
-- `pi05_libero_task_audit_u20d4` — the audit above. The (20, 4) timing
-  profile collapses FC (task 4: 95% → 20%) while shallow reversal keeps about
-  half the trials.
-- `human_pilot/p01` — the first pilot on task 4. At their best depths FC d10
-  (90%), FRS d1 and MARS d2 (100%) tie on ten resets. The separation is at
-  low measured authority (about 0.3, the shallow settings), where the reversal
-  arms sit at 70-100% and FC at 40%: FC does not get less of the operator's
-  push there, it converts the same push into fewer successes.
-
 ### User study
 
 The study of the MARS user module on LIBERO-Goal
 ([design](../../../../docs/superpowers/specs/2026-11-14-mars-libero-user-study-design.md)),
 round 1 since 2026-11-20: the prompt-dropout checkpoint
-(`outputs/pi05_libero_generic_prompt/checkpoints/006000/pretrained_model`) is
+(`examples/pi05/mars/checkpoints/policies/libero_generic_prompt/checkpoints/006000/pretrained_model`) is
 told "do something", the synthetic operator's command says which goal is meant,
-and four users corrupt it, one per panel of the paper's Fig. 1a.
+and three users corrupt it (the study dropped a fourth, a six-key pad, on 2026-11-25). LIBERO-Goal's other four
+tasks (0, 2, 3, 9) are not played: an earlier synthetic-operator sweep scored them about 0 for every method (a
+translation command cannot express them), so they serve the user modules' calibration instead.
 
 | Condition file             | User                                                                   |
 | -------------------------- | ---------------------------------------------------------------------- |
@@ -634,7 +525,6 @@ and four users corrupt it, one per panel of the paper's Fig. 1a.
 | `study_goal_rotation.yaml` | decoding error: one random 3-D rotation of 60°, drawn from seed 0      |
 | `study_goal_lowdof.yaml`   | low-DOF control: the vertical component dropped (`{scale: [1, 1, 0]}`) |
 | `study_goal_lag.yaml`      | misperception and delay: a lag-and-turn field (`{curl: 2, tau: 0.5}`)  |
-| `study_goal_keypad.yaml`   | discrete input: a six-key pad (`{quantize: axes}`)                     |
 
 They run LIBERO-Goal's six tasks a translation command can express (1, 4, 5,
 6, 7, 8; `study_object*.yaml` are the same users on LIBERO-Object). Every file
@@ -646,11 +536,11 @@ development split. A test split takes the next states with
 
 ```bash
 U=./examples/pi05/mars/libero/experiments/user_study.sh
-P="--set policy.path=$PWD/outputs/pi05_libero_generic_prompt/checkpoints/006000/pretrained_model"
+P="--set policy.path=$PWD/examples/pi05/mars/checkpoints/policies/libero_generic_prompt/checkpoints/006000/pretrained_model"
 N="SUITES=goal TRANSLATION_NOISE=0.2 ROTATION_NOISE=0.016 GRIPPER_NOISE=0.4"
-env $N OUT=outputs/pi05_libero_user_study/round1/gain "$U" gain $P      # FC's gain, once: 1.5, 3, 5, 8, 12 at tau 10 and 50, clean readout
-env $N SPLIT=1 ARMS="fc frs teleop floor ceiling" FC_GAIN=3 OUT=outputs/pi05_libero_user_study/round1/stage1 "$U" 1 $P   # the baselines and anchors
-env $N MODULES=outputs/pi05_libero_user_study/round1/modules "$U" modules $P   # one user module per user, calibrated by watching the policy
+env $N OUT=examples/pi05/mars/results/libero_sim/round1/gain "$U" gain $P      # FC's gain, once: 1.5, 3, 5, 8, 12 at tau 10 and 50, clean readout
+env $N SPLIT=1 ARMS="fc frs teleop floor ceiling" FC_GAIN=3 OUT=examples/pi05/mars/results/libero_sim/round1/stage1 "$U" 1 $P   # the baselines and anchors
+env $N MODULES=examples/pi05/mars/results/libero_sim/round1/modules "$U" modules $P   # one user module per user, calibrated by watching the policy
 env $N "$U" 2 $P --dry-run                  # validate a stage's runs without loading a policy
 ```
 
@@ -687,7 +577,7 @@ direction), and a policy that knows the tasks but is not told which.
 
 The launcher runs several experiments at a time across the GPUs (a worker
 takes the next run as it finishes one). Results go to `OUT` (default
-`outputs/pi05_libero_user_study/stage<N>/`); each launch keeps its runs' logs
+`examples/pi05/mars/results/libero_sim/stage<N>/`); each launch keeps its runs' logs
 and the code state (`HEAD` and the working-tree diff) under `logs/<launch
 time>/`, and a dry run writes nothing there.
 
@@ -735,10 +625,10 @@ without a shorter `len_user`; one that only weakens the steering raises
 
 ```bash
 python examples/pi05/mars/libero/train_user_module.py \
-    --config configs/experiment/base.yaml --set 'control.corruption={rotation_z_deg: 20}' \
-    --out outputs/user_modules/rotz20 --episodes 20 --steps 3000      # ~45 min on one GPU
+    --config configs/base.yaml --set 'control.corruption={rotation_z_deg: 20}' \
+    --out examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k> --episodes 20 --steps 3000      # ~45 min on one GPU
 $R experiment --config base.yaml --set 'control.corruption={rotation_z_deg: 20}' \
-    --set 'control.reversal_adapter={learned: outputs/user_modules/rotz20/user.pt}' --sweep control.n_reversal_steps=2,4,6,8,10
+    --set 'control.reversal_adapter={learned: examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k>/user.pt}' --sweep control.n_reversal_steps=2,4,6,8,10
 ```
 
 The trainer takes the arm's readout and ignores its reversal adapter, so it starts
@@ -841,18 +731,6 @@ operator:
   the same way (`METHOD_COLORS`, a colourblind-safe triple for the steered
   arms, neutral for the anchors) and follows `paper.mplstyle`.
 
-[`analyze_human_pilot.ipynb`](notebooks/analyze_human_pilot.ipynb) uses these
-for the human study; the same calls work on any oracle-sweep directory. Jupyter
-is not part of the `pi`/`libero` extras; run it without touching the project
-environment with:
-
-```bash
-uv run --extra pi --extra libero --with jupyterlab jupyter lab examples/pi05/mars/libero/notebooks/analyze_human_pilot.ipynb
-```
-
-Notebook outputs are stripped before commit by the `nbstripout` pre-commit
-hook, so diffs stay to the code cells.
-
 ## Fine-tuning
 
 A basic Pi0.5 LIBERO fine-tuning job can be launched with:
@@ -866,7 +744,7 @@ uv run --locked --extra pi --extra libero lerobot-train \
   --policy.gradient_checkpointing=true \
   --policy.compile_model=true \
   --policy.device=cuda \
-  --output_dir=outputs/pi05_libero_train \
+  --output_dir=examples/pi05/mars/checkpoints/policies/libero_train \
   --job_name=pi05_libero_train \
   --steps=6000 \
   --batch_size=1
@@ -876,41 +754,6 @@ Increase the batch size or use distributed training according to available
 VRAM. The published LeRobot result used an effective batch size of 256 on eight
 H100 GPUs; the command above deliberately starts with a safer per-process batch
 size of 1.
-
-### The generic prompt (prompt dropout)
-
-The released checkpoint always saw a task sentence. Under `do something` it
-follows one fixed behaviour per scene: two samples from fresh noise head the
-same way at every early state, on all four suites. Steering then has to force
-the policy off that default; it cannot choose among behaviours the policy
-already offers, as it does on the cursor, whose policy was trained with goal
-dropout.
-
-`train_generic_prompt.py` is `lerobot-train` with prompt dropout: every
-training sample keeps its task sentence with probability `1 - p` and gets the
-generic prompt otherwise. Under the generic prompt the policy learns the mix of
-tasks the demonstrations show for that image, and it still follows a task
-sentence. Expect a spread only where one scene carries several tasks
-(LIBERO-Goal: ten tasks, one scene); where the layout gives the task away
-(LIBERO-Spatial, LIBERO-Object) it learns that layout's own task.
-
-```bash
-source examples/pi05/mars/libero/env.sh
-CUDA_VISIBLE_DEVICES=0,1 uv run --locked --extra pi --extra libero --extra training \
-  accelerate launch --multi_gpu --num_processes=2 \
-  examples/pi05/mars/libero/train_generic_prompt.py --prompt-dropout 0.5 \
-  --policy.path=lerobot/pi05_libero_finetuned --policy.push_to_hub=false \
-  --policy.compile_model=true --policy.train_expert_only=true \
-  --dataset.repo_id=HuggingFaceVLA/libero --batch_size=32 --steps=6000 \
-  --save_freq=1000 --eval_freq=0 --wandb.enable=false \
-  --output_dir=outputs/pi05_libero_generic_prompt
-```
-
-On one RTX 6000 Ada (49 GB), batch 32: training the action expert only with
-the compiled model takes 4.4 s per step and 26 GB; the whole model takes
-10.3 s per step (not compiled) and 48 GB. Gradient checkpointing has to stay
-on (batch 32 does not fit without it). Every flag but `--prompt-dropout` and
-`--generic-prompt` is `lerobot-train`'s.
 
 ## Troubleshooting
 

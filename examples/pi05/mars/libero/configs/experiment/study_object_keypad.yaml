@@ -1,5 +1,0 @@
-# U4, discrete input: a six-key pad. The command is snapped to the axis of its largest component and keeps its
-# own length (only its direction is lost), so a diagonal reach becomes a staircase.
-extends: study_object.yaml
-control:
-  corruption: {quantize: axes}

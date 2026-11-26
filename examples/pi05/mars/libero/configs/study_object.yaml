@@ -6,7 +6,7 @@ extends: base.yaml
 experiment:
   n_trials: 50                # 5 per task with task_order sequential: the development split
   task_order: sequential
-  output_dir: outputs/pi05_libero_user_study
+  output_dir: examples/pi05/mars/results/libero_sim
 scene:
   suite: libero_object
   task_ids: null

@@ -24,7 +24,7 @@ from config import (
 from lerobot.teleoperators import readout
 
 CONDITIONS = sorted(
-    p.name for p in (CONFIG_DIR / "experiment").glob("*.yaml") if not p.name.startswith("base")
+    p.name for p in CONFIG_DIR.glob("*.yaml") if not p.name.startswith(("base", "interactive"))
 )
 
 
@@ -78,7 +78,7 @@ def test_shipped_interactive_config_loads():
     s = load_interactive_settings(DEFAULT_INTERACTIVE_CONFIG, {})
     assert isinstance(s, SessionSettings)
     assert s.control.mode == "policy" and s.control.corruption_matrix is None
-    assert s.output_dir == Path("outputs/pi05_libero_interactive")
+    assert s.output_dir == Path("examples/pi05/mars/results/libero_study/interactive")
     assert s.control.resolved_translation_gain is not None  # the REPL cannot clip either
 
 
@@ -95,7 +95,7 @@ def test_every_shipped_condition_loads():
 
 
 def _check_shipped_condition(name):
-    s = load_experiment_settings(CONFIG_DIR / "experiment" / name, {})
+    s = load_experiment_settings(CONFIG_DIR / name, {})
     assert isinstance(s, ExperimentSettings)
     assert s.name == Path(name).stem
     assert s.session.control.mode in MODES
@@ -107,9 +107,9 @@ def _check_shipped_condition(name):
 
 
 def test_the_base_with_an_arms_settings_resolves():
-    """An arm is the base file plus its settings (experiments/arms.sh's flags): MARS with F = M, FRS, flow control
+    """An arm is the base file plus its settings (the flags a launch adds): MARS with F = M, FRS, flow control
     and a learned user module."""
-    base = CONFIG_DIR / "experiment" / "base.yaml"
+    base = CONFIG_DIR / "base.yaml"
     turned = "control.corruption={rotation_z_deg: 20}"
     adapter = "control.reversal_adapter={translation: corruption, orientation: identity, gripper: identity}"
     c = load_experiment_settings(base, {}, sets=[turned, adapter]).session.control
@@ -126,7 +126,11 @@ def test_the_base_with_an_arms_settings_resolves():
     fc = load_experiment_settings(base, {}, sets=["control.mode=shared_flow_control"]).session.control
     assert fc.mode == "shared_flow_control" and (fc.tau, fc.lam, fc.ic_gain) == (None, 1, "action")
     learned = load_experiment_settings(
-        base, {}, sets=["control.reversal_adapter={learned: outputs/user_modules/rotz20/user.pt}"]
+        base,
+        {},
+        sets=[
+            "control.reversal_adapter={learned: examples/pi05/mars/checkpoints/adapters/libero_sim/rotation/d1/user.pt}"
+        ],
     ).session.control
     assert learned.reversal_adapter_user_path.endswith("user.pt") and learned.reversal_adapter_matrix is None
 
@@ -228,7 +232,7 @@ def test_parse_set_and_tree():
 
 
 def test_sets_override_the_file_and_are_validated():
-    path = CONFIG_DIR / "experiment" / "study_goal_rotation.yaml"
+    path = CONFIG_DIR / "study_goal_rotation.yaml"
     assert load_experiment_settings(path, {}).session.control.corruption_matrix is not None
     s = load_experiment_settings(path, {}, sets=["control.n_guided_steps=4", "control.corruption=null"])
     assert s.session.control.lam == 4 and s.session.control.corruption_matrix is None  # the old key is lambda
@@ -243,7 +247,7 @@ def test_sets_override_the_file_and_are_validated():
 
 
 def test_policy_operator_timing_overrides_and_defaults():
-    path = CONFIG_DIR / "experiment" / "base.yaml"
+    path = CONFIG_DIR / "base.yaml"
     default = load_experiment_settings(path, {}, sets=["operator=policy"])
     assert default.session.policy_operator.update_every_steps is None
     assert default.session.policy_operator.delay_steps == 0
@@ -297,12 +301,12 @@ def test_experiment_cli_overrides(tmp_path):
 
 
 def test_base_yaml_matches_dataclass_defaults():
-    data = yaml.safe_load((CONFIG_DIR / "experiment" / "base.yaml").read_text())
+    data = yaml.safe_load((CONFIG_DIR / "base.yaml").read_text())
     assert set(data) == {"experiment", "scene", "prompt", "policy", "control", "server"}
 
 
 def test_operator_settings():
-    path = CONFIG_DIR / "experiment" / "base.yaml"
+    path = CONFIG_DIR / "base.yaml"
     default = load_experiment_settings(path, {})
     assert default.session.operator == "human"
     assert default.session.control.operator_dims == ["translation"]
@@ -371,17 +375,15 @@ def test_the_study_rotation_is_the_recorded_draw(tmp_path):
     )  # the draw the study recorded: 60 degrees about a random axis
     drawn = Rotation.from_rotvec(axis / np.linalg.norm(axis) * np.radians(60.0)).as_matrix()
     for suite in ("object", "goal"):
-        control = load_experiment_settings(
-            CONFIG_DIR / "experiment" / f"study_{suite}_rotation.yaml", {}
-        ).session.control
+        control = load_experiment_settings(CONFIG_DIR / f"study_{suite}_rotation.yaml", {}).session.control
         np.testing.assert_array_equal(control.corruption_matrix, drawn)  # one 60 degree draw, seed 0
     with pytest.raises(
         ValueError, match="control.corruption"
     ):  # a corruption drawn per trial is no longer a form
         _load(tmp_path, "control: {corruption: {random: {scale: [1, 2]}}}")
-    goal = load_experiment_settings(CONFIG_DIR / "experiment" / "study_goal_keypad.yaml", {})
+    goal = load_experiment_settings(CONFIG_DIR / "study_goal_lag.yaml", {})
     assert goal.session.suite == "libero_goal" and goal.task_ids == [1, 4, 5, 6, 7, 8] and goal.n_trials == 30
-    assert goal.session.control.corruption_quantize and goal.session.operator == "policy"
+    assert goal.session.operator == "policy"
     timing = goal.session.policy_operator  # the immediate operator: every chunk, no delay
     assert timing.update_every_steps is None and timing.delay_steps == 0
 
@@ -393,7 +395,7 @@ def test_study_runs_are_headless_and_a_human_cannot_be(tmp_path):
     from session import Session
     from teleop import KeyboardReader
 
-    study = load_experiment_settings(CONFIG_DIR / "experiment" / "study_goal_rotation.yaml", {}).session
+    study = load_experiment_settings(CONFIG_DIR / "study_goal_rotation.yaml", {}).session
     assert study.headless and not load_interactive_settings(DEFAULT_INTERACTIVE_CONFIG, {}).headless
     view = Session.build_view(study, KeyboardReader(), dict)
     assert isinstance(view, HeadlessView) and view.url is None

@@ -33,7 +33,7 @@ tuned lead) is chosen on the tuning trials only. Every trial runs through
 session.run_trials, exactly as a participant's. Cells whose layouts cannot be
 sampled (too many targets for the spacing) are skipped and listed.
 
-Writes results/sim/sweeps/<name>/: tuning.json, test.json, settings.yaml (the
+Writes results/cursor_sim/sweeps/<name>/: tuning.json, test.json, settings.yaml (the
 tuned settings, to copy into arm configs), ranking.csv (every cell, best lead
 first), log.txt (everything the run printed) and figs/ (a users x tasks grid:
 grid.png, the focus method's maps, and summary.png, every method on every
@@ -915,7 +915,7 @@ def main(argv=None):
     p.add_argument("--test-trials", type=int, help="override trials.test")
     p.add_argument("--resume", action="store_true", help="keep the cells already in the output folder, run the rest")
     p.add_argument("--results", default=str(RESULTS))
-    p.add_argument("--out", help="output folder name under results/sim/sweeps/ (default: the sweep name)")
+    p.add_argument("--out", help="output folder name under results/cursor_sim/sweeps/ (default: the sweep name)")
     p.add_argument("--cells", nargs="+", help="run only these grid levels (e.g. U1xT3; a family's levels as written)")
     p.add_argument("--merge", nargs="+", help="output folders of parts of this sweep: combine them into --out, run nothing")
     p.add_argument("--module-seed", type=int, help="the modules' training seed: _n<demos>_s0 or _t<seconds>_s0 -> _s<k> "
@@ -936,12 +936,12 @@ def main(argv=None):
         sweep["trials"]["tune"] = args.tune_trials
     if args.test_trials:
         sweep["trials"]["test"] = args.test_trials
-    out = Path(args.results) / "sim" / "sweeps" / (args.out or sweep["name"])
+    out = Path(args.results) / "cursor_sim" / "sweeps" / (args.out or sweep["name"])
     if not args.precompute_scene:  # which writes nothing under --out
         (out / "figs").mkdir(parents=True, exist_ok=True)
     with (nullcontext() if args.precompute_scene else logged(out / "log.txt", append=args.resume)) as log:
         for part in [] if args.precompute_scene else args.merge or []:  # a merged sweep's log starts with its parts' logs
-            src = Path(args.results) / "sim" / "sweeps" / part / "log.txt"
+            src = Path(args.results) / "cursor_sim" / "sweeps" / part / "log.txt"
             if src.exists():
                 log.write(f"=== {part}\n{src.read_text()}")
         encoders = []
@@ -1001,7 +1001,7 @@ def run(args, sweep, out, encoder_factory=None):
     tuning, test, skipped = {}, {}, {}
     if args.merge:
         for part in args.merge:
-            src = Path(args.results) / "sim" / "sweeps" / part
+            src = Path(args.results) / "cursor_sim" / "sweeps" / part
             saved = json.loads((src / "test.json").read_text())
             test.update(saved["test"])
             skipped.update(saved.get("skipped", {}))

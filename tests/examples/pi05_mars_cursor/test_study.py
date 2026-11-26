@@ -154,7 +154,7 @@ def test_shipped_study_protocols_resolve():
             protocol = config.load_protocol(f"{study}_{expected}.yaml")
             assert (
                 protocol["name"] == f"{study}_{expected}" and protocol["study"] == study
-            )  # results/<study>/
+            )  # results/cursor_<study>/
             assert protocol["display"] == {"blind": True, "cues": False}
             assert run_sweep.load_sweep(protocol["name"])["grid"]["users"] == [
                 expected
@@ -237,7 +237,7 @@ def test_a_calibrated_visit_plays_mars_with_the_participants_own_module(tmp_path
     argv = ["--protocol", str(tmp_path / "tiny.yaml"), "--participant", "sim", "--cpu", "--calibrate"]
     argv += ["--results", str(tmp_path / "results")]
     run_experiment.main(argv)
-    runs = tmp_path / "results" / "tiny" / "sim"
+    runs = tmp_path / "results" / "cursor_tiny" / "sim"
     manifest, reaches = load_run(runs / "tiny_s1_calibration")
     assert (
         manifest["block_order"] == ["calibration"] and manifest["arms"]["calibration"]["mode"] == "playback"

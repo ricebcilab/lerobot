@@ -32,8 +32,8 @@ of the reversed reference (the rest is handed to the policy). A module that land
 rebuild the meant chunk, where one fitted to the full reversal reaches no further than FRS on an exact command.
 
 Usage (from the example directory, in the LIBERO environment):
-    python train_user_module.py --config configs/experiment/base.yaml \
-        --set 'control.corruption={rotation_z_deg: 20}' --out outputs/user_modules/rotz20 --episodes 20 --steps 3000
+    python train_user_module.py --config configs/base.yaml \
+        --set 'control.corruption={rotation_z_deg: 20}' --out examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k> --episodes 20 --steps 3000
 The log's validation, on held-out states: the chunk the rollouts' steering computes (`FlowReversalSteering`, the
 executed prefix pinned) at each of `--val-depths`, from the same noise for the policy's own plan, FRS on the
 user's command (`none`: with its frozen draw, else at the middle of the noise range), the same through

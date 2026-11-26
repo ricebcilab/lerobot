@@ -10,13 +10,13 @@
 
 """Run a shared-autonomy user study on LIBERO with pi0.5.
 
-Runs `n_trials` trials from a YAML description (configs/experiment/): each trial shows *you*
+Runs `n_trials` trials from a YAML description (configs/): each trial shows *you*
 the task and lets you attempt it with the VLA in the configured shared-autonomy mode, while
 the VLA only ever sees the config's `prompt`.
 
     ./run.sh experiment --config <condition>.yaml [--set KEY=VALUE ...] [--sweep KEY=V1,V2,...] [--dry-run]
 
-`--config` is looked up as given, then under configs/experiment/. `--set` overrides one YAML
+`--config` is looked up as given, then under configs/. `--set` overrides one YAML
 key (dotted path, YAML value); `--sweep` runs one block per listed value with a single policy
 load. Every block is written to `<output_dir>/<timestamp>_<config stem>[_<key>-<value>...]/`:
 
@@ -53,7 +53,7 @@ from lerobot.policies.steering import N_ACTION_DIMS
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.utils import init_logging
 
-EXPERIMENT_CONFIG_DIR = CONFIG_DIR / "experiment"
+EXPERIMENT_CONFIG_DIR = CONFIG_DIR  # base.yaml and the study conditions, beside interactive.yaml
 
 
 def build_trial_specs(settings: ExperimentSettings, schedule: list[int]):
@@ -261,7 +261,11 @@ def parse_args() -> tuple[argparse.Namespace, list[Block]]:
     if not Path(args.config).exists() and (EXPERIMENT_CONFIG_DIR / args.config).exists():
         args.config = str(EXPERIMENT_CONFIG_DIR / args.config)  # a bare condition name
     if not Path(args.config).exists():
-        found = sorted(p.name for p in EXPERIMENT_CONFIG_DIR.glob("*.yaml") if not p.name.startswith("base"))
+        found = sorted(
+            p.name
+            for p in EXPERIMENT_CONFIG_DIR.glob("*.yaml")
+            if not p.name.startswith(("base", "interactive"))
+        )
         parser.error(
             f"--config: {args.config} not found. Available in {EXPERIMENT_CONFIG_DIR}: {', '.join(found)}"
         )

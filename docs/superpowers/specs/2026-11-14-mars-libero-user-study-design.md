@@ -609,6 +609,16 @@ lines 543 to 597); its run folders are no longer on this machine.
 
 ## The replication: a trained module and tuned baselines (2026-11-24)
 
+**Kept for the paper (2026-11-25).** The study is the final round's three users (rotation, lowdof, lag) with MARS,
+FRS without a module at MARS's setting, FC and FRS at the full reversal; the keypad user was discarded, and the
+teleop arms, the 20 degree rotation test, the earlier rounds' runs and the keypad's runs were deleted. What remains:
+`examples/pi05/mars/results/libero_sim/replication/` (`users.sh`, `users_report.py`, the three users' runs).
+
+**Files moved (2026-11-25).** `outputs/pi05_libero_user_study/` is now
+`examples/pi05/mars/results/libero_sim/`, and its user modules (`replication/modules/`,
+`replication/users/<user>/modules/`) are now `examples/pi05/mars/checkpoints/adapters/libero_sim/<user>/d<k>`
+(the 20 degree rotation's under `rotz20/`). The paths below are as they were when the runs were made.
+
 On the author's word ("switch to trained adaptor and well tuned FC and FRS settings like the one we ran recently to
 see if the gain can be replicated", then "add in a fixed adaptor arm in final test" and "add in depth 10 (full
 reverse) module"). The fourth step's cell, kept: Goal-6, the released checkpoint under "do something", the told

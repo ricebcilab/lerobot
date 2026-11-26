@@ -125,16 +125,16 @@ def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
 
 
 def test_fig3_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
-    _grid_results(tmp_path / "sim" / "sweeps")
+    _grid_results(tmp_path / "cursor_sim" / "sweeps")
     D = bf.grid_data(tmp_path)
     assert D["methods"] == bf.GRID_METHODS   # the grid's arms, the fine-tuned arm among them
     assert bf.seed_values(D, "U1", "T2", "ft_mars_user") == [25.0] and "mars_user" not in D["cell"]("U1", "T2")["metrics"]
     results = tmp_path / "results"
-    _demo_time_results(results / "sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
+    _demo_time_results(results / "cursor_sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
     D = bf.demo_time_data(results)
     assert D["seeds"] == {arm: [0, 1] for arm in bf.DEMO_ARMS} and D["curve"]["mars"][300] == pytest.approx([70, 80])
     assert D["curve"]["ft_flow_control"][300] == pytest.approx([30, 40]) and D["curve"]["ft_frs"][30] == pytest.approx([10, 10])
-    _demo_time_results(tmp_path / "off" / "sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))
+    _demo_time_results(tmp_path / "off" / "cursor_sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))
     with pytest.raises(ValueError, match="not on the grid's cells and trials"):  # a curve off the grid's trials: refused
         bf.demo_time_data(tmp_path / "off")
     monkeypatch.setattr(bf, "demo_log", lambda task, seconds, seed=0: {"args": {"n_demos": seconds}, "best_step": 5000})
@@ -144,8 +144,8 @@ def test_fig3_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
     assert [line.get_color() for line in fig.axes[0].get_lines()] == [bf.GRID_COLOR[arm] for arm in bf.DEMO_ARMS]   # MARS-UT last, on top
     assert stats["success"]["mars"]["300"][0] == pytest.approx(75) and stats["grid_demonstrations_minutes"]["T2"] == pytest.approx(5.0)
     bf.plt.close(fig)
-    _demo_time_results(tmp_path / "other" / "sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))
-    (tmp_path / "other" / "sim" / "sweeps" / "grid_s0" / "test.json").write_text(  # the grid's own teleop trials
-        (results / "sim" / "sweeps" / "grid_s0" / "test.json").read_text())
+    _demo_time_results(tmp_path / "other" / "cursor_sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))
+    (tmp_path / "other" / "cursor_sim" / "sweeps" / "grid_s0" / "test.json").write_text(  # the grid's own teleop trials
+        (results / "cursor_sim" / "sweeps" / "grid_s0" / "test.json").read_text())
     with pytest.raises(ValueError):
         bf.demo_time_data(tmp_path / "other")

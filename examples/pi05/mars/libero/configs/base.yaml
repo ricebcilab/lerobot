@@ -5,7 +5,7 @@ experiment:
   n_trials: 10                # per block
   seed: 0                     # seeds the task schedule, the resets, the policy, the operator and the noise
   task_order: random          # random | shuffled | sequential
-  output_dir: outputs/pi05_libero_experiments
+  output_dir: examples/pi05/mars/results/libero_sim/experiments
 
 scene:
   suite: libero_goal

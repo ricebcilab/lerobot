@@ -1,6 +1,6 @@
 # Figure 3e: the grid's 16 obstacle cells (U1-U4 x T2-T5, noise 1.0) against the time spent demonstrating each task
 # (30 s to 180 min; 2026-11-25, demo_time_vision.yaml, demo_time_ft.yaml and demo_time_baselines.yaml in one; its
-# runs, results/sim/sweeps/demo_time_s<k>, are merged from theirs). Per budget t<seconds>, on the same trials:
+# runs, results/cursor_sim/sweeps/demo_time_s<k>, are merged from theirs). Per budget t<seconds>, on the same trials:
 #   mars_t<s>                MARS with the vision task module trained on that budget's demonstrations
 #                            (cursor_time/task_<task>_t<s>_s0_with_<user>_vlm_image_rel_rigid_r256) and the grid's user module
 #   ft_mars_user_t<s>        the frozen policy fine-tuned on the same demonstrations, through each user's module refitted on it

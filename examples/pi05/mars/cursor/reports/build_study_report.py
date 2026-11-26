@@ -6,7 +6,7 @@
 The study recorded in October 2026 (protocol `study`): reads every session of each participant under
 results/old/2026-11-23/<participant>/<protocol>_s<k>/ (--results) and, when
 present, the expert agent's test result for the same condition from
-results/sim/sweeps/study_tuning/test.json. One participant gives reports/study_<participant>.pdf;
+results/cursor_sim/sweeps/study_tuning/test.json. One participant gives reports/study_<participant>.pdf;
 several give reports/study_group.pdf, where the unit of analysis is the participant (each one's
 sessions pooled first). Figures go to results/analysis/study_<participant|group>/ as PDF and PNG.
 """
@@ -49,7 +49,7 @@ ARM_COLOR = {"teleop": "#008300", "flow_control": "#e87ba4", "frs": "#e69f00", "
 OUTCOME_COLOR = {"hit": "#0ca30c", "wrong_target": "#6250d6", "collision": "#1f1f1e", "timeout": "#898781"}  # CVD-distinct
 OUTCOME_LABEL = {"hit": "Hit", "wrong_target": "Wrong target", "collision": "Collision", "timeout": "Timeout"}
 OUTCOMES = ("hit", "wrong_target", "collision", "timeout")
-REFERENCE = RESULTS / "sim" / "sweeps" / "study_tuning" / "test.json"  # the expert agent, same condition
+REFERENCE = RESULTS / "cursor_sim" / "sweeps" / "study_tuning" / "test.json"  # the expert agent, same condition
 FULL_W, HALF_W = 7.2, 3.5  # figure widths in inches (the page's text width, and a column)
 
 FONTS = Path(matplotlib.get_data_path()) / "fonts" / "ttf"

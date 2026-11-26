@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Report for the image task modules' gates: verdicts, scan crossings, recipe choice and width check.
 
-Reads ``<results>/sim/sweeps/<run>/test.json`` of a gate run (``grid_task_check_*``) and writes ``report.md`` and
+Reads ``<results>/cursor_sim/sweeps/<run>/test.json`` of a gate run (``grid_task_check_*``) and writes ``report.md`` and
 ``report.json`` to ``--out``. The gate gives each image arm one of three verdicts against two reference rows of the
 check run, ``oracle_task`` (the parametric module) and ``oracle_ft`` (the fine-tuned policy, the floor): pass (within 10
 points of parametric hits, collisions at most parametric's + 10 points), marginal (more hits than the fine-tuned policy
@@ -276,7 +276,7 @@ def width_check(
 
 
 def _load(results: Path, name: str) -> dict:
-    return json.loads((results / "sim" / "sweeps" / name / "test.json").read_text())
+    return json.loads((results / "cursor_sim" / "sweeps" / name / "test.json").read_text())
 
 
 def _fmt(v, pct=True, none="-"):

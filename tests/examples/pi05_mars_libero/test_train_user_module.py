@@ -76,9 +76,11 @@ def test_the_session_is_built_without_the_arms_adapter():
         mode="shared_flow_reversal_steering",
         corruption={"rotation_z_deg": 20},
         corruption_matrix=np.eye(3),
-        reversal_adapter={"learned": "outputs/user_modules/rotz20/user.pt"},
+        reversal_adapter={
+            "learned": "examples/pi05/mars/checkpoints/adapters/libero_sim/rotation/d1/user.pt"
+        },
         reversal_adapter_matrix=np.eye(7),
-        reversal_adapter_user_path="outputs/user_modules/rotz20/user.pt",
+        reversal_adapter_user_path="examples/pi05/mars/checkpoints/adapters/libero_sim/rotation/d1/user.pt",
         reversal_adapter_task_path="task.pt",
     )
     calibration = tum.calibration_control(control)

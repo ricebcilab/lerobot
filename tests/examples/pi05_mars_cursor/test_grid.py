@@ -151,7 +151,7 @@ def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
     (tmp_path / "grid.yaml").write_text(RUN_GRID + "tune: {frs: {n_reverse_steps: [10]}}\n")
     argv = ["--sweep", str(tmp_path / "grid.yaml"), "--results", str(tmp_path), "--cpu", "--out", "grid"]
     sweep_main(argv)
-    out = tmp_path / "sim" / "sweeps" / "grid"
+    out = tmp_path / "cursor_sim" / "sweeps" / "grid"
     result = json.loads((out / "test.json").read_text())
     assert set(result["test"]) == {"U1xT0|0.75", "U1xT1|0.75"}
     cell = result["test"]["U1xT1|0.75"]
@@ -182,7 +182,7 @@ def test_tiny_grid_sweep_end_to_end(tmp_path, monkeypatch):
     sweep_main(argv[:-2] + ["--out", "part_a", "--cells", "U1xT0"])
     sweep_main(argv[:-2] + ["--out", "part_b", "--cells", "U1xT1"])
     sweep_main(argv[:-2] + ["--out", "merged", "--merge", "part_a", "part_b"])
-    merged = tmp_path / "sim" / "sweeps" / "merged"
+    merged = tmp_path / "cursor_sim" / "sweeps" / "merged"
     assert json.loads((merged / "test.json").read_text())["test"] == result["test"]
     assert (merged / "figs" / "grid.png").exists() and (merged / "ranking.csv").read_text() == (out / "ranking.csv").read_text()
     log = (merged / "log.txt").read_text()

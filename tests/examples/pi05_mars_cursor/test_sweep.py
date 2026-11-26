@@ -167,7 +167,7 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path, monkeypat
         "grid: {family: gain, levels: [0.25], noises: [1.25]}\nfocus: mars\n")
     common = ["--sweep", str(tmp_path / "jt.yaml"), "--tune-trials", "2", "--test-trials", "4", "--cpu", "--results", str(tmp_path)]
     sweep_main(common + ["--out", "joint"])
-    out = tmp_path / "sim" / "sweeps" / "joint"
+    out = tmp_path / "cursor_sim" / "sweeps" / "joint"
     test, tuning = (json.loads((out / f"{n}.json").read_text()) for n in ("test", "tuning"))
     assert set(test["test"]) == {"0.25|1.25"}
     cell = test["test"]["0.25|1.25"]
@@ -180,7 +180,7 @@ def test_tiny_sweep_tunes_jointly_and_replays_fixed_settings(tmp_path, monkeypat
     for fig in ("test.png", "showcase.png"):
         assert (out / "figs" / fig).exists()
     sweep_main(common + ["--fixed-settings", str(out / "settings.yaml"), "--out", "replay"])
-    replay = tmp_path / "sim" / "sweeps" / "replay"
+    replay = tmp_path / "cursor_sim" / "sweeps" / "replay"
     assert json.loads((replay / "tuning.json").read_text())["tuning"] == {}
     assert (replay / "settings.yaml").read_text() == (out / "settings.yaml").read_text()
     for key, cell in test["test"].items():
@@ -224,7 +224,7 @@ def test_task_axes_make_cells_skip_impossible_ones_rank_and_resume(tmp_path, mon
         "tune: {frs: {n_reverse_steps: [2, 10]}}\n")
     argv = ["--sweep", str(tmp_path / "run.yaml"), "--tune-trials", "3", "--test-trials", "3", "--results", str(tmp_path), "--out", "ax"]
     sweep_main(argv)
-    out = tmp_path / "sim" / "sweeps" / "ax"
+    out = tmp_path / "cursor_sim" / "sweeps" / "ax"
     result = json.loads((out / "test.json").read_text())
     keys = {"0.25|1.25|targets=2-2|min_target_sep=0.12", "0.25|1.25|targets=3-3|min_target_sep=0.12"}
     assert set(result["test"]) == keys and result["showcase"] in keys
@@ -360,7 +360,7 @@ def test_a_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monk
     argv = ["--sweep", str(tmp_path / "tiny.yaml"), "--tune-trials", "2", "--test-trials", "2", "--results", str(tmp_path)]
     sweep_main(argv + ["--out", "tiny_image", "--scene-cache", str(tmp_path / "scene")])
     assert {re.sub(r"_[0-9a-f]{12}\.npy$", "", p.name) for p in (tmp_path / "scene").glob("*.npy")} == {"U1xT2|1.0_tune_cnn_64", "U1xT2|1.0_test_cnn_64"}
-    assert set(json.loads((tmp_path / "sim" / "sweeps" / "tiny_image" / "test.json").read_text())["test"]["U1xT2|1.0"]["metrics"]) == {"teleop", "mars_cnn"}
+    assert set(json.loads((tmp_path / "cursor_sim" / "sweeps" / "tiny_image" / "test.json").read_text())["test"]["U1xT2|1.0"]["metrics"]) == {"teleop", "mars_cnn"}
     # --precompute-scene fills the default folder, one per sweep that every --module-seed run shares, and tests nothing
     real = run_sweep.cursor_paths.CHECKPOINTS
     (tmp_path / "ck").mkdir()
@@ -371,7 +371,7 @@ def test_a_tiny_sweep_attaches_the_scene_for_an_image_task_module(tmp_path, monk
     sweep_main(argv + ["--precompute-scene", "--out", "plain"])
     (folder,) = (tmp_path / "ck" / "scene").iterdir()
     files = _files(folder)
-    assert folder.name == "tiny_image" and len(files) == 2 and not (tmp_path / "sim" / "sweeps" / "plain" / "test.json").exists()
+    assert folder.name == "tiny_image" and len(files) == 2 and not (tmp_path / "cursor_sim" / "sweeps" / "plain" / "test.json").exists()
     sweep_main(argv + ["--precompute-scene", "--out", "seeded", "--module-seed", "1"])
     assert [p.name for p in (tmp_path / "ck" / "scene").iterdir()] == ["tiny_image"] and _files(folder) == files  # seed 1 hit seed 0's files
 
@@ -386,7 +386,7 @@ def test_precompute_scene_writes_nothing_under_out_for_skipped_cells_and_visits_
     )
     argv = ["--sweep", str(tmp_path / "ax.yaml"), "--results", str(tmp_path), "--out", "pre", "--scene-cache",
             str(tmp_path / "scene"), "--precompute-scene", "--tune-trials", "2", "--test-trials", "2", "--resume"]
-    out = tmp_path / "sim" / "sweeps" / "pre"
+    out = tmp_path / "cursor_sim" / "sweeps" / "pre"
     out.mkdir(parents=True)
     (out / "test.json").write_text(json.dumps({"test": {"0.25|1.25|targets=2-2|min_target_sep=0.12": {}}, "skipped": {}}))
     before = (out / "test.json").read_text()

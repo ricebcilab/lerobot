@@ -5,7 +5,7 @@
     python examples/pi05/mars/cursor/tools/analyze_results.py --study study_long --protocol study_long_U2 --out long_U2
     python examples/pi05/mars/cursor/tools/analyze_results.py --results ../results/old/2026-11-23 --protocol study  # the October study
 
-A study's runs are under results/<study>/<participant>/ (run_experiment.py); without --study the participants'
+A study's runs are under results/cursor_<study>/<participant>/ (run_experiment.py); without --study the participants'
 folders are read from --results itself. Practice and aborted trials are excluded. Writes to
 results/analysis/<out>/ (by default the study's name, or all):
 
@@ -190,13 +190,13 @@ def fig_paths(trials, arms, participant, out):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--results", default=str(RESULTS))
-    p.add_argument("--study", help="the study's folder under --results (study_short, study_long), whose participants are read")
+    p.add_argument("--study", help="the study (study_short, study_long), whose participants under --results/cursor_<study>/ are read")
     p.add_argument("--participants", nargs="+", help="p1 p2 ... sim (default: all)")
     p.add_argument("--protocol", help="only runs of this protocol name")
     p.add_argument("--out", help="folder name under results/analysis/ (default: the study, or all)")
     args = p.parse_args()
 
-    runs = find_runs(Path(args.results) / (args.study or ""), args.participants, args.protocol)
+    runs = find_runs(Path(args.results) / (f"cursor_{args.study}" if args.study else ""), args.participants, args.protocol)
     if not runs:
         raise SystemExit("no runs found")
     trials, arms = load_trials(runs)

@@ -28,8 +28,8 @@ def _run(by_ctx):
 
 def _write(root, **runs):
     for name, run in runs.items():
-        (root / "sim" / "sweeps" / name).mkdir(parents=True)
-        (root / "sim" / "sweeps" / name / "test.json").write_text(json.dumps(run))
+        (root / "cursor_sim" / "sweeps" / name).mkdir(parents=True)
+        (root / "cursor_sim" / "sweeps" / name / "test.json").write_text(json.dumps(run))
     return list(runs)
 
 

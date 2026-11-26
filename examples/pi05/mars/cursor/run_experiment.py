@@ -16,7 +16,7 @@ study_long_<user>.yaml); --user picks it (study_short and U3 play
 study_short_U3.yaml, which --protocol can also name whole). A protocol gives its
 cells, one user x the tasks played, as a sweep of its own (run_sweep.py tunes
 it): one task section per task, each a run of its own in
-results/<study>/<participant>/<protocol>_s<session>_<task>/ (study_short or
+results/cursor_<study>/<participant>/<protocol>_s<session>_<task>/ (study_short or
 study_long), with the arms for the user's cell at their tuned settings.
 
 --calibrate trains the user module in the session, on the participant's own
@@ -193,7 +193,7 @@ def run_protocol(args):
     protocol = config.load_protocol(args.protocol)
     sim = args.participant == "sim"
     agent = make_agent("expert", **protocol["expert"]) if sim else make_agent("human", allow_keyboard=args.allow_keyboard)
-    results = Path(args.results) / protocol["study"]  # results/study_short/p1/, results/study_long/p1/
+    results = Path(args.results) / f"cursor_{protocol['study']}"  # results/cursor_study_short/p1/, results/cursor_study_long/p1/
     device, common = device_for(args), (args.participant, args.session, agent, device_for(args), results, args.resume)
     sections, user = protocol_sections(protocol)  # a task section per task, its arms at their tuned settings
     calibration = None
