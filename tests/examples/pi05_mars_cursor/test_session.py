@@ -17,7 +17,7 @@ from lerobot.envs.cursor import TaskConfig, sample_layouts
 from lerobot.policies.steering import SteeringPolicy
 
 PROTOCOL = dict(name="tiny", blocks={"trials": 3, "practice": 1, "order": "latin_square"},
-                trial={"ready_hold_s": 0.0, "feedback_s": 0.0}, expert={"lag": 0, "slow_radius": 0.15},
+                trial={"ready_s": 0.0, "feedback_s": 0.0}, expert={"lag": 0, "slow_radius": 0.15},
                 display={"blind": True})
 
 

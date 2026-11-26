@@ -55,7 +55,7 @@ If no window opens (e.g. over SSH), set `DISPLAY=:1`. A study run needs the Spac
 block screens wait for it); `--allow-keyboard` lets the arrow keys drive the cursor too.
 
 `hub.py manifest --check` checks that `hub_manifest.yaml` still lists every checkpoint folder the configs
-reference (the study protocols' and `configs/sweeps/grid.yaml`'s methods in every cell, and the grid's seeds
+reference (the study protocols' and `configs/grid.yaml`'s methods in every cell, and the grid's seeds
 1–4, each seed-0 module's `_s0` swapped for `_s<k>`); `hub.py manifest` rewrites it. `hub.py upload` (maintainers, on command only)
 creates the public repo if it is missing and uploads each folder's converted files.
 
@@ -93,7 +93,7 @@ configs/              base.yaml and condition_*.yaml (arms), study_short_U1-U4.y
                       protocols, one per study and user, each its own sweep), sweeps/*.yaml (sweep definitions)
 ../checkpoints/       IGNORED  (examples/pi05/mars/checkpoints/) policies/<name>/, adapters/<name>/ (weights +
                       training logs; none tracked; hub.py download fetches the study's and the grid's);
-                      adapters/participants/ holds the user modules of calibrated visits (never uploaded)
+                      adapters/cursor_participants/ holds the user modules of calibrated visits (never uploaded)
 ../results/           IGNORED  (examples/pi05/mars/results/) study_short/ and study_long/ (a study's runs, by
                       participant: p<N>/, sim/), sim/sweeps/<name>/ (run_sweep.py), analysis/, old/ (superseded
                       results, by date; old/2026-11-23/ the October study: p1-p7, sim/study_s1, analysis/)
@@ -125,7 +125,7 @@ such as `checkpoints/` and `results/` are under `examples/pi05/mars/`.
   five visits of 2026-10-18 all used row 1). Within a visit every arm sees the **same target layouts**
   (fixed from the participant and session), shuffled per block; practice layouts are a separate
   small set. The noise is drawn from its own generator, so the layouts never depend on it.
-- **Trial.** The layout is shown; the trial starts once the stick has been idle for 0.3 s; the
+- **Trial.** The layout is shown under "Get ready" for 0.3 s (`trial.ready_s`), then the trial starts; the
   person has 5 s (`task.time_limit_s`) to move onto the gold target and hold for 0.3 s
   (`task.dwell_s`); 0.6 s of feedback. The task geometry and timing are arm parameters (`task:`),
   and every arm of a protocol must agree on the layout ones (targets, radius, spacing, reach),
@@ -189,9 +189,9 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
   records also name the `task` and the `user`). T1 comes first and T2 to T5 in a balanced Latin square row by
   participant number and visit; each section takes the next row of the arms' square. A visit can stop after any
   block and `--resume`; finished sections are left as they are.
-- **Modules.** The user modules are `study/user_<tag>_expert_n100_s0`: the grid's recipe (100 simulated expert
-  reaches, 500 steps, frozen noise) at noise 0.5, with the loss over every read, a rest's noise included. Every
-  participant shares them unless the visit is calibrated (next). The task modules are the grid's vision modules.
+- **Modules.** The user modules are the grid's own, `cursor_sim/user_<tag>_expert_n100_s0` (100 simulated expert
+  reaches, 500 steps, frozen noise, at the grid's noise 1.0, the study's too since 2026-11-25). Every participant
+  shares them unless the visit is calibrated (next). The task modules are the grid's vision modules.
 - **Calibration (`--calibrate`, either study).** The user module is trained in the session, on the participant's
   own commands. Before the first block the cursor plays demonstration reaches by itself on the open field (the
   protocol's `calibration`: 50 reaches after 5 practice ones) while the participant pushes as if steering it,
@@ -205,7 +205,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
   module. About 2.5 minutes in all (about 71 s of reaches, as the dwell on the goal is not slowed, the gates between
   them, the training). The reaches are a run of their own,
   `<protocol>_s<session>_calibration/` (mode `playback`), and the module is
-  `checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>/`, named in every manifest and
+  `checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>/`, named in every manifest and
   record of the visit; its meta holds the calibration and a closing check (how well a regenerated chunk heads
   where the demonstration did, with no module and with it, on the calibration's own steps). `--resume` continues
   an interrupted calibration and keeps a finished one, and a visit begun with `--calibrate` is resumed with it.
@@ -231,7 +231,7 @@ uv run --extra mars python examples/pi05/mars/cursor/run_experiment.py --protoco
 trial mechanism: for every grid cell (a corruption level × an input noise, × the task axes if any)
 each method's setting is tuned on the tuning trials, then every method is tested at its tuned
 setting on new trials, with a paired bootstrap 95% CI on the focus method's lead. A sweep is a file
-under `configs/sweeps/` naming the agent, the base arm, the methods (arm overrides), the settings to
+in `configs/` (`grid.yaml`, `grid_demo_time.yaml`) naming the agent, the base arm, the methods (arm overrides), the settings to
 tune per mode (`tune`: flow control's `tau`, `lambda` and `ic_gain`, FRS's `n_reverse_steps` and
 `pinned_steps`, each with a list of values; every combination is a setting, recorded as
 `{knob: value}`), the grid (`family: gain | rotation | curl | none`, `levels`, `noises`, and
@@ -266,21 +266,16 @@ on a task, e.g. a task-module arm where the task has none, are named below it) a
 
 | Sweep | Agent | Grid | Takes |
 |---|---|---|---|
-| `study_short_<user>` (the protocols `configs/study_short_U1.yaml` to `U4`) | expert | the short study's cell for one user (T1 under `condition_study.yaml`, noise 0.5): flow control over tau (lambda 1), FRS over pinned_steps (the full reversal), MARS over n_reverse_steps × pinned_steps; its `settings.yaml` goes into the protocol's `cells.settings` | ~2 min |
-| `study_long_<user>` (the protocols `configs/study_long_U1.yaml` to `U4`) | expert | the long study's cells for one user (T1 to T5 under `condition_grid.yaml`, noise 0.5; flow control and FRS on the fine-tuned policies, MARS with the vision task modules), tuned the same way | ~40 min a user on two GPUs |
-| `grid_expert_check` | expert | the expert alone (teleop, clean readout) and the frozen policy alone on the grid's tasks T1–T5 | 10 min |
-| `grid_task_check` | expert_chunk | the goal-given policy's own chunks executed, with and without each task module, and each task's retrained policy alone (T2–T5) | 2 min on a free GPU |
-| `grid` | expert | users {U1 … U4} × tasks {T1 … T5} at noise 1.0: the composed user × task adapter, each module alone, each task's retrained policy with its user modules, teleop, flow control and FRS; per cell flow control tunes tau (lambda 1), FRS pinned_steps (the full reversal), every MARS variant n_reverse_steps × pinned_steps | seed 0 tuned in parallel parts (`--cells`, then `--merge <parts> --out grid_s0`); seeds 1–4 at seed 0's settings (`--module-seed k --fixed-settings .../grid_s0/settings.yaml --out grid_s<k>`) |
-| `grid_ft` | expert | the grid's 20 cells for its fine-tuned arm (Figure 3's in place of the retrained one): on each obstacle task the frozen policy fine-tuned on 300 demonstrations, as many as the task's module, MARS-U on it with each user's module refitted; on T1 the frozen policy and the user module; tuned as the grid's MARS variants, on the grid's trials | a part per cell, seed 0 tuned, seeds 1–4 at its settings; `results/research/grid_ft/pipeline.sh` trains and runs all five |
-| `grid_vision` | expert | the grid's 20 cells with the vision task module (the rigid recipe at 300 demonstrations, rank 256 through the disk store) alone and with the user module, and flow control and FRS on each obstacle task's fine-tuned policy; Figure 3d's arms with MARS-U from `grid` and the fine-tuned arm from `grid_ft` | ~55 min per obstacle cell tuned |
-| `grid_vision_decoy` | expert | the decoy control: the grid's four trained-on obstacle cells with the obstacle placed about a non-goal target, nine arms at the grid's tuned settings (`results/research/grid_vision/merge_settings.py`); not a Figure 3 panel | minutes |
-| `demo_time_check` | expert_chunk | the demonstration-time curve's gate: on T2–T5, alone with the goal given and hidden, the frozen policy, with the grid's task module, retrained from scratch, and fine-tuned on 5 and 180 min of demonstrations | 3 min |
-| `demo_time_mars`, `demo_time_ft` | expert | the grid's 16 obstacle cells against the time spent demonstrating each task (0.5, 1, 2, 5, 10, 20, 60 and 180 min): MARS with a task module per budget, and MARS-U on the frozen policy fine-tuned on the same demonstrations; every method tuned as the grid's MARS variants, on the grid's trials | a part per cell (`--cells`, then `--merge`), seed 0 tuned, seeds 1–2 at its settings; `results/research/demo_time/pipeline.sh <seed>` runs a seed end to end |
-| `demo_time_vision`, `demo_time_baselines` | expert | the demonstration-time curve with the vision task module (Figure 3e, rederived 2026-11-09): `demo_time_mars`'s cells and budgets with the grid's rigid vision module per budget (`demo_time/image/...`), and flow control and FRS on each budget's fine-tuned policy (`demo_time_ft`'s models); driver `results/research/demo_time_vision/pipeline.sh` | ~2 days per seed on two GPUs |
-| `grid_vision_any_pilot`, `grid_vision_any_pilot_decoy` | expert | the decoy-robust pilot (2026-11-09): U1xT2 with the vision module, the fine-tuned policy and its user refit trained on `decoy: any` layouts, on the grid's and the decoy layouts at the grid's tuned settings (`results/research/decoy_any/`); appendix material | minutes |
+| `study_short_<user>` (the protocols `configs/study_short_U1.yaml` to `U4`) | expert | the short study's cell for one user (T1 under `condition_study.yaml`, noise 1.0): flow control over tau (lambda 1), FRS over pinned_steps (the full reversal), MARS over n_reverse_steps × pinned_steps; its `settings.yaml` goes into the protocol's `cells.settings` | ~2 min |
+| `study_long_<user>` (the protocols `configs/study_long_U1.yaml` to `U4`) | expert | the long study's cells for one user (T1 to T5 under `condition_grid.yaml`, noise 1.0; flow control and FRS on the fine-tuned policies, MARS with the vision task modules), tuned the same way | ~40 min a user on two GPUs |
+| `grid` | expert | Figure 3d: users {U1 … U4} × tasks {T1 … T5} at noise 1.0; teleop, flow control and FRS on each obstacle task's fine-tuned policy (each tuned on its paper's one knob), the vision task module alone and with the user module, and the fine-tuned policy with each user's module refitted on it (every MARS arm over the reversal depth × the pinned prefix) | seed 0 tuned in parallel parts (`--cells`, then `--merge <parts> --out grid_s0`); seeds 1–4 at its settings (`--module-seed k --fixed-settings .../grid_s0/settings.yaml --out grid_s<k>`); its runs are `grid_s<k>` (`grid_vision_s<k>` and `grid_ft_s<k>` merged on 2026-11-25) |
+| `grid_demo_time` | expert | Figure 3e: the grid's 16 obstacle cells against the time spent demonstrating each task (0.5, 1, 2, 5, 10, 20, 60 and 180 min); per budget MARS with a vision task module trained on that budget's demonstrations, the frozen policy fine-tuned on them with each user's module refitted, and flow control and FRS on that fine-tuned policy | a part per cell (`--cells`, then `--merge`), seed 0 tuned, seeds 1–2 at its settings; its runs are `demo_time_s<k>` (the three earlier sweeps' runs merged on 2026-11-25) |
 
 Times are on one RTX 6000 Ada. Settings only need re-tuning when something that can move them changes:
-the condition, a retrained module or a retrained policy.
+the condition, a retrained module or a retrained policy. Retraining Figure 3e's vision task modules needs disk: a
+trainer's token store holds every scene's full tokens (1 MB each), 347k scenes and 364 GB at the 180-min budget, so
+train those one at a time and delete each store once its module is saved (a shared store filled the disk on
+2026-11-10, 1.09 TB after 28 modules).
 
 ## Conventions
 
@@ -466,8 +461,8 @@ the policy's own chunks (`learned_adapter/*`) and task modules without a user.
 parameters, or the scene rendered at `--render-size` pixels (a multiple of 16 for `cnn`), through π0.5's frozen vision
 tokens (`--vlm`, default `lerobot/pi05_base`) or a CNN trained with the module. `--pooled <entries file>` trains one
 module over several contexts, a YAML `entries: [{obstacle, user_module, corruption}, ...]` in place of `--obstacle`,
-`--user-module` and `--corruption`. Image modules are checkpointed under `image/` (`image/task_<ctx>_n300_s0_with_<user>_<source>`;
-the pooled `image/task_all_n1200_s0_<source>`). Sweeps attach the scene to each cell's layouts and cache the arrays
+`--user-module` and `--corruption`. The simulation's modules are checkpointed under `cursor_sim/` (`cursor_sim/task_<ctx>_n300_s0_with_<user>_<source>`;
+the pooled `cursor_sim/task_all_n1200_s0_<source>`). Sweeps attach the scene to each cell's layouts and cache the arrays
 in `checkpoints/scene/<sweep>/` (`--scene-cache` moves it); `run_sweep.py --precompute-scene` fills the cache for every cell in one
 process and exits. A layout batch's scene array is `render_scene_array` (lerobot's `cursor_flow` processors: the render,
 encoded for `vlm_*`); a steering policy's pre-processor gets the cursor's render step before its scene-tokens step
@@ -491,11 +486,15 @@ weights alone with the goal given on 200 layouts of its task under the grid's co
 sweeps' trials) and keeps the best, every score in its `train_log.json`.
 
 Checkpoints go to `examples/pi05/mars/checkpoints/policies/<name>/` and `.../adapters/<name>/`, which git
-ignores. The ones the study and the grid use (the study's policy and MARS adapter, the grid's policies and
-modules of all five training seeds, each named with `_s<k>` after its demonstration count) are on the Hub
-(`ricebcilab/mars-cursor`, listed in `hub_manifest.yaml`); `hub.py download` fetches them. Earlier experiments'
-checkpoints are grouped by experiment under `adapters/learned_adapter/`, `adapters/grid_20000demos/`,
-`adapters/refit/` and `adapters/data_efficiency/`, and are not distributed.
+ignores. The adapters sit in four folders: `cursor_sim/` the simulation's user and task modules (the grid's, all
+five training seeds, each named with `_s<k>` after its demonstration count; the studies play its user modules),
+`cursor_participants/` the modules of calibrated visits and `cursor_time/` the demonstration-time
+curve's. An older run's records name modules in the layout before 2026-11-25 (`image/`, `study/`, `demo_time/`,
+`participants/`, the grid's user modules at the top); `cursor_sa.paths.current_name` finds them in this one. The
+ones the study and the grid use are on the Hub (`ricebcilab/mars-cursor`, listed in `hub_manifest.yaml`); `hub.py
+download` fetches them. Earlier experiments' checkpoints (`adapters/learned_adapter/`, `grid_20000demos/`,
+`refit/`, `data_efficiency/`, the user module's rank ablations and the task modules that read the obstacle's
+geometry) were deleted on 2026-11-25, with the sweeps that used them; only their results remain.
 
 `train_adapter.py` writes `adapter.pt` in lerobot's `AdapterModules.save_module` format (kind, config, weights, meta),
 which `AdapterModules.load` reads; `train_policy.py` writes a `cursor_flow` policy folder (`config.json` +
@@ -513,7 +512,7 @@ The notes on the experiments up to 2026-10-30 (the policy's checks, the steering
 adapter, the search for the study's condition and task parameters, the composed user × task adapter's
 development, data efficiency, closed-loop recalibration and the user module's ranks) are in git history
 (`git show b02c1551:examples/pi05/mars/cursor/README.md`); their results are under `results/old/2026-10-30/`
-and their checkpoints under `checkpoints/adapters/{learned_adapter,grid_20000demos,refit,data_efficiency}/`.
+(their checkpoints were deleted on 2026-11-25).
 On 2026-10-30 the study's and the grid's settings were re-tuned with the baselines as their papers define them
 (flow control's tau at lambda 1; FRS's pinned prefix at the full reversal) and MARS over its reversal depth ×
 pinned prefix, and the study's MARS arm moved to the grid's 100-demonstration user module.

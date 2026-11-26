@@ -15,14 +15,14 @@ Reads (results/ is git-ignored, so these are local):
     fig1  nothing (its reaches come from the readout's rule, its densities are made up)
     fig2  the study recorded in October 2026, moved to results/old/2026-11-23/: p*/study_s*/ (the sessions) and
           sim/study_s1 (the expert's reference)
-    fig3  the vision grid's five training seeds: results/sim/sweeps/grid_vision_s<k>/test.json (seed 0 tuned, seeds 1-4
-          tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
-          module alone and with the user module) joined trial for trial by the fine-tuned arm from
-          grid_ft_s<k>/test.json, and seed 0's checkpoints for one cell's rollouts (the vision
-          module's scene tokens through checkpoints/scene/fig3); for panel e's curve the demonstration-time sweeps,
-          results/sim/sweeps/demo_time_{vision,ft,baselines}_s<k>/test.json (the vision module, Fine-tuned + MARS-U,
-          flow control and FRS on the fine-tuned policies, each per budget; on the grid's trials), and the fine-tuned
-          policies' training logs (checkpoints/policies/demo_time/: each budget's demonstration count and training length)
+    fig3  the grid's five training seeds: results/sim/sweeps/grid_s<k>/test.json (configs/grid.yaml; seed 0 tuned, seeds
+          1-4 tested at seed 0's settings: teleop, flow control and FRS on each task's fine-tuned policy, the vision task
+          module alone and with the user module, and the fine-tuned policy with the user module refitted on it), and seed
+          0's checkpoints for one cell's rollouts (the vision module's scene tokens through checkpoints/scene/fig3); for
+          panel e's curve the demonstration-time runs, results/sim/sweeps/demo_time_s<k>/test.json (configs/grid_demo_time.yaml:
+          the vision module, Fine-tuned + MARS-U, flow control and FRS on the fine-tuned policies, each per budget; on the
+          grid's trials), and the fine-tuned policies' training logs (checkpoints/policies/demo_time/: each budget's
+          demonstration count and training length)
 
 Figures 1b and 3a are schematics in FRS's manner: their 1-D densities are made up to show the mechanism.
 """
@@ -705,36 +705,21 @@ def build_fig2(out, results):
 
 
 TASK_SEEDS = (11, 5, 8, 2, 7)  # one sampled layout per task for the illustration
-SEED_RUNS = tuple(f"grid_vision_s{k}" for k in range(5))  # the grid's runs on the vision task module, under
-# results/sim/sweeps, one per training seed: 0 is the grid of record, tuned; 1-4 retrain every module on its own draw of the
+SEED_RUNS = tuple(f"grid_s{k}" for k in range(5))  # the grid's runs (configs/grid.yaml), under results/sim/sweeps, one per
+# training seed: 0 is the grid of record, tuned; 1-4 retrain every module and fine-tuned policy on its own draw of the
 # demonstrations and are tested at seed 0's settings on the grid's trials (teleop trains nothing, so every seed has the grid's)
 FT_ARM = "ft_mars_user"   # the policy fine-tuned on each obstacle task's 300 demonstrations (as many as its task module's),
-FT_RUNS = tuple(f"grid_ft_s{k}" for k in range(5))  # with the user modules refitted on it: a sweep of its own per seed
-JOINED = {FT_ARM: FT_RUNS}  # arm -> the runs it joins the grid's from, per seed
+# with the user modules refitted on it
 GRID_BASELINES = ("teleop", "ft_flow_control", "ft_frs")
 N_BOOT = 4000  # bootstrap draws for the 95% CIs over the seeds, then the trials
 ROLLOUT_SEED = 7  # panel b's trials
 FIG3_H = 6.15  # in: a (the schematic) and b (the tasks) side by side on top, then c, then d and e (positions in inches from the bottom)
 
 
-def join_arm(test, other, arm, what):
-    """`other`'s arm joins `test` cell by cell (its settings, metrics and trial records), once the two sweeps are shown to
-    be on the same trials: the cells, each trial's side and teleop's outcome, trial for trial."""
-    if other.keys() != test.keys() or any(c["trials"]["side"] != test[key]["trials"]["side"] or
-                                          c["trials"]["outcome"]["teleop"] != test[key]["trials"]["outcome"]["teleop"]
-                                          for key, c in other.items()):
-        raise ValueError(f"{what} is not on its run's trials")
-    for key, c in other.items():
-        for f in ("settings", "metrics"):
-            test[key][f][arm] = c[f][arm]
-        for f in ("outcome", "duration_s"):
-            test[key]["trials"][f][arm] = c["trials"][f][arm]
-
-
 def grid_data(results):
-    """The vision grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the
-    seed D["seeds"][k]), each joined trial for trial by its seed's fine-tuned arm (`JOINED`). Every run is on
-    the grid's trials, so methods compare trial for trial within a seed and a cell's numbers average over the seeds."""
+    """The grid's runs, one per training seed found (seed 0 is required; D["cell"](u, t, k) is run k's cell, the seed
+    D["seeds"][k]). Every run is on the grid's trials, so methods compare trial for trial within a seed and a cell's
+    numbers average over the seeds."""
     sweeps = Path(results) / "sim" / "sweeps"
     seeds = [k for k, run in enumerate(SEED_RUNS) if k == 0 or (sweeps / run / "test.json").exists()]
     runs = [json.loads((sweeps / SEED_RUNS[k] / "test.json").read_text()) for k in seeds]
@@ -743,15 +728,11 @@ def grid_data(results):
         if run["test"].keys() != grid["test"].keys() or any(c["trials"]["side"] != grid["test"][key]["trials"]["side"]
                                                              for key, c in run["test"].items()):
             raise ValueError(f"seed {k}'s run ({SEED_RUNS[k]}) is not on the grid's trials")
-    for k, run in zip(seeds, runs):   # the joined arms come from their seed's own sweeps, trial for trial
-        for arm, names in JOINED.items():
-            join_arm(run["test"], json.loads((sweeps / names[k] / "test.json").read_text())["test"], arm,
-                     f"seed {k}'s {GRID_LABEL[arm]} ({names[k]})")
     G = grid["args"]["sweep"]["grid"]
     users, tasks, noise = G["users"], G["tasks"], G["noises"][0]
-    train = yaml.safe_load((config.CONFIG_DIR / "sweeps" / "grid.yaml").read_text())["grid"]["train"]
+    train = yaml.safe_load((config.CONFIG_DIR / "grid.yaml").read_text())["grid"]["train"]
     return dict(G=G, runs=runs, seeds=seeds, users=users, tasks=tasks, noise=noise, leads={},
-                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"] or m in JOINED],
+                methods=[m for m in GRID_METHODS if m in grid["args"]["sweep"]["methods"]],
                 obstacle_tasks=[t for t in tasks if G["cells"][f"{users[0]}x{t}"]["obstacle"]],
                 cell=lambda u, t, k=0: runs[k]["test"][f"{u}x{t}|{noise}"], train={tuple(p) for p in train},
                 test_n=grid["args"]["test_trials"])
@@ -976,7 +957,6 @@ def build_fig3(out, results, device):
     write_stats(out, "fig3", dict(
         names={"MARS-UT": "user + task modules (mars)", "MARS-T": "task module alone (mars_task)"},
         seeds=seeds, seed_runs=[f"results/sim/sweeps/{SEED_RUNS[k]}" for k in seeds],
-        fine_tuned_runs=[f"results/sim/sweeps/{FT_RUNS[k]}" for k in seeds],
         task_module_note="the task module is the vision module: pi0.5's vision tokens of a picture of the scene (vlm_image, "
                          "relative geometry), trained on 300 demonstrations with 32 rigid copies of each, rank 256",
         seed_note="every number is over the seeds: seed 0 is the grid of record; seeds 1-4 retrain every module (user modules "
@@ -1015,33 +995,32 @@ def build_fig3(out, results, device):
 
 
 DEMO_SECONDS = (30, 60, 120, 300, 600, 1200, 3600, 10800)  # the budgets, time spent demonstrating a task (s; _t<s> in names)
-DEMO_ARMS = {"ft_frs": ("demo_time_baselines", "ft_frs_t{s}"), "ft_flow_control": ("demo_time_baselines", "ft_flow_control_t{s}"),
-             FT_ARM: ("demo_time_ft", "ft_mars_user_t{s}"), "mars": ("demo_time_vision", "mars_t{s}")}  # panel d's arm:
-# its sweep and its method per budget (_t<s>), in drawing order (MARS-UT on top); colours and labels are panel d's
+DEMO_RUNS = "demo_time"  # results/sim/sweeps/demo_time_s<k> (configs/grid_demo_time.yaml), one per training seed
+DEMO_ARMS = {"ft_frs": "ft_frs_t{s}", "ft_flow_control": "ft_flow_control_t{s}", FT_ARM: "ft_mars_user_t{s}",
+             "mars": "mars_t{s}"}  # panel d's arm: its method per budget (_t<s>), in drawing order (MARS-UT on top);
+# colours and labels are panel d's
 DEMO_TASKS = {"T2": "disc_large", "T3": "wall_gap", "T4": "ring_goal", "T5": "ring_start"}  # the tasks' checkpoint names
 GRID_DEMOS = 300  # the grid's task modules (and panel d's fine-tuned policies): 300 demonstrations of the task
 
 
 def demo_time_data(results):
-    """Each arm's runs (`DEMO_ARMS`), one per training seed found (seed 0 is required). An arm's value at a budget is
-    its success averaged over the 16 obstacle cells, one value per seed. The sweeps play the grid's cells and trials: their teleop's
-    outcomes must be the grid's (grid_s0's), trial for trial."""
+    """The demonstration-time runs, one per training seed found (seed 0 is required). An arm's value at a budget is its
+    success averaged over the 16 obstacle cells, one value per seed. The runs play the grid's cells and trials: their
+    teleop's outcomes must be the grid's (grid_s0's), trial for trial."""
     sweeps = Path(results) / "sim" / "sweeps"
-    load = lambda name: json.loads((sweeps / name / "test.json").read_text())
-    found = lambda name: [k for k in range(5) if k == 0 or (sweeps / f"{name}_s{k}" / "test.json").exists()]
-    by_sweep = {sweep: {k: load(f"{sweep}_s{k}") for k in found(sweep)} for sweep in {s for s, _ in DEMO_ARMS.values()}}
-    runs = {arm: by_sweep[sweep] for arm, (sweep, _) in DEMO_ARMS.items()}
+    load = lambda name: json.loads((sweeps / name / "test.json").read_text())  # noqa: E731
+    seeds = [k for k in range(5) if k == 0 or (sweeps / f"{DEMO_RUNS}_s{k}" / "test.json").exists()]
+    runs = {k: load(f"{DEMO_RUNS}_s{k}") for k in seeds}
     grid = load("grid_s0")
-    cells = list(runs["mars"][0]["test"])
-    teleop = lambda run, c: run["test"][c]["trials"]["outcome"]["teleop"]
-    for arm, by_seed in runs.items():
-        for k, run in by_seed.items():
-            if list(run["test"]) != cells or any(teleop(run, c) != teleop(grid, c) for c in cells):
-                raise ValueError(f"{DEMO_ARMS[arm][0]}_s{k} is not on the grid's cells and trials")
-    pooled = lambda run, m: 100 * float(np.mean([run["test"][c]["metrics"][m]["success"] for c in cells]))
-    curve = {arm: {s: [pooled(run, method.format(s=s)) for run in runs[arm].values()] for s in DEMO_SECONDS}
-             for arm, (_, method) in DEMO_ARMS.items()}
-    return dict(cells=cells, curve=curve, seeds={arm: list(by_seed) for arm, by_seed in runs.items()})
+    cells = list(runs[0]["test"])
+    teleop = lambda run, c: run["test"][c]["trials"]["outcome"]["teleop"]  # noqa: E731
+    for k, run in runs.items():
+        if list(run["test"]) != cells or any(teleop(run, c) != teleop(grid, c) for c in cells):
+            raise ValueError(f"{DEMO_RUNS}_s{k} is not on the grid's cells and trials")
+    pooled = lambda run, m: 100 * float(np.mean([run["test"][c]["metrics"][m]["success"] for c in cells]))  # noqa: E731
+    curve = {arm: {s: [pooled(run, method.format(s=s)) for run in runs.values()] for s in DEMO_SECONDS}
+             for arm, method in DEMO_ARMS.items()}
+    return dict(cells=cells, curve=curve, seeds={arm: seeds for arm in DEMO_ARMS})
 
 
 def demo_log(task, seconds, seed=0):

@@ -34,10 +34,10 @@ class Renderer:
     apart on screen: the served command's line, the planned path and the STEERING label
     (a blinded study shows the cursor, the targets and the obstacles)."""
 
-    def __init__(self, title="Cursor shared autonomy", blind=True, ready_hold_s=0.3,
+    def __init__(self, title="Cursor shared autonomy", blind=True, ready_s=0.3,
                  feedback_s=0.6, fps=50, auto_continue_s=None, cues=True):
         self.blind, self.cues = blind, cues
-        self.ready_hold_s, self.feedback_s, self.fps = ready_hold_s, feedback_s, fps
+        self.ready_s, self.feedback_s, self.fps = ready_s, feedback_s, fps
         self.auto_continue_s = auto_continue_s  # screens continue by themselves (watching the expert)
         self.deadline = None  # when the current trial frame is due to end (`frame`)
         pygame.init()
@@ -145,16 +145,10 @@ class Renderer:
 
     # ------------------------------------------------------------ trial phases
     def ready_phase(self, ctx):
-        """Show the layout; start once the stick has been idle for ready_hold_s."""
-        agent, idle_since = ctx["agent"], [None]
-
-        def done(keys):
-            idle = agent.idle
-            idle_since[0] = None if not idle else (idle_since[0] if idle_since[0] is not None else time.monotonic())
-            return idle_since[0] is not None and time.monotonic() - idle_since[0] >= self.ready_hold_s
-
-        self.frames(agent, lambda: self.draw(ctx, banner="Get ready" if idle_since[0] is not None else "Release the stick",
-                                             banner_color=INK_2), done)
+        """Show the layout under "Get ready" for ready_s, then start the trial, whatever the stick is doing."""
+        tic = time.monotonic()
+        self.frames(ctx["agent"], lambda: self.draw(ctx, banner="Get ready", banner_color=INK_2),
+                    lambda keys: time.monotonic() - tic >= self.ready_s)
         self.begin_trial()
 
     def begin_trial(self):

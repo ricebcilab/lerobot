@@ -29,30 +29,35 @@ def test_manifest_covers_study_grid_and_seeds():
     study = {
         "policies/flow_goaldrop",
         "policies/flow_goaldrop_ring_goal_ft_n300_s0",
-        "adapters/study/user_gain025y_expert_n100_s0",
-        "adapters/study/user_curl20_expert_n100_s0",
-        "adapters/image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256",
+        "adapters/cursor_sim/user_gain025y_expert_n100_s0",
+        "adapters/cursor_sim/user_curl20_expert_n100_s0",
+        "adapters/cursor_sim/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256",
     }
     assert (
         study <= set(folders["study"]) and len(folders["study"]) == 5 + 4 + 4
     )  # policies, user modules, task modules
-    grid = {"policies/flow_goaldrop_ring_start", "adapters/user_rot60_expert_n100_s0_on_wall_gap"}
-    assert grid | {"adapters/task_ring_goal_n300_s0_with_rot60"} <= set(folders["grid"])
+    grid = {
+        "policies/flow_goaldrop_ring_start_ft_n300_s0",
+        "adapters/cursor_sim/user_rot60_expert_n100_s0_on_wall_gap_ft_n300",
+    }
+    assert grid | {"adapters/cursor_sim/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256"} <= set(
+        folders["grid"]
+    )
     seeds = folders["grid_seeds"]
     assert len(seeds) == 4 * (
         len(folders["grid"]) - 5
     )  # every seed-0 module, four times; the 5 policies stay one seed
     assert {
-        "adapters/user_curl20_expert_n100_s3_on_ring_goal",
-        "adapters/task_wall_gap_n300_s4_with_gain025x",
+        "adapters/cursor_sim/user_curl20_expert_n100_s3_on_ring_goal_ft_n300",
+        "adapters/cursor_sim/task_wall_gap_n300_s4_with_gain025x_vlm_image_rel_rigid_r256",
     } <= set(seeds)
     assert not any("grid_seeds/" in f for group in folders.values() for f in group)  # all seeds side by side
     assert (
         hub.seed_name("user_rot60_expert_n100_s0_on_wall_gap", 3) == "user_rot60_expert_n100_s3_on_wall_gap"
     )
     assert (
-        hub.seed_name("demo_time/task_ring_goal_t300_s0_with_rot60", 2)
-        == "demo_time/task_ring_goal_t300_s2_with_rot60"
+        hub.seed_name("cursor_time/task_ring_goal_t300_s0_with_rot60_vlm_image_rel_rigid_r256", 2)
+        == "cursor_time/task_ring_goal_t300_s2_with_rot60_vlm_image_rel_rigid_r256"
     )
     with pytest.raises(ValueError):
         hub.seed_name("user_gain025y_expert_n100", 1)  # no _s0 tag
@@ -85,7 +90,7 @@ def test_download_targets(tmp_path, monkeypatch, capsys):
     assert Path(call["local_dir"]) == tmp_path / "checkpoints"
     assert sorted(call["allow_patterns"]) == sorted(f"{f}/*" for f in folders)
     assert hub.main(["download", "--repo", "someone/else"]) == 0 and calls[-1]["repo_id"] == "someone/else"
-    left_out.append("adapters/user_rot60_expert_n100_s0")
+    left_out.append("adapters/cursor_sim/user_rot60_expert_n100_s0")
     monkeypatch.setattr(hub, "CHECKPOINTS", tmp_path / "fresh")
     assert left_out[0] in folders and hub.main(["download"]) == 1
     out = capsys.readouterr().out

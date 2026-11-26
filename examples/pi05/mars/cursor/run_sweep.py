@@ -2,12 +2,12 @@
 
     python run_sweep.py --sweep study_short_U1                         # a study protocol's cells (configs/study_short_U1.yaml)
     python run_sweep.py --sweep study_short_U1 --tune-trials 50 --test-trials 50   # a quick look
-    python run_sweep.py --sweep grid --resume                          # continue an interrupted sweep
-    python run_sweep.py --sweep grid --cells U1xT3 U2xT4 --out grid_part1   # some cells, in a process of their own
-    python run_sweep.py --sweep grid --merge grid_part1 grid_part2 --out grid_s0   # combine the parts
+    python run_sweep.py --sweep grid --resume                               # continue an interrupted sweep
+    python run_sweep.py --sweep grid --cells U1xT3 U2xT4 --out part1        # some cells, in a process of their own
+    python run_sweep.py --sweep grid --merge part1 part2 --out grid_s0      # combine the parts
     python run_sweep.py --sweep grid --module-seed 1 --fixed-settings ../results/sim/sweeps/grid_s0/settings.yaml --out grid_s1
 
-A sweep config (configs/sweeps/<name>.yaml, or a study protocol's `cells`, configs/<name>.yaml) names the agent, the base arm, the
+A sweep config (configs/<name>.yaml: grid.yaml, grid_demo_time.yaml, or a study protocol's `cells`) names the agent, the base arm, the
 methods (overrides of the arm), the settings to tune per mode (`tune`: for
 flow_control tau (chunk steps of 16), lambda (Euler steps the command is written
 at) and ic_gain, for frs n_reverse_steps (Euler steps of flow_steps) and
@@ -143,14 +143,11 @@ def protocol_cells(protocol):
 
 
 def load_sweep(path, module_seed=None):
-    """A sweep config (a bare name is configs/sweeps/<name>.yaml), or a study protocol (configs/<name>.yaml), whose
-    cells are the sweep that tunes it."""
+    """A sweep config (a bare name is configs/<name>.yaml), or a study protocol (configs/<name>.yaml), whose cells are
+    the sweep that tunes it."""
     path = Path(path)
     if not path.exists():
-        name = path.name if path.suffix else path.name + ".yaml"
-        path = config.CONFIG_DIR / "sweeps" / name
-        if not path.exists() and (config.CONFIG_DIR / name).exists():
-            path = config.CONFIG_DIR / name
+        path = config.CONFIG_DIR / (path.name if path.suffix else path.name + ".yaml")
     data = yaml.safe_load(path.read_text())
     if "cells" in data:
         data = protocol_cells({"name": path.stem, **data})
@@ -913,7 +910,7 @@ def print_cells(sweep, rows):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sweep", required=True, help="sweep config (bare names are looked up in configs/sweeps/)")
+    p.add_argument("--sweep", required=True, help="sweep config (bare names are looked up in configs/)")
     p.add_argument("--tune-trials", type=int, help="override trials.tune")
     p.add_argument("--test-trials", type=int, help="override trials.test")
     p.add_argument("--resume", action="store_true", help="keep the cells already in the output folder, run the rest")

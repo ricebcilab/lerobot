@@ -25,8 +25,23 @@ def policy_log(name):
     return policy_path(name) / "train_log.json"
 
 
+# The adapters' layout since 2026-11-25: cursor_sim/ the simulation's user and task modules (the studies play its
+# user modules), cursor_participants/ the calibrated visits', cursor_time/ the demonstration-time curve's. An
+# older run's records name a module in the layout before it; `current_name` finds it here.
+MOVED = (("demo_time/image/", "cursor_time/"), ("demo_time/", "cursor_time/"), ("image/", "cursor_sim/"),
+         ("participants/", "cursor_participants/"))
+
+
+def current_name(name):
+    """An adapter's name in the current layout (a current name stays as it is)."""
+    for old, new in MOVED:
+        if name.startswith(old):
+            return new + name[len(old):]
+    return f"cursor_sim/{name}" if "/" not in name and name.startswith("user_") else name
+
+
 def adapter_dir(name):
-    return CHECKPOINTS / "adapters" / name
+    return CHECKPOINTS / "adapters" / current_name(name)
 
 
 def adapter_path(name):

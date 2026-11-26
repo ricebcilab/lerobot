@@ -2,7 +2,7 @@
 #
 # Every arm parameter lives here. An arm file says `extends: base.yaml` (or
 # another arm) and overrides only what it changes; a sweep's method and cell
-# override it again (configs/sweeps/). Unknown or missing keys are errors. Who
+# override it again (configs/grid.yaml, configs/grid_demo_time.yaml). Unknown or missing keys are errors. Who
 # plays (a person, the expert) and how many trials are the protocol's business
 # (configs/study_short_<user>.yaml, study_long_<user>.yaml).
 

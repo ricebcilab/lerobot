@@ -271,7 +271,7 @@ def test_gain_scales_the_cursor_by_step_or_by_time():
 
 def test_shipped_configs_load_and_overrides_win():
     arms = {p.name: config.load_arm(p) for p in config.CONFIG_DIR.glob("*.yaml")
-            if not p.name.startswith("study_")}  # the other files of configs/ are protocols
+            if not p.name.startswith(("study_", "grid"))}  # the other files of configs/ are protocols and sweeps
     assert {"base.yaml", "condition_study.yaml", "condition_grid.yaml"} == set(arms)  # the default arm and the sweeps' two bases
     study = arms["condition_study.yaml"]  # the short study's task alone: its sweep sets the user and the noise
     assert (study["targets"], study["reach"], study["corruption"], study["input_noise"]) == ([4, 4], [0.35, 0.5], None, 0.0)

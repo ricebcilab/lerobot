@@ -1,11 +1,13 @@
 # The long user study (2026-11-23) for U3 (a 60 degree rotation): the five tasks (T1 the open field, T2-T5 the obstacle tasks)
 # under the grid's condition (condition_grid.yaml: gain_mode time, a replan every 80 ms, 8 s per trial, T1 5 s) at
-# input noise 0.5, which the readout serves at every read. Four arms per task, under the same four names on every task:
-# teleop; flow control and FRS (the frozen policy on T1, the task's fine-tuned policy on T2-T5, grid_vision.yaml's ft
-# arms); MARS (the user's module, study/user_<tag>_expert_n100_s0: the grid's recipe at noise 0.5 with the loss over
-# every read, and on T2-T5 the grid's vision task module: T2 trained with U1 in the loop, T3 with U2, T4 with U3, T5
+# input noise 1.0 (the grid's), which the readout serves at every read. Four arms per task, under the same four names on every task:
+# teleop; flow control and FRS (the frozen policy on T1, the task's fine-tuned policy on T2-T5, grid.yaml's ft
+# arms); MARS (the user's module, cursor_sim/user_<tag>_expert_n100_s0: the grid's own module, trained at noise 1.0,
+# and on T2-T5 the grid's vision task module: T2 trained with U1 in the loop, T3 with U2, T4 with U3, T5
 # with U4). About 1 h 30 to 1 h 45 min; 2 h 40 min if every trial ran out. study_long_U1.yaml to study_long_U4.yaml
 # differ only in their user and its settings.
+# Not tuned at noise 1.0 yet (2026-11-25): cells.settings is empty, so the protocol does not play until
+# `run_sweep.py --sweep study_long_<user>` has tuned it and its settings.yaml is copied in.
 #
 #   python run_experiment.py --protocol study_long --user U3 --participant p1 --prepare   # the visit's scene tokens, ahead
 #   python run_experiment.py --protocol study_long --user U3 --participant p1
@@ -40,48 +42,28 @@ cells:
       reversal_adapter:
         user: cell
         task: {T1: null,
-               T2: image/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256,
-               T3: image/task_wall_gap_n300_s0_with_gain025x_vlm_image_rel_rigid_r256,
-               T4: image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256,
-               T5: image/task_ring_start_n300_s0_with_curl20_vlm_image_rel_rigid_r256}
+               T2: cursor_sim/task_disc_large_n300_s0_with_gain025y_vlm_image_rel_rigid_r256,
+               T3: cursor_sim/task_wall_gap_n300_s0_with_gain025x_vlm_image_rel_rigid_r256,
+               T4: cursor_sim/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256,
+               T5: cursor_sim/task_ring_start_n300_s0_with_curl20_vlm_image_rel_rigid_r256}
   tune:
     flow_control: {tau: [2, 4, 6, 8, 10, 12, 14, 16]}
     frs: {pinned_steps: [2, 4, 8, 16]}
   grid:
     users:
-      U3: {corruption: {rotation_deg: 60}, adapter: study/user_rot60_expert_n100_s0}
+      U3: {corruption: {rotation_deg: 60}, adapter: cursor_sim/user_rot60_expert_n100_s0}
     tasks:
       T1: {obstacle: null, adapter: null, time_limit_s: 5.0}
       T2: {obstacle: {kind: disc, radius: 0.08, along: 0.5, offset: [0.012, 0.024]}, adapter: null}
       T3: {obstacle: {kind: wall, along: 0.5, gap: 0.16, gap_offset: 0.14, radius: 0.015, extent: 0.4}, adapter: null}
       T4: {obstacle: {kind: ring, around: goal, gap_angle: [15, 30]}, adapter: null}
       T5: {obstacle: {kind: ring, around: start, gap_angle: [15, 30]}, adapter: null}
-    noises: [0.5]
+    noises: [1.0]
   trials: {tune: 200, test: 500}
   seed: 800
   task_order: latin_square
-  settings:
-    U3xT1|0.5:
-      flow_control: {tau: 6}
-      frs: {pinned_steps: 4}
-      mars: {n_reverse_steps: 1, pinned_steps: 2}
-    U3xT2|0.5:
-      flow_control: {tau: 10}
-      frs: {pinned_steps: 4}
-      mars: {n_reverse_steps: 4, pinned_steps: 4}
-    U3xT3|0.5:
-      flow_control: {tau: 4}
-      frs: {pinned_steps: 2}
-      mars: {n_reverse_steps: 8, pinned_steps: 8}
-    U3xT4|0.5:
-      flow_control: {tau: 8}
-      frs: {pinned_steps: 2}
-      mars: {n_reverse_steps: 8, pinned_steps: 8}
-    U3xT5|0.5:
-      flow_control: {tau: 10}
-      frs: {pinned_steps: 16}
-      mars: {n_reverse_steps: 7, pinned_steps: 2}
+  settings: {}
 blocks: {trials: 40, practice: 5, order: latin_square}
-trial: {ready_hold_s: 0.3, feedback_s: 0.6}
+trial: {ready_s: 0.3, feedback_s: 0.6}
 expert: {lag: 0, slow_radius: 0.15}
 display: {blind: true, cues: false}

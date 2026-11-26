@@ -105,7 +105,7 @@ def table(results, arms):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sweep", required=True, help="sweep config (bare names are looked up in configs/sweeps/)")
+    p.add_argument("--sweep", required=True, help="sweep config (bare names are looked up in configs/)")
     p.add_argument("--context", required=True, help="the task, e.g. T2 or T4")
     p.add_argument("--method", required=True, help="the sweep's method playing the image module, e.g. oracle_task_rel")
     p.add_argument("--seed", type=int, default=0, help="the module's training --seed")

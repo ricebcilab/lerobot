@@ -415,7 +415,7 @@ class Calibration(Run):
 
     `sections` are the visit's ({task: {arm name: arm}}): the readout and the layouts' task are their first arm's,
     the policy the one their user module steers. `module` names the module trained on the calibration
-    (checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>), `with_module` puts it in the
+    (checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>), `with_module` puts it in the
     shared module's place and `data` is what its trainer reads."""
 
     calibration = True
@@ -434,7 +434,7 @@ class Calibration(Run):
         section = dict(task="calibration", index=0, first_block=0, n_blocks=1, last=False)
         super().__init__({**protocol, "blocks": blocks}, participant, session, agent, device, results_dir, resume,
                          arms={"calibration": arm}, section=section, labels=labels)
-        self.module = f"participants/{protocol['study']}/{participant}/{protocol['name']}_s{session}"
+        self.module = f"cursor_participants/{protocol['study']}/{participant}/{protocol['name']}_s{session}"
         self.slow = int(plan["slow"])
         if self.slow < 1:
             raise ValueError(f"protocol {protocol['name']}: calibration.slow is the frames a step is played over (>= 1)")

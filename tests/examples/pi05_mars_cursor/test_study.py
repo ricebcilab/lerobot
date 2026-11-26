@@ -4,6 +4,7 @@ commands (--calibrate), and what a window without cues draws."""
 
 import functools
 import os
+import time
 
 import numpy as np
 import pytest
@@ -45,7 +46,7 @@ TUNED = {"teleop": None, "flow_control": {"tau": 8}, "mars": {"n_reverse_steps":
 PROTOCOL = {
     "name": "tiny",
     "blocks": {"trials": 2, "practice": 1, "order": "latin_square"},
-    "trial": {"ready_hold_s": 0.0, "feedback_s": 0.0},
+    "trial": {"ready_s": 0.0, "feedback_s": 0.0},
     "expert": {"lag": 0, "slow_radius": 0.15},
 }
 USERS = ("U1", "U2", "U3", "U4")
@@ -66,7 +67,7 @@ cells:
     U3xT1|0.5:
       mars: {n_reverse_steps: 2, pinned_steps: 4}
 blocks: {trials: 2, practice: 1}
-trial: {ready_hold_s: 0.0, feedback_s: 0.0}
+trial: {ready_s: 0.0, feedback_s: 0.0}
 calibration: {reaches: 6, practice: 1, steps: 3}
 """
 
@@ -142,8 +143,9 @@ def test_protocol_cells_give_each_task_its_tuned_arms(tmp_path):
 
 def test_shipped_study_protocols_resolve():
     """study_short_<user>.yaml (each grid user on T1) and study_long_<user>.yaml (each on T1-T5): the arms of every
-    task section at their tuned settings, noise 0.5, the condition hidden and no cues; the long ones' obstacle tasks
-    play the fine-tuned policy and MARS's task module, and a study's four differ only in their user and its settings."""
+    task section at their tuned settings, noise 1.0, the condition hidden and no cues; the long ones' obstacle tasks
+    play the fine-tuned policy and MARS's task module, and a study's four differ only in their user and its settings.
+    The long ones are not tuned at noise 1.0 yet, so they refuse to play until they are."""
     import run_sweep
 
     studies = {"study_short": ["T1"], "study_long": ["T1", "T2", "T3", "T4", "T5"]}
@@ -157,11 +159,15 @@ def test_shipped_study_protocols_resolve():
             assert run_sweep.load_sweep(protocol["name"])["grid"]["users"] == [
                 expected
             ]  # run_sweep.py --sweep <protocol>
+            if study == "study_long":
+                with pytest.raises(ValueError, match="no tuned setting"):
+                    run_experiment.protocol_sections(protocol)
+                continue
             sections, user = run_experiment.protocol_sections(protocol)
             assert user == expected and list(sections) == tasks, protocol["name"]
             for task, arms in sections.items():
                 assert list(arms) == ["teleop", "flow_control", "frs", "mars"]
-                assert {arm["input_noise"] for arm in arms.values()} == {0.5}
+                assert {arm["input_noise"] for arm in arms.values()} == {1.0}
                 assert (
                     arms["flow_control"]["lambda"] == 1 and arms["frs"]["n_reverse_steps"] is None
                 )  # as their papers define them
@@ -175,7 +181,9 @@ def test_shipped_study_protocols_resolve():
                 assert arms["flow_control"]["ic_gain"] == pytest.approx(
                     float(to_action(1.0, policy)), abs=1e-4
                 )
-    assert sections["T2"]["teleop"]["gain_mode"] == "time"
+    assert (
+        run_sweep.method_arm(run_sweep.load_sweep("study_long_U1"), "teleop", "U1xT2")["gain_mode"] == "time"
+    )
 
     def shared(p):  # all of a protocol but its name, its user and that user's settings
         cells = {k: v for k, v in p["cells"].items() if k != "settings"}
@@ -250,7 +258,7 @@ def test_a_calibrated_visit_plays_mars_with_the_participants_own_module(tmp_path
         np.testing.assert_allclose(
             steps[:, 0], steps[:, 1], atol=2e-3
         )  # at half speed: every step over two frames
-    name = "participants/tiny/sim/tiny_s1"
+    name = "cursor_participants/tiny/sim/tiny_s1"
     path = tmp_path / "adapters" / name / "adapter.pt"
     assert AdapterModules.load(path).kind == "user"
     meta = torch.load(path)["meta"]["calibration"]
@@ -415,4 +423,24 @@ def test_trial_frames_keep_their_deadlines(monkeypatch):
     ends = [frame(33 if k % 4 == 0 else 1) for k in range(8)]  # a chunk every fourth frame
     assert ends == [33, 40, 60, 80, 113, 120, 140, 160]
     assert [frame(200), frame(1)] == [360, 380]  # a stall: no catching up
+    screen.close()
+
+
+def test_a_trial_starts_after_the_ready_pause_whatever_the_stick_does(monkeypatch):
+    """Before each trial the window shows the layout under "Get ready" for ready_s and then starts: a person still
+    pushing the stick is not asked to release it first."""
+    monkeypatch.setitem(os.environ, "SDL_VIDEODRIVER", "dummy")
+    from cursor_sa import renderer as window
+
+    class Pushing:  # a person who never lets go of the stick
+        idle = False
+
+    screen, banners = window.Renderer(ready_s=0.05), []
+    monkeypatch.setattr(screen, "draw", lambda ctx, banner=None, **k: banners.append(banner))
+    tic = time.monotonic()
+    screen.ready_phase({"agent": Pushing()})
+    assert (
+        time.monotonic() - tic >= 0.05 and screen.deadline is not None
+    )  # the trial's frame grid starts there
+    assert banners and set(banners) == {"Get ready"}
     screen.close()

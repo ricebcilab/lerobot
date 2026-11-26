@@ -77,7 +77,7 @@ def test_the_expert_chunk_agent_plans_goal_given_chunks_and_holds_each_planned_s
 
 
 def test_every_shipped_sweep_resolves_every_method():
-    for path in sorted((config.CONFIG_DIR / "sweeps").glob("*.yaml")):
+    for path in (config.CONFIG_DIR / "grid.yaml", config.CONFIG_DIR / "grid_demo_time.yaml"):  # the shipped sweeps
         sweep = load_sweep(path)
         assert sweep.get("focus") is None or sweep["focus"] in sweep["methods"], path.name
         assert all(m in sweep["methods"] for m in sweep.get("against") or []), path.name
@@ -87,33 +87,28 @@ def test_every_shipped_sweep_resolves_every_method():
                 assert arm["mode"] in ("teleop", "policy", "flow_control", "frs"), (path.name, m)
                 if arm["mode"] in ("flow_control", "frs"):
                     assert settings_for(sweep, arm["mode"], m), (path.name, m)  # every mode a sweep plays has its knobs
-    grid = load_sweep("grid.yaml")  # the baselines with their papers' fixed knob (lambda 1, the full reversal); MARS both
-    assert settings_for(grid, "flow_control", "flow_control") == [{"tau": t} for t in range(2, 17, 2)]
-    assert settings_for(grid, "frs", "frs") == [{"pinned_steps": p} for p in (2, 4, 8, 16)]
-    assert method_arm(grid, "frs", "U1xT1")["n_reverse_steps"] is None and method_arm(grid, "flow_control", "U1xT1")["lambda"] == 1
-    for m in ("mars_user", "mars_task", "mars", "retrained_mars_user"):
+    grid = load_sweep("grid.yaml")  # the baselines with their papers' fixed knob (lambda 1, the full reversal)
+    assert settings_for(grid, "flow_control", "ft_flow_control") == [{"tau": t} for t in range(2, 17, 2)]
+    assert settings_for(grid, "frs", "ft_frs") == [{"pinned_steps": p} for p in (2, 4, 8, 16)]
+    assert method_arm(grid, "ft_frs", "U1xT1")["n_reverse_steps"] is None
+    assert method_arm(grid, "ft_flow_control", "U1xT1")["lambda"] == 1
+    for m in ("mars_task", "mars"):  # MARS over its depth x the pinned prefix
         assert len(settings_for(grid, "frs", m)) == 10 * 4 and "tune" not in method_arm(grid, m, "U1xT1")
     cells = grid["grid"]["cells"]
     assert len(cells) == 20 and sorted(n for n, c in cells.items() if c["train"]) == [
         "U1xT1", "U1xT2", "U2xT1", "U2xT3", "U3xT1", "U3xT4", "U4xT1", "U4xT5"]
     arm = method_arm(grid, "mars", "U4xT4")
     assert arm["corruption_curl"] == {"curl": 20.0, "tau": 0.1} and arm["obstacle"]["around"] == "goal"
-    assert arm["learned_adapter"] == {"user": "user_curl20_expert_n100_s0", "task": "task_ring_goal_n300_s0_with_rot60"}
+    assert arm["learned_adapter"] == {"user": "cursor_sim/user_curl20_expert_n100_s0",
+                                      "task": "cursor_sim/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256"}
     assert arm["time_limit_s"] == 8.0 and arm["input_noise"] == 1.0
-    ft = method_arm(load_sweep("grid_ft.yaml", 1), "ft_mars_user", "U2xT3")  # on the obstacle tasks fine-tuned, per seed
-    assert (ft["model"], ft["reversal_adapter"]["user"]) == ("flow_goaldrop_wall_gap_ft_n300_s1", "user_gain025x_expert_n100_s1_on_wall_gap_ft_n300")
-    arm = method_arm(grid, "frs", "U1xT1")
+    ft = method_arm(load_sweep("grid.yaml", 1), "ft_mars_user", "U2xT3")  # on the obstacle tasks fine-tuned, per seed
+    assert (ft["model"], ft["reversal_adapter"]["user"]) == (
+        "flow_goaldrop_wall_gap_ft_n300_s1", "cursor_sim/user_gain025x_expert_n100_s1_on_wall_gap_ft_n300")
+    arm = method_arm(grid, "ft_frs", "U1xT1")
     assert with_setting(arm, {"n_reverse_steps": 10, "pinned_steps": 4})["n_reverse_steps"] is None
     assert with_setting(arm, {"n_reverse_steps": 6, "pinned_steps": 4})["pinned_steps"] == 4
     assert with_setting(arm, 10)["n_reverse_steps"] is None  # a bare number: an older run's depth
-    # the leak check differs from the rigid recipe's check only by the decoy and the fine-tuned arm
-    rigid, leak = load_sweep("grid_task_check_rel_rigid.yaml"), load_sweep("grid_task_check_rel_leak.yaml")
-    assert set(leak["methods"]) == set(rigid["methods"]) - {"oracle_ft"} and leak["focus"] == "oracle_task_rel_rigid"
-    assert leak["against"] == ["oracle_task"] and (leak["seed"], leak["trials"]) == (820, {"tune": 20, "test": 500})
-    for cell in ("U0xT2", "U0xT4"):
-        for m in leak["methods"]:
-            a, b = method_arm(leak, m, cell), method_arm(rigid, m, cell)
-            assert a["learned_adapter"] == b["learned_adapter"] and a["obstacle"] == dict(b["obstacle"], decoy=True)
 
 
 def test_module_seed_swaps_the_seed_0_tag_of_a_count_or_a_time_budget():

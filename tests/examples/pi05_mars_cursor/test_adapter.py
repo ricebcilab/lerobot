@@ -85,6 +85,21 @@ def test_composed_adapter_applies_task_forward_and_user_task_backward():
     assert not reverse_flow(model, obs, x, 3, 10, AdapterModules(user=user)).requires_grad
 
 
+def test_an_older_runs_adapter_name_finds_its_module_in_the_current_layout():
+    """Recorded runs name modules in the layout before 2026-11-25; `adapter_dir` finds them where they are now."""
+    from cursor_sa.paths import CHECKPOINTS, adapter_dir
+
+    moved = {
+        "user_rot60_expert_n100_s3_on_wall_gap_ft_n300": "cursor_sim/user_rot60_expert_n100_s3_on_wall_gap_ft_n300",
+        "image/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256": "cursor_sim/task_ring_goal_n300_s0_with_rot60_vlm_image_rel_rigid_r256",
+        "participants/study_short/p1/study_short_U1_s1": "cursor_participants/study_short/p1/study_short_U1_s1",
+        "demo_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t30": "cursor_time/user_gain025x_expert_n100_s0_on_disc_large_ft_t30",
+        "demo_time/image/task_disc_large_t60_s1_with_gain025y_vlm_image_rel_rigid_r256": "cursor_time/task_disc_large_t60_s1_with_gain025y_vlm_image_rel_rigid_r256",
+    }
+    for old, new in moved.items():
+        assert adapter_dir(old) == adapter_dir(new) == CHECKPOINTS / "adapters" / new
+
+
 def test_a_saved_user_module_loads_as_a_user_only_adapter(tmp_path):
     user = LearnedUserModule(FlowPolicy().horizon, n_dims=2)
     torch.manual_seed(0)

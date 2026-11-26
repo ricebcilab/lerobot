@@ -90,56 +90,53 @@ def test_fig2_builds_from_the_recorded_sessions(tmp_path):
     assert all(len(v) == 3 for v in stats["success_mean_ci"].values())
 
 
-def _grid_results(sweeps, ft_teleop=("hit", "timeout")):
-    """Seed 0 of a one-user vision grid (teleop, the fine-tuned baselines, MARS-T, MARS-UT) and its fine-tuned arm, two
-    trials a cell."""
+def _grid_results(sweeps):
+    """Seed 0 of a one-user grid run (configs/grid.yaml's arms: teleop, the fine-tuned baselines, MARS-T, MARS-UT and the
+    fine-tuned policy with the user module), two trials a cell."""
     cells = {"U1xT1": None, "U1xT2": {"kind": "disc"}}
-    def write(name, methods, teleop):
-        test = {f"{c}|1.0": dict(settings=dict.fromkeys(methods),
-                                 metrics={m: {"success": 0.25 if m == "ft_mars_user" else 0.5} for m in methods},
-                                 trials=dict(side=["left", "right"], duration_s={m: [1.0, 8.0] for m in methods},
-                                             outcome={m: list(teleop) if m == "teleop" else ["hit", "timeout"] for m in methods}))
-                for c in cells}
-        grid = dict(users=["U1"], tasks=["T1", "T2"], noises=[1.0], cells={c: {"obstacle": o} for c, o in cells.items()})
-        (sweeps / name).mkdir(parents=True)
-        (sweeps / name / "test.json").write_text(json.dumps(dict(args=dict(sweep=dict(methods=dict.fromkeys(methods, {}), grid=grid),
-                                                                           test_trials=2), test=test)))
-    write("grid_vision_s0", ["teleop", "ft_flow_control", "ft_frs", "mars_task", "mars"], ("hit", "timeout"))
-    write("grid_ft_s0", ["teleop", "ft_mars_user"], ft_teleop)
+    methods = ["teleop", "ft_flow_control", "ft_frs", "mars_task", "mars", "ft_mars_user"]
+    test = {f"{c}|1.0": dict(settings=dict.fromkeys(methods),
+                             metrics={m: {"success": 0.25 if m == "ft_mars_user" else 0.5} for m in methods},
+                             trials=dict(side=["left", "right"], duration_s={m: [1.0, 8.0] for m in methods},
+                                         outcome={m: ["hit", "timeout"] for m in methods}))
+            for c in cells}
+    grid = dict(users=["U1"], tasks=["T1", "T2"], noises=[1.0], cells={c: {"obstacle": o} for c, o in cells.items()})
+    (sweeps / "grid_s0").mkdir(parents=True)
+    (sweeps / "grid_s0" / "test.json").write_text(json.dumps(dict(args=dict(sweep=dict(methods=dict.fromkeys(methods, {}), grid=grid),
+                                                                          test_trials=2), test=test)))
 
 
 def _demo_time_results(root, mars, ft, teleop=("hit", "timeout")):
-    """Sweep outputs for Figure 3e on two cells, one per seed: the vision module (mars), Fine-tuned + MARS-U (ft), flow
-    control and FRS on the fine-tuned policy (ft - 0.1 and 0.1), and the grid's teleop."""
+    """Figure 3e's runs on two cells, one per seed (configs/grid_demo_time.yaml's arms): the vision module (mars),
+    Fine-tuned + MARS-U (ft), flow control and FRS on the fine-tuned policy (ft - 0.1 and 0.1), and teleop; and the grid's
+    run, whose teleop the curve's must replay."""
     cells = ["U1xT2|1.0", "U2xT3|1.0"]
-    def run(methods):
-        return {"test": {c: {"metrics": {m: {"success": v} for m, v in methods.items()},
-                             "trials": {"outcome": {"teleop": list(teleop)}}} for c in cells}}
-    def write(name, methods):
+    def write(name, methods, outcome=("hit", "timeout")):
         (root / name).mkdir(parents=True)
-        (root / name / "test.json").write_text(json.dumps(run(methods)))
+        (root / name / "test.json").write_text(json.dumps({"test": {c: {"metrics": {m: {"success": v} for m, v in methods.items()},
+                                                                         "trials": {"outcome": {"teleop": list(outcome)}}}
+                                                                     for c in cells}}))
     for k, (m, f) in enumerate(zip(mars, ft)):
-        write(f"demo_time_vision_s{k}", {"teleop": 0.2, **{f"mars_t{s}": m for s in bf.DEMO_SECONDS}})
-        write(f"demo_time_ft_s{k}", {"teleop": 0.2, **{f"ft_mars_user_t{s}": f for s in bf.DEMO_SECONDS}})
-        write(f"demo_time_baselines_s{k}", {"teleop": 0.2, **{f"ft_flow_control_t{s}": f - 0.1 for s in bf.DEMO_SECONDS},
-                                           **{f"ft_frs_t{s}": 0.1 for s in bf.DEMO_SECONDS}})
+        write(f"demo_time_s{k}", {"teleop": 0.2, **{f"mars_t{s}": m for s in bf.DEMO_SECONDS},
+                                  **{f"ft_mars_user_t{s}": f for s in bf.DEMO_SECONDS},
+                                  **{f"ft_flow_control_t{s}": f - 0.1 for s in bf.DEMO_SECONDS},
+                                  **{f"ft_frs_t{s}": 0.1 for s in bf.DEMO_SECONDS}}, teleop)
     write("grid_s0", {"teleop": 0.2})
 
 
-def test_fig3_joins_the_fine_tuned_and_demo_time_sweeps_trial_for_trial(tmp_path, monkeypatch):
+def test_fig3_reads_one_run_per_seed_on_the_grids_trials(tmp_path, monkeypatch):
     _grid_results(tmp_path / "sim" / "sweeps")
     D = bf.grid_data(tmp_path)
-    assert D["methods"] == bf.GRID_METHODS   # the vision grid's arms, the fine-tuned arm joined in its place
+    assert D["methods"] == bf.GRID_METHODS   # the grid's arms, the fine-tuned arm among them
     assert bf.seed_values(D, "U1", "T2", "ft_mars_user") == [25.0] and "mars_user" not in D["cell"]("U1", "T2")["metrics"]
-    assert D["cell"]("U1", "T2")["trials"]["outcome"]["ft_mars_user"] == ["hit", "timeout"]
-    _grid_results(tmp_path / "off_ft" / "sim" / "sweeps", ft_teleop=("timeout", "timeout"))   # a joined sweep off the grid's trials: refused
-    with pytest.raises(ValueError, match="not on its run's trials"):
-        bf.grid_data(tmp_path / "off_ft")
     results = tmp_path / "results"
     _demo_time_results(results / "sim" / "sweeps", mars=[0.7, 0.8], ft=[0.4, 0.5])
     D = bf.demo_time_data(results)
     assert D["seeds"] == {arm: [0, 1] for arm in bf.DEMO_ARMS} and D["curve"]["mars"][300] == pytest.approx([70, 80])
     assert D["curve"]["ft_flow_control"][300] == pytest.approx([30, 40]) and D["curve"]["ft_frs"][30] == pytest.approx([10, 10])
+    _demo_time_results(tmp_path / "off" / "sim" / "sweeps", mars=[0.7], ft=[0.4], teleop=("timeout", "timeout"))
+    with pytest.raises(ValueError, match="not on the grid's cells and trials"):  # a curve off the grid's trials: refused
+        bf.demo_time_data(tmp_path / "off")
     monkeypatch.setattr(bf, "demo_log", lambda task, seconds, seed=0: {"args": {"n_demos": seconds}, "best_step": 5000})
     bf.paper_style()
     fig = bf.plt.figure(figsize=(bf.FULL_W, bf.FIG3_H))

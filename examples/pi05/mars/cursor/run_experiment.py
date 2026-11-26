@@ -27,7 +27,7 @@ about 2.5 minutes), a user module is trained on what the readout served (the
 shared modules' recipe, 500 steps), and it takes
 the shared module's place in MARS for the visit. The reaches are a run of their
 own (<protocol>_s<session>_calibration/), the module is
-checkpoints/adapters/participants/<study>/<participant>/<protocol>_s<session>/.
+checkpoints/adapters/cursor_participants/<study>/<participant>/<protocol>_s<session>/.
 
 If a window cannot open (e.g. over SSH), set DISPLAY=:1 first.
 """
@@ -228,7 +228,7 @@ def run_protocol(args):
         if renderer is None and (not sim or args.watch):
             renderer = make_renderer(title=f"{protocol['name']}: {args.participant}",
                                      blind=protocol["display"]["blind"] and not args.no_blind, cues=protocol["display"]["cues"],
-                                     ready_hold_s=protocol["trial"]["ready_hold_s"],
+                                     ready_s=protocol["trial"]["ready_s"],
                                      feedback_s=protocol["trial"]["feedback_s"], auto_continue_s=1.0 if sim else None)
         return renderer
 

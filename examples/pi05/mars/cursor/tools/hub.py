@@ -10,12 +10,13 @@ The manifest is rebuilt from the configs, never edited by hand:
 - study: every method of the study protocols (configs/study_short_<user>.yaml, study_long_<user>.yaml) in every cell: the
   policies (frozen and fine-tuned per task), the four users' modules and the vision task modules, so the protocols
   play and tune after a download;
-- grid: every method of configs/sweeps/grid.yaml in every cell (the frozen policy, the retrained policies, the
-  seed-0 user and task modules, and the user modules calibrated on the retrained policies);
+- grid: every method of the grid's sweep (configs/grid.yaml, Figure 3d's) in every cell: the frozen and the
+  fine-tuned policies, the seed-0 user modules and vision task
+  modules (adapters/cursor_sim/), and the user modules calibrated on the fine-tuned policies;
 - grid_seeds: the grid's training seeds 1-4, derived from each seed-0 module of the grid group by putting _s<k> in
-  place of its _s0 (user_rot60_expert_n100_s0_on_wall_gap -> user_rot60_expert_n100_s3_on_wall_gap); the retrained
+  place of its _s0 (cursor_sim/user_rot60_expert_n100_s0_on_wall_gap_ft_n300 -> ..._s3_on_wall_gap_ft_n300); the
   policies stay one seed.
-All five seeds' modules sit side by side in adapters/, every one named with its seed right after its demonstration
+All five seeds' modules sit side by side in adapters/cursor_sim/, every one named with its seed right after its demonstration
 count (_n100 / _n300).
 
 `download` fetches those folders from the repo (default ricebcilab/mars-cursor) into examples/pi05/mars/checkpoints/
@@ -55,7 +56,7 @@ POLICY_REQUIRED = ("config.json", "model.safetensors", *POLICY_PIPELINE_FILES)
 ADAPTER_REQUIRED = ("adapter.pt",)
 HEADER = """\
 # The checkpoint folders (under examples/pi05/mars/checkpoints/) that the study and the grid use, on the Hub at
-# `repo`. Written by `hub.py manifest` from the study protocols, configs/sweeps/grid.yaml and the grid's seeds 1-4;
+# `repo`. Written by `hub.py manifest` from the study protocols, the grid's sweeps (grid_vision, grid_ft) and seeds 1-4;
 # do not edit by hand (`hub.py manifest --check` fails when this file and the configs disagree).
 """
 

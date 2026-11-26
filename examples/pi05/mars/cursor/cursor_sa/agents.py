@@ -144,10 +144,6 @@ class ExpertAgent(StepAgent):
                 target[i], at_goal[i] = pts[i, best[i]], best[i] == len(self._routes[b][1]) - 1
         return target, at_goal
 
-    @property
-    def idle(self):
-        return True
-
     def params(self):
         return dict(lag=self.lag, slow_radius=self.slow_radius, clearance=self.clearance, margin=self.margin)
 
@@ -182,10 +178,6 @@ class ExpertChunkAgent:
         parts = ctl.steps_of(0 if new else ctl.t)  # the step(s) the controller plays now, at the gain's pace
         play = lambda chunk: sum((share / ctl.gain) * chunk[:, i] for i, share in parts)
         return play(self.raw), play(self.served), self.served if new else None
-
-    @property
-    def idle(self):
-        return True
 
     def params(self):
         return {}
@@ -240,10 +232,6 @@ class HumanAgent(StepAgent):
     @property
     def connected(self):
         return self.spacemouse is not None and self.spacemouse.connected
-
-    @property
-    def idle(self):
-        return not is_active(self.command()[0])
 
     def take_button(self):
         """True once per SpaceMouse button press."""

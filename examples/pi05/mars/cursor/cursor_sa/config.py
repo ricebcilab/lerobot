@@ -51,7 +51,7 @@ MODE_ALIASES = {"shared_flow_control": "flow_control", "shared_flow_reversal_ste
 CHUNK_STEPS = CursorFlowConfig.horizon  # the cursor policy's chunk length: flow_control's tau counts chunk steps
 PROTOCOL_DEFAULTS = {
     "blocks": {"trials": 40, "practice": 5, "order": "latin_square"},
-    "trial": {"ready_hold_s": 0.3, "feedback_s": 0.6},
+    "trial": {"ready_s": 0.3, "feedback_s": 0.6},
     "expert": {"lag": 0, "slow_radius": 0.15, "clearance": 0.05, "margin": 0.03},
     "display": {"blind": True, "cues": True},  # cues: the served command, the planned path and the STEERING label
     # --calibrate: the reaches the cursor plays by itself before the visit (straight, each step over `slow` frames, so
